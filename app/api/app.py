@@ -6,11 +6,13 @@ from fastapi import FastAPI
 from langchain_core.runnables import RunnableLambda
 from langserve import add_routes
 
+from app.api.middleware.auth import OAuthMiddleware
 from app.api.routes.health import router as health_router
 from app.api.routes.workflows import router as workflows_router
 from app.core.config import get_settings
 from app.core.container import ApplicationContainer, build_container
 from app.domain.models.runtime import WorkflowRequest
+from app.infrastructure.auth.auth_service import AuthService
 
 
 @asynccontextmanager
@@ -25,6 +27,14 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(title=settings.app_name, debug=settings.debug, lifespan=lifespan)
+    if settings.oauth_enabled:
+        auth_service = AuthService(
+            jwks_url=settings.oauth_jwks_url,
+            issuer=settings.oauth_issuer,
+            algorithms=settings.oauth_algorithms,
+            audience=settings.oauth_audience,
+        )
+        app.add_middleware(OAuthMiddleware, auth_service=auth_service)
     app.include_router(health_router)
     app.include_router(workflows_router, prefix=settings.api_prefix)
     _register_langserve_routes(app, settings.langserve_path)

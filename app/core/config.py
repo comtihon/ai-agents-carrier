@@ -33,6 +33,13 @@ class Settings(BaseSettings):
     langserve_path: str = Field(default="/langserve/workflow-runner", alias="LANGSERVE_PATH")
     http_action_timeout_seconds: float = Field(default=30.0, alias="HTTP_ACTION_TIMEOUT_SECONDS")
 
+    # --- OAuth ---
+    oauth_enabled: bool = Field(default=False, alias="OAUTH_ENABLED")
+    oauth_jwks_url: str | None = Field(default=None, alias="OAUTH_JWKS_URL")
+    oauth_issuer: str | None = Field(default=None, alias="OAUTH_ISSUER")
+    oauth_audience: str | None = Field(default=None, alias="OAUTH_AUDIENCE")
+    oauth_algorithms: list[str] = Field(default=["RS256"], alias="OAUTH_ALGORITHMS")
+
     # --- LLM ---
     llm_provider: str | None = Field(default=None, alias="LLM_PROVIDER")          # "anthropic" | "openai"
     llm_model: str | None = Field(default=None, alias="LLM_MODEL")                # overrides provider default
