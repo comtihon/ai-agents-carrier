@@ -16,6 +16,7 @@ from app.domain.models.runtime import WorkflowRequest
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     container = build_container(get_settings())
+    await container.startup()
     app.state.container = container
     yield
     await container.shutdown()

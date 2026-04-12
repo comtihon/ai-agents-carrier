@@ -8,3 +8,20 @@ data:
   MONGODB_DATABASE: {{ .Values.mongodb.database | quote }}
   OPENHANDS_BASE_URL: {{ .Values.app.openhandsBaseUrl | quote }}
   OPENHANDS_MOCK_MODE: {{ .Values.app.openhandsMockMode | quote }}
+  # MCP integration config — non-sensitive (URLs, enabled flags, transports).
+  # API keys must live in the k8s Secret referenced by app.existingSecret.
+  MCP_FIGMA_ENABLED: {{ .Values.mcp.figma.enabled | quote }}
+  MCP_FIGMA_TRANSPORT: {{ .Values.mcp.figma.transport | quote }}
+  MCP_FIGMA_URL: {{ .Values.mcp.figma.url | quote }}
+  MCP_JIRA_ENABLED: {{ .Values.mcp.jira.enabled | quote }}
+  MCP_JIRA_TRANSPORT: {{ .Values.mcp.jira.transport | quote }}
+  MCP_JIRA_URL: {{ .Values.mcp.jira.url | quote }}
+  MCP_MIRO_ENABLED: {{ .Values.mcp.miro.enabled | quote }}
+  MCP_MIRO_TRANSPORT: {{ .Values.mcp.miro.transport | quote }}
+  MCP_MIRO_URL: {{ .Values.mcp.miro.url | quote }}
+  MCP_NOTION_ENABLED: {{ .Values.mcp.notion.enabled | quote }}
+  MCP_NOTION_TRANSPORT: {{ .Values.mcp.notion.transport | quote }}
+  MCP_NOTION_URL: {{ .Values.mcp.notion.url | quote }}
+  MCP_GITHUB_ENABLED: {{ .Values.mcp.github.enabled | quote }}
+  MCP_GITHUB_TRANSPORT: {{ .Values.mcp.github.transport | quote }}
+  MCP_GITHUB_URL: {{ .Values.mcp.github.url | quote }}

@@ -1,0 +1,50 @@
+{
+  "id": "design_first_flow",
+  "name": "Design-First Delivery Flow",
+  "description": "Fetch design and project context from Figma and Jira before planning and executing.",
+  "entrypoint": "plan",
+  "metadata": {
+    "default_repo": "acme/backend",
+    "outputs_required": ["backend_pr"]
+  },
+  "steps": [
+    {
+      "id": "fetch_figma",
+      "name": "Fetch Figma Design",
+      "type": "fetch",
+      "tool": "figma_get_file",
+      "tool_input": {},
+      "output_key": "figma_design",
+      "requires": []
+    },
+    {
+      "id": "fetch_jira_issue",
+      "name": "Fetch Jira Issue",
+      "type": "fetch",
+      "tool": "jira_get_issue",
+      "tool_input": {},
+      "output_key": "jira_issue",
+      "requires": []
+    },
+    {
+      "id": "plan",
+      "name": "Plan Work",
+      "type": "plan",
+      "requires": ["fetch_figma", "fetch_jira_issue"]
+    },
+    {
+      "id": "execute_backend",
+      "name": "Implement Backend Changes",
+      "type": "execute",
+      "repo": "acme/backend",
+      "instructions": "Implement backend changes based on the Figma design and Jira issue context.",
+      "requires": ["plan"]
+    },
+    {
+      "id": "result",
+      "name": "Produce Result",
+      "type": "result",
+      "requires": ["execute_backend"]
+    }
+  ]
+}

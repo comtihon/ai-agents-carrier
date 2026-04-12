@@ -7,8 +7,9 @@ from langgraph.graph import END, StateGraph
 from app.application.services.planning_service import PlanningService
 from app.domain.interfaces.openhands import OpenHandsPort
 from app.domain.interfaces.repositories import WorkflowRunRepository
-from app.domain.models.runtime import ExecutionStepResult, PlanResult, WorkflowRequest, WorkflowRun
+from app.domain.models.runtime import ExecutionStepResult, PlanResult, ToolCallResult, WorkflowRequest, WorkflowRun
 from app.domain.models.workflow_definition import WorkflowDefinition
+from app.infrastructure.tools.mcp_client import McpToolsProvider
 
 
 class WorkflowGraphState(TypedDict):
@@ -24,20 +25,24 @@ class WorkflowGraphRunner:
         planning_service: PlanningService,
         openhands_port: OpenHandsPort,
         workflow_run_repository: WorkflowRunRepository,
+        mcp_tools_provider: McpToolsProvider,
     ) -> None:
         self._planning_service = planning_service
         self._openhands_port = openhands_port
         self._workflow_run_repository = workflow_run_repository
+        self._mcp_tools_provider = mcp_tools_provider
         self._graph = self._build_graph()
 
     def _build_graph(self):
         graph = StateGraph(WorkflowGraphState)
         graph.add_node("request", self._request_node)
+        graph.add_node("fetch_context", self._fetch_context_node)
         graph.add_node("plan", self._plan_node)
         graph.add_node("execute", self._execute_node)
         graph.add_node("result", self._result_node)
         graph.set_entry_point("request")
-        graph.add_edge("request", "plan")
+        graph.add_edge("request", "fetch_context")
+        graph.add_edge("fetch_context", "plan")
         graph.add_edge("plan", "execute")
         graph.add_edge("execute", "result")
         graph.add_edge("result", END)
@@ -61,9 +66,66 @@ class WorkflowGraphRunner:
         await self._workflow_run_repository.update(workflow_run)
         return state
 
+    async def _fetch_context_node(self, state: WorkflowGraphState) -> WorkflowGraphState:
+        workflow_run = state["workflow_run"]
+        workflow_definition = state["workflow_definition"]
+
+        fetch_steps = [s for s in workflow_definition.steps if s.type == "fetch"]
+        if not fetch_steps:
+            return state
+
+        workflow_run.current_step = "fetch_context"
+        tool_call_results: list[ToolCallResult] = list(workflow_run.tool_call_results)
+
+        for step in fetch_steps:
+            tool_name = step.tool  # always set — validated at definition load time
+            tool = self._mcp_tools_provider.get_tool(tool_name)  # type: ignore[arg-type]
+            if tool is None:
+                workflow_run.status = "failed"
+                workflow_run.error = (
+                    f"Fetch step '{step.id}' requires MCP tool '{tool_name}', "
+                    "but it is not available. Ensure the integration is enabled and configured."
+                )
+                tool_call_results.append(
+                    ToolCallResult(step_id=step.id, tool=tool_name, status="failed", error=workflow_run.error)
+                )
+                workflow_run.tool_call_results = tool_call_results
+                await self._workflow_run_repository.update(workflow_run)
+                state["workflow_run"] = workflow_run
+                return state
+
+            try:
+                raw_output = await tool.ainvoke(step.tool_input)
+            except Exception as exc:
+                workflow_run.status = "failed"
+                workflow_run.error = f"Fetch step '{step.id}' failed calling tool '{tool_name}': {exc}"
+                tool_call_results.append(
+                    ToolCallResult(step_id=step.id, tool=tool_name, status="failed", error=str(exc))
+                )
+                workflow_run.tool_call_results = tool_call_results
+                await self._workflow_run_repository.update(workflow_run)
+                state["workflow_run"] = workflow_run
+                return state
+
+            output: dict[str, Any] = raw_output if isinstance(raw_output, dict) else {"result": raw_output}
+            output_key = step.output_key or step.id
+            workflow_run.intermediate_outputs[output_key] = output
+            tool_call_results.append(
+                ToolCallResult(step_id=step.id, tool=tool_name, status="success", output=output)
+            )
+
+        workflow_run.tool_call_results = tool_call_results
+        await self._workflow_run_repository.update(workflow_run)
+        state["workflow_run"] = workflow_run
+        return state
+
     async def _plan_node(self, state: WorkflowGraphState) -> WorkflowGraphState:
         workflow_run = state["workflow_run"]
         workflow_definition = state["workflow_definition"]
+
+        if workflow_run.status == "failed":
+            return state
+
         workflow_run.current_step = "plan"
         plan = await self._planning_service.create_plan(
             WorkflowRequest(
@@ -85,6 +147,10 @@ class WorkflowGraphRunner:
     async def _execute_node(self, state: WorkflowGraphState) -> WorkflowGraphState:
         workflow_run = state["workflow_run"]
         plan = state["plan"]
+
+        if workflow_run.status == "failed":
+            return state
+
         if plan is None:
             raise ValueError("Execution requires a plan.")
 

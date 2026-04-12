@@ -3,6 +3,19 @@ replicaCount: 2
 app:
   environment: prod
   openhandsMockMode: "false"
+  existingSecret: "langgraph-backend-secrets-prod"
 
 image:
   tag: prod
+
+mcp:
+  figma:
+    enabled: "false"
+  jira:
+    enabled: "false"
+  miro:
+    enabled: "false"
+  notion:
+    enabled: "false"
+  github:
+    enabled: "false"

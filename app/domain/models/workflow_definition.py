@@ -8,11 +8,22 @@ from pydantic import BaseModel, Field, model_validator
 class WorkflowStepDefinition(BaseModel):
     id: str
     name: str
-    type: Literal["plan", "execute", "approval", "result"]
+    type: Literal["plan", "execute", "approval", "result", "fetch"]
+    # execute fields
     repo: str | None = None
     instructions: str | None = None
+    # fetch fields
+    tool: str | None = None
+    tool_input: dict[str, Any] = Field(default_factory=dict)
+    output_key: str | None = None
     requires: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_type_fields(self) -> "WorkflowStepDefinition":
+        if self.type == "fetch" and not self.tool:
+            raise ValueError(f"Step '{self.id}' of type 'fetch' must specify a 'tool'.")
+        return self
 
 
 class WorkflowDefinition(BaseModel):

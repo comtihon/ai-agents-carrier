@@ -12,6 +12,7 @@ from app.infrastructure.integrations.openhands import OpenHandsAdapter
 from app.infrastructure.orchestration.graph import WorkflowGraphRunner
 from app.infrastructure.persistence.mongo import MongoClientProvider, MongoWorkflowRunRepository
 from app.infrastructure.tools.langchain_tools import build_default_tools
+from app.infrastructure.tools.mcp_client import McpToolsProvider
 
 
 @dataclass
@@ -22,10 +23,15 @@ class ApplicationContainer:
     workflow_run_repository: MongoWorkflowRunRepository
     planning_service: PlanningService
     tools: list[Any]
+    mcp_tools_provider: McpToolsProvider
     graph_runner: WorkflowGraphRunner
     orchestration_service: OrchestrationService
 
+    async def startup(self) -> None:
+        await self.mcp_tools_provider.start()
+
     async def shutdown(self) -> None:
+        await self.mcp_tools_provider.stop()
         await self.mongo_provider.close()
 
 
@@ -35,8 +41,9 @@ def build_container(settings: Settings) -> ApplicationContainer:
     workflow_run_repository = mongo_provider.get_repository()
     planning_service = PlanningService()
     tools = build_default_tools()
+    mcp_tools_provider = McpToolsProvider(settings)
     openhands_adapter = OpenHandsAdapter(settings)
-    graph_runner = WorkflowGraphRunner(planning_service, openhands_adapter, workflow_run_repository)
+    graph_runner = WorkflowGraphRunner(planning_service, openhands_adapter, workflow_run_repository, mcp_tools_provider)
     orchestration_service = OrchestrationService(workflow_registry, workflow_run_repository, graph_runner)
     return ApplicationContainer(
         settings=settings,
@@ -45,6 +52,7 @@ def build_container(settings: Settings) -> ApplicationContainer:
         workflow_run_repository=workflow_run_repository,
         planning_service=planning_service,
         tools=tools,
+        mcp_tools_provider=mcp_tools_provider,
         graph_runner=graph_runner,
         orchestration_service=orchestration_service,
     )
