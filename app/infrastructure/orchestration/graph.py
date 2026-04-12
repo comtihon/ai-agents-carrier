@@ -44,13 +44,22 @@ class WorkflowGraphRunner:
         graph.add_node("request", self._request_node)
         graph.add_node("fetch_context", self._fetch_context_node)
         graph.add_node("plan", self._plan_node)
+        graph.add_node("approval_check", self._approval_check_node)
         graph.add_node("run_actions", self._run_actions_node)
         graph.add_node("execute", self._execute_node)
         graph.add_node("result", self._result_node)
         graph.set_entry_point("request")
         graph.add_edge("request", "fetch_context")
         graph.add_edge("fetch_context", "plan")
-        graph.add_edge("plan", "run_actions")
+        graph.add_edge("plan", "approval_check")
+        graph.add_conditional_edges(
+            "approval_check",
+            self._route_after_approval,
+            {
+                "run_actions": "run_actions",
+                "result": "result",
+            }
+        )
         graph.add_edge("run_actions", "execute")
         graph.add_edge("execute", "result")
         graph.add_edge("result", END)
@@ -151,6 +160,60 @@ class WorkflowGraphRunner:
         state["plan"] = plan
         state["workflow_run"] = workflow_run
         return state
+
+    async def _approval_check_node(self, state: WorkflowGraphState) -> WorkflowGraphState:
+        workflow_run = state["workflow_run"]
+        workflow_definition = state["workflow_definition"]
+
+        if workflow_run.status == "failed":
+            return state
+
+        # Check if workflow definition has an approval step
+        has_approval_step = any(step.type == "approval" for step in workflow_definition.steps)
+        
+        if not has_approval_step:
+            # No approval required, continue to next phase
+            return state
+
+        workflow_run.current_step = "approval_check"
+        
+        # If approval is already approved, continue
+        if workflow_run.approval_status == "approved":
+            await self._workflow_run_repository.update(workflow_run)
+            return state
+        
+        # If approval is rejected, fail the workflow
+        if workflow_run.approval_status == "rejected":
+            workflow_run.status = "failed"
+            workflow_run.error = "Workflow execution rejected by user during approval step."
+            await self._workflow_run_repository.update(workflow_run)
+            return state
+        
+        # Otherwise, require approval - pause execution
+        workflow_run.status = "waiting_approval"
+        workflow_run.approval_status = "pending"
+        workflow_run.intermediate_outputs["approval_required"] = True
+        workflow_run.intermediate_outputs["approval_message"] = (
+            f"Please review the plan and approve to continue execution:\n{workflow_run.plan.summary if workflow_run.plan else 'No plan available'}"
+        )
+        await self._workflow_run_repository.update(workflow_run)
+        state["workflow_run"] = workflow_run
+        
+        # Raise interrupt to pause the graph execution
+        raise ValueError(
+            "Workflow execution paused for approval. "
+            f"Use POST /workflows/runs/{workflow_run.id}/approve or /reject to continue."
+        )
+
+    def _route_after_approval(self, state: WorkflowGraphState) -> str:
+        workflow_run = state["workflow_run"]
+        
+        # If rejected or failed, go to result
+        if workflow_run.approval_status == "rejected" or workflow_run.status == "failed":
+            return "result"
+        
+        # Otherwise continue to run_actions
+        return "run_actions"
 
     async def _run_actions_node(self, state: WorkflowGraphState) -> WorkflowGraphState:
         workflow_run = state["workflow_run"]

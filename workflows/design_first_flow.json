@@ -33,12 +33,21 @@
       "requires": ["fetch_figma", "fetch_jira_issue"]
     },
     {
+      "id": "review_plan",
+      "name": "Review and Approve Plan",
+      "type": "approval",
+      "requires": ["plan"],
+      "metadata": {
+        "description": "Human review checkpoint - user must approve the plan before execution continues"
+      }
+    },
+    {
       "id": "execute_backend",
       "name": "Implement Backend Changes",
       "type": "execute",
       "repo": "acme/backend",
       "instructions": "Implement backend changes based on the Figma design and Jira issue context.",
-      "requires": ["plan"]
+      "requires": ["review_plan"]
     },
     {
       "id": "result",

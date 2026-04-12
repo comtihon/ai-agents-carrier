@@ -13,6 +13,38 @@ It provides a system where:
 
 The backend is designed for multi-step, multi-repository workflows with persistent runtime state and optional human approval checkpoints.
 
+### Example Use Case: Jira Task to Implementation
+
+```text
+1. User asks: "Implement Jira task PROJ-123"
+   ↓
+2. Backend fetches Jira ticket details via Jira MCP
+   ↓
+3. LLM analyzes requirements and checks if Figma design exists
+   ↓
+4. If design required → Figma MCP creates/fetches design spec
+   ↓
+5. LLM creates high-level solution design and implementation plan
+   ↓
+6. ⏸️  APPROVAL CHECKPOINT - Execution pauses
+   - Plan is shown to user via CopilotKit UI or Slack
+   - User reviews the plan and design
+   - User clicks "Approve" or "Reject"
+   ↓
+7. If approved → Continue execution
+   - OpenHands implements the code changes
+   - Creates PR(s) in the target repository(ies)
+   - Updates Jira ticket status
+   ↓
+8. Results returned to user with PR links
+```
+
+This workflow combines:
+- **External integrations** (Jira, Figma) via MCP
+- **AI planning** with LLM-powered solution design
+- **Human approval** for quality control
+- **Automated execution** via OpenHands
+
 ## Core Stack
 
 - FastAPI for the HTTP API
@@ -127,10 +159,13 @@ The backend currently expects workflow definitions as JSON documents with this s
 
 Supported step types:
 
-- `plan`
-- `execute`
-- `approval`
-- `result`
+- `plan` - LLM-based planning step
+- `execute` - Repository-level execution via OpenHands
+- `approval` - Human review checkpoint (pauses execution until approved/rejected)
+- `result` - Final aggregation step
+- `fetch` - Retrieve data via MCP tools
+- `http` - Execute HTTP calls
+- `action` - Run registered Python handlers
 
 Validation rules:
 
@@ -232,10 +267,67 @@ Primary settings are provided through environment variables:
 1. User submits a request through the client.
 2. FastAPI or LangServe receives the request.
 3. The backend loads the selected workflow definition.
-4. LangGraph plans the work.
-5. Execution steps call OpenHands through the adapter.
-6. Runtime state is persisted in MongoDB after each step.
-7. The final result is returned to the client.
+4. LangGraph orchestrates the workflow:
+   - **fetch_context**: Retrieves external data via MCP tools
+   - **plan**: LLM creates execution plan
+   - **approval_check**: If workflow has an approval step, execution pauses for human review
+   - **run_actions**: Executes HTTP calls and Python action handlers
+   - **execute**: OpenHands implements code changes in repositories
+   - **result**: Aggregates outputs and finalizes the workflow
+5. Runtime state is persisted in MongoDB after each step.
+6. The final result is returned to the client.
+
+### Human-in-the-Loop Approval
+
+When a workflow definition includes a step of type `approval`, the execution will pause after the planning phase and wait for explicit user approval before proceeding to execution.
+
+**Workflow behavior:**
+- After the plan is generated, the workflow status changes to `waiting_approval`
+- The approval status is set to `pending`
+- The workflow run is saved to MongoDB with the current state
+- An error message is returned indicating that approval is required
+
+**User actions:**
+- **Approve**: `POST /workflows/runs/{run_id}/approve` - Continues execution
+- **Reject**: `POST /workflows/runs/{run_id}/reject` - Marks workflow as failed and stops execution
+
+**Example approval flow:**
+
+```bash
+# 1. Submit workflow with approval step
+curl -X POST http://localhost:8000/workflows/runs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "workflow_id": "design_first_flow",
+    "user_request": "Implement user profile page"
+  }'
+
+# Response includes run_id and status "waiting_approval"
+# {
+#   "run": {
+#     "id": "abc-123",
+#     "status": "waiting_approval",
+#     "approval_status": "pending",
+#     "intermediate_outputs": {
+#       "plan_summary": "...",
+#       "approval_message": "Please review the plan..."
+#     }
+#   }
+# }
+
+# 2. Review the plan via GET endpoint
+curl http://localhost:8000/workflows/runs/abc-123
+
+# 3a. Approve the plan to continue execution
+curl -X POST http://localhost:8000/workflows/runs/abc-123/approve
+
+# OR
+
+# 3b. Reject the plan with optional reason
+curl -X POST http://localhost:8000/workflows/runs/abc-123/reject \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "Design needs revision"}'
+```
 
 ## MCP-Powered Workflow Example
 
@@ -280,16 +372,25 @@ using OpenHands — all driven by a single workflow definition.
                                                               result
 ```
 
-The full LangGraph topology is always:
+The full LangGraph topology is:
 
 ```text
-request → fetch_context → plan → run_actions → execute → result
+request → fetch_context → plan → approval_check → run_actions → execute → result
+                                       ↓
+                                  (conditional)
+                                       ↓
+                            waiting_approval (pause)
+                                       ↓
+                            user approve/reject
+                                       ↓
+                            continue or fail
 ```
 
 | Phase | Step types | Description |
 |---|---|---|
 | `fetch_context` | `fetch` | Reads external data via MCP tools before planning |
 | `plan` | `plan` | LLM decomposes work; result is stored in the run |
+| `approval_check` | `approval` | Human review checkpoint - pauses if approval step exists in workflow |
 | `run_actions` | `http`, `action` | Side-effects after planning: HTTP calls, Python handlers |
 | `execute` | `execute` | OpenHands implements code in each repository |
 
@@ -455,6 +556,72 @@ async def transition_jira_issue(handler_input: dict, run: WorkflowRun) -> dict:
 container.action_registry.register("jira.transition_issue", transition_jira_issue)
 ```
 
+#### `approval` — human review checkpoint
+
+Pauses workflow execution after the planning phase and requires explicit user approval before proceeding to execution. This enables human-in-the-loop workflows where plans can be reviewed and approved before code changes are implemented.
+
+```json
+{
+  "id": "review_plan",
+  "name": "Review and Approve Plan",
+  "type": "approval",
+  "requires": ["plan"],
+  "metadata": {
+    "description": "Human review checkpoint - user must approve the plan before execution continues"
+  }
+}
+```
+
+**Behavior:**
+- When an `approval` step is present in the workflow, execution pauses after planning
+- Workflow status changes to `waiting_approval`
+- Approval status is set to `pending`
+- User must call `POST /workflows/runs/{run_id}/approve` to continue
+- Or call `POST /workflows/runs/{run_id}/reject` to cancel execution
+
+**Integration points:**
+- **CopilotKit UI**: Display the plan and show approve/reject buttons
+- **Slack notifications**: Send message with plan summary and action buttons
+- **Custom webhooks**: Notify external systems when approval is required
+
+**Example workflow with approval:**
+
+```json
+{
+  "id": "jira_task_flow",
+  "name": "Jira Task Implementation",
+  "steps": [
+    {
+      "id": "fetch_jira",
+      "type": "fetch",
+      "tool": "jira_get_issue",
+      "tool_input": { "issue_key": "PROJ-123" }
+    },
+    {
+      "id": "plan",
+      "type": "plan",
+      "requires": ["fetch_jira"]
+    },
+    {
+      "id": "approval",
+      "type": "approval",
+      "requires": ["plan"]
+    },
+    {
+      "id": "execute",
+      "type": "execute",
+      "repo": "myorg/myrepo",
+      "requires": ["approval"]
+    },
+    {
+      "id": "result",
+      "type": "result",
+      "requires": ["execute"]
+    }
+  ]
+}
+```
+
 ### Required environment configuration
 
 Enable the integrations in your Helm values and point to the right secret:
@@ -485,12 +652,89 @@ MCP_FIGMA_API_KEY=<figma-personal-access-token>
 OPENHANDS_API_KEY=<openhands-api-key>
 ```
 
+## API Reference
+
+### Workflow Endpoints
+
+#### Submit a workflow
+
+```
+POST /workflows/runs
+```
+
+**Request body:**
+```json
+{
+  "workflow_id": "design_first_flow",
+  "user_request": "Implement user authentication",
+  "session_id": "optional-session-id",
+  "user_id": "optional-user-id",
+  "context": {}
+}
+```
+
+**Response:**
+```json
+{
+  "run": {
+    "id": "abc-123",
+    "workflow_id": "design_first_flow",
+    "status": "running|waiting_approval|completed|failed",
+    "approval_status": "not_required|pending|approved|rejected",
+    "plan": { ... },
+    "execution_results": [],
+    ...
+  }
+}
+```
+
+#### Get workflow run status
+
+```
+GET /workflows/runs/{run_id}
+```
+
+Returns the current state of a workflow run, including status, plan, and any intermediate outputs.
+
+#### Approve a workflow run
+
+```
+POST /workflows/runs/{run_id}/approve
+```
+
+Approves a workflow that is in `waiting_approval` status and resumes execution.
+
+**Response:** Returns the updated workflow run that will continue execution.
+
+#### Reject a workflow run
+
+```
+POST /workflows/runs/{run_id}/reject
+```
+
+**Request body (optional):**
+```json
+{
+  "reason": "Design needs revision before implementation"
+}
+```
+
+Rejects a workflow in `waiting_approval` status and marks it as failed.
+
+#### Resume a workflow run
+
+```
+POST /workflows/runs/{run_id}/resume
+```
+
+Resumes a previously paused or failed workflow run. Generally used for manual recovery scenarios.
+
 ## Current Status
 
 Current MVP goals:
 
 - workflow loading from mounted files
-- LangGraph orchestration
+- LangGraph orchestration with human-in-the-loop approval
 - OpenHands integration
 - MongoDB runtime persistence
 - Copilot-compatible API surface

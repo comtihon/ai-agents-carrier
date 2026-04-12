@@ -1,0 +1,82 @@
+{
+  "id": "jira_task_with_approval",
+  "name": "Jira Task Implementation with Approval",
+  "description": "Fetch Jira ticket, optionally create Figma design, plan implementation, wait for approval, then execute.",
+  "entrypoint": "plan",
+  "metadata": {
+    "default_repo": "myorg/myrepo",
+    "outputs_required": ["pr_url"]
+  },
+  "steps": [
+    {
+      "id": "fetch_jira_ticket",
+      "name": "Fetch Jira Ticket Details",
+      "type": "fetch",
+      "tool": "jira_get_issue",
+      "tool_input": {},
+      "output_key": "jira_ticket",
+      "requires": []
+    },
+    {
+      "id": "fetch_figma_design",
+      "name": "Fetch or Create Figma Design",
+      "type": "fetch",
+      "tool": "figma_get_file",
+      "tool_input": {},
+      "output_key": "figma_design",
+      "requires": ["fetch_jira_ticket"]
+    },
+    {
+      "id": "plan",
+      "name": "Create Solution Design and Implementation Plan",
+      "type": "plan",
+      "requires": ["fetch_jira_ticket", "fetch_figma_design"]
+    },
+    {
+      "id": "review_and_approve",
+      "name": "Human Review Checkpoint",
+      "type": "approval",
+      "requires": ["plan"],
+      "metadata": {
+        "description": "User reviews the implementation plan and design before code changes are made",
+        "notification_channels": ["copilotkit_ui", "slack"]
+      }
+    },
+    {
+      "id": "transition_jira_in_progress",
+      "name": "Move Jira to In Progress",
+      "type": "action",
+      "handler": "jira.transition_issue",
+      "handler_input": {
+        "transition": "In Progress"
+      },
+      "output_key": "jira_transition",
+      "requires": ["review_and_approve"]
+    },
+    {
+      "id": "execute_implementation",
+      "name": "Implement Code Changes",
+      "type": "execute",
+      "repo": "myorg/myrepo",
+      "instructions": "Implement the changes described in the plan. Reference the Figma design and Jira ticket for context.",
+      "requires": ["review_and_approve"]
+    },
+    {
+      "id": "update_jira_with_pr",
+      "name": "Add PR Link to Jira",
+      "type": "action",
+      "handler": "jira.add_comment",
+      "handler_input": {
+        "comment_template": "Implementation completed. PR: {{ run.intermediate_outputs.myorg/myrepo.pr_url }}"
+      },
+      "output_key": "jira_pr_comment",
+      "requires": ["execute_implementation"]
+    },
+    {
+      "id": "result",
+      "name": "Produce Result",
+      "type": "result",
+      "requires": ["execute_implementation", "update_jira_with_pr"]
+    }
+  ]
+}
