@@ -25,7 +25,7 @@ class WorkflowDefinitionLoader:
     def __init__(self, definitions_path: str) -> None:
         self._definitions_path = Path(definitions_path)
 
-    def load(self) -> InMemoryWorkflowDefinitionRegistry:
+    def load(self) -> WorkflowDefinitionRegistry:
         if not self._definitions_path.exists():
             raise FileNotFoundError(f"Workflow definitions path does not exist: {self._definitions_path}")
 

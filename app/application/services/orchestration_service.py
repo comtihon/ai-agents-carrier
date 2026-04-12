@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from fastapi import HTTPException, status
-
+from app.domain.exceptions import NotFoundError
 from app.domain.interfaces.repositories import WorkflowRunRepository
 from app.domain.interfaces.workflow_registry import WorkflowDefinitionRegistry
 from app.domain.models.runtime import WorkflowRequest, WorkflowRun
@@ -23,7 +22,7 @@ class OrchestrationService:
         try:
             workflow = self._workflow_registry.get_definition(request.workflow_id)
         except KeyError as exc:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+            raise NotFoundError(str(exc)) from exc
         workflow_run = WorkflowRun(
             workflow_id=workflow.id,
             workflow_name=workflow.name,
@@ -33,12 +32,18 @@ class OrchestrationService:
             metadata={"request_context": request.context},
         )
         await self._workflow_run_repository.create(workflow_run)
-        return await self._graph_runner.run(workflow_run=workflow_run, workflow_definition=workflow)
+        try:
+            return await self._graph_runner.run(workflow_run=workflow_run, workflow_definition=workflow)
+        except Exception as exc:
+            workflow_run.status = "failed"
+            workflow_run.error = str(exc)
+            await self._workflow_run_repository.update(workflow_run)
+            raise
 
     async def get_run(self, run_id: str) -> WorkflowRun:
         workflow_run = await self._workflow_run_repository.get_by_id(run_id)
         if workflow_run is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow run not found.")
+            raise NotFoundError(f"Workflow run '{run_id}' not found.")
         return workflow_run
 
     async def resume(self, run_id: str) -> WorkflowRun:
@@ -46,5 +51,5 @@ class OrchestrationService:
         try:
             workflow_definition = self._workflow_registry.get_definition(workflow_run.workflow_id)
         except KeyError as exc:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+            raise NotFoundError(str(exc)) from exc
         return await self._graph_runner.run(workflow_run=workflow_run, workflow_definition=workflow_definition)

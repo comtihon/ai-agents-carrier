@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorCollection
 
 from app.core.config import Settings
@@ -28,7 +30,7 @@ class MongoWorkflowRunRepository(WorkflowRunRepository):
         return self._deserialize(document)
 
     @staticmethod
-    def _serialize(workflow_run: WorkflowRun) -> dict:
+    def _serialize(workflow_run: WorkflowRun) -> dict[str, Any]:
         payload = workflow_run.model_dump(mode="python")
         payload["_id"] = payload.pop("id")
         return payload

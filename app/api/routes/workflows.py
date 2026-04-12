@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.api.dependencies import get_orchestration_service
 from app.application.services.orchestration_service import OrchestrationService
+from app.domain.exceptions import NotFoundError
 from app.domain.models.runtime import WorkflowRequest, WorkflowRunResponse
 
 router = APIRouter(prefix="/workflows", tags=["workflows"])
@@ -14,7 +15,10 @@ async def submit_workflow(
     request: WorkflowRequest,
     orchestration_service: OrchestrationService = Depends(get_orchestration_service),
 ) -> WorkflowRunResponse:
-    return WorkflowRunResponse(run=await orchestration_service.submit(request))
+    try:
+        return WorkflowRunResponse(run=await orchestration_service.submit(request))
+    except NotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
 
 @router.get("/runs/{run_id}", response_model=WorkflowRunResponse)
@@ -22,7 +26,10 @@ async def get_workflow_run(
     run_id: str,
     orchestration_service: OrchestrationService = Depends(get_orchestration_service),
 ) -> WorkflowRunResponse:
-    return WorkflowRunResponse(run=await orchestration_service.get_run(run_id))
+    try:
+        return WorkflowRunResponse(run=await orchestration_service.get_run(run_id))
+    except NotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
 
 @router.post("/runs/{run_id}/resume", response_model=WorkflowRunResponse)
@@ -30,4 +37,7 @@ async def resume_workflow_run(
     run_id: str,
     orchestration_service: OrchestrationService = Depends(get_orchestration_service),
 ) -> WorkflowRunResponse:
-    return WorkflowRunResponse(run=await orchestration_service.resume(run_id))
+    try:
+        return WorkflowRunResponse(run=await orchestration_service.resume(run_id))
+    except NotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
