@@ -44,17 +44,25 @@ class WorkflowGraphRunner:
         graph.add_node("request", self._request_node)
         graph.add_node("fetch_context", self._fetch_context_node)
         graph.add_node("plan", self._plan_node)
+        graph.add_node("approval", self._approval_node)
         graph.add_node("run_actions", self._run_actions_node)
         graph.add_node("execute", self._execute_node)
         graph.add_node("result", self._result_node)
         graph.set_entry_point("request")
         graph.add_edge("request", "fetch_context")
         graph.add_edge("fetch_context", "plan")
-        graph.add_edge("plan", "run_actions")
+        graph.add_edge("plan", "approval")
+        graph.add_conditional_edges("approval", self._route_after_approval)
         graph.add_edge("run_actions", "execute")
         graph.add_edge("execute", "result")
         graph.add_edge("result", END)
         return graph.compile()
+
+    def _route_after_approval(self, state: WorkflowGraphState) -> str:
+        workflow_run = state["workflow_run"]
+        if workflow_run.status in ("waiting_approval", "failed"):
+            return END
+        return "run_actions"
 
     async def run(self, workflow_run: WorkflowRun, workflow_definition: WorkflowDefinition) -> WorkflowRun:
         result: dict[str, Any] = await self._graph.ainvoke(
@@ -81,6 +89,12 @@ class WorkflowGraphRunner:
         fetch_steps = [s for s in workflow_definition.steps if s.type == "fetch"]
         if not fetch_steps:
             return state
+
+        # Skip if already completed — handles resume after approval pause
+        if workflow_run.tool_call_results:
+            completed_ids = {r.step_id for r in workflow_run.tool_call_results}
+            if {s.id for s in fetch_steps} <= completed_ids:
+                return state
 
         workflow_run.current_step = "fetch_context"
         tool_call_results: list[ToolCallResult] = list(workflow_run.tool_call_results)
@@ -134,6 +148,11 @@ class WorkflowGraphRunner:
         if workflow_run.status == "failed":
             return state
 
+        # Skip if plan already exists — handles resume after approval pause
+        if workflow_run.plan is not None:
+            state["plan"] = workflow_run.plan
+            return state
+
         workflow_run.current_step = "plan"
         plan = await self._planning_service.create_plan(
             WorkflowRequest(
@@ -149,6 +168,44 @@ class WorkflowGraphRunner:
         workflow_run.intermediate_outputs["plan_summary"] = plan.summary
         await self._workflow_run_repository.update(workflow_run)
         state["plan"] = plan
+        state["workflow_run"] = workflow_run
+        return state
+
+    async def _approval_node(self, state: WorkflowGraphState) -> WorkflowGraphState:
+        workflow_run = state["workflow_run"]
+        workflow_definition = state["workflow_definition"]
+
+        if workflow_run.status == "failed":
+            return state
+
+        # No approval steps defined in this workflow — pass through
+        approval_steps = [s for s in workflow_definition.steps if s.type == "approval"]
+        if not approval_steps:
+            return state
+
+        # Already approved — pass through (idempotent resume)
+        if workflow_run.approval_status == "approved":
+            return state
+
+        # Rejected — mark as failed
+        if workflow_run.approval_status == "rejected":
+            workflow_run.status = "failed"
+            workflow_run.error = (
+                workflow_run.metadata.get("rejection_reason")
+                or "Workflow run rejected during approval review."
+            )
+            await self._workflow_run_repository.update(workflow_run)
+            state["workflow_run"] = workflow_run
+            return state
+
+        # First encounter — pause and wait for human review
+        workflow_run.status = "waiting_approval"
+        workflow_run.approval_status = "pending"
+        workflow_run.current_step = "approval"
+        workflow_run.intermediate_outputs["approval_steps"] = [
+            {"id": s.id, "name": s.name, "metadata": s.metadata} for s in approval_steps
+        ]
+        await self._workflow_run_repository.update(workflow_run)
         state["workflow_run"] = workflow_run
         return state
 

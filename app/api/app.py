@@ -37,4 +37,15 @@ def _register_langserve_routes(app: FastAPI, path: str) -> None:
         run = await container.orchestration_service.submit(request)
         return run.model_dump(mode="json")
 
-    add_routes(app, RunnableLambda(invoke), path=path)
+    try:
+        add_routes(
+            app,
+            RunnableLambda(invoke).with_types(input_type=WorkflowRequest, output_type=dict),
+            path=path,
+        )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning(
+            "LangServe routes could not be registered (pydantic / Python version incompatibility). "
+            "The REST API is unaffected."
+        )

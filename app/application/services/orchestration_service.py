@@ -53,3 +53,39 @@ class OrchestrationService:
         except KeyError as exc:
             raise NotFoundError(str(exc)) from exc
         return await self._graph_runner.run(workflow_run=workflow_run, workflow_definition=workflow_definition)
+
+    async def approve(self, run_id: str, feedback: str | None = None) -> WorkflowRun:
+        workflow_run = await self.get_run(run_id)
+        if workflow_run.status != "waiting_approval":
+            raise ValueError(
+                f"Workflow run '{run_id}' is not awaiting approval (current status: '{workflow_run.status}')."
+            )
+        try:
+            workflow_definition = self._workflow_registry.get_definition(workflow_run.workflow_id)
+        except KeyError as exc:
+            raise NotFoundError(str(exc)) from exc
+        workflow_run.approval_status = "approved"
+        if feedback:
+            workflow_run.metadata["approval_feedback"] = feedback
+        await self._workflow_run_repository.update(workflow_run)
+        try:
+            return await self._graph_runner.run(workflow_run=workflow_run, workflow_definition=workflow_definition)
+        except Exception as exc:
+            workflow_run.status = "failed"
+            workflow_run.error = str(exc)
+            await self._workflow_run_repository.update(workflow_run)
+            raise
+
+    async def reject(self, run_id: str, reason: str | None = None) -> WorkflowRun:
+        workflow_run = await self.get_run(run_id)
+        if workflow_run.status != "waiting_approval":
+            raise ValueError(
+                f"Workflow run '{run_id}' is not awaiting approval (current status: '{workflow_run.status}')."
+            )
+        workflow_run.approval_status = "rejected"
+        workflow_run.status = "failed"
+        workflow_run.error = reason or "Workflow run rejected during approval review."
+        if reason:
+            workflow_run.metadata["rejection_reason"] = reason
+        await self._workflow_run_repository.update(workflow_run)
+        return workflow_run

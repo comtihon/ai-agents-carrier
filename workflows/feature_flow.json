@@ -10,12 +10,21 @@
   "steps": [
     { "id": "plan", "name": "Plan Work", "type": "plan" },
     {
+      "id": "review_plan",
+      "name": "Review Plan",
+      "type": "approval",
+      "requires": ["plan"],
+      "metadata": {
+        "description": "Review the generated plan before implementation begins. Approve to proceed or reject to cancel."
+      }
+    },
+    {
       "id": "execute_app",
       "name": "Implement Application Changes",
       "type": "execute",
       "repo": "acme/app",
       "instructions": "Implement the requested feature in the main application repository.",
-      "requires": ["plan"]
+      "requires": ["review_plan"]
     },
     { "id": "result", "name": "Produce Result", "type": "result", "requires": ["execute_app"] }
   ]
