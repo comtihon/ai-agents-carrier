@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field, model_validator
 class WorkflowStepDefinition(BaseModel):
     id: str
     name: str
-    type: Literal["plan", "execute", "approval", "result", "fetch", "http", "action"]
+    type: Literal["plan", "execute", "approval", "result", "fetch", "http", "action", "llm"]
     # execute fields
     repo: str | None = None
     instructions: str | None = None

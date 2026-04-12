@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     langserve_path: str = Field(default="/langserve/workflow-runner", alias="LANGSERVE_PATH")
     http_action_timeout_seconds: float = Field(default=30.0, alias="HTTP_ACTION_TIMEOUT_SECONDS")
 
+    # --- LLM ---
+    llm_provider: str | None = Field(default=None, alias="LLM_PROVIDER")          # "anthropic" | "openai"
+    llm_model: str | None = Field(default=None, alias="LLM_MODEL")                # overrides provider default
+    anthropic_api_key: str | None = Field(default=None, alias="ANTHROPIC_API_KEY")
+    openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
+
     # --- Figma MCP ---
     mcp_figma_enabled: bool = Field(default=False, alias="MCP_FIGMA_ENABLED")
     mcp_figma_transport: Literal["streamable_http", "sse"] = Field(default="streamable_http", alias="MCP_FIGMA_TRANSPORT")

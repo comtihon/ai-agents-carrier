@@ -65,6 +65,32 @@ class ActionStepResult(BaseModel):
     error: str | None = None
 
 
+class LlmToolCall(BaseModel):
+    name: str
+    args: dict[str, Any] = Field(default_factory=dict)
+    result: dict[str, Any] = Field(default_factory=dict)
+
+
+class LlmStepResult(BaseModel):
+    response: str
+    tool_calls_made: list[LlmToolCall] = Field(default_factory=list)
+
+
+class LlmAgentStepResult(BaseModel):
+    step_id: str
+    status: Literal["success", "failed"]
+    response: str | None = None
+    tool_calls_made: list[LlmToolCall] = Field(default_factory=list)
+    error: str | None = None
+
+
+class ApprovalGate(BaseModel):
+    gate_id: str
+    name: str
+    status: Literal["pending", "approved", "rejected"] = "pending"
+    feedback: str | None = None
+
+
 class WorkflowRun(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     workflow_id: str
@@ -75,9 +101,11 @@ class WorkflowRun(BaseModel):
     status: Literal["pending", "running", "waiting_approval", "completed", "failed"] = "pending"
     current_step: str | None = None
     approval_status: Literal["not_required", "pending", "approved", "rejected"] = "not_required"
+    approval_gates: list[ApprovalGate] = Field(default_factory=list)
     plan: PlanResult | None = None
     tool_call_results: list[ToolCallResult] = Field(default_factory=list)
     action_results: list[ActionStepResult] = Field(default_factory=list)
+    llm_agent_results: list[LlmAgentStepResult] = Field(default_factory=list)
     execution_results: list[ExecutionStepResult] = Field(default_factory=list)
     intermediate_outputs: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None

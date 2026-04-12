@@ -1,0 +1,38 @@
+{
+  "id": "mcp_llm_http_flow",
+  "name": "MCP + LLM + HTTP Flow",
+  "description": "Fetch context via MCP, plan with LLM, fire an HTTP action, and return a result.",
+  "entrypoint": "fetch_data",
+  "steps": [
+    {
+      "id": "fetch_data",
+      "name": "Fetch Issue Data via MCP",
+      "type": "fetch",
+      "tool": "get_issue_details",
+      "tool_input": { "issue_id": "123" },
+      "output_key": "issue_data"
+    },
+    {
+      "id": "plan",
+      "name": "Plan Work",
+      "type": "plan",
+      "requires": ["fetch_data"]
+    },
+    {
+      "id": "notify",
+      "name": "Notify via HTTP",
+      "type": "http",
+      "url": "https://example.com/notify",
+      "method": "POST",
+      "body": { "run_id": "{{ run.id }}", "request": "{{ run.user_request }}" },
+      "output_key": "notify",
+      "requires": ["plan"]
+    },
+    {
+      "id": "result",
+      "name": "Produce Result",
+      "type": "result",
+      "requires": ["notify"]
+    }
+  ]
+}

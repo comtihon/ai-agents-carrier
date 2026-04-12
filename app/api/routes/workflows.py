@@ -66,6 +66,36 @@ async def approve_workflow_run(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
 
+@router.post("/runs/{run_id}/gates/{gate_id}/approve", response_model=WorkflowRunResponse)
+async def approve_workflow_gate(
+    run_id: str,
+    gate_id: str,
+    body: ApproveRequest = ApproveRequest(),
+    orchestration_service: OrchestrationService = Depends(get_orchestration_service),
+) -> WorkflowRunResponse:
+    try:
+        return WorkflowRunResponse(run=await orchestration_service.approve_gate(run_id, gate_id, body.feedback))
+    except NotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+
+@router.post("/runs/{run_id}/gates/{gate_id}/reject", response_model=WorkflowRunResponse)
+async def reject_workflow_gate(
+    run_id: str,
+    gate_id: str,
+    body: RejectRequest = RejectRequest(),
+    orchestration_service: OrchestrationService = Depends(get_orchestration_service),
+) -> WorkflowRunResponse:
+    try:
+        return WorkflowRunResponse(run=await orchestration_service.reject_gate(run_id, gate_id, body.reason))
+    except NotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+
 @router.post("/runs/{run_id}/reject", response_model=WorkflowRunResponse)
 async def reject_workflow_run(
     run_id: str,

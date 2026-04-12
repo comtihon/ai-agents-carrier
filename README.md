@@ -1,308 +1,423 @@
-# AI Development Orchestration System
+# LangGraph Backend
 
-## Overview
+Workflow orchestration backend for AI-assisted software delivery. Receives a user request, coordinates MCP tool calls, LLM reasoning, human approval gates, and autonomous repository execution (via OpenHands) into structured, observable, and resumable workflows.
 
-This project is an AI-powered software delivery orchestration backend.
+Sits between the Copilot UI and your external systems. The UI submits a request and polls for results; this service decides what to fetch, what to reason about, what to ask a human, and what code to write.
 
-It provides a system where:
+---
 
-- users interact through a Copilot-style UI
-- workflows are orchestrated with LangGraph
-- tools and integrations are exposed through LangChain abstractions
-- repository-level execution is delegated to OpenHands
+## Table of Contents
 
-The backend is designed for multi-step, multi-repository workflows with persistent runtime state and optional human approval checkpoints.
+- [How to run](#how-to-run)
+- [Configuration](#configuration)
+  - [LLM](#llm)
+  - [MCP integrations](#mcp-integrations)
+  - [OpenHands](#openhands)
+  - [Full environment variable reference](#full-environment-variable-reference)
+- [Workflow definitions](#workflow-definitions)
+- [Step type reference](#step-type-reference)
+- [Example workflow: Miro → LLM → Jira + Figma → Code](#example-workflow)
+- [Current limitations](#current-limitations)
 
-## Core Stack
+---
 
-- FastAPI for the HTTP API
-- LangServe for exposing runnable workflows
-- LangGraph for orchestration
-- LangChain for tool abstraction
-- OpenHands for repository execution
-- MongoDB for runtime workflow state
-- Helm for deployment and workflow-definition delivery
+## How to run
 
-## Architecture
+**1. Start MongoDB**
 
-```text
-Copilot UI / Client
-        |
-        v
-FastAPI + LangServe
-        |
-        v
-Application Services
-        |
-        v
-LangGraph Orchestrator
-        |
-        v
-OpenHands Adapter + Tool Adapters
-        |
-        v
-External Systems
+```bash
+docker-compose up -d
 ```
 
-## Workflow Model
+**2. Install dependencies**
 
-### Workflow Definitions
+```bash
+pip install -e ".[dev]"
+```
 
-Workflow definitions are static deployment artifacts.
+**3. Configure (see [Configuration](#configuration) below)**
 
-- Stored in the repository under `workflows/`
-- Versioned with Git
-- Packaged by Helm into a ConfigMap
-- Mounted into the application container filesystem
-- Loaded and validated at application startup
+```bash
+cp .env.example .env   # then fill in your values
+```
 
-Example repository layout:
+**4. Start the server**
 
-```text
+```bash
+uvicorn app.main:app --reload
+```
+
+The API is available at `http://localhost:8000`. Health check: `GET /health`.
+
+---
+
+## Configuration
+
+### LLM
+
+The `llm` step type drives an agentic tool-calling loop. Configure the provider, model, and API key through environment variables:
+
+| Variable | Description |
+|---|---|
+| `LLM_PROVIDER` | `anthropic` or `openai` |
+| `LLM_MODEL` | Model name — overrides the provider default (optional) |
+| `ANTHROPIC_API_KEY` | Required when `LLM_PROVIDER=anthropic` |
+| `OPENAI_API_KEY` | Required when `LLM_PROVIDER=openai` |
+
+**Anthropic** (default model: `claude-opus-4-6`)
+
+```env
+LLM_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+# LLM_MODEL=claude-sonnet-4-6   # optional override
+```
+
+**OpenAI** (default model: `gpt-4o`)
+
+```env
+LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+# LLM_MODEL=gpt-4o-mini   # optional override
+```
+
+When `LLM_PROVIDER` is not set the service starts with a no-op stub. Workflows without any `llm` steps run normally; any run that reaches an `llm` step will fail with a clear error message.
+
+### MCP integrations
+
+MCP servers are configured through environment variables and loaded at startup via `McpToolsProvider`. Set one group per integration:
+
+| Variable | Description |
+|---|---|
+| `MCP_MIRO_ENABLED` | `true` to enable |
+| `MCP_MIRO_URL` | MCP server URL (e.g. `https://mcp.miro.com/v1`) |
+| `MCP_MIRO_API_KEY` | Bearer token / OAuth token |
+| `MCP_MIRO_TRANSPORT` | `streamable_http` (default) or `sse` |
+| `MCP_JIRA_ENABLED` | `true` to enable |
+| `MCP_JIRA_URL` | e.g. `https://mcp.atlassian.com/v1/sse` |
+| `MCP_JIRA_API_KEY` | Atlassian API token |
+| `MCP_JIRA_TRANSPORT` | `streamable_http` or `sse` |
+| `MCP_FIGMA_ENABLED` | `true` to enable |
+| `MCP_FIGMA_URL` | e.g. `https://www.figma.com/api/mcp/v1` |
+| `MCP_FIGMA_API_KEY` | Figma personal access token |
+| `MCP_FIGMA_TRANSPORT` | `streamable_http` or `sse` |
+| `MCP_NOTION_ENABLED` | `true` to enable |
+| `MCP_NOTION_URL` | Notion MCP URL |
+| `MCP_NOTION_API_KEY` | Notion integration token |
+| `MCP_GITHUB_ENABLED` | `true` to enable |
+| `MCP_GITHUB_URL` | GitHub MCP URL |
+| `MCP_GITHUB_API_KEY` | GitHub personal access token |
+
+Tools exposed by enabled MCP servers are automatically available to `fetch` steps (by tool name) and bound to the LLM in `llm` steps.
+
+### OpenHands
+
+OpenHands is the repository-level execution agent. It receives instructions, opens branches, writes code, runs tests, and creates PRs.
+
+| Variable | Default | Description |
+|---|---|---|
+| `OPENHANDS_BASE_URL` | `http://openhands:3000` | Base URL of the OpenHands service |
+| `OPENHANDS_API_KEY` | — | API key if auth is enabled |
+| `OPENHANDS_TIMEOUT_SECONDS` | `60` | Per-task timeout |
+| `OPENHANDS_MOCK_MODE` | `true` | If `true`, returns stub results without calling OpenHands (useful for local dev) |
+
+### Full environment variable reference
+
+| Variable | Default | Description |
+|---|---|---|
+| `MONGODB_URI` | `mongodb://localhost:27017` | MongoDB connection string |
+| `MONGODB_DATABASE` | `langgraph_backend` | Database name |
+| `WORKFLOW_DEFINITIONS_PATH` | `workflows` | Directory containing workflow JSON files |
+| `HTTP_ACTION_TIMEOUT_SECONDS` | `30` | Timeout for `http` step requests |
+| `LLM_PROVIDER` | — | `anthropic` or `openai` |
+| `LLM_MODEL` | provider default | Model name override |
+| `ANTHROPIC_API_KEY` | — | Anthropic API key |
+| `OPENAI_API_KEY` | — | OpenAI API key |
+| `OPENHANDS_BASE_URL` | `http://openhands:3000` | OpenHands service URL |
+| `OPENHANDS_API_KEY` | — | OpenHands auth token |
+| `OPENHANDS_TIMEOUT_SECONDS` | `60` | Per-task timeout |
+| `OPENHANDS_MOCK_MODE` | `true` | Use stub OpenHands responses |
+
+---
+
+## Workflow definitions
+
+Workflows are JSON files stored in `workflows/` (or the path set by `WORKFLOW_DEFINITIONS_PATH`). They are loaded and validated at startup.
+
+```
 workflows/
   feature_flow.json
-  multi_repo_delivery.json
+  mcp_llm_http_flow.json
+  llm_tool_call_flow.json
+  jira_actions.py        # Python action handlers — auto-loaded at startup
 ```
 
-### Runtime Workflow State
+The fixed graph topology is:
 
-Runtime state is stored in MongoDB and includes:
+```
+request → fetch_context → llm_agent → plan → approval → run_actions → execute → result
+```
 
-- workflow run id
-- current node / current step
-- intermediate outputs
-- approval status
-- execution status
-- timestamps
-- errors
-- linked session, user, and task metadata
+Each node runs the steps of its matching type. Nodes with no matching steps in the workflow definition are skipped automatically.
 
-MongoDB is used for live execution state and history only. It is not the source of truth for workflow definitions.
+### Resumable runs
 
-## Expected Graph Format
+When a workflow hits an `approval` step it pauses with `status: waiting_approval`. The API endpoints to drive it forward:
 
-The backend currently expects workflow definitions as JSON documents with this shape:
+```
+POST /api/v1/workflows/runs                    # submit
+GET  /api/v1/workflows/runs/{id}               # poll status
+POST /api/v1/workflows/runs/{id}/approve       # approve → resumes execution
+POST /api/v1/workflows/runs/{id}/reject        # reject → marks run as failed
+```
+
+---
+
+## Step type reference
+
+### `fetch` — read data via MCP
+
+Calls a named MCP tool and stores the result in `intermediate_outputs`. Runs in the `fetch_context` node, before the LLM and before any approval gate.
 
 ```json
 {
-  "id": "multi_repo_delivery",
-  "name": "Multi Repository Delivery",
-  "description": "Plan and execute coordinated work across repositories.",
-  "entrypoint": "plan",
-  "metadata": {
-    "default_repo": "acme/backend",
-    "outputs_required": ["backend_pr", "frontend_pr"]
-  },
-  "steps": [
-    {
-      "id": "plan",
-      "name": "Plan Work",
-      "type": "plan"
-    },
-    {
-      "id": "execute_backend",
-      "name": "Implement Backend Changes",
-      "type": "execute",
-      "repo": "acme/backend",
-      "instructions": "Implement backend changes required by the request.",
-      "requires": ["plan"]
-    },
-    {
-      "id": "execute_frontend",
-      "name": "Implement Frontend Changes",
-      "type": "execute",
-      "repo": "acme/frontend",
-      "instructions": "Implement frontend changes after backend outputs are available.",
-      "requires": ["execute_backend"]
-    },
-    {
-      "id": "result",
-      "name": "Produce Result",
-      "type": "result",
-      "requires": ["execute_frontend"]
-    }
+  "id": "fetch_miro_board",
+  "name": "Fetch Miro Board",
+  "type": "fetch",
+  "tool": "miro_get_board",
+  "tool_input": { "board_id": "uXjVIpExample=" },
+  "output_key": "miro_board"
+}
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `tool` | yes | MCP tool name (must be exposed by an enabled MCP server) |
+| `tool_input` | no | Static input payload forwarded to the tool |
+| `output_key` | no | Key under `intermediate_outputs` (defaults to step `id`) |
+
+---
+
+### `llm` — agentic tool-calling loop
+
+Sends the user request to the configured LLM. If the LLM requests a tool call, the tool is executed and the result is fed back. This loop repeats until the LLM returns a final text answer. All MCP tools from enabled integrations are bound to the LLM automatically.
+
+```json
+{
+  "id": "ask_llm",
+  "name": "Ask LLM with Tools",
+  "type": "llm",
+  "output_key": "agent_result"
+}
+```
+
+The output stored under `output_key` has the shape:
+
+```json
+{
+  "response": "Here is the plan...",
+  "tool_calls_made": [
+    { "name": "miro_get_board", "args": { "board_id": "..." }, "result": { ... } }
   ]
 }
 ```
 
-Supported step types:
-
-- `plan`
-- `execute`
-- `approval`
-- `result`
-
-Validation rules:
-
-- `id` must be unique across workflow files
-- each step `id` must be unique within a workflow
-- `entrypoint` must reference an existing step
-- each `requires` dependency must reference an existing step
-
-### Expected Execution Shape
-
-The MVP graph executes in this order:
-
-```text
-request -> plan -> execute -> result
-```
-
-For a multi-repository workflow, the logical dependency graph is expected to look like:
-
-```text
-plan
-  |
-  v
-execute_backend
-  |
-  v
-execute_frontend
-  |
-  v
-result
-```
-
-The current MVP executes repository tasks sequentially.
-
-## Responsibilities
-
-### LangGraph
-
-- workflow orchestration
-- state transitions
-- task decomposition
-- approval checkpoints
-- execution routing
-
-### OpenHands
-
-- step-level execution agent
-- repository interaction
-- code generation and modification
-- test execution
-- branch and PR creation
-
-### LangChain Tools
-
-- GitHub integration
-- Jira integration stub
-- Figma integration stub
-- future infrastructure tooling
-
-### LangServe
-
-- exposes workflows as runnable endpoints
-- integrates LangGraph into FastAPI
-- supports task submission and result retrieval
-
-## Repository Structure
-
-```text
-/
-|-- app/
-|-- workflows/
-|-- tests/
-|-- .helm/
-|-- README.md
-|-- AGENTS.md
-```
-
-## Deployment
-
-Deployment is managed with Helm.
-
-- Chart location: `.helm/`
-- Workflow files are packaged into a ConfigMap
-- Workflow ConfigMap is mounted into the application container
-- The service loads definitions from `WORKFLOW_DEFINITIONS_PATH`
-
-### Runtime Configuration
-
-Primary settings are provided through environment variables:
-
-- `WORKFLOW_DEFINITIONS_PATH`
-- `MONGODB_URI`
-- `MONGODB_DATABASE`
-- `OPENHANDS_BASE_URL`
-- `OPENHANDS_API_KEY`
-- `OPENHANDS_MOCK_MODE`
-
-## Execution Flow
-
-1. User submits a request through the client.
-2. FastAPI or LangServe receives the request.
-3. The backend loads the selected workflow definition.
-4. LangGraph plans the work.
-5. Execution steps call OpenHands through the adapter.
-6. Runtime state is persisted in MongoDB after each step.
-7. The final result is returned to the client.
-
-## MCP-Powered Workflow Example
-
-The following example shows an end-to-end workflow that pulls context from Miro and Jira,
-creates a Figma design spec, decomposes work into Jira tickets, then implements them
-using OpenHands — all driven by a single workflow definition.
-
-### Graph
-
-```text
-┌─────────────────────────────────────────────────────────────────────┐
-│  fetch_context  (type: fetch — reads data from MCP integrations)    │
-│                                                                      │
-│   fetch_miro_board ─────────────────────────────────────────────┐   │
-│                                                                  │   │
-│   fetch_jira_epic  ─────────────────────────────────────────────┤   │
-└──────────────────────────────────────────────────────────────── ┼ ──┘
-                                                                  │
-                                                                  ▼
-                                                       create_figma_design  (type: fetch)
-                                                                  │
-                                                                  ▼
-                                                              plan
-                                                         (LLM decomposes work,
-                                                          creates Jira tickets)
-                                                                  │
-                                                                  ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  run_actions  (type: http / action — side-effects after planning)   │
-│                                                                      │
-│   notify_internal  (http POST → internal notification service)      │
-│                                                                      │
-│   transition_jira  (action → Python handler updates ticket state)   │
-└──────────────────────────────────────────────────────────────────── ┘
-                                                                  │
-                                                                  ▼
-                                                   ┌──── execute_backend ────┐
-                                                   │                         │
-                                                   └──── execute_frontend ───┘
-                                                                  │
-                                                                  ▼
-                                                              result
-```
-
-The full LangGraph topology is always:
-
-```text
-request → fetch_context → plan → run_actions → execute → result
-```
-
-| Phase | Step types | Description |
+| Field | Required | Description |
 |---|---|---|
-| `fetch_context` | `fetch` | Reads external data via MCP tools before planning |
-| `plan` | `plan` | LLM decomposes work; result is stored in the run |
-| `run_actions` | `http`, `action` | Side-effects after planning: HTTP calls, Python handlers |
-| `execute` | `execute` | OpenHands implements code in each repository |
+| `output_key` | no | Key under `intermediate_outputs` (defaults to step `id`) |
 
-### Workflow Definition
+---
+
+### `plan` — LLM task decomposition
+
+Produces a `PlanResult` that drives the `execute` node: which repositories to touch and in what order. If the workflow has no `execute` steps, a single default task is created pointing at `metadata.default_repo`.
 
 ```json
 {
-  "id": "idea_to_implementation",
-  "name": "Idea to Implementation",
-  "description": "Turn a Miro board idea into implemented code via Figma and Jira.",
-  "entrypoint": "plan",
+  "id": "plan",
+  "name": "Plan Work",
+  "type": "plan"
+}
+```
+
+---
+
+### `approval` — human review gate
+
+Pauses the run (`status: waiting_approval`, `approval_status: pending`) until the client calls `/approve` or `/reject`. Multiple `approval` steps in one workflow are treated as a single gate.
+
+```json
+{
+  "id": "review_plan",
+  "name": "Review Plan",
+  "type": "approval",
   "metadata": {
-    "default_repo": "acme/backend",
+    "description": "Review the generated plan before implementation begins."
+  }
+}
+```
+
+---
+
+### `http` — outbound HTTP request
+
+Sends an HTTP request to any URL. Supports `{{ run.* }}` template variables in `url`, `body`, and `http_headers`. Runs after the approval gate in the `run_actions` node.
+
+```json
+{
+  "id": "create_jira_ticket",
+  "name": "Create Jira Ticket",
+  "type": "http",
+  "url": "https://your-org.atlassian.net/rest/api/3/issue",
+  "method": "POST",
+  "http_headers": {
+    "Authorization": "Bearer <token>",
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "summary": "{{ run.user_request }}",
+    "run_id": "{{ run.id }}"
+  },
+  "output_key": "jira_ticket"
+}
+```
+
+Available template variables: `{{ run.id }}`, `{{ run.workflow_id }}`, `{{ run.workflow_name }}`, `{{ run.user_request }}`.
+
+| Field | Required | Description |
+|---|---|---|
+| `url` | yes | Target URL (supports templates) |
+| `method` | no | `GET`, `POST`, `PUT`, `PATCH`, or `DELETE` (default: `POST`) |
+| `http_headers` | no | Request headers (supports templates) |
+| `body` | no | JSON body (supports templates) |
+| `output_key` | no | Key under `intermediate_outputs` (defaults to step `id`) |
+
+---
+
+### `action` — Python handler loaded from file
+
+Calls a named async Python function defined in a `.py` file placed alongside your workflow JSON files. Useful for logic that is too complex for a raw HTTP call. Runs in the `run_actions` node (after approval).
+
+At startup the service scans the workflow definitions directory for `*.py` files, imports them, and registers every entry in their `ACTIONS` dict — no application code changes required.
+
+**Step definition** (`workflows/idea_to_code.json`):
+
+```json
+{
+  "id": "update_ticket_status",
+  "name": "Move Ticket to In Progress",
+  "type": "action",
+  "handler": "jira.transition_issue",
+  "handler_input": {
+    "issue_key": "PLAT-42",
+    "transition": "In Progress"
+  },
+  "output_key": "jira_transition"
+}
+```
+
+**Handler file** (`workflows/jira_actions.py`):
+
+```python
+async def transition_issue(handler_input: dict, run) -> dict:
+    issue_key = handler_input["issue_key"]
+    transition = handler_input["transition"]
+    # call your internal Jira client here
+    return {"transitioned": True, "issue_key": issue_key}
+
+ACTIONS = {
+    "jira.transition_issue": transition_issue,
+}
+```
+
+Drop the file into the same directory as your JSON workflows and restart the server — the handler is picked up automatically.
+
+| Field | Required | Description |
+|---|---|---|
+| `handler` | yes | Handler name matching a key in an `ACTIONS` dict |
+| `handler_input` | no | Static input dict forwarded to the handler (supports `{{ run.* }}` templates) |
+| `output_key` | no | Key under `intermediate_outputs` (defaults to step `id`) |
+
+---
+
+### `execute` — repository implementation via OpenHands
+
+Delegates implementation to OpenHands for a specific repository. OpenHands opens a branch, writes or modifies code, runs tests, and creates a PR. One `execute` step corresponds to one repository. Multiple execute steps run sequentially.
+
+```json
+{
+  "id": "execute_backend",
+  "name": "Implement Backend Changes",
+  "type": "execute",
+  "repo": "your-org/backend",
+  "instructions": "Implement the changes described in the plan. Reference the Figma design for UI guidance."
+}
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `repo` | yes | Repository in `org/repo` format |
+| `instructions` | no | Additional instructions passed to OpenHands (supplements the user request) |
+
+---
+
+### `result` — complete the run
+
+Marks the workflow run as `completed` and finalises the response. Every workflow must have exactly one `result` step.
+
+```json
+{
+  "id": "result",
+  "name": "Produce Result",
+  "type": "result"
+}
+```
+
+---
+
+## Example workflow
+
+The following workflow takes a user idea, reads the Miro board for context, sends it to the LLM for analysis, waits for a human to approve the plan, then creates a Jira ticket and a Figma design file, and finally has OpenHands implement the code.
+
+### Execution graph
+
+```
+POST /runs  ─────────────────────────────────────────────────────────────┐
+                                                                          │
+  [fetch_context]                                                         │
+    fetch_miro_board  ──── reads the idea board from Miro via MCP        │
+                                                                          │
+  [llm_agent]                                                             │
+    ask_llm  ──────────── LLM receives Miro data + user request          │
+                          may call MCP tools for additional context       │
+                          returns structured analysis                     │
+                                                                          │
+  [approval]                                                              │
+    review_analysis  ──── run paused: status = waiting_approval ─────────┘
+
+POST /runs/{id}/approve  ────────────────────────────────────────────────┐
+                                                                          │
+  [run_actions]  (sequential — see Limitations for parallel support)     │
+    create_jira_ticket  ── HTTP POST → Jira REST API                     │
+    create_figma_design ── HTTP POST → Figma API                         │
+    update_jira_status  ── Python action handler                         │
+                                                                          │
+  [execute]  (sequential per task)                                        │
+    execute_backend  ───── OpenHands implements backend changes           │
+    execute_frontend ───── OpenHands implements frontend changes          │
+                                                                          │
+  status = completed ──────────────────────────────────────────────────── ┘
+```
+
+### Workflow definition
+
+```json
+{
+  "id": "idea_to_code",
+  "name": "Idea to Code",
+  "description": "Read a Miro board, reason with an LLM, get human approval, then implement.",
+  "entrypoint": "fetch_miro_board",
+  "metadata": {
+    "default_repo": "your-org/backend",
     "outputs_required": ["backend_pr", "frontend_pr"]
   },
   "steps": [
@@ -312,74 +427,69 @@ request → fetch_context → plan → run_actions → execute → result
       "type": "fetch",
       "tool": "miro_get_board",
       "tool_input": { "board_id": "uXjVIpExample=" },
-      "output_key": "miro_board",
-      "requires": []
+      "output_key": "miro_board"
     },
     {
-      "id": "fetch_jira_epic",
-      "name": "Fetch Jira Epic",
-      "type": "fetch",
-      "tool": "jira_get_issue",
-      "tool_input": { "issue_key": "PLAT-42" },
-      "output_key": "jira_epic",
-      "requires": []
-    },
-    {
-      "id": "create_figma_design",
-      "name": "Create Figma Design Spec",
-      "type": "fetch",
-      "tool": "figma_create_file",
-      "tool_input": { "project_id": "123456789" },
-      "output_key": "figma_design",
+      "id": "ask_llm",
+      "name": "Analyse with LLM",
+      "type": "llm",
+      "output_key": "analysis",
       "requires": ["fetch_miro_board"]
     },
     {
-      "id": "plan",
-      "name": "Plan Work and Create Jira Tickets",
-      "type": "plan",
-      "requires": ["fetch_miro_board", "fetch_jira_epic", "create_figma_design"]
+      "id": "review_analysis",
+      "name": "Review Analysis",
+      "type": "approval",
+      "requires": ["ask_llm"],
+      "metadata": {
+        "description": "Review the LLM analysis before creating tickets and designs."
+      }
     },
     {
-      "id": "notify_internal",
-      "name": "Notify Internal Service",
+      "id": "create_jira_ticket",
+      "name": "Create Jira Ticket",
       "type": "http",
-      "url": "https://internal.example.com/delivery/started",
+      "url": "https://your-org.atlassian.net/rest/api/3/issue",
       "method": "POST",
-      "body": {
-        "run_id": "{{ run.id }}",
-        "workflow": "{{ run.workflow_name }}",
-        "request": "{{ run.user_request }}"
-      },
-      "output_key": "notification_result",
-      "requires": ["plan"]
+      "http_headers": { "Authorization": "Bearer <token>", "Content-Type": "application/json" },
+      "body": { "summary": "{{ run.user_request }}", "run_id": "{{ run.id }}" },
+      "output_key": "jira_ticket",
+      "requires": ["review_analysis"]
     },
     {
-      "id": "transition_jira",
-      "name": "Move Jira Epic to In Progress",
+      "id": "create_figma_design",
+      "name": "Create Figma Design File",
+      "type": "http",
+      "url": "https://api.figma.com/v1/files",
+      "method": "POST",
+      "http_headers": { "X-Figma-Token": "<token>" },
+      "body": { "name": "{{ run.user_request }}", "run_id": "{{ run.id }}" },
+      "output_key": "figma_file",
+      "requires": ["review_analysis"]
+    },
+    {
+      "id": "update_jira_status",
+      "name": "Move Ticket to In Progress",
       "type": "action",
       "handler": "jira.transition_issue",
-      "handler_input": {
-        "issue_key": "PLAT-42",
-        "transition": "In Progress",
-        "run_id": "{{ run.id }}"
-      },
-      "output_key": "jira_transition_result",
-      "requires": ["plan"]
+      "handler_input": { "transition": "In Progress" },
+      "output_key": "jira_transition",
+      "requires": ["create_jira_ticket"]
     },
     {
       "id": "execute_backend",
-      "name": "Implement Backend Changes",
+      "name": "Implement Backend",
       "type": "execute",
-      "repo": "acme/backend",
-      "instructions": "Implement backend changes from the plan. Reference the Figma design and Jira epic for context.",
-      "requires": ["plan"]
+      "repo": "your-org/backend",
+      "instructions": "Implement the backend changes from the plan. Use the Figma design file for reference.",
+      "requires": ["update_jira_status", "create_figma_design"]
     },
     {
       "id": "execute_frontend",
-      "name": "Implement Frontend Changes",
+      "name": "Implement Frontend",
       "type": "execute",
-      "repo": "acme/frontend",
-      "instructions": "Implement frontend changes matching the Figma design spec.",
+      "repo": "your-org/frontend",
+      "instructions": "Implement the frontend matching the Figma design.",
       "requires": ["execute_backend"]
     },
     {
@@ -392,113 +502,38 @@ request → fetch_context → plan → run_actions → execute → result
 }
 ```
 
-### What each node does
+### What each step does at runtime
 
-| Node | Type | Integration | Description |
-|---|---|---|---|
-| `fetch_miro_board` | `fetch` | Miro MCP | Reads the idea board — shapes, stickies, and structure become context for the planner |
-| `fetch_jira_epic` | `fetch` | Jira MCP | Reads the parent epic — acceptance criteria and labels flow into planning |
-| `create_figma_design` | `fetch` | Figma MCP | Creates a design file in the target project using the Miro board content as input |
-| `plan` | `plan` | LLM | Decomposes work into repository tasks and creates Jira sub-tickets under the epic |
-| `notify_internal` | `http` | Internal API | POST to the internal notification service with `{{ run.id }}` and plan summary |
-| `transition_jira` | `action` | Python handler | Calls registered handler `jira.transition_issue` to move the epic to In Progress |
-| `execute_backend` | `execute` | OpenHands | Implements backend changes, opens a branch and PR |
-| `execute_frontend` | `execute` | OpenHands | Implements frontend changes against the Figma spec, opens a branch and PR |
-| `result` | `result` | — | Aggregates PR URLs and a summary into the workflow run response |
+| Step | Node | Description |
+|---|---|---|
+| `fetch_miro_board` | `fetch_context` | Calls the Miro MCP tool and stores board data before planning |
+| `ask_llm` | `llm_agent` | Sends user request + Miro data to the LLM; LLM may call further MCP tools |
+| `review_analysis` | `approval` | Pauses the run; client calls `/approve` to continue or `/reject` to abort |
+| `create_jira_ticket` | `run_actions` | HTTP POST to Jira REST API to create a ticket |
+| `create_figma_design` | `run_actions` | HTTP POST to Figma API to create a design file |
+| `update_jira_status` | `run_actions` | Calls Python handler from `workflows/jira_actions.py` to transition the ticket |
+| `execute_backend` | `execute` | OpenHands implements backend changes, opens branch + PR |
+| `execute_frontend` | `execute` | OpenHands implements frontend changes, opens branch + PR |
+| `result` | `result` | Aggregates outputs and marks run as `completed` |
 
-### Step type reference
+---
 
-#### `http` — outbound HTTP call
+## Current limitations
 
-Sends a request to any URL. Supports `{{ run.* }}` templates in `body`, `http_headers`, and `url`.
+### No parallel step execution
 
-```json
-{
-  "id": "notify",
-  "type": "http",
-  "url": "https://internal.example.com/notify",
-  "method": "POST",
-  "body": { "run_id": "{{ run.id }}", "workflow": "{{ run.workflow_name }}" },
-  "http_headers": { "X-Source": "acme" },
-  "output_key": "notification_result"
-}
-```
-
-Available template variables: `{{ run.id }}`, `{{ run.workflow_id }}`, `{{ run.workflow_name }}`, `{{ run.user_request }}`.
-
-#### `action` — registered Python handler
-
-Calls a named Python function registered in `ActionRegistry` at startup. The handler receives the resolved `handler_input` dict and the live `WorkflowRun`.
-
-```json
-{
-  "id": "transition_jira",
-  "type": "action",
-  "handler": "jira.transition_issue",
-  "handler_input": { "issue_key": "PLAT-42", "transition": "In Progress" },
-  "output_key": "jira_transition_result"
-}
-```
-
-Register the handler in application startup (e.g. in `app/api/app.py`):
-
-```python
-from app.infrastructure.actions.registry import ActionRegistry
-from app.domain.models.runtime import WorkflowRun
-
-async def transition_jira_issue(handler_input: dict, run: WorkflowRun) -> dict:
-    issue_key = handler_input["issue_key"]
-    transition = handler_input["transition"]
-    # ... call your internal Jira client ...
-    return {"transitioned": True, "issue_key": issue_key}
-
-container.action_registry.register("jira.transition_issue", transition_jira_issue)
-```
-
-### Required environment configuration
-
-Enable the integrations in your Helm values and point to the right secret:
-
-```yaml
-# values-prod.yaml
-app:
-  existingSecret: "langgraph-backend-secrets-prod"
-
-mcp:
-  miro:
-    enabled: "true"
-    url: "https://mcp.miro.com/v1"
-  jira:
-    enabled: "true"
-    url: "https://mcp.atlassian.com/v1/sse"
-  figma:
-    enabled: "true"
-    url: "https://www.figma.com/api/mcp/v1"
-```
-
-The corresponding k8s Secret must contain:
+The internal LangGraph graph is a linear chain:
 
 ```
-MCP_MIRO_API_KEY=<miro-oauth-token>
-MCP_JIRA_API_KEY=<atlassian-api-token>
-MCP_FIGMA_API_KEY=<figma-personal-access-token>
-OPENHANDS_API_KEY=<openhands-api-key>
+request → fetch_context → llm_agent → plan → approval → run_actions → execute → result
 ```
 
-## Current Status
+Steps of the same type (e.g. two `fetch` steps, two `http` steps) always run **sequentially** within their node. The `requires` field in step definitions is stored as metadata for documentation purposes but does not change execution order at runtime.
 
-Current MVP goals:
+LangGraph itself supports parallel node execution via fan-out edges and the `Send` API — this is a planned addition to this service.
 
-- workflow loading from mounted files
-- LangGraph orchestration
-- OpenHands integration
-- MongoDB runtime persistence
-- Copilot-compatible API surface
+### Single approval gate per run
 
-## Vision
+Each workflow run supports **one** approval pause. If a workflow defines multiple `approval` steps they are all treated as a single gate: the run pauses once, and a single `/approve` or `/reject` call resumes or cancels it.
 
-Build a system where:
-
-- AI plans and executes development work
-- humans review and approve when needed
-- workflows remain structured, observable, and reproducible
+Workflows requiring separate approval decisions at different stages (e.g. "approve the design" then later "approve the implementation") should be split into multiple sequential workflow runs, where the output of the first becomes the input context of the next.

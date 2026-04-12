@@ -1,0 +1,62 @@
+{
+  "id": "parallel_flow",
+  "name": "Parallel Fetch + Dual LLM + Dual Approval Flow",
+  "description": "Fetch Figma and GitHub context in parallel, run two LLM analyses in parallel, then require approval on both before continuing.",
+  "entrypoint": "fetch_figma",
+  "steps": [
+    {
+      "id": "fetch_figma",
+      "name": "Fetch Figma Design",
+      "type": "fetch",
+      "tool": "figma_get_file",
+      "tool_input": { "file_key": "example_file_key" },
+      "output_key": "design_context"
+    },
+    {
+      "id": "fetch_github",
+      "name": "Fetch GitHub Code",
+      "type": "fetch",
+      "tool": "github_get_repo",
+      "tool_input": { "repo": "your-org/frontend" },
+      "output_key": "code_context"
+    },
+    {
+      "id": "design_analysis",
+      "name": "Analyse Design with LLM",
+      "type": "llm",
+      "output_key": "design_update",
+      "requires": ["fetch_figma"]
+    },
+    {
+      "id": "plan_creation",
+      "name": "Create Solution Plan with LLM",
+      "type": "llm",
+      "output_key": "solution_plan",
+      "requires": ["fetch_github"]
+    },
+    {
+      "id": "approval_design",
+      "name": "Approve Design Update",
+      "type": "approval",
+      "requires": ["design_analysis"],
+      "metadata": {
+        "description": "Review the proposed design changes before implementation."
+      }
+    },
+    {
+      "id": "approval_plan",
+      "name": "Approve Solution Plan",
+      "type": "approval",
+      "requires": ["plan_creation"],
+      "metadata": {
+        "description": "Review the solution plan before implementation begins."
+      }
+    },
+    {
+      "id": "result",
+      "name": "Produce Result",
+      "type": "result",
+      "requires": ["approval_design", "approval_plan"]
+    }
+  ]
+}

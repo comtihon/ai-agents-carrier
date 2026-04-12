@@ -1,0 +1,20 @@
+{
+  "id": "llm_tool_call_flow",
+  "name": "LLM Tool-Call Flow",
+  "description": "Call an LLM that can invoke local tools, receives their results, and returns a final answer.",
+  "entrypoint": "ask_llm",
+  "steps": [
+    {
+      "id": "ask_llm",
+      "name": "Ask LLM with Tools",
+      "type": "llm",
+      "output_key": "agent_result"
+    },
+    {
+      "id": "result",
+      "name": "Produce Result",
+      "type": "result",
+      "requires": ["ask_llm"]
+    }
+  ]
+}
