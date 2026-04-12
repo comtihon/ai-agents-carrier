@@ -1,0 +1,30 @@
+{
+  "id": "multi_repo_delivery",
+  "name": "Multi Repository Delivery",
+  "description": "Plan and execute coordinated work across backend and frontend repositories.",
+  "entrypoint": "plan",
+  "metadata": {
+    "default_repo": "acme/backend",
+    "outputs_required": ["backend_pr", "frontend_pr"]
+  },
+  "steps": [
+    { "id": "plan", "name": "Plan Work", "type": "plan" },
+    {
+      "id": "execute_backend",
+      "name": "Implement Backend Changes",
+      "type": "execute",
+      "repo": "acme/backend",
+      "instructions": "Implement backend changes required by the request.",
+      "requires": ["plan"]
+    },
+    {
+      "id": "execute_frontend",
+      "name": "Implement Frontend Changes",
+      "type": "execute",
+      "repo": "acme/frontend",
+      "instructions": "Implement frontend changes after backend outputs are available.",
+      "requires": ["execute_backend"]
+    },
+    { "id": "result", "name": "Produce Result", "type": "result", "requires": ["execute_frontend"] }
+  ]
+}

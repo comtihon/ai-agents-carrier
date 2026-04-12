@@ -1,0 +1,26 @@
+replicaCount: 1
+
+image:
+  repository: langgraph-backend
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8000
+
+app:
+  environment: dev
+  workflowDefinitionsPath: /app/workflows
+  openhandsBaseUrl: http://openhands:3000
+  openhandsMockMode: "true"
+  existingSecret: ""
+
+mongodb:
+  uri: mongodb://mongodb:27017
+  database: langgraph_backend
+
+resources: {}
+nodeSelector: {}
+affinity: {}
+tolerations: []

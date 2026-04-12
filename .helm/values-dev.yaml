@@ -1,0 +1,6 @@
+app:
+  environment: dev
+  openhandsMockMode: "true"
+
+image:
+  tag: dev
