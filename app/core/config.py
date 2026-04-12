@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     openhands_timeout_seconds: float = Field(default=60.0, alias="OPENHANDS_TIMEOUT_SECONDS")
     openhands_mock_mode: bool = Field(default=True, alias="OPENHANDS_MOCK_MODE")
     langserve_path: str = Field(default="/langserve/workflow-runner", alias="LANGSERVE_PATH")
+    http_action_timeout_seconds: float = Field(default=30.0, alias="HTTP_ACTION_TIMEOUT_SECONDS")
 
     # --- Figma MCP ---
     mcp_figma_enabled: bool = Field(default=False, alias="MCP_FIGMA_ENABLED")

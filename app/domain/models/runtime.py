@@ -57,6 +57,14 @@ class ToolCallResult(BaseModel):
     error: str | None = None
 
 
+class ActionStepResult(BaseModel):
+    step_id: str
+    type: str  # "http" or "action"
+    status: Literal["success", "failed"]
+    output: dict[str, Any] = Field(default_factory=dict)
+    error: str | None = None
+
+
 class WorkflowRun(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     workflow_id: str
@@ -69,6 +77,7 @@ class WorkflowRun(BaseModel):
     approval_status: Literal["not_required", "pending", "approved", "rejected"] = "not_required"
     plan: PlanResult | None = None
     tool_call_results: list[ToolCallResult] = Field(default_factory=list)
+    action_results: list[ActionStepResult] = Field(default_factory=list)
     execution_results: list[ExecutionStepResult] = Field(default_factory=list)
     intermediate_outputs: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None

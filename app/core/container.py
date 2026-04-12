@@ -11,6 +11,8 @@ from app.infrastructure.config.workflow_loader import WorkflowDefinitionLoader
 from app.infrastructure.integrations.openhands import OpenHandsAdapter
 from app.infrastructure.orchestration.graph import WorkflowGraphRunner
 from app.infrastructure.persistence.mongo import MongoClientProvider, MongoWorkflowRunRepository
+from app.infrastructure.actions.http_executor import HttpStepExecutor
+from app.infrastructure.actions.registry import ActionRegistry
 from app.infrastructure.tools.langchain_tools import build_default_tools
 from app.infrastructure.tools.mcp_client import McpToolsProvider
 
@@ -24,6 +26,7 @@ class ApplicationContainer:
     planning_service: PlanningService
     tools: list[Any]
     mcp_tools_provider: McpToolsProvider
+    action_registry: ActionRegistry
     graph_runner: WorkflowGraphRunner
     orchestration_service: OrchestrationService
 
@@ -42,8 +45,17 @@ def build_container(settings: Settings) -> ApplicationContainer:
     planning_service = PlanningService()
     tools = build_default_tools()
     mcp_tools_provider = McpToolsProvider(settings)
+    action_registry = ActionRegistry()
+    http_executor = HttpStepExecutor(timeout=settings.http_action_timeout_seconds)
     openhands_adapter = OpenHandsAdapter(settings)
-    graph_runner = WorkflowGraphRunner(planning_service, openhands_adapter, workflow_run_repository, mcp_tools_provider)
+    graph_runner = WorkflowGraphRunner(
+        planning_service,
+        openhands_adapter,
+        workflow_run_repository,
+        mcp_tools_provider,
+        http_executor,
+        action_registry,
+    )
     orchestration_service = OrchestrationService(workflow_registry, workflow_run_repository, graph_runner)
     return ApplicationContainer(
         settings=settings,
@@ -53,6 +65,7 @@ def build_container(settings: Settings) -> ApplicationContainer:
         planning_service=planning_service,
         tools=tools,
         mcp_tools_provider=mcp_tools_provider,
+        action_registry=action_registry,
         graph_runner=graph_runner,
         orchestration_service=orchestration_service,
     )

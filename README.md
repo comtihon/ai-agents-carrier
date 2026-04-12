@@ -246,34 +246,52 @@ using OpenHands — all driven by a single workflow definition.
 ### Graph
 
 ```text
-┌──────────────────────────────────────────────────────────────────────┐
-│  fetch_context                                                        │
-│                                                                       │
-│   fetch_miro_board ──────────────────────────────────────────────┐   │
-│                                                                   │   │
-│   fetch_jira_epic  ──────────────────────────────────────────────┤   │
-└───────────────────────────────────────────────────────────────── ┼ ──┘
-                                                                   │
-                                                                   ▼
-                                                            create_figma_design
-                                                                   │
-                                                                   ▼
-                                                               plan
-                                                          (LLM decomposes work,
-                                                           creates Jira tickets)
-                                                                   │
-                                                                   ▼
-                                                    ┌──── execute_backend ────┐
-                                                    │                         │
-                                                    └──── execute_frontend ───┘
-                                                                   │
-                                                                   ▼
-                                                               result
+┌─────────────────────────────────────────────────────────────────────┐
+│  fetch_context  (type: fetch — reads data from MCP integrations)    │
+│                                                                      │
+│   fetch_miro_board ─────────────────────────────────────────────┐   │
+│                                                                  │   │
+│   fetch_jira_epic  ─────────────────────────────────────────────┤   │
+└──────────────────────────────────────────────────────────────── ┼ ──┘
+                                                                  │
+                                                                  ▼
+                                                       create_figma_design  (type: fetch)
+                                                                  │
+                                                                  ▼
+                                                              plan
+                                                         (LLM decomposes work,
+                                                          creates Jira tickets)
+                                                                  │
+                                                                  ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  run_actions  (type: http / action — side-effects after planning)   │
+│                                                                      │
+│   notify_internal  (http POST → internal notification service)      │
+│                                                                      │
+│   transition_jira  (action → Python handler updates ticket state)   │
+└──────────────────────────────────────────────────────────────────── ┘
+                                                                  │
+                                                                  ▼
+                                                   ┌──── execute_backend ────┐
+                                                   │                         │
+                                                   └──── execute_frontend ───┘
+                                                                  │
+                                                                  ▼
+                                                              result
 ```
 
-> `fetch_context` runs all `fetch`-type steps in parallel (resolved from the workflow definition)
-> before handing off to the rest of the graph. The plan and execute nodes receive all
-> fetched data via `intermediate_outputs`.
+The full LangGraph topology is always:
+
+```text
+request → fetch_context → plan → run_actions → execute → result
+```
+
+| Phase | Step types | Description |
+|---|---|---|
+| `fetch_context` | `fetch` | Reads external data via MCP tools before planning |
+| `plan` | `plan` | LLM decomposes work; result is stored in the run |
+| `run_actions` | `http`, `action` | Side-effects after planning: HTTP calls, Python handlers |
+| `execute` | `execute` | OpenHands implements code in each repository |
 
 ### Workflow Definition
 
@@ -322,6 +340,33 @@ using OpenHands — all driven by a single workflow definition.
       "requires": ["fetch_miro_board", "fetch_jira_epic", "create_figma_design"]
     },
     {
+      "id": "notify_internal",
+      "name": "Notify Internal Service",
+      "type": "http",
+      "url": "https://internal.example.com/delivery/started",
+      "method": "POST",
+      "body": {
+        "run_id": "{{ run.id }}",
+        "workflow": "{{ run.workflow_name }}",
+        "request": "{{ run.user_request }}"
+      },
+      "output_key": "notification_result",
+      "requires": ["plan"]
+    },
+    {
+      "id": "transition_jira",
+      "name": "Move Jira Epic to In Progress",
+      "type": "action",
+      "handler": "jira.transition_issue",
+      "handler_input": {
+        "issue_key": "PLAT-42",
+        "transition": "In Progress",
+        "run_id": "{{ run.id }}"
+      },
+      "output_key": "jira_transition_result",
+      "requires": ["plan"]
+    },
+    {
       "id": "execute_backend",
       "name": "Implement Backend Changes",
       "type": "execute",
@@ -355,9 +400,60 @@ using OpenHands — all driven by a single workflow definition.
 | `fetch_jira_epic` | `fetch` | Jira MCP | Reads the parent epic — acceptance criteria and labels flow into planning |
 | `create_figma_design` | `fetch` | Figma MCP | Creates a design file in the target project using the Miro board content as input |
 | `plan` | `plan` | LLM | Decomposes work into repository tasks and creates Jira sub-tickets under the epic |
+| `notify_internal` | `http` | Internal API | POST to the internal notification service with `{{ run.id }}` and plan summary |
+| `transition_jira` | `action` | Python handler | Calls registered handler `jira.transition_issue` to move the epic to In Progress |
 | `execute_backend` | `execute` | OpenHands | Implements backend changes, opens a branch and PR |
 | `execute_frontend` | `execute` | OpenHands | Implements frontend changes against the Figma spec, opens a branch and PR |
 | `result` | `result` | — | Aggregates PR URLs and a summary into the workflow run response |
+
+### Step type reference
+
+#### `http` — outbound HTTP call
+
+Sends a request to any URL. Supports `{{ run.* }}` templates in `body`, `http_headers`, and `url`.
+
+```json
+{
+  "id": "notify",
+  "type": "http",
+  "url": "https://internal.example.com/notify",
+  "method": "POST",
+  "body": { "run_id": "{{ run.id }}", "workflow": "{{ run.workflow_name }}" },
+  "http_headers": { "X-Source": "acme" },
+  "output_key": "notification_result"
+}
+```
+
+Available template variables: `{{ run.id }}`, `{{ run.workflow_id }}`, `{{ run.workflow_name }}`, `{{ run.user_request }}`.
+
+#### `action` — registered Python handler
+
+Calls a named Python function registered in `ActionRegistry` at startup. The handler receives the resolved `handler_input` dict and the live `WorkflowRun`.
+
+```json
+{
+  "id": "transition_jira",
+  "type": "action",
+  "handler": "jira.transition_issue",
+  "handler_input": { "issue_key": "PLAT-42", "transition": "In Progress" },
+  "output_key": "jira_transition_result"
+}
+```
+
+Register the handler in application startup (e.g. in `app/api/app.py`):
+
+```python
+from app.infrastructure.actions.registry import ActionRegistry
+from app.domain.models.runtime import WorkflowRun
+
+async def transition_jira_issue(handler_input: dict, run: WorkflowRun) -> dict:
+    issue_key = handler_input["issue_key"]
+    transition = handler_input["transition"]
+    # ... call your internal Jira client ...
+    return {"transitioned": True, "issue_key": issue_key}
+
+container.action_registry.register("jira.transition_issue", transition_jira_issue)
+```
 
 ### Required environment configuration
 

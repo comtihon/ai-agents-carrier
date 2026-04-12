@@ -7,8 +7,10 @@ from langgraph.graph import END, StateGraph
 from app.application.services.planning_service import PlanningService
 from app.domain.interfaces.openhands import OpenHandsPort
 from app.domain.interfaces.repositories import WorkflowRunRepository
-from app.domain.models.runtime import ExecutionStepResult, PlanResult, ToolCallResult, WorkflowRequest, WorkflowRun
+from app.domain.models.runtime import ActionStepResult, ExecutionStepResult, PlanResult, ToolCallResult, WorkflowRequest, WorkflowRun
 from app.domain.models.workflow_definition import WorkflowDefinition
+from app.infrastructure.actions.http_executor import HttpStepExecutor
+from app.infrastructure.actions.registry import ActionRegistry
 from app.infrastructure.tools.mcp_client import McpToolsProvider
 
 
@@ -26,11 +28,15 @@ class WorkflowGraphRunner:
         openhands_port: OpenHandsPort,
         workflow_run_repository: WorkflowRunRepository,
         mcp_tools_provider: McpToolsProvider,
+        http_executor: HttpStepExecutor,
+        action_registry: ActionRegistry,
     ) -> None:
         self._planning_service = planning_service
         self._openhands_port = openhands_port
         self._workflow_run_repository = workflow_run_repository
         self._mcp_tools_provider = mcp_tools_provider
+        self._http_executor = http_executor
+        self._action_registry = action_registry
         self._graph = self._build_graph()
 
     def _build_graph(self):
@@ -38,12 +44,14 @@ class WorkflowGraphRunner:
         graph.add_node("request", self._request_node)
         graph.add_node("fetch_context", self._fetch_context_node)
         graph.add_node("plan", self._plan_node)
+        graph.add_node("run_actions", self._run_actions_node)
         graph.add_node("execute", self._execute_node)
         graph.add_node("result", self._result_node)
         graph.set_entry_point("request")
         graph.add_edge("request", "fetch_context")
         graph.add_edge("fetch_context", "plan")
-        graph.add_edge("plan", "execute")
+        graph.add_edge("plan", "run_actions")
+        graph.add_edge("run_actions", "execute")
         graph.add_edge("execute", "result")
         graph.add_edge("result", END)
         return graph.compile()
@@ -141,6 +149,52 @@ class WorkflowGraphRunner:
         workflow_run.intermediate_outputs["plan_summary"] = plan.summary
         await self._workflow_run_repository.update(workflow_run)
         state["plan"] = plan
+        state["workflow_run"] = workflow_run
+        return state
+
+    async def _run_actions_node(self, state: WorkflowGraphState) -> WorkflowGraphState:
+        workflow_run = state["workflow_run"]
+        workflow_definition = state["workflow_definition"]
+
+        if workflow_run.status == "failed":
+            return state
+
+        action_steps = [s for s in workflow_definition.steps if s.type in ("http", "action")]
+        if not action_steps:
+            return state
+
+        workflow_run.current_step = "run_actions"
+        action_results: list[ActionStepResult] = list(workflow_run.action_results)
+
+        for step in action_steps:
+            try:
+                if step.type == "http":
+                    output = await self._http_executor.execute(step, workflow_run)
+                else:
+                    output = await self._action_registry.execute(
+                        step.handler,  # type: ignore[arg-type]  -- validated non-None for action steps
+                        step.handler_input,
+                        workflow_run,
+                    )
+            except Exception as exc:
+                workflow_run.status = "failed"
+                workflow_run.error = f"Action step '{step.id}' failed: {exc}"
+                action_results.append(
+                    ActionStepResult(step_id=step.id, type=step.type, status="failed", error=str(exc))
+                )
+                workflow_run.action_results = action_results
+                await self._workflow_run_repository.update(workflow_run)
+                state["workflow_run"] = workflow_run
+                return state
+
+            output_key = step.output_key or step.id
+            workflow_run.intermediate_outputs[output_key] = output
+            action_results.append(
+                ActionStepResult(step_id=step.id, type=step.type, status="success", output=output)
+            )
+
+        workflow_run.action_results = action_results
+        await self._workflow_run_repository.update(workflow_run)
         state["workflow_run"] = workflow_run
         return state
 
