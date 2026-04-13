@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from copilotkit import LangGraphAgent
+from copilotkit import LangGraphAGUIAgent
 from copilotkit.integrations.fastapi import add_fastapi_endpoint
 from copilotkit.sdk import CopilotKitRemoteEndpoint
 from fastapi import FastAPI
@@ -29,7 +29,7 @@ async def lifespan(app: FastAPI):
     router_graph = build_router_graph(container.llm)
     sdk = CopilotKitRemoteEndpoint(
         agents=[
-            LangGraphAgent(
+            LangGraphAGUIAgent(
                 name="router",
                 description=(
                     "Routes user requests to the right workflow or answers directly "
