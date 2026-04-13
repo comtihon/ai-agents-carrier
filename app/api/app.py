@@ -4,8 +4,9 @@ from contextlib import asynccontextmanager
 
 from copilotkit import LangGraphAGUIAgent
 from copilotkit.integrations.fastapi import add_fastapi_endpoint
+from copilotkit.integrations.fastapi import handler as _ck_handler
 from copilotkit.sdk import CopilotKitRemoteEndpoint
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.middleware.auth import OAuthMiddleware
@@ -40,6 +41,20 @@ async def lifespan(app: FastAPI):
         ]
     )
     add_fastapi_endpoint(app, sdk, "/copilotkit")
+
+    # add_fastapi_endpoint only registers /copilotkit/{path:path}.
+    # FastAPI's redirect_slashes redirects POST /copilotkit → 307 /copilotkit/,
+    # which breaks streaming. Register the bare path explicitly so no redirect fires.
+    async def _ck_root(request: Request) -> None:
+        request.scope.setdefault("path_params", {})["path"] = ""
+        return await _ck_handler(request, sdk)
+
+    app.add_api_route(
+        "/copilotkit",
+        _ck_root,
+        methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        include_in_schema=False,
+    )
 
     yield
     await container.shutdown()
