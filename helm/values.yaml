@@ -9,49 +9,22 @@ service:
   type: ClusterIP
   port: 8000
 
-app:
-  environment: dev
-  workflowDefinitionsPath: /app/workflows
-  openhandsBaseUrl: http://openhands:3000
-  openhandsMockMode: "true"
-  # Name of a pre-existing k8s Secret whose keys are injected as env vars.
-  # Required keys for enabled integrations: OPENHANDS_API_KEY,
-  # MCP_FIGMA_API_KEY, MCP_JIRA_API_KEY, MCP_MIRO_API_KEY,
-  # MCP_NOTION_API_KEY, MCP_GITHUB_API_KEY.
-  existingSecret: ""
+# All non-secret env vars passed to the container as a ConfigMap.
+# Keys become env var names; values become env var values.
+config: {}
 
-mongodb:
-  uri: mongodb://mongodb:27017
-  database: langgraph_backend
+# Secrets injected as individual env vars.
+# Key becomes the env var name (uppercased if needed by convention).
+# Value must have 'name' (k8s Secret name) and 'key' (Secret data key).
+# Example:
+#   ANTHROPIC_API_KEY:
+#     name: langgraph-backend-secrets
+#     key: ANTHROPIC_API_KEY
+secrets: {}
 
-# MCP integration settings.
-# API keys must be provided via existingSecret (see above) — never in values files.
-mcp:
-  figma:
-    enabled: "false"
-    transport: streamable_http
-    # Official Figma remote MCP endpoint.
-    url: "https://www.figma.com/api/mcp/v1"
-  jira:
-    enabled: "false"
-    transport: streamable_http
-    # Atlassian remote MCP endpoint — requires an Atlassian API token.
-    url: "https://mcp.atlassian.com/v1/mcp"
-  miro:
-    enabled: "false"
-    transport: streamable_http
-    # Miro remote MCP endpoint.
-    url: "https://mcp.miro.com/v1"
-  notion:
-    enabled: "false"
-    transport: streamable_http
-    # Notion remote MCP endpoint — requires an OAuth access token (not an integration token).
-    url: "https://mcp.notion.com/mcp"
-  github:
-    enabled: "false"
-    transport: streamable_http
-    # GitHub MCP endpoint — requires a GitHub personal access token.
-    url: "https://api.githubcopilot.com/mcp/"
+# Graph definitions mounted as YAML files under GRAPH_DEFINITIONS_PATH.
+# Key becomes the file name (without .yaml extension), value is the YAML content.
+graphs: {}
 
 resources: {}
 nodeSelector: {}

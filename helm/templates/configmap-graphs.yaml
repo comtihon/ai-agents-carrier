@@ -1,0 +1,11 @@
+{{- if .Values.graphs }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "langgraph-backend.fullname" . }}-graphs
+data:
+{{- range $name, $content := .Values.graphs }}
+  {{ $name }}.yaml: |
+{{ $content | indent 4 }}
+{{- end }}
+{{- end }}

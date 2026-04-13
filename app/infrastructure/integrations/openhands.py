@@ -5,32 +5,28 @@ from typing import Any
 import httpx
 
 from app.core.config import Settings
-from app.domain.interfaces.openhands import OpenHandsPort
-from app.domain.models.runtime import OpenHandsExecutionResult, RepositoryTask, WorkflowRun
 
 
-class OpenHandsAdapter(OpenHandsPort):
+class OpenHandsAdapter:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
-    async def execute_task(self, workflow_run: WorkflowRun, task: RepositoryTask) -> OpenHandsExecutionResult:
+    async def execute(self, repo: str, instructions: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
         if self._settings.openhands_mock_mode:
-            return OpenHandsExecutionResult(
-                branch=f"feature/{workflow_run.id[:8]}-{task.repo.replace('/', '-')}",
-                summary=f"Mock OpenHands execution completed for repository '{task.repo}'.",
-                pr_url=None,
-                status="success",
-                details={"mock": True, "step_id": task.step_id},
-            )
+            return {
+                "status": "success",
+                "branch": f"feature/openhands-{repo.replace('/', '-')[:20]}",
+                "summary": f"Mock execution completed for '{repo}'.",
+                "mock": True,
+            }
 
-        payload = {
-            "workflow_run_id": workflow_run.id,
-            "workflow_id": workflow_run.workflow_id,
-            "repo": task.repo,
-            "instructions": task.instructions,
-            "context": workflow_run.metadata,
-        }
-        headers = self._build_headers()
+        payload: dict[str, Any] = {"repo": repo, "instructions": instructions}
+        if context:
+            payload["context"] = context
+
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if self._settings.openhands_api_key:
+            headers["Authorization"] = f"Bearer {self._settings.openhands_api_key}"
 
         async with httpx.AsyncClient(timeout=self._settings.openhands_timeout_seconds) as client:
             response = await client.post(
@@ -39,12 +35,4 @@ class OpenHandsAdapter(OpenHandsPort):
                 headers=headers,
             )
             response.raise_for_status()
-            data: dict[str, Any] = response.json()
-
-        return OpenHandsExecutionResult.model_validate(data)
-
-    def _build_headers(self) -> dict[str, str]:
-        headers = {"Content-Type": "application/json"}
-        if self._settings.openhands_api_key:
-            headers["Authorization"] = f"Bearer {self._settings.openhands_api_key}"
-        return headers
+            return response.json()

@@ -15,6 +15,5 @@ async def healthcheck() -> dict[str, str]:
 
 @router.get("/ready")
 async def readiness(container: ApplicationContainer = Depends(get_container)) -> dict[str, str]:
-    mongo_ok = await container.mongo_provider.ping()
-    workflows_ok = bool(container.workflow_registry.list_definitions())
-    return {"status": "ready" if mongo_ok and workflows_ok else "not_ready"}
+    graphs_loaded = bool(container.yaml_graph_registry.list_ids())
+    return {"status": "ready" if graphs_loaded else "not_ready"}

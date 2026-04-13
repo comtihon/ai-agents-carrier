@@ -21,12 +21,20 @@ spec:
           ports:
             - containerPort: 8000
               name: http
+{{- if .Values.config }}
           envFrom:
             - configMapRef:
                 name: {{ include "langgraph-backend.fullname" . }}-config
-{{- if .Values.app.existingSecret }}
-            - secretRef:
-                name: {{ .Values.app.existingSecret }}
+{{- end }}
+{{- if .Values.secrets }}
+          env:
+{{- range $envKey, $secret := .Values.secrets }}
+            - name: {{ $envKey }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret.name }}
+                  key: {{ $secret.key }}
+{{- end }}
 {{- end }}
           readinessProbe:
             httpGet:
@@ -40,16 +48,20 @@ spec:
               port: http
             initialDelaySeconds: 10
             periodSeconds: 20
+{{- if .Values.graphs }}
           volumeMounts:
-            - name: workflow-definitions
-              mountPath: {{ .Values.app.workflowDefinitionsPath }}
+            - name: graph-definitions
+              mountPath: /app/graphs
               readOnly: true
+{{- end }}
           resources:
 {{ toYaml .Values.resources | indent 12 }}
+{{- if .Values.graphs }}
       volumes:
-        - name: workflow-definitions
+        - name: graph-definitions
           configMap:
-            name: {{ include "langgraph-backend.fullname" . }}-workflows
+            name: {{ include "langgraph-backend.fullname" . }}-graphs
+{{- end }}
       nodeSelector:
 {{ toYaml .Values.nodeSelector | indent 8 }}
       affinity:

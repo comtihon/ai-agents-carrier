@@ -5,64 +5,50 @@ from typing import Any
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorCollection
 
 from app.core.config import Settings
-from app.domain.interfaces.repositories import WorkflowRunRepository
-from app.domain.models.runtime import WorkflowRun
+from app.domain.models.graph_run import GraphRun
 
 
-class MongoWorkflowRunRepository(WorkflowRunRepository):
+class MongoGraphRunRepository:
     def __init__(self, collection: AsyncIOMotorCollection) -> None:
         self._collection = collection
 
-    async def create(self, workflow_run: WorkflowRun) -> WorkflowRun:
-        workflow_run.touch()
-        await self._collection.insert_one(self._serialize(workflow_run))
-        return workflow_run
+    async def create(self, run: GraphRun) -> None:
+        run.touch()
+        await self._collection.insert_one(self._to_doc(run))
 
-    async def update(self, workflow_run: WorkflowRun) -> WorkflowRun:
-        workflow_run.touch()
-        await self._collection.replace_one({"_id": workflow_run.id}, self._serialize(workflow_run), upsert=True)
-        return workflow_run
+    async def update(self, run: GraphRun) -> None:
+        run.touch()
+        await self._collection.replace_one({"_id": run.id}, self._to_doc(run), upsert=True)
 
-    async def get_by_id(self, run_id: str) -> WorkflowRun | None:
-        document = await self._collection.find_one({"_id": run_id})
-        if document is None:
-            return None
-        return self._deserialize(document)
+    async def get(self, run_id: str) -> GraphRun | None:
+        doc = await self._collection.find_one({"_id": run_id})
+        return self._from_doc(doc) if doc else None
 
     @staticmethod
-    def _serialize(workflow_run: WorkflowRun) -> dict[str, Any]:
-        payload = workflow_run.model_dump(mode="python")
-        payload["_id"] = payload.pop("id")
-        return payload
+    def _to_doc(run: GraphRun) -> dict[str, Any]:
+        data = run.model_dump(mode="python")
+        data["_id"] = data.pop("id")
+        return data
 
     @staticmethod
-    def _deserialize(document: dict) -> WorkflowRun:
-        payload = dict(document)
-        payload["id"] = payload.pop("_id")
-        return WorkflowRun.model_validate(payload)
+    def _from_doc(doc: dict[str, Any]) -> GraphRun:
+        data = dict(doc)
+        data["id"] = data.pop("_id")
+        return GraphRun.model_validate(data)
 
 
 class MongoClientProvider:
+    _COLLECTION = "graph_runs"
+
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._client: AsyncIOMotorClient | None = None
 
-    def get_client(self) -> AsyncIOMotorClient:
+    def get_repository(self) -> MongoGraphRunRepository:
         if self._client is None:
             self._client = AsyncIOMotorClient(self._settings.mongodb_uri)
-        return self._client
-
-    def get_repository(self) -> MongoWorkflowRunRepository:
-        database = self.get_client()[self._settings.mongodb_database]
-        collection = database[self._settings.workflow_runs_collection]
-        return MongoWorkflowRunRepository(collection)
-
-    async def ping(self) -> bool:
-        try:
-            await self.get_client().admin.command("ping")
-            return True
-        except Exception:
-            return False
+        db = self._client[self._settings.mongodb_database]
+        return MongoGraphRunRepository(db[self._COLLECTION])
 
     async def close(self) -> None:
         if self._client is not None:

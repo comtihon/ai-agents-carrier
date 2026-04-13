@@ -1,0 +1,71 @@
+id: dev-assistant
+description: >
+  Dev assistant: resolves whether Jira/GitHub context is needed, fetches it,
+  produces a plan, waits for human approval, then implements.
+
+steps:
+  - id: resolve_context
+    type: llm_structured
+    system_prompt: |
+      You are a planning assistant. Given a user request decide whether
+      Jira (issue/ticket context) or GitHub (code, PRs, repos) context
+      is needed to handle it well. Answer with boolean flags only.
+    user_template: "{request}"
+    output:
+      - name: needs_jira
+        type: bool
+        description: "True if Jira issue or ticket context is needed"
+      - name: needs_github
+        type: bool
+        description: "True if GitHub repository or code context is needed"
+
+  - id: fetch_jira
+    type: mcp
+    when: needs_jira
+    tool: search_issues
+    tool_input:
+      query: "{request}"
+    output_key: jira_context
+
+  - id: fetch_github
+    type: mcp
+    when: needs_github
+    tool: search_repositories
+    tool_input:
+      query: "{request}"
+    output_key: github_context
+
+  - id: plan
+    type: llm
+    system_prompt: |
+      You are a technical planning assistant. Produce a clear, numbered
+      step-by-step implementation plan based on the request and any context provided.
+    user_template: |
+      Request: {request}
+
+      Jira context: {jira_context}
+
+      GitHub context: {github_context}
+    output_key: plan
+
+  - id: approve
+    type: human_approval
+    interrupt_payload:
+      plan: "{plan}"
+
+  - id: implement
+    type: llm
+    when: approved
+    system_prompt: |
+      You are a technical implementation assistant.
+      Execute the approved plan and deliver the solution.
+    user_template: |
+      Request: {request}
+
+      Approved plan:
+      {plan}
+
+      Jira context: {jira_context}
+
+      GitHub context: {github_context}
+    output_key: implementation

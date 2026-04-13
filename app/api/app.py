@@ -3,15 +3,14 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from langchain_core.runnables import RunnableLambda
-from langserve import add_routes
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.middleware.auth import OAuthMiddleware
+from app.api.routes.graphs import router as graphs_router
 from app.api.routes.health import router as health_router
 from app.api.routes.workflows import router as workflows_router
 from app.core.config import get_settings
 from app.core.container import ApplicationContainer, build_container
-from app.domain.models.runtime import WorkflowRequest
 from app.infrastructure.auth.auth_service import AuthService
 
 
@@ -35,27 +34,15 @@ def create_app() -> FastAPI:
             audience=settings.oauth_audience,
         )
         app.add_middleware(OAuthMiddleware, auth_service=auth_service)
+    # CORSMiddleware must be outermost — added after OAuthMiddleware so it wraps it
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.allowed_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
     app.include_router(health_router)
+    app.include_router(graphs_router, prefix=settings.api_prefix)
     app.include_router(workflows_router, prefix=settings.api_prefix)
-    _register_langserve_routes(app, settings.langserve_path)
     return app
-
-
-def _register_langserve_routes(app: FastAPI, path: str) -> None:
-    async def invoke(request: WorkflowRequest) -> dict:
-        container: ApplicationContainer = app.state.container
-        run = await container.orchestration_service.submit(request)
-        return run.model_dump(mode="json")
-
-    try:
-        add_routes(
-            app,
-            RunnableLambda(invoke).with_types(input_type=WorkflowRequest, output_type=dict),
-            path=path,
-        )
-    except Exception:
-        import logging
-        logging.getLogger(__name__).warning(
-            "LangServe routes could not be registered (pydantic / Python version incompatibility). "
-            "The REST API is unaffected."
-        )
