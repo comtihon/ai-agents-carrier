@@ -29,8 +29,13 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
         "reject_reason": str,
     }
     for step in steps:
+        # Regular output nodes store their result under output_key
         if "output_key" in step:
             fields[step["output_key"]] = Any  # type: ignore[assignment]
+        # llm_structured stores each named output field directly in state
+        if step.get("type") == "llm_structured":
+            for out_field in step.get("output", []):
+                fields[out_field["name"]] = Any  # type: ignore[assignment]
     return TypedDict("YamlGraphState", fields, total=False)  # type: ignore[misc]
 
 

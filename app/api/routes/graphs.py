@@ -128,7 +128,7 @@ async def reject_run(
     )
 
     snap = runner.graph.get_state(_config(thread_id))
-    run.status = "completed"
+    run.status = _langgraph_status(snap)
     run.state = snap.values
     await container.run_repository.update(run)
 
