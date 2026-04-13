@@ -19,7 +19,7 @@ class McpIntegrationConfig(BaseModel):
 
 class Settings(BaseSettings):
     app_name: str = "LangGraph Backend"
-    environment: Literal["local", "dev", "prod", "test"] = "local"
+    environment: str = "local"
     api_prefix: str = "/api/v1"
     debug: bool = False
     graph_definitions_path: str = Field(default="graphs", alias="GRAPH_DEFINITIONS_PATH")
