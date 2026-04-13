@@ -5,6 +5,7 @@ from typing import Any, TypedDict
 
 from langgraph.graph import END, StateGraph
 
+from app.application.services.classifier_service import ClassifierService
 from app.application.services.llm_agent_service import LlmAgentService
 from app.application.services.planning_service import PlanningService
 from app.domain.interfaces.openhands import OpenHandsPort
@@ -21,6 +22,7 @@ class WorkflowGraphState(TypedDict):
     workflow_definition: WorkflowDefinition
     plan: PlanResult | None
     execution_results: list[ExecutionStepResult]
+    selected_fetcher_ids: list[str] | None
 
 
 class WorkflowGraphRunner:
@@ -33,6 +35,7 @@ class WorkflowGraphRunner:
         http_executor: HttpStepExecutor,
         action_registry: ActionRegistry,
         llm_agent_service: LlmAgentService,
+        classifier_service: ClassifierService,
     ) -> None:
         self._planning_service = planning_service
         self._openhands_port = openhands_port
@@ -41,11 +44,13 @@ class WorkflowGraphRunner:
         self._http_executor = http_executor
         self._action_registry = action_registry
         self._llm_agent_service = llm_agent_service
+        self._classifier_service = classifier_service
         self._graph = self._build_graph()
 
     def _build_graph(self):
         graph = StateGraph(WorkflowGraphState)
         graph.add_node("request", self._request_node)
+        graph.add_node("classifier", self._classifier_node)
         graph.add_node("fetch_context", self._fetch_context_node)
         graph.add_node("llm_agent", self._llm_agent_node)
         graph.add_node("plan", self._plan_node)
@@ -54,7 +59,8 @@ class WorkflowGraphRunner:
         graph.add_node("execute", self._execute_node)
         graph.add_node("result", self._result_node)
         graph.set_entry_point("request")
-        graph.add_edge("request", "fetch_context")
+        graph.add_edge("request", "classifier")
+        graph.add_edge("classifier", "fetch_context")
         graph.add_edge("fetch_context", "llm_agent")
         graph.add_edge("llm_agent", "plan")
         graph.add_edge("plan", "approval")
@@ -77,6 +83,7 @@ class WorkflowGraphRunner:
                 "workflow_definition": workflow_definition,
                 "plan": workflow_run.plan,
                 "execution_results": workflow_run.execution_results,
+                "selected_fetcher_ids": None,
             }
         )
         return result["workflow_run"]
@@ -88,11 +95,52 @@ class WorkflowGraphRunner:
         await self._workflow_run_repository.update(workflow_run)
         return state
 
+    async def _classifier_node(self, state: WorkflowGraphState) -> WorkflowGraphState:
+        workflow_run = state["workflow_run"]
+        workflow_definition = state["workflow_definition"]
+
+        if workflow_run.status == "failed":
+            return state
+
+        if not workflow_definition.metadata.get("use_classifier", False):
+            return state
+
+        fetch_steps = [s for s in workflow_definition.steps if s.type == "fetch"]
+        if not fetch_steps:
+            return state
+
+        workflow_run.current_step = "classifier"
+
+        fetch_steps_info = [
+            {
+                "id": s.id,
+                "tool": s.tool,
+                "description": self._mcp_tools_provider.get_tool(s.tool).description  # type: ignore[union-attr]
+                if self._mcp_tools_provider.get_tool(s.tool) is not None
+                else s.tool,
+            }
+            for s in fetch_steps
+        ]
+
+        prompt_override: str | None = workflow_definition.metadata.get("classifier_prompt")
+        selected_ids = await self._classifier_service.classify(
+            user_request=workflow_run.user_request,
+            fetch_steps=fetch_steps_info,
+            prompt_override=prompt_override,
+        )
+
+        state["selected_fetcher_ids"] = selected_ids
+        return state
+
     async def _fetch_context_node(self, state: WorkflowGraphState) -> WorkflowGraphState:
         workflow_run = state["workflow_run"]
         workflow_definition = state["workflow_definition"]
 
-        fetch_steps = [s for s in workflow_definition.steps if s.type == "fetch"]
+        selected_ids = state.get("selected_fetcher_ids")
+        fetch_steps = [
+            s for s in workflow_definition.steps
+            if s.type == "fetch" and (selected_ids is None or s.id in selected_ids)
+        ]
         if not fetch_steps:
             return state
 

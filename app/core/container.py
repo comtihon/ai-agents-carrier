@@ -5,6 +5,7 @@ from typing import Any
 
 from langchain_core.language_models import BaseChatModel
 
+from app.application.services.classifier_service import ClassifierService
 from app.application.services.llm_agent_service import LlmAgentService
 from app.application.services.orchestration_service import OrchestrationService
 from app.application.services.planning_service import PlanningService
@@ -32,6 +33,7 @@ class ApplicationContainer:
     mcp_tools_provider: McpToolsProvider
     action_registry: ActionRegistry
     llm_agent_service: LlmAgentService
+    classifier_service: ClassifierService
     graph_runner: WorkflowGraphRunner
     orchestration_service: OrchestrationService
 
@@ -90,7 +92,9 @@ def build_container(settings: Settings) -> ApplicationContainer:
     load_actions_from_directory(settings.workflow_definitions_path, action_registry)
     http_executor = HttpStepExecutor(timeout=settings.http_action_timeout_seconds)
     openhands_adapter = OpenHandsAdapter(settings)
-    llm_agent_service = LlmAgentService(llm=build_llm(settings), tools=tools)
+    llm = build_llm(settings)
+    llm_agent_service = LlmAgentService(llm=llm, tools=tools)
+    classifier_service = ClassifierService(llm=llm)
     graph_runner = WorkflowGraphRunner(
         planning_service,
         openhands_adapter,
@@ -99,6 +103,7 @@ def build_container(settings: Settings) -> ApplicationContainer:
         http_executor,
         action_registry,
         llm_agent_service,
+        classifier_service,
     )
     orchestration_service = OrchestrationService(workflow_registry, workflow_run_repository, graph_runner)
     return ApplicationContainer(
@@ -111,6 +116,7 @@ def build_container(settings: Settings) -> ApplicationContainer:
         mcp_tools_provider=mcp_tools_provider,
         action_registry=action_registry,
         llm_agent_service=llm_agent_service,
+        classifier_service=classifier_service,
         graph_runner=graph_runner,
         orchestration_service=orchestration_service,
     )
