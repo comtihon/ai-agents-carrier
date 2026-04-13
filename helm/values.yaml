@@ -26,6 +26,21 @@ secrets: {}
 # Key becomes the file name (without .yaml extension), value is the YAML content.
 graphs: {}
 
+ingress:
+  enabled: false
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt"
+  hosts: []
+  # - host: langgraph.example.com
+  #   paths:
+  #     - path: /
+  #       pathType: Prefix
+  tls: []
+  # - secretName: langgraph-backend-tls
+  #   hosts:
+  #     - langgraph.example.com
+
 resources: {}
 nodeSelector: {}
 affinity: {}
