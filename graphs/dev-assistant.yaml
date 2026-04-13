@@ -1,4 +1,5 @@
 id: dev-assistant
+name: Dev Assistant
 description: >
   Dev assistant: resolves whether Jira/GitHub context is needed, fetches it,
   produces a plan, waits for human approval, then implements.

@@ -80,6 +80,11 @@ class YamlGraphRunner:
         openhands: OpenHandsAdapter | None = None,
     ) -> None:
         self.id: str = definition["id"]
+        # Human-readable name; fall back to title-casing the id
+        self.name: str = definition.get(
+            "name",
+            self.id.replace("-", " ").replace("_", " ").title(),
+        )
         self.description: str = definition.get("description", "")
         self._steps: list[dict[str, Any]] = definition["steps"]
         self._llm = llm
