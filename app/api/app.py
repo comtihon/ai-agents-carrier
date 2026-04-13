@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
+from copilotkit import LangGraphAgent
+from copilotkit.integrations.fastapi import add_fastapi_endpoint
+from copilotkit.sdk import CopilotKitRemoteEndpoint
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -12,6 +15,7 @@ from app.api.routes.workflows import router as workflows_router
 from app.core.config import get_settings
 from app.core.container import ApplicationContainer, build_container
 from app.infrastructure.auth.auth_service import AuthService
+from app.infrastructure.orchestration.router_agent import build_router_graph
 
 
 @asynccontextmanager
@@ -19,6 +23,24 @@ async def lifespan(app: FastAPI):
     container = build_container(get_settings())
     await container.startup()
     app.state.container = container
+
+    # Register the CopilotKit runtime endpoint backed by the router LangGraph agent.
+    # Routes are added before yielding so they're available when the server starts serving.
+    router_graph = build_router_graph(container.llm)
+    sdk = CopilotKitRemoteEndpoint(
+        agents=[
+            LangGraphAgent(
+                name="router",
+                description=(
+                    "Routes user requests to the right workflow or answers directly "
+                    "when no workflow action is required."
+                ),
+                graph=router_graph,
+            )
+        ]
+    )
+    add_fastapi_endpoint(app, sdk, "/copilotkit")
+
     yield
     await container.shutdown()
 

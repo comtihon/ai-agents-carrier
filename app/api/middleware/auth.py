@@ -10,8 +10,14 @@ from app.infrastructure.auth.auth_service import AuthError, AuthService
 
 logger = logging.getLogger(__name__)
 
-# Paths that bypass authentication (health/readiness probes)
+# Exact paths that bypass authentication (health/readiness probes)
 _UNPROTECTED_PATHS = {"/health", "/ready"}
+
+# Path prefixes that bypass authentication.
+# /copilotkit is the CopilotKit runtime endpoint — it has no user-specific data
+# and cannot reach the backend API without the frontend actions providing their
+# own authenticated calls.  Secure at the network / API-gateway level instead.
+_UNPROTECTED_PREFIXES = ("/copilotkit",)
 
 
 class OAuthMiddleware(BaseHTTPMiddleware):
@@ -20,7 +26,8 @@ class OAuthMiddleware(BaseHTTPMiddleware):
         self.auth_service = auth_service
 
     async def dispatch(self, request: Request, call_next):
-        if request.url.path in _UNPROTECTED_PATHS:
+        path = request.url.path
+        if path in _UNPROTECTED_PATHS or path.startswith(_UNPROTECTED_PREFIXES):
             return await call_next(request)
 
         auth_header = request.headers.get("Authorization", "")

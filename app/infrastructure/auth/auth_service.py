@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -8,6 +9,9 @@ import jwt
 from jwt.algorithms import RSAAlgorithm
 
 logger = logging.getLogger(__name__)
+
+# Userinfo response TTL before re-validating with the provider
+_USERINFO_CACHE_TTL = timedelta(minutes=5)
 
 
 class AuthError(Exception):
@@ -31,6 +35,16 @@ class AuthService:
         self._kid_cache: dict[str, dict] = {}
         self._last_updated: datetime | None = None
 
+        # Cache for opaque-token userinfo responses: {token_hash: (claims, expires_at)}
+        self._userinfo_cache: dict[str, tuple[dict, datetime]] = {}
+
+        # Derive userinfo URL from issuer (Zitadel: <issuer>/oidc/v1/userinfo)
+        self._userinfo_url: str | None = (
+            issuer.rstrip("/") + "/oidc/v1/userinfo" if issuer else None
+        )
+
+    # ── JWKS helpers ─────────────────────────────────────────────────────────
+
     async def _fetch_jwks(self) -> None:
         async with httpx.AsyncClient() as client:
             response = await client.get(self.jwks_url)
@@ -50,7 +64,6 @@ class AuthService:
 
         key = self._kid_cache.get(kid)
         if not key:
-            # KID not in cache — refresh once before giving up
             await self._fetch_jwks()
             key = self._kid_cache.get(kid)
             if not key:
@@ -58,11 +71,53 @@ class AuthService:
 
         return RSAAlgorithm.from_jwk(key)
 
+    # ── Opaque-token fallback ─────────────────────────────────────────────────
+
+    async def _validate_via_userinfo(self, token: str) -> dict:
+        """Validate an opaque (non-JWT) token by calling the OIDC userinfo endpoint.
+
+        Zitadel issues opaque access tokens by default when no API audience
+        scope is requested.  The userinfo endpoint accepts them and returns
+        user claims, effectively acting as token introspection.
+        """
+        if not self._userinfo_url:
+            raise AuthError("Token is not a JWT and userinfo URL cannot be derived (issuer not set)")
+
+        # Short-lived cache keyed on a hash of the token
+        cache_key = hashlib.sha256(token.encode()).hexdigest()[:24]
+        now = datetime.now(timezone.utc)
+        if cache_key in self._userinfo_cache:
+            claims, expires_at = self._userinfo_cache[cache_key]
+            if now < expires_at:
+                return claims
+
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                self._userinfo_url,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        if resp.status_code in (401, 403):
+            raise AuthError("Token rejected by userinfo endpoint")
+        if resp.status_code != 200:
+            raise AuthError(f"Userinfo endpoint returned unexpected status {resp.status_code}")
+
+        claims = resp.json()
+        self._userinfo_cache[cache_key] = (claims, now + _USERINFO_CACHE_TTL)
+        logger.debug("Validated opaque token via userinfo for sub=%s", claims.get("sub", "?"))
+        return claims
+
+    # ── Main entry point ──────────────────────────────────────────────────────
+
     async def validate_token(self, token: str) -> dict:
+        # Fast path: try standard JWT validation
         try:
             header = jwt.get_unverified_header(token)
         except jwt.DecodeError:
-            raise AuthError("Invalid JWT header")
+            # Not a JWT — Zitadel issued an opaque access token.
+            # Fall back to userinfo endpoint introspection.
+            logger.debug("Token is not a JWT; falling back to userinfo introspection")
+            return await self._validate_via_userinfo(token)
 
         kid = header.get("kid")
         if not kid:
