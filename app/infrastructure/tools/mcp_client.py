@@ -27,14 +27,11 @@ class McpToolsProvider:
         if not server_configs:
             return
         self._client = MultiServerMCPClient(server_configs)
-        await self._client.__aenter__()
-        self._tools = self._client.get_tools()
+        self._tools = await self._client.get_tools()
 
     async def stop(self) -> None:
-        if self._client is not None:
-            await self._client.__aexit__(None, None, None)
-            self._client = None
-            self._tools = []
+        self._client = None
+        self._tools = []
 
     def get_tools(self) -> list[BaseTool]:
         return list(self._tools)
