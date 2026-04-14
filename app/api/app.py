@@ -14,7 +14,7 @@ from langgraph.types import Command
 
 from app.api.middleware.auth import OAuthMiddleware
 from app.api.routes.health import router as health_router
-from app.api.routes.workflows import router as workflows_router
+from app.api.routes.graphs import router as graphs_router
 from app.core.config import get_settings
 from app.core.container import ApplicationContainer, build_container
 from app.domain.models.graph_run import GraphRun
@@ -211,5 +211,5 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.include_router(health_router)
-    app.include_router(workflows_router, prefix=settings.api_prefix)
+    app.include_router(graphs_router, prefix=settings.api_prefix)
     return app
