@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from app.core.config import Settings
+
+logger = logging.getLogger(__name__)
 
 
 class McpToolsProvider:
@@ -35,6 +38,12 @@ class McpToolsProvider:
             for tool in server_tools:
                 self._tools.append(tool)
                 self._tool_server[tool.name] = server_name
+            logger.info(
+                "MCP server '%s': loaded %d tool(s): %s",
+                server_name,
+                len(server_tools),
+                [t.name for t in server_tools],
+            )
 
     async def stop(self) -> None:
         self._client = None
