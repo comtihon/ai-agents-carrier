@@ -52,17 +52,22 @@ def _fake_repo() -> AsyncMock:
     return repo
 
 
+async def _astream_chunks(content: str):
+    """Async generator that yields a single AIMessage chunk."""
+    yield AIMessage(content=content)
+
+
 def _llm_with_decision(decision: RouterDecision) -> MagicMock:
     """
     LLM mock whose with_structured_output(...).ainvoke(...) returns *decision*.
-    The plain ainvoke (fallback reply path) returns decision.reply_text as an AIMessage.
+    The astream fallback (reply node when reply_text is empty) yields a single chunk.
     """
     structured = AsyncMock()
     structured.ainvoke = AsyncMock(return_value=decision)
 
     llm = MagicMock()
     llm.with_structured_output = MagicMock(return_value=structured)
-    llm.ainvoke = AsyncMock(return_value=AIMessage(content=decision.reply_text or ""))
+    llm.astream = MagicMock(side_effect=lambda msgs: _astream_chunks(decision.reply_text or ""))
     return llm
 
 
@@ -100,6 +105,7 @@ async def test_develop_feature_spawns_child_workflow():
     with patch(_STREAM_FN, new_callable=AsyncMock) as mock_stream:
         result = await graph.ainvoke(
             {**_BASE_STATE, "messages": [HumanMessage(content="develop a feature X")]},
+            {"configurable": {"thread_id": "test-spawn-thread"}},
         )
         # Let event loop drain so the background task completes cleanly
         await asyncio.sleep(0)
@@ -149,6 +155,7 @@ async def test_arithmetic_question_returns_direct_reply():
     with patch(_STREAM_FN, new_callable=AsyncMock) as mock_stream:
         result = await graph.ainvoke(
             {**_BASE_STATE, "messages": [HumanMessage(content="2+2")]},
+            {"configurable": {"thread_id": "test-reply-thread"}},
         )
         await asyncio.sleep(0)
 
