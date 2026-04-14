@@ -98,6 +98,27 @@ async def test_start_run(client):
 
 
 @pytest.mark.asyncio
+async def test_start_run_step_statuses_in_response(client):
+    c, container = client
+    resp = await c.post(
+        "/api/v1/workflows/runs",
+        json={"workflow_id": "simple", "user_request": "hello"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    steps = data["steps"]
+    assert len(steps) == 1
+    assert steps[0]["id"] == "step1"
+    assert "status" in steps[0]
+
+    # Background task should have updated the run with step_statuses
+    update_calls = container.run_repository.update.call_args_list
+    assert len(update_calls) >= 1
+    last_run: GraphRun = update_calls[-1].args[0]
+    assert last_run.step_statuses.get("step1") == "finished"
+
+
+@pytest.mark.asyncio
 async def test_start_run_unknown_workflow(client):
     c, _ = client
     resp = await c.post(
