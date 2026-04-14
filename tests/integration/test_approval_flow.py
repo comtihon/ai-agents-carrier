@@ -62,25 +62,25 @@ async def test_submit_pauses_at_approval() -> None:
     client, mongo = await build_int_client(_GRAPH, llm)
     try:
         resp = await client.post(
-            f"/api/v1/graphs/{_GRAPH_ID}/runs",
-            json={"request": "implement feature X"},
+            "/api/v1/workflows/runs",
+            json={"workflow_id": _GRAPH_ID, "user_request": "implement feature X"},
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
-        thread_id = body["thread_id"]
+        run_id = body["id"]
 
         assert body["status"] == "waiting_approval"
-        assert body["state"]["plan"] == "step-by-step plan stub"
+        assert body["intermediate_outputs"]["plan"] == "step-by-step plan stub"
 
         # ------------------------------------------------------------------
         # MongoDB persisted the run
         # ------------------------------------------------------------------
-        get_resp = await client.get(f"/api/v1/graphs/{_GRAPH_ID}/runs/{thread_id}")
+        get_resp = await client.get(f"/api/v1/workflows/runs/{run_id}")
         assert get_resp.status_code == 200
         persisted = get_resp.json()
-        assert persisted["thread_id"] == thread_id
+        assert persisted["id"] == run_id
         assert persisted["status"] == "waiting_approval"
-        assert persisted["state"]["plan"] == "step-by-step plan stub"
+        assert persisted["intermediate_outputs"]["plan"] == "step-by-step plan stub"
     finally:
         await mongo.close()
 
@@ -95,25 +95,23 @@ async def test_approve_runs_implement_step() -> None:
     client, mongo = await build_int_client(_GRAPH, llm)
     try:
         start = await client.post(
-            f"/api/v1/graphs/{_GRAPH_ID}/runs",
-            json={"request": "implement feature Y"},
+            "/api/v1/workflows/runs",
+            json={"workflow_id": _GRAPH_ID, "user_request": "implement feature Y"},
         )
         assert start.status_code == 200
-        thread_id = start.json()["thread_id"]
+        run_id = start.json()["id"]
 
-        approve = await client.post(
-            f"/api/v1/graphs/{_GRAPH_ID}/runs/{thread_id}/approve"
-        )
+        approve = await client.post(f"/api/v1/workflows/runs/{run_id}/approve")
         assert approve.status_code == 200, approve.text
         body = approve.json()
 
         assert body["status"] == "completed"
-        assert body["state"]["plan"] == "the plan"
-        assert body["state"]["implementation"] == "the implementation"
-        assert body["state"]["approved"] is True
+        assert body["intermediate_outputs"]["plan"] == "the plan"
+        assert body["intermediate_outputs"]["implementation"] == "the implementation"
+        assert body["intermediate_outputs"]["approved"] is True
 
         # MongoDB reflects completed status
-        get_resp = await client.get(f"/api/v1/graphs/{_GRAPH_ID}/runs/{thread_id}")
+        get_resp = await client.get(f"/api/v1/workflows/runs/{run_id}")
         assert get_resp.json()["status"] == "completed"
     finally:
         await mongo.close()
@@ -129,22 +127,22 @@ async def test_reject_skips_implement_step() -> None:
     client, mongo = await build_int_client(_GRAPH, llm)
     try:
         start = await client.post(
-            f"/api/v1/graphs/{_GRAPH_ID}/runs",
-            json={"request": "implement feature Z"},
+            "/api/v1/workflows/runs",
+            json={"workflow_id": _GRAPH_ID, "user_request": "implement feature Z"},
         )
-        thread_id = start.json()["thread_id"]
+        run_id = start.json()["id"]
 
         reject = await client.post(
-            f"/api/v1/graphs/{_GRAPH_ID}/runs/{thread_id}/reject",
+            f"/api/v1/workflows/runs/{run_id}/reject",
             json={"reason": "plan looks wrong"},
         )
         assert reject.status_code == 200, reject.text
         body = reject.json()
 
         assert body["status"] == "completed"
-        assert body["state"]["approved"] is False
-        assert body["state"]["reject_reason"] == "plan looks wrong"
+        assert body["intermediate_outputs"]["approved"] is False
+        assert body["intermediate_outputs"]["reject_reason"] == "plan looks wrong"
         # implement step skipped — key not set
-        assert "implementation" not in body["state"]
+        assert "implementation" not in body["intermediate_outputs"]
     finally:
         await mongo.close()

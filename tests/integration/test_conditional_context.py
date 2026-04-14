@@ -95,11 +95,11 @@ async def test_github_only() -> None:
     )
     try:
         resp = await client.post(
-            f"/api/v1/graphs/{_GRAPH_ID}/runs",
-            json={"request": "add dark mode to acme/app"},
+            "/api/v1/workflows/runs",
+            json={"workflow_id": _GRAPH_ID, "user_request": "add dark mode to acme/app"},
         )
         assert resp.status_code == 200, resp.text
-        state = resp.json()["state"]
+        state = resp.json()["intermediate_outputs"]
 
         github_tool.ainvoke.assert_called_once_with({"query": "add dark mode to acme/app"})
         jira_tool.ainvoke.assert_not_called()
@@ -124,11 +124,11 @@ async def test_jira_only() -> None:
     )
     try:
         resp = await client.post(
-            f"/api/v1/graphs/{_GRAPH_ID}/runs",
-            json={"request": "check issues for PRJ-42"},
+            "/api/v1/workflows/runs",
+            json={"workflow_id": _GRAPH_ID, "user_request": "check issues for PRJ-42"},
         )
         assert resp.status_code == 200, resp.text
-        state = resp.json()["state"]
+        state = resp.json()["intermediate_outputs"]
 
         jira_tool.ainvoke.assert_called_once_with({"query": "check issues for PRJ-42"})
         github_tool.ainvoke.assert_not_called()
@@ -152,8 +152,8 @@ async def test_both_needed() -> None:
     )
     try:
         resp = await client.post(
-            f"/api/v1/graphs/{_GRAPH_ID}/runs",
-            json={"request": "cross-reference jira and github"},
+            "/api/v1/workflows/runs",
+            json={"workflow_id": _GRAPH_ID, "user_request": "cross-reference jira and github"},
         )
         assert resp.status_code == 200, resp.text
 
@@ -176,11 +176,11 @@ async def test_neither_needed() -> None:
     )
     try:
         resp = await client.post(
-            f"/api/v1/graphs/{_GRAPH_ID}/runs",
-            json={"request": "simple question"},
+            "/api/v1/workflows/runs",
+            json={"workflow_id": _GRAPH_ID, "user_request": "simple question"},
         )
         assert resp.status_code == 200, resp.text
-        state = resp.json()["state"]
+        state = resp.json()["intermediate_outputs"]
 
         jira_tool.ainvoke.assert_not_called()
         github_tool.ainvoke.assert_not_called()

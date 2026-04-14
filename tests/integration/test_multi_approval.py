@@ -82,40 +82,36 @@ async def test_two_sequential_approvals_complete() -> None:
     try:
         # ---- submit ----
         start = await client.post(
-            f"/api/v1/graphs/{_GRAPH_ID}/runs",
-            json={"request": "add dark mode"},
+            "/api/v1/workflows/runs",
+            json={"workflow_id": _GRAPH_ID, "user_request": "add dark mode"},
         )
         assert start.status_code == 200, start.text
         body = start.json()
-        thread_id = body["thread_id"]
+        run_id = body["id"]
 
         assert body["status"] == "waiting_approval"
-        assert body["state"]["design"] == "design draft"
+        assert body["intermediate_outputs"]["design"] == "design draft"
         # plan not yet run — gate 1 paused before it
-        assert "plan" not in body["state"]
+        assert "plan" not in body["intermediate_outputs"]
 
         # ---- approve gate 1 ----
-        approve1 = await client.post(
-            f"/api/v1/graphs/{_GRAPH_ID}/runs/{thread_id}/approve"
-        )
+        approve1 = await client.post(f"/api/v1/workflows/runs/{run_id}/approve")
         assert approve1.status_code == 200, approve1.text
         body = approve1.json()
 
         # graph ran plan step then paused at gate 2
         assert body["status"] == "waiting_approval"
-        assert body["state"]["design"] == "design draft"
-        assert body["state"]["plan"] == "impl plan"
-        assert "implementation" not in body["state"]
+        assert body["intermediate_outputs"]["design"] == "design draft"
+        assert body["intermediate_outputs"]["plan"] == "impl plan"
+        assert "implementation" not in body["intermediate_outputs"]
 
         # ---- approve gate 2 ----
-        approve2 = await client.post(
-            f"/api/v1/graphs/{_GRAPH_ID}/runs/{thread_id}/approve"
-        )
+        approve2 = await client.post(f"/api/v1/workflows/runs/{run_id}/approve")
         assert approve2.status_code == 200, approve2.text
         body = approve2.json()
 
         assert body["status"] == "completed"
-        assert body["state"]["implementation"] == "implementation done"
+        assert body["intermediate_outputs"]["implementation"] == "implementation done"
     finally:
         await mongo.close()
 
@@ -131,14 +127,14 @@ async def test_reject_at_gate_1_skips_plan_and_impl() -> None:
     client, mongo = await build_int_client(_GRAPH, llm)
     try:
         start = await client.post(
-            f"/api/v1/graphs/{_GRAPH_ID}/runs",
-            json={"request": "risky feature"},
+            "/api/v1/workflows/runs",
+            json={"workflow_id": _GRAPH_ID, "user_request": "risky feature"},
         )
-        thread_id = start.json()["thread_id"]
+        run_id = start.json()["id"]
 
         # ---- reject gate 1 ----
         rej = await client.post(
-            f"/api/v1/graphs/{_GRAPH_ID}/runs/{thread_id}/reject",
+            f"/api/v1/workflows/runs/{run_id}/reject",
             json={"reason": "design not good enough"},
         )
         assert rej.status_code == 200, rej.text
@@ -146,19 +142,17 @@ async def test_reject_at_gate_1_skips_plan_and_impl() -> None:
 
         # plan step skipped — approved=False — then hits gate 2
         assert body["status"] == "waiting_approval"
-        assert "plan" not in body["state"]
-        assert body["state"]["approved"] is False
-        assert body["state"]["reject_reason"] == "design not good enough"
+        assert "plan" not in body["intermediate_outputs"]
+        assert body["intermediate_outputs"]["approved"] is False
+        assert body["intermediate_outputs"]["reject_reason"] == "design not good enough"
 
         # ---- approve gate 2 (now approved=True) → implement runs ----
-        approve2 = await client.post(
-            f"/api/v1/graphs/{_GRAPH_ID}/runs/{thread_id}/approve"
-        )
+        approve2 = await client.post(f"/api/v1/workflows/runs/{run_id}/approve")
         body = approve2.json()
 
         assert body["status"] == "completed"
-        assert body["state"]["approved"] is True
-        assert body["state"]["implementation"] == "implementation done"
+        assert body["intermediate_outputs"]["approved"] is True
+        assert body["intermediate_outputs"]["implementation"] == "implementation done"
     finally:
         await mongo.close()
 
@@ -166,28 +160,28 @@ async def test_reject_at_gate_1_skips_plan_and_impl() -> None:
 @pytest.mark.asyncio
 async def test_state_persisted_between_gates() -> None:
     """
-    GET /runs/{thread_id} between gates returns the state as-of the last
+    GET /runs/{run_id} between gates returns the state as-of the last
     interrupt, proving MongoDB is updated on each approval step.
     """
     llm = make_mock_llm(text_responses=["design draft", "impl plan", "done"])
     client, mongo = await build_int_client(_GRAPH, llm)
     try:
         start = await client.post(
-            f"/api/v1/graphs/{_GRAPH_ID}/runs",
-            json={"request": "feature"},
+            "/api/v1/workflows/runs",
+            json={"workflow_id": _GRAPH_ID, "user_request": "feature"},
         )
-        thread_id = start.json()["thread_id"]
+        run_id = start.json()["id"]
 
         # GET before any approval
-        get1 = await client.get(f"/api/v1/graphs/{_GRAPH_ID}/runs/{thread_id}")
+        get1 = await client.get(f"/api/v1/workflows/runs/{run_id}")
         assert get1.json()["status"] == "waiting_approval"
-        assert get1.json()["state"]["design"] == "design draft"
+        assert get1.json()["intermediate_outputs"]["design"] == "design draft"
 
-        await client.post(f"/api/v1/graphs/{_GRAPH_ID}/runs/{thread_id}/approve")
+        await client.post(f"/api/v1/workflows/runs/{run_id}/approve")
 
         # GET after gate 1 approval — now waiting at gate 2
-        get2 = await client.get(f"/api/v1/graphs/{_GRAPH_ID}/runs/{thread_id}")
+        get2 = await client.get(f"/api/v1/workflows/runs/{run_id}")
         assert get2.json()["status"] == "waiting_approval"
-        assert get2.json()["state"]["plan"] == "impl plan"
+        assert get2.json()["intermediate_outputs"]["plan"] == "impl plan"
     finally:
         await mongo.close()

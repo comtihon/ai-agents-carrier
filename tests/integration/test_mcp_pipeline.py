@@ -125,8 +125,8 @@ async def test_mcp_tool_called_with_templated_input() -> None:
     )
     try:
         resp = await client.post(
-            "/api/v1/graphs/mcp-then-llm/runs",
-            json={"request": "PRJ-99"},
+            "/api/v1/workflows/runs",
+            json={"workflow_id": "mcp-then-llm", "user_request": "PRJ-99"},
         )
         assert resp.status_code == 200, resp.text
         issue_tool.ainvoke.assert_called_once_with({"issue_id": "PRJ-99"})
@@ -147,10 +147,10 @@ async def test_mcp_result_stored_in_state() -> None:
     )
     try:
         resp = await client.post(
-            "/api/v1/graphs/mcp-then-llm/runs",
-            json={"request": "PRJ-99"},
+            "/api/v1/workflows/runs",
+            json={"workflow_id": "mcp-then-llm", "user_request": "PRJ-99"},
         )
-        state = resp.json()["state"]
+        state = resp.json()["intermediate_outputs"]
         assert str(state["issue_data"]) == str(_ISSUE_DATA)
     finally:
         await mongo.close()
@@ -186,8 +186,8 @@ async def test_llm_receives_mcp_output_via_template() -> None:
     )
     try:
         await client.post(
-            "/api/v1/graphs/mcp-then-llm/runs",
-            json={"request": "PRJ-99"},
+            "/api/v1/workflows/runs",
+            json={"workflow_id": "mcp-then-llm", "user_request": "PRJ-99"},
         )
         # At least one prompt should contain the rendered issue data
         assert any(str(_ISSUE_DATA) in p for p in received_prompts), (
@@ -210,11 +210,11 @@ async def test_mcp_tool_error_captured_gracefully() -> None:
     )
     try:
         resp = await client.post(
-            "/api/v1/graphs/mcp-error/runs",
-            json={"request": "anything"},
+            "/api/v1/workflows/runs",
+            json={"workflow_id": "mcp-error", "user_request": "anything"},
         )
         assert resp.status_code == 200, resp.text
-        state = resp.json()["state"]
+        state = resp.json()["intermediate_outputs"]
         assert "Error" in state["data"] or "upstream 503" in state["data"]
     finally:
         await mongo.close()
@@ -236,11 +236,11 @@ async def test_chained_mcp_both_results_in_state() -> None:
     )
     try:
         resp = await client.post(
-            "/api/v1/graphs/chained-mcp/runs",
-            json={"request": "implement feature"},
+            "/api/v1/workflows/runs",
+            json={"workflow_id": "chained-mcp", "user_request": "implement feature"},
         )
         assert resp.status_code == 200, resp.text
-        state = resp.json()["state"]
+        state = resp.json()["intermediate_outputs"]
 
         issue_tool.ainvoke.assert_called_once()
         repo_tool.ainvoke.assert_called_once()

@@ -117,17 +117,18 @@ async def test_graph_loaded_from_yaml_file_is_runnable(tmp_path) -> None:
     client, mongo = await _build_from_dir(tmp_path, llm)
     try:
         # Graph should appear in the listing
-        list_resp = await client.get("/api/v1/graphs")
+        list_resp = await client.get("/api/v1/workflows")
         assert list_resp.status_code == 200
-        assert "file-loaded-graph" in list_resp.json()["graphs"]
+        workflow_ids = [w["id"] for w in list_resp.json()]
+        assert "file-loaded-graph" in workflow_ids
 
         # Graph should be runnable
         run_resp = await client.post(
-            "/api/v1/graphs/file-loaded-graph/runs",
-            json={"request": "hello from disk"},
+            "/api/v1/workflows/runs",
+            json={"workflow_id": "file-loaded-graph", "user_request": "hello from disk"},
         )
         assert run_resp.status_code == 200, run_resp.text
-        assert run_resp.json()["state"]["answer"] == "answer from disk graph"
+        assert run_resp.json()["intermediate_outputs"]["answer"] == "answer from disk graph"
     finally:
         await mongo.close()
 
@@ -143,9 +144,9 @@ async def test_missing_directory_yields_empty_registry(tmp_path) -> None:
 
     client, mongo = await _build_from_dir(missing_dir, llm)
     try:
-        list_resp = await client.get("/api/v1/graphs")
+        list_resp = await client.get("/api/v1/workflows")
         assert list_resp.status_code == 200
-        assert list_resp.json()["graphs"] == []
+        assert list_resp.json() == []
     finally:
         await mongo.close()
 
@@ -162,10 +163,10 @@ async def test_malformed_yaml_skipped_valid_still_loads(tmp_path) -> None:
 
     client, mongo = await _build_from_dir(tmp_path, llm)
     try:
-        list_resp = await client.get("/api/v1/graphs")
-        graphs = list_resp.json()["graphs"]
-        assert "file-loaded-graph" in graphs
-        assert "broken" not in graphs
+        list_resp = await client.get("/api/v1/workflows")
+        workflow_ids = [w["id"] for w in list_resp.json()]
+        assert "file-loaded-graph" in workflow_ids
+        assert "broken" not in workflow_ids
     finally:
         await mongo.close()
 
@@ -181,10 +182,10 @@ async def test_multiple_yaml_files_all_registered(tmp_path) -> None:
 
     client, mongo = await _build_from_dir(tmp_path, llm)
     try:
-        list_resp = await client.get("/api/v1/graphs")
-        graphs = list_resp.json()["graphs"]
-        assert "file-loaded-graph" in graphs
-        assert "second-graph" in graphs
-        assert len(graphs) == 2
+        list_resp = await client.get("/api/v1/workflows")
+        workflow_ids = [w["id"] for w in list_resp.json()]
+        assert "file-loaded-graph" in workflow_ids
+        assert "second-graph" in workflow_ids
+        assert len(workflow_ids) == 2
     finally:
         await mongo.close()
