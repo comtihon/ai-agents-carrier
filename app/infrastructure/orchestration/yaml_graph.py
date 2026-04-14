@@ -93,6 +93,10 @@ class YamlGraphRunner:
         self._state_schema = _build_state_schema(self._steps)
         self.graph = self._build()
 
+    @property
+    def steps(self) -> list[dict[str, Any]]:
+        return self._steps
+
     # ------------------------------------------------------------------
     # Graph construction
     # ------------------------------------------------------------------
