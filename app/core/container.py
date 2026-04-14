@@ -76,6 +76,7 @@ def build_container(settings: Settings) -> ApplicationContainer:
         llm=llm,
         mcp_tools_provider=mcp_tools_provider,
         openhands=openhands,
+        run_repository=run_repository,
     )
     return ApplicationContainer(
         settings=settings,

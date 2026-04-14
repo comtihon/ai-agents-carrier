@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import string
 from typing import TYPE_CHECKING, Any, TypedDict
+from uuid import uuid4
 
 from langchain_core.language_models import BaseChatModel
 
@@ -13,6 +15,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field, create_model
 
+from app.domain.models.graph_run import GraphRun
 from app.infrastructure.tools.mcp_client import McpToolsProvider
 
 if TYPE_CHECKING:
@@ -43,6 +46,55 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
 
 
 # ---------------------------------------------------------------------------
+# Shared graph streaming helper (used by workflow steps and default_workflow)
+# ---------------------------------------------------------------------------
+
+async def stream_graph_to_pause(
+    runner: YamlGraphRunner,
+    run: GraphRun,
+    run_repository: Any,
+    input_value: Any,
+) -> None:
+    """
+    Stream *runner* from *input_value* until it reaches an interrupt or END,
+    updating step_statuses and run status in *run_repository* after each node.
+
+    Callers should initialise ``run.step_statuses`` before calling this.
+    """
+    config = {"configurable": {"thread_id": run.id}}
+    try:
+        async for chunk in runner.graph.astream(input_value, config, stream_mode="updates"):
+            for node_name, output in chunk.items():
+                if node_name in ("__start__", "__end__"):
+                    continue
+                status = "skipped" if output == {} else "finished"
+                run.step_statuses[node_name] = status
+                run.current_step = node_name
+                logger.info("run %s: step '%s' → %s", run.id, node_name, status)
+                run.touch()
+                await run_repository.update(run)
+    except Exception as exc:
+        logger.exception("run %s: graph execution failed", run.id)
+        for sid in run.step_statuses:
+            if run.step_statuses.get(sid) == "pending":
+                run.step_statuses[sid] = "failed"
+                break
+        run.status = "failed"
+        run.state = {"error": str(exc)}
+        run.current_step = None
+        run.touch()
+        await run_repository.update(run)
+        return
+
+    snap = runner.graph.get_state(config)
+    run.status = "waiting_approval" if snap.next else "completed"
+    run.current_step = snap.next[0] if snap.next else None
+    run.state = snap.values
+    run.touch()
+    await run_repository.update(run)
+
+
+# ---------------------------------------------------------------------------
 # YAML graph runner
 # ---------------------------------------------------------------------------
 
@@ -56,11 +108,11 @@ class YamlGraphRunner:
         description: "..."
         steps:
           - id: <node-id>
-            type: llm_structured | llm | mcp | human_approval | execute
+            type: llm_structured | llm | mcp | human_approval | execute | workflow
             when: <state-key>          # skip node if state[key] is falsy
             system_prompt: "..."       # llm / llm_structured
             user_template: "..."       # {key} placeholders resolved from state
-            output_key: <key>          # where to store the LLM/MCP/execute result
+            output_key: <key>          # where to store the result
             output:                    # llm_structured only
               - name: needs_jira
                 type: bool
@@ -70,9 +122,16 @@ class YamlGraphRunner:
               query: "{request}"
             repo_template: "{repo}"    # execute only
             instructions_template: "{plan}"  # execute only
+            workflow_id: <id>          # workflow only — child workflow to spawn
+            input_template: "{request}"  # workflow only — request passed to child
 
     Steps are chained sequentially.  ``human_approval`` calls interrupt() and
     expects the caller to resume with {"approved": bool, "reason": str|None}.
+
+    ``workflow`` steps fire-and-forget spawn a child workflow run and store
+    {"child_run_id": ..., "workflow_id": ..., "status": "started"} in output_key.
+    Registry and run_repository must be injected after construction (done by
+    load_yaml_graphs).
     """
 
     def __init__(
@@ -93,6 +152,9 @@ class YamlGraphRunner:
         self._llm = llm
         self._mcp = mcp_tools_provider
         self._openhands = openhands
+        # Injected post-construction by load_yaml_graphs
+        self._registry: Any = None
+        self._run_repository: Any = None
         self._state_schema = _build_state_schema(self._steps)
         self.graph = self._build()
 
@@ -133,6 +195,8 @@ class YamlGraphRunner:
             return self._approval_node(step)
         if t == "execute":
             return self._execute_node(step)
+        if t == "workflow":
+            return self._workflow_node(step)
         raise ValueError(f"Unknown step type '{t}' in graph '{self.id}'")
 
     def _llm_structured_node(self, step: dict[str, Any]):
@@ -238,6 +302,64 @@ class YamlGraphRunner:
             except Exception as exc:
                 logger.exception("[%s] step '%s' execute failed", graph_id, step_id)
                 return {step["output_key"]: {"error": str(exc)}}
+        return node
+
+    def _workflow_node(self, step: dict[str, Any]):
+        """
+        Spawns a child workflow run asynchronously (fire-and-forget).
+
+        The child run is persisted to MongoDB immediately; the parent continues
+        to the next step without waiting.  The child's run_id is stored in
+        state under ``output_key`` so downstream steps can reference it.
+        """
+        graph_id = self.id
+        step_id = step["id"]
+        output_key = step.get("output_key", f"{step_id}_result")
+
+        async def node(state: dict) -> dict:
+            if not self._when(step, state):
+                logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
+                return {}
+
+            if self._registry is None or self._run_repository is None:
+                logger.error(
+                    "[%s] step '%s': registry/run_repository not injected — "
+                    "ensure load_yaml_graphs is called with run_repository",
+                    graph_id, step_id,
+                )
+                return {output_key: {"error": "workflow step not configured"}}
+
+            child_workflow_id = step["workflow_id"]
+            child_runner: YamlGraphRunner | None = self._registry.get(child_workflow_id)
+            if child_runner is None:
+                logger.error(
+                    "[%s] step '%s': child workflow '%s' not found",
+                    graph_id, step_id, child_workflow_id,
+                )
+                return {output_key: {"error": f"workflow '{child_workflow_id}' not found"}}
+
+            child_request = self._render(step.get("input_template", "{request}"), state)
+            child_run_id = str(uuid4())
+            child_run = GraphRun(
+                id=child_run_id,
+                graph_id=child_workflow_id,
+                user_request=child_request,
+                status="running",
+                step_statuses={s["id"]: "pending" for s in child_runner.steps},
+            )
+            await self._run_repository.create(child_run)
+
+            # Fire-and-forget: child runs independently in the background
+            asyncio.create_task(
+                stream_graph_to_pause(child_runner, child_run, self._run_repository, {"request": child_request})
+            )
+
+            logger.info(
+                "[%s] step '%s' spawned child workflow '%s' as run %s",
+                graph_id, step_id, child_workflow_id, child_run_id,
+            )
+            return {output_key: {"child_run_id": child_run_id, "workflow_id": child_workflow_id, "status": "started"}}
+
         return node
 
     # ------------------------------------------------------------------

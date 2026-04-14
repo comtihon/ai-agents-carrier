@@ -19,6 +19,7 @@ _STEP_TYPE_MAP: dict[str, str] = {
     "mcp": "fetch",
     "human_approval": "approval",
     "execute": "execute",
+    "workflow": "workflow",
 }
 
 
@@ -57,6 +58,7 @@ def load_yaml_graphs(
     llm: Any,
     mcp_tools_provider: McpToolsProvider,
     openhands: OpenHandsAdapter | None = None,
+    run_repository: Any = None,
 ) -> YamlGraphRegistry:
     path = Path(directory)
     runners: dict[str, YamlGraphRunner] = {}
@@ -79,4 +81,12 @@ def load_yaml_graphs(
         except Exception:
             logger.exception("Failed to load YAML graph from %s", yaml_file)
 
-    return YamlGraphRegistry(runners)
+    registry = YamlGraphRegistry(runners)
+
+    # Two-pass: inject registry and run_repository into every runner so that
+    # workflow steps can look up child runners and persist child runs.
+    for runner in runners.values():
+        runner._registry = registry
+        runner._run_repository = run_repository
+
+    return registry

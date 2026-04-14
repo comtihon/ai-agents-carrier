@@ -19,6 +19,7 @@ from app.core.config import get_settings
 from app.core.container import ApplicationContainer, build_container
 from app.domain.models.graph_run import GraphRun
 from app.infrastructure.auth.auth_service import AuthService
+from app.infrastructure.orchestration.default_workflow import build_default_workflow
 from app.infrastructure.orchestration.router_agent import build_router_graph
 
 
@@ -158,8 +159,21 @@ async def lifespan(app: FastAPI):
     app.state.container = container
 
     router_graph = build_router_graph(container.llm)
+    default_graph = build_default_workflow(
+        container.llm,
+        container.yaml_graph_registry,
+        container.run_repository,
+    )
     sdk = CopilotKitRemoteEndpoint(
         agents=[
+            LangGraphAgent(
+                name="default",
+                description=(
+                    "Intelligent assistant that decides whether to reply directly "
+                    "or route the request to the appropriate workflow."
+                ),
+                graph=default_graph,
+            ),
             LangGraphAgent(
                 name="router",
                 description=(
@@ -167,7 +181,7 @@ async def lifespan(app: FastAPI):
                     "and guides users through available workflows."
                 ),
                 graph=router_graph,
-            )
+            ),
         ],
         actions=_build_actions(container),
     )

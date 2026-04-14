@@ -11,6 +11,7 @@ class GraphRun(BaseModel):
     graph_id: str
     user_request: str = ""
     status: Literal["running", "waiting_approval", "completed", "failed", "cancelled"]
+    parent_run_id: str | None = None  # set when this run was spawned by a workflow step
     state: dict[str, Any] = {}       # latest graph state snapshot
     current_step: str | None = None  # id of the node currently active / paused
     step_statuses: dict[str, str] = {}  # step_id → pending/running/finished/skipped/failed
