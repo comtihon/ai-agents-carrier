@@ -136,7 +136,7 @@ def test_render_template():
     assert runner._render("Request: {request}, Plan: {plan}", state) == "Request: hello, Plan: do x"
 
 
-def test_render_missing_key_leaves_intact():
+def test_render_missing_key_renders_empty():
     runner = _make_runner([{"id": "s", "type": "llm", "output_key": "r"}])
     result = runner._render("Value: {missing}", {})
-    assert result == "Value: {missing}"
+    assert result == "Value: "

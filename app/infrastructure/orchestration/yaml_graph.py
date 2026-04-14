@@ -210,11 +210,14 @@ class YamlGraphRunner:
             logger.info("[%s] step '%s' running (llm_structured)", graph_id, step_id)
             output_model = self._build_output_model(step["output"])
             structured = self._llm.with_structured_output(output_model)
-            result = await structured.ainvoke([
+            messages = [
                 SystemMessage(content=step.get("system_prompt", "")),
                 HumanMessage(content=self._render(step.get("user_template", "{request}"), state)),
-            ])
+            ]
+            logger.debug("[%s] step '%s' LLM input: %s", graph_id, step_id, [m.content for m in messages])
+            result = await structured.ainvoke(messages)
             output = result.model_dump()
+            logger.debug("[%s] step '%s' LLM output: %s", graph_id, step_id, output)
             logger.info("[%s] step '%s' finished: %s", graph_id, step_id, list(output.keys()))
             return output
         return node
@@ -228,10 +231,13 @@ class YamlGraphRunner:
                 logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
                 return {}
             logger.info("[%s] step '%s' running (llm)", graph_id, step_id)
-            response = await self._llm.ainvoke([
+            messages = [
                 SystemMessage(content=step.get("system_prompt", "")),
                 HumanMessage(content=self._render(step.get("user_template", "{request}"), state)),
-            ])
+            ]
+            logger.debug("[%s] step '%s' LLM input: %s", graph_id, step_id, [m.content for m in messages])
+            response = await self._llm.ainvoke(messages)
+            logger.debug("[%s] step '%s' LLM output: %s", graph_id, step_id, response.content)
             logger.info("[%s] step '%s' finished", graph_id, step_id)
             return {step["output_key"]: response.content}
         return node
@@ -373,10 +379,14 @@ class YamlGraphRunner:
 
     @staticmethod
     def _render(template: str, state: dict) -> str:
-        """Render a {key} template against state, leaving unknown keys as-is."""
+        """Render a {key} template against state; missing keys render as empty string."""
+        class _DefaultDict(dict):
+            def __missing__(self, key: str) -> str:
+                return ""
+
         try:
-            return string.Formatter().vformat(template, [], state)  # type: ignore[arg-type]
-        except (KeyError, ValueError):
+            return string.Formatter().vformat(template, [], _DefaultDict(state))  # type: ignore[arg-type]
+        except ValueError:
             return template
 
     @staticmethod
