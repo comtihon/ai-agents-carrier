@@ -150,7 +150,8 @@ async def test_mcp_result_stored_in_state() -> None:
             "/api/v1/workflows/runs",
             json={"workflow_id": "mcp-then-llm", "user_request": "PRJ-99"},
         )
-        state = resp.json()["intermediate_outputs"]
+        run_id = resp.json()["id"]
+        state = (await client.get(f"/api/v1/workflows/runs/{run_id}")).json()["intermediate_outputs"]
         assert str(state["issue_data"]) == str(_ISSUE_DATA)
     finally:
         await mongo.close()
@@ -214,7 +215,8 @@ async def test_mcp_tool_error_captured_gracefully() -> None:
             json={"workflow_id": "mcp-error", "user_request": "anything"},
         )
         assert resp.status_code == 200, resp.text
-        state = resp.json()["intermediate_outputs"]
+        run_id = resp.json()["id"]
+        state = (await client.get(f"/api/v1/workflows/runs/{run_id}")).json()["intermediate_outputs"]
         assert "Error" in state["data"] or "upstream 503" in state["data"]
     finally:
         await mongo.close()
@@ -240,10 +242,12 @@ async def test_chained_mcp_both_results_in_state() -> None:
             json={"workflow_id": "chained-mcp", "user_request": "implement feature"},
         )
         assert resp.status_code == 200, resp.text
-        state = resp.json()["intermediate_outputs"]
+        run_id = resp.json()["id"]
 
         issue_tool.ainvoke.assert_called_once()
         repo_tool.ainvoke.assert_called_once()
+
+        state = (await client.get(f"/api/v1/workflows/runs/{run_id}")).json()["intermediate_outputs"]
         assert str(state["issue_data"]) == str(_ISSUE_DATA)
         assert str(state["repo_data"]) == str(_REPO_DATA)
         assert state["plan"] == "combined plan"

@@ -99,11 +99,12 @@ async def test_github_only() -> None:
             json={"workflow_id": _GRAPH_ID, "user_request": "add dark mode to acme/app"},
         )
         assert resp.status_code == 200, resp.text
-        state = resp.json()["intermediate_outputs"]
+        run_id = resp.json()["id"]
 
         github_tool.ainvoke.assert_called_once_with({"query": "add dark mode to acme/app"})
         jira_tool.ainvoke.assert_not_called()
 
+        state = (await client.get(f"/api/v1/workflows/runs/{run_id}")).json()["intermediate_outputs"]
         assert str(state["github_context"]) == str(_GITHUB_DATA)
         assert "jira_context" not in state
         assert state["result"] == "summary using github data"
@@ -128,11 +129,12 @@ async def test_jira_only() -> None:
             json={"workflow_id": _GRAPH_ID, "user_request": "check issues for PRJ-42"},
         )
         assert resp.status_code == 200, resp.text
-        state = resp.json()["intermediate_outputs"]
+        run_id = resp.json()["id"]
 
         jira_tool.ainvoke.assert_called_once_with({"query": "check issues for PRJ-42"})
         github_tool.ainvoke.assert_not_called()
 
+        state = (await client.get(f"/api/v1/workflows/runs/{run_id}")).json()["intermediate_outputs"]
         assert str(state["jira_context"]) == str(_JIRA_DATA)
         assert "github_context" not in state
     finally:
@@ -180,10 +182,12 @@ async def test_neither_needed() -> None:
             json={"workflow_id": _GRAPH_ID, "user_request": "simple question"},
         )
         assert resp.status_code == 200, resp.text
-        state = resp.json()["intermediate_outputs"]
+        run_id = resp.json()["id"]
 
         jira_tool.ainvoke.assert_not_called()
         github_tool.ainvoke.assert_not_called()
+
+        state = (await client.get(f"/api/v1/workflows/runs/{run_id}")).json()["intermediate_outputs"]
         assert "jira_context" not in state
         assert "github_context" not in state
     finally:

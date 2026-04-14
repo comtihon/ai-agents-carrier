@@ -128,7 +128,9 @@ async def test_graph_loaded_from_yaml_file_is_runnable(tmp_path) -> None:
             json={"workflow_id": "file-loaded-graph", "user_request": "hello from disk"},
         )
         assert run_resp.status_code == 200, run_resp.text
-        assert run_resp.json()["intermediate_outputs"]["answer"] == "answer from disk graph"
+        run_id = run_resp.json()["id"]
+        get_resp = await client.get(f"/api/v1/workflows/runs/{run_id}")
+        assert get_resp.json()["intermediate_outputs"]["answer"] == "answer from disk graph"
     finally:
         await mongo.close()
 
