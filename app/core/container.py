@@ -31,6 +31,7 @@ class ApplicationContainer:
 
 _ANTHROPIC_DEFAULT_MODEL = "claude-opus-4-6"
 _OPENAI_DEFAULT_MODEL = "gpt-4o"
+_GOOGLE_DEFAULT_MODEL = "gemini-2.0-flash"
 
 
 def build_llm(settings: Settings) -> BaseChatModel:
@@ -48,6 +49,13 @@ def build_llm(settings: Settings) -> BaseChatModel:
         return ChatOpenAI(
             model=settings.llm_model or _OPENAI_DEFAULT_MODEL,
             api_key=settings.openai_api_key,  # type: ignore[arg-type]
+        )
+
+    if provider == "google":
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        return ChatGoogleGenerativeAI(
+            model=settings.llm_model or _GOOGLE_DEFAULT_MODEL,
+            google_api_key=settings.google_api_key,  # type: ignore[arg-type]
         )
 
     from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel

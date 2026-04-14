@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     llm_model: str | None = Field(default=None, alias="LLM_MODEL")
     anthropic_api_key: str | None = Field(default=None, alias="ANTHROPIC_API_KEY")
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
+    google_api_key: str | None = Field(default=None, alias="GOOGLE_API_KEY")
 
     # --- MongoDB ---
     mongodb_uri: str = Field(default="mongodb://localhost:27017", alias="MONGODB_URI")
