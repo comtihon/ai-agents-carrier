@@ -159,7 +159,7 @@ async def reject_run(
     )
 
     snap = runner.graph.get_state(_config(run_id))
-    run.status = "cancelled"
+    run.status = "cancelled" if not snap.next else "waiting_approval"
     run.state = snap.values
     await container.run_repository.update(run)
 

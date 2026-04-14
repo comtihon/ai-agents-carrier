@@ -6,7 +6,7 @@ Scenarios
 1. Submit run → graph pauses at human_approval → status=waiting_approval
    MongoDB row is persisted and readable via GET.
 2. Approve → implement step (when: approved) runs → status=completed.
-3. Reject  → implement step is skipped        → status=completed, implementation absent.
+3. Reject  → implement step is skipped        → status=cancelled, implementation absent.
 """
 from __future__ import annotations
 
@@ -121,7 +121,7 @@ async def test_approve_runs_implement_step() -> None:
 async def test_reject_skips_implement_step() -> None:
     """
     Submit → reject → implement step is skipped (when: approved=False) →
-    status=completed, implementation key absent.
+    status=cancelled, implementation key absent.
     """
     llm = make_mock_llm(text_responses=["the plan"])
     client, mongo = await build_int_client(_GRAPH, llm)
@@ -139,7 +139,7 @@ async def test_reject_skips_implement_step() -> None:
         assert reject.status_code == 200, reject.text
         body = reject.json()
 
-        assert body["status"] == "completed"
+        assert body["status"] == "cancelled"
         assert body["intermediate_outputs"]["approved"] is False
         assert body["intermediate_outputs"]["reject_reason"] == "plan looks wrong"
         # implement step skipped — key not set
