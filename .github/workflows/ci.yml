@@ -101,11 +101,15 @@ jobs:
           echo "$NEW_VERSION" > VERSION
           echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
 
+      - name: Update Helm image tag
+        run: |
+          sed -i "s/^  tag: .*/  tag: v${{ steps.version.outputs.version }}/" helm/values.yaml
+
       - name: Commit bumped version
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add VERSION
+          git add VERSION helm/values.yaml
           git commit -m "chore: bump version to ${{ steps.bump.outputs.new_version }} [skip ci]"
           git push origin main
 
