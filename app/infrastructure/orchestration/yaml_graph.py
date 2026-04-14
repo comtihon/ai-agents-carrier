@@ -9,7 +9,8 @@ from uuid import uuid4
 from langchain_core.language_models import BaseChatModel
 
 logger = logging.getLogger(__name__)
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
@@ -199,6 +200,9 @@ class YamlGraphRunner:
             return self._workflow_node(step)
         raise ValueError(f"Unknown step type '{t}' in graph '{self.id}'")
 
+    _SUBMIT_TOOL = "submit_output"
+    _MAX_ITERATIONS = 10
+
     def _llm_structured_node(self, step: dict[str, Any]):
         graph_id = self.id
 
@@ -208,18 +212,72 @@ class YamlGraphRunner:
                 logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
                 return {}
             logger.info("[%s] step '%s' running (llm_structured)", graph_id, step_id)
+
             output_model = self._build_output_model(step["output"])
-            structured = self._llm.with_structured_output(output_model)
-            messages = [
+            submit_tool = StructuredTool(
+                name=self._SUBMIT_TOOL,
+                description=(
+                    "Call this when you have gathered all necessary information "
+                    "and are ready to return the final structured result."
+                ),
+                args_schema=output_model,
+                func=lambda **kwargs: kwargs,  # never actually invoked
+            )
+
+            mcp_tools = self._mcp.get_tools()
+            llm = self._llm.bind_tools(mcp_tools + [submit_tool])
+
+            messages: list = [
                 SystemMessage(content=step.get("system_prompt", "")),
                 HumanMessage(content=self._render(step.get("user_template", "{request}"), state)),
             ]
             logger.debug("[%s] step '%s' LLM input: %s", graph_id, step_id, [m.content for m in messages])
-            result = await structured.ainvoke(messages)
-            output = result.model_dump()
-            logger.debug("[%s] step '%s' LLM output: %s", graph_id, step_id, output)
-            logger.info("[%s] step '%s' finished: %s", graph_id, step_id, list(output.keys()))
-            return output
+
+            for iteration in range(1, self._MAX_ITERATIONS + 1):
+                response = await llm.ainvoke(messages)
+                messages.append(response)
+                tool_calls = response.tool_calls or []
+                logger.debug(
+                    "[%s] step '%s' iteration %d tool_calls: %s",
+                    graph_id, step_id, iteration, [tc["name"] for tc in tool_calls],
+                )
+
+                if not tool_calls:
+                    raise ValueError(
+                        f"[{graph_id}] step '{step_id}': LLM returned no tool calls on iteration {iteration}"
+                    )
+
+                # Check for submit_output before executing side-effect tools
+                for tc in tool_calls:
+                    if tc["name"] == self._SUBMIT_TOOL:
+                        output = tc["args"]
+                        logger.debug("[%s] step '%s' LLM output: %s", graph_id, step_id, output)
+                        logger.info("[%s] step '%s' finished: %s", graph_id, step_id, list(output.keys()))
+                        return output
+
+                # Execute MCP tool calls and feed results back
+                for tc in tool_calls:
+                    tool = self._mcp.get_tool(tc["name"])
+                    if tool:
+                        try:
+                            result = await tool.ainvoke(tc["args"])
+                            content = str(result)
+                        except Exception as exc:
+                            logger.exception("[%s] step '%s' tool '%s' failed", graph_id, step_id, tc["name"])
+                            content = f"Error calling '{tc['name']}': {exc}"
+                    else:
+                        logger.warning(
+                            "[%s] step '%s' unknown tool requested: '%s'",
+                            graph_id, step_id, tc["name"],
+                        )
+                        content = f"Tool '{tc['name']}' is not available"
+                    logger.debug("[%s] step '%s' tool '%s' result: %s", graph_id, step_id, tc["name"], content)
+                    messages.append(ToolMessage(content=content, tool_call_id=tc["id"]))
+
+            raise ValueError(
+                f"[{graph_id}] step '{step_id}': reached {self._MAX_ITERATIONS} iterations without structured output"
+            )
+
         return node
 
     def _llm_node(self, step: dict[str, Any]):

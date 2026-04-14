@@ -35,7 +35,7 @@ from app.core.config import Settings
 from app.core.container import ApplicationContainer
 from app.infrastructure.config.graph_loader import YamlGraphRegistry
 from app.infrastructure.integrations.openhands import OpenHandsAdapter
-from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner
+from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner, YamlGraphRunner as _Runner
 from app.infrastructure.persistence.mongo import MongoClientProvider
 from app.infrastructure.tools.mcp_client import McpToolsProvider
 
@@ -80,8 +80,9 @@ def make_mock_llm(
     """
     Build a mock LLM that returns deterministic responses without a real API key.
 
-    *structured_responses* — consumed in order for ``.with_structured_output(schema).ainvoke()``.
-    *text_responses*       — consumed in order for direct ``.ainvoke()`` calls.
+    *structured_responses* — consumed in order for ``.bind_tools(...).ainvoke()`` calls
+                             (llm_structured steps). Returned as a submit_output tool call.
+    *text_responses*       — consumed in order for direct ``.ainvoke()`` calls (llm steps).
     Both lists cycle back to their last element once exhausted.
     """
     s_iter = _cycling_iter(structured_responses or [{}])
@@ -94,17 +95,20 @@ def make_mock_llm(
 
     llm.ainvoke = AsyncMock(side_effect=_ainvoke)
 
-    def _with_structured_output(schema, **kwargs):
+    def _bind_tools(tools, **kwargs):
         chain = MagicMock()
 
         async def _chain_ainvoke(messages, **kwargs):
             data = next(s_iter)
-            return schema(**data)
+            return AIMessage(
+                content="",
+                tool_calls=[{"name": _Runner._SUBMIT_TOOL, "args": data, "id": "mock-tc-id"}],
+            )
 
         chain.ainvoke = AsyncMock(side_effect=_chain_ainvoke)
         return chain
 
-    llm.with_structured_output = MagicMock(side_effect=_with_structured_output)
+    llm.bind_tools = MagicMock(side_effect=_bind_tools)
     return llm
 
 
@@ -143,6 +147,7 @@ async def build_int_client(
 
     mcp = MagicMock(spec=McpToolsProvider)
     mcp.get_tool = MagicMock(side_effect=lambda name: (mcp_tools or {}).get(name))
+    mcp.get_tools = MagicMock(return_value=[])
 
     runner = YamlGraphRunner(graph_def, llm=llm, mcp_tools_provider=mcp)
     registry = YamlGraphRegistry({runner.id: runner})
