@@ -3,7 +3,6 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from asgi_lifespan import LifespanManager
 from httpx import ASGITransport, AsyncClient
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
@@ -36,8 +35,9 @@ def _build_container(registry: YamlGraphRegistry) -> ApplicationContainer:
     repo = AsyncMock(spec=MongoGraphRunRepository)
     repo.create = AsyncMock()
     repo.update = AsyncMock()
-    # Return a valid GraphRun on get
-    repo.get = AsyncMock(return_value=GraphRun(id="tid1", graph_id="simple", status="running"))
+    repo.get = AsyncMock(
+        return_value=GraphRun(id="tid1", graph_id="simple", user_request="hello", status="running")
+    )
     mcp = MagicMock(spec=McpToolsProvider)
     mcp.start = AsyncMock()
     mcp.stop = AsyncMock()
@@ -70,45 +70,57 @@ async def client():
 
 
 @pytest.mark.asyncio
-async def test_list_graphs(client):
+async def test_list_workflows(client):
     c, _ = client
-    resp = await c.get("/api/v1/graphs")
+    resp = await c.get("/api/v1/workflows")
     assert resp.status_code == 200
-    assert "simple" in resp.json()["graphs"]
+    data = resp.json()
+    assert isinstance(data, list)
+    assert any(w["id"] == "simple" for w in data)
+    assert all("name" in w and "description" in w and "steps" in w for w in data)
 
 
 @pytest.mark.asyncio
 async def test_start_run(client):
     c, container = client
-    resp = await c.post("/api/v1/graphs/simple/runs", json={"request": "hello"})
+    resp = await c.post(
+        "/api/v1/workflows/runs",
+        json={"workflow_id": "simple", "user_request": "hello"},
+    )
     assert resp.status_code == 200
     data = resp.json()
-    assert data["graph_id"] == "simple"
-    assert "thread_id" in data
+    assert data["workflow_id"] == "simple"
+    assert data["user_request"] == "hello"
+    assert "id" in data
     assert data["status"] in ("running", "waiting_approval", "completed")
     container.run_repository.create.assert_called_once()
     container.run_repository.update.assert_called()
 
 
 @pytest.mark.asyncio
-async def test_start_run_unknown_graph(client):
+async def test_start_run_unknown_workflow(client):
     c, _ = client
-    resp = await c.post("/api/v1/graphs/nonexistent/runs", json={"request": "hi"})
+    resp = await c.post(
+        "/api/v1/workflows/runs",
+        json={"workflow_id": "nonexistent", "user_request": "hi"},
+    )
     assert resp.status_code == 404
 
 
 @pytest.mark.asyncio
 async def test_get_run(client):
     c, container = client
-    resp = await c.get("/api/v1/graphs/simple/runs/tid1")
+    resp = await c.get("/api/v1/workflows/runs/tid1")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["thread_id"] == "tid1"
+    assert data["id"] == "tid1"
+    assert data["workflow_id"] == "simple"
+    assert data["user_request"] == "hello"
 
 
 @pytest.mark.asyncio
 async def test_get_run_not_found(client):
     c, container = client
     container.run_repository.get = AsyncMock(return_value=None)
-    resp = await c.get("/api/v1/graphs/simple/runs/missing")
+    resp = await c.get("/api/v1/workflows/runs/missing")
     assert resp.status_code == 404
