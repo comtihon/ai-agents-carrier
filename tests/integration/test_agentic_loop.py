@@ -217,3 +217,77 @@ async def test_multi_turn_mcp_loop() -> None:
         assert state["answer"] == "combined answer"
     finally:
         await mongo.close()
+
+
+@pytest.mark.asyncio
+async def test_tool_error_nudges_to_submit() -> None:
+    """
+    When an MCP tool raises an error, the error is fed back to the LLM as a
+    ToolMessage.  If the LLM then replies with plain text (no tool calls) —
+    e.g. acknowledging the failure — the loop appends a nudge asking it to
+    call submit_output, and the LLM complies on the next iteration.
+
+    Mirrors the real-world case where a tool returns a permission-denied error
+    and the LLM responds with an explanation instead of calling submit_output.
+    """
+    failing_tool = MagicMock()
+    failing_tool.ainvoke = AsyncMock(
+        side_effect=Exception('{"error":true,"message":"You don\'t have permission"}')
+    )
+
+    # Responses from bind_tools().ainvoke():
+    #   iteration 1 — LLM calls the failing tool
+    #   iteration 2 — LLM gets the error, replies with plain text (no tool calls)
+    #   iteration 3 — LLM receives the nudge, calls submit_output
+    call_count = 0
+    llm = MagicMock()
+
+    async def _text_ainvoke(messages, **kwargs):
+        return AIMessage(content="default")
+
+    llm.ainvoke = AsyncMock(side_effect=_text_ainvoke)
+
+    def _bind_tools(tools, **kwargs):
+        chain = MagicMock()
+
+        async def _chain_ainvoke(messages, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Request the failing tool
+                return AIMessage(
+                    content="",
+                    tool_calls=[{"name": "bad_tool", "args": {}, "id": "tc-bad"}],
+                )
+            if call_count == 2:
+                # Plain text after receiving the error — no tool calls
+                return AIMessage(content="I'm sorry, I don't have permission to access that tool.")
+            # After nudge: submit the final answer
+            return AIMessage(
+                content="",
+                tool_calls=[{"name": _SUBMIT, "args": {"answer": "unavailable"}, "id": "tc-submit"}],
+            )
+
+        chain.ainvoke = AsyncMock(side_effect=_chain_ainvoke)
+        return chain
+
+    llm.bind_tools = MagicMock(side_effect=_bind_tools)
+
+    client, mongo = await build_int_client(
+        _GRAPH, llm, mcp_tools={"bad_tool": failing_tool}
+    )
+    try:
+        resp = await client.post(
+            "/api/v1/workflows/runs",
+            json={"workflow_id": _GRAPH_ID, "user_request": "fetch something"},
+        )
+        assert resp.status_code == 200, resp.text
+        run_id = resp.json()["id"]
+
+        # Three LLM iterations: tool call → plain text → submit after nudge
+        assert call_count == 3
+
+        state = (await client.get(f"/api/v1/workflows/runs/{run_id}")).json()["intermediate_outputs"]
+        assert state["answer"] == "unavailable"
+    finally:
+        await mongo.close()

@@ -68,6 +68,7 @@ def _init_step_statuses(runner: YamlGraphRunner) -> dict[str, str]:
 def _run_response(run: GraphRun, runner: YamlGraphRunner | None = None) -> dict:
     workflow_name = runner.name if runner else run.graph_id
     step_statuses = run.step_statuses
+    step_inputs = run.step_inputs
     step_outputs = run.step_outputs
     steps = [
         {
@@ -75,6 +76,7 @@ def _run_response(run: GraphRun, runner: YamlGraphRunner | None = None) -> dict:
             "type": _STEP_TYPE_MAP.get(s.get("type", "llm"), s.get("type", "llm")),
             "name": s.get("name", s["id"]),
             "status": step_statuses.get(s["id"], "pending"),
+            "input": step_inputs.get(s["id"]),
             "output": step_outputs.get(s["id"]),
         }
         for s in runner.steps
@@ -119,6 +121,17 @@ async def _stream_graph(
     """
     step_ids = [s["id"] for s in runner.steps]
 
+    # Seed current_state so we can record each step's input before it runs.
+    # For Command (approve/reject resume) fetch the checkpointed state instead.
+    if isinstance(input_value, dict):
+        current_state: dict = dict(input_value)
+    else:
+        try:
+            snap = runner.graph.get_state(_config(run.id))
+            current_state = dict(snap.values) if snap.values else {}
+        except Exception:
+            current_state = {}
+
     try:
         async for chunk in runner.graph.astream(
             input_value, _config(run.id), stream_mode="updates",
@@ -127,10 +140,13 @@ async def _stream_graph(
                 if node_name in ("__start__", "__end__"):
                     continue
                 status = _step_status_for_output(output)
+                run.step_inputs[node_name] = dict(current_state)
                 run.step_statuses[node_name] = status
                 run.current_step = node_name
                 if output:
                     run.step_outputs[node_name] = output
+                    if isinstance(output, dict):
+                        current_state.update(output)
                 logger.info(
                     "run %s: step '%s' → %s", run.id, node_name, status,
                 )
@@ -140,6 +156,7 @@ async def _stream_graph(
         logger.exception("run %s: graph execution failed", run.id)
         for sid in step_ids:
             if run.step_statuses.get(sid) == "pending":
+                run.step_inputs[sid] = dict(current_state)
                 run.step_statuses[sid] = "failed"
                 break
         run.status = "failed"

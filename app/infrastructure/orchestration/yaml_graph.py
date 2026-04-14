@@ -63,16 +63,20 @@ async def stream_graph_to_pause(
     Callers should initialise ``run.step_statuses`` before calling this.
     """
     config = {"configurable": {"thread_id": run.id}}
+    current_state: dict = dict(input_value) if isinstance(input_value, dict) else {}
     try:
         async for chunk in runner.graph.astream(input_value, config, stream_mode="updates"):
             for node_name, output in chunk.items():
                 if node_name in ("__start__", "__end__"):
                     continue
                 status = "skipped" if output == {} else "finished"
+                run.step_inputs[node_name] = dict(current_state)
                 run.step_statuses[node_name] = status
                 run.current_step = node_name
                 if output:
                     run.step_outputs[node_name] = output
+                    if isinstance(output, dict):
+                        current_state.update(output)
                 logger.info("run %s: step '%s' → %s", run.id, node_name, status)
                 run.touch()
                 await run_repository.update(run)
@@ -80,6 +84,7 @@ async def stream_graph_to_pause(
         logger.exception("run %s: graph execution failed", run.id)
         for sid in run.step_statuses:
             if run.step_statuses.get(sid) == "pending":
+                run.step_inputs[sid] = dict(current_state)
                 run.step_statuses[sid] = "failed"
                 break
         run.status = "failed"
@@ -245,9 +250,14 @@ class YamlGraphRunner:
                 )
 
                 if not tool_calls:
-                    raise ValueError(
-                        f"[{graph_id}] step '{step_id}': LLM returned no tool calls on iteration {iteration}"
+                    logger.warning(
+                        "[%s] step '%s' iteration %d: LLM returned no tool calls, nudging to call %s",
+                        graph_id, step_id, iteration, self._SUBMIT_TOOL,
                     )
+                    messages.append(HumanMessage(
+                        content=f"Please call `{self._SUBMIT_TOOL}` to submit your final answer."
+                    ))
+                    continue
 
                 # Check for submit_output before executing side-effect tools
                 for tc in tool_calls:
@@ -259,21 +269,27 @@ class YamlGraphRunner:
 
                 # Execute MCP tool calls and feed results back
                 for tc in tool_calls:
-                    tool = self._mcp.get_tool(tc["name"])
+                    tool_name = tc["name"]
+                    server = self._mcp.get_tool_server(tool_name)
+                    server_tag = f" (server: {server})" if server else ""
+                    tool = self._mcp.get_tool(tool_name)
                     if tool:
                         try:
                             result = await tool.ainvoke(tc["args"])
                             content = str(result)
                         except Exception as exc:
-                            logger.exception("[%s] step '%s' tool '%s' failed", graph_id, step_id, tc["name"])
-                            content = f"Error calling '{tc['name']}': {exc}"
+                            logger.exception(
+                                "[%s] step '%s' tool '%s'%s failed",
+                                graph_id, step_id, tool_name, server_tag,
+                            )
+                            content = f"Error calling '{tool_name}': {exc}"
                     else:
                         logger.warning(
                             "[%s] step '%s' unknown tool requested: '%s'",
-                            graph_id, step_id, tc["name"],
+                            graph_id, step_id, tool_name,
                         )
-                        content = f"Tool '{tc['name']}' is not available"
-                    logger.debug("[%s] step '%s' tool '%s' result: %s", graph_id, step_id, tc["name"], content)
+                        content = f"Tool '{tool_name}' is not available"
+                    logger.debug("[%s] step '%s' tool '%s'%s result: %s", graph_id, step_id, tool_name, server_tag, content)
                     messages.append(ToolMessage(content=content, tool_call_id=tc["id"]))
 
             raise ValueError(
@@ -310,11 +326,14 @@ class YamlGraphRunner:
             if not self._when(step, state):
                 logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
                 return {}
-            logger.info("[%s] step '%s' running (mcp tool='%s')", graph_id, step_id, step["tool"])
-            tool = self._mcp.get_tool(step["tool"])
+            tool_name = step["tool"]
+            server = self._mcp.get_tool_server(tool_name)
+            server_tag = f" (server: {server})" if server else ""
+            logger.info("[%s] step '%s' running (mcp tool='%s'%s)", graph_id, step_id, tool_name, server_tag)
+            tool = self._mcp.get_tool(tool_name)
             if not tool:
-                logger.warning("[%s] step '%s' MCP tool '%s' not available", graph_id, step_id, step["tool"])
-                return {step["output_key"]: f"MCP tool '{step['tool']}' not available"}
+                logger.warning("[%s] step '%s' MCP tool '%s' not available", graph_id, step_id, tool_name)
+                return {step["output_key"]: f"MCP tool '{tool_name}' not available"}
             tool_input = {
                 k: self._render(v, state)
                 for k, v in step.get("tool_input", {}).items()
@@ -324,8 +343,8 @@ class YamlGraphRunner:
                 logger.info("[%s] step '%s' finished", graph_id, step_id)
                 return {step["output_key"]: str(result)}
             except Exception as exc:
-                logger.exception("[%s] step '%s' MCP call failed", graph_id, step_id)
-                return {step["output_key"]: f"Error calling '{step['tool']}': {exc}"}
+                logger.exception("[%s] step '%s' MCP tool '%s'%s failed", graph_id, step_id, tool_name, server_tag)
+                return {step["output_key"]: f"Error calling '{tool_name}': {exc}"}
         return node
 
     def _approval_node(self, step: dict[str, Any]):

@@ -21,23 +21,35 @@ class McpToolsProvider:
         self._settings = settings
         self._client: MultiServerMCPClient | None = None
         self._tools: list[BaseTool] = []
+        self._tool_server: dict[str, str] = {}  # tool name → server name
 
     async def start(self) -> None:
         server_configs = self._build_server_configs()
         if not server_configs:
             return
         self._client = MultiServerMCPClient(server_configs)
-        self._tools = await self._client.get_tools()
+        self._tools = []
+        self._tool_server = {}
+        for server_name in server_configs:
+            server_tools = await self._client.get_tools(server_name=server_name)
+            for tool in server_tools:
+                self._tools.append(tool)
+                self._tool_server[tool.name] = server_name
 
     async def stop(self) -> None:
         self._client = None
         self._tools = []
+        self._tool_server = {}
 
     def get_tools(self) -> list[BaseTool]:
         return list(self._tools)
 
     def get_tool(self, name: str) -> BaseTool | None:
         return next((t for t in self._tools if t.name == name), None)
+
+    def get_tool_server(self, name: str) -> str | None:
+        """Return the MCP server name that provides the given tool, or None if unknown."""
+        return self._tool_server.get(name)
 
     def _build_server_configs(self) -> dict[str, dict[str, Any]]:
         configs: dict[str, dict[str, Any]] = {}
