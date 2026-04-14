@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir \
         copilotkit \
         "langgraph<0.6.0" \
+        "starlette<0.47.0" \
         "uvicorn[standard]" \
         pydantic-settings \
         "pyjwt[crypto]" \
@@ -21,6 +22,7 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir \
         langchain-mcp-adapters \
         langchain-google-genai \
+        "starlette<0.47.0" \
     && mkdir -p app && touch app/__init__.py \
     && pip install --no-cache-dir --no-deps . \
     && rm -rf app

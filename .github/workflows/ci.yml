@@ -34,11 +34,12 @@ jobs:
           pip install \
             copilotkit \
             "langgraph<0.6.0" \
+            "starlette<0.47.0" \
             "uvicorn[standard]" \
             pydantic-settings \
             "pyjwt[crypto]" \
             motor
-          pip install langchain-mcp-adapters langchain-google-genai
+          pip install langchain-mcp-adapters langchain-google-genai "starlette<0.47.0"
           pip install --no-deps -e .
           pip install pytest pytest-asyncio asgi-lifespan
 
