@@ -14,9 +14,9 @@ from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
 from copilotkit import CopilotKitState
-from copilotkit.langgraph import copilotkit_customize_config
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, SystemMessage
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import RunnableConfig
 from pydantic import BaseModel, Field
@@ -67,7 +67,8 @@ from typing import TypedDict  # noqa: E402
 
 
 class DefaultWorkflowState(CopilotKitState, total=False):  # type: ignore[misc]
-    decision: Any  # RouterDecision, typed loosely to satisfy TypedDict constraints
+    decision: Any          # RouterDecision, typed loosely to satisfy TypedDict constraints
+    spawned_workflow: Any  # populated by spawn_workflow node: {workflow_id, workflow_name, run_id}
 
 
 # ---------------------------------------------------------------------------
@@ -130,14 +131,15 @@ workflow, use `reply`.
         decision: RouterDecision = state["decision"]
         text = decision.reply_text or ""
         if not text:
-            # Fallback: ask the LLM again without structured output so it can
-            # produce a natural conversational response.
-            ck_config = copilotkit_customize_config(config, emit_messages=True)
-            response = await llm.ainvoke(
-                [SystemMessage(content=SYSTEM_PROMPT)] + list(state.get("messages", [])),
-                config=ck_config,
-            )
-            return {"messages": [response]}
+            # Use astream so that astream_events captures per-token chunks for
+            # the /chat SSE endpoint.
+            content = ""
+            async for chunk in llm.astream(
+                [SystemMessage(content=SYSTEM_PROMPT)] + list(state.get("messages", []))
+            ):
+                if chunk.content:
+                    content += chunk.content
+            text = content
         return {"messages": [AIMessage(content=text)]}
 
     async def spawn_workflow(state: DefaultWorkflowState, config: RunnableConfig) -> dict:
@@ -180,7 +182,12 @@ workflow, use `reply`.
                     f"Run ID: `{child_run_id}`\n\n"
                     f"You can track its progress in the workflow panel."
                 )
-            )]
+            )],
+            "spawned_workflow": {
+                "workflow_id": workflow_id,
+                "workflow_name": runner.name,
+                "run_id": child_run_id,
+            },
         }
 
     # ── routing ──────────────────────────────────────────────────────────────
@@ -207,4 +214,4 @@ workflow, use `reply`.
     sg.add_edge("reply", END)
     sg.add_edge("spawn_workflow", END)
 
-    return sg.compile()
+    return sg.compile(checkpointer=MemorySaver())
