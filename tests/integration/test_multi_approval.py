@@ -7,8 +7,9 @@ with two approval gates in series — each pauses the run independently.
 
 Scenarios
 ─────────
-1. Two-gate graph: run pauses at gate 1, resumes on approve, pauses at
-   gate 2, resumes on approve, then completes.
+1. Two-gate graph: POST /runs returns "running" immediately; GET after POST
+   shows waiting_approval at gate 1; approve → waiting_approval at gate 2;
+   approve → completed.
 2. Rejecting at gate 1 writes approved=False and reason; gate 2 is
    reached but its when-guarded step after it is skipped.
 3. State from steps before each gate is preserved and accessible at
@@ -86,9 +87,11 @@ async def test_two_sequential_approvals_complete() -> None:
             json={"workflow_id": _GRAPH_ID, "user_request": "add dark mode"},
         )
         assert start.status_code == 200, start.text
-        body = start.json()
-        run_id = body["id"]
+        run_id = start.json()["id"]
 
+        # POST returns immediately with "running"; GET reflects post-background-task state
+        get_start = await client.get(f"/api/v1/workflows/runs/{run_id}")
+        body = get_start.json()
         assert body["status"] == "waiting_approval"
         assert body["intermediate_outputs"]["design"] == "design draft"
         # plan not yet run — gate 1 paused before it

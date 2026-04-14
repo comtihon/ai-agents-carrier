@@ -3,10 +3,11 @@ Integration test: full HTTP approval / rejection flow against real MongoDB.
 
 Scenarios
 ─────────
-1. Submit run → graph pauses at human_approval → status=waiting_approval
-   MongoDB row is persisted and readable via GET.
+1. Submit run → POST returns status=running immediately; background task runs
+   the graph, pauses at human_approval, and persists status=waiting_approval
+   so a subsequent GET reflects the correct state.
 2. Approve → implement step (when: approved) runs → status=completed.
-3. Reject  → implement step is skipped        → status=cancelled, implementation absent.
+3. Reject  → implement step is skipped → status=cancelled, implementation absent.
 """
 from __future__ import annotations
 
@@ -55,8 +56,9 @@ _GRAPH_ID = "approval-test"
 @pytest.mark.asyncio
 async def test_submit_pauses_at_approval() -> None:
     """
-    Submit a request → the graph interrupts at human_approval →
-    status=waiting_approval, MongoDB row persisted.
+    Submit a request → POST returns status=running immediately (non-blocking).
+    Background task runs the graph, pauses at human_approval, and persists the
+    result, so GET reflects status=waiting_approval with the plan in state.
     """
     llm = make_mock_llm(text_responses=["step-by-step plan stub"])
     client, mongo = await build_int_client(_GRAPH, llm)
@@ -69,12 +71,10 @@ async def test_submit_pauses_at_approval() -> None:
         body = resp.json()
         run_id = body["id"]
 
-        assert body["status"] == "waiting_approval"
-        assert body["intermediate_outputs"]["plan"] == "step-by-step plan stub"
+        # POST returns immediately with "running"
+        assert body["status"] == "running"
 
-        # ------------------------------------------------------------------
-        # MongoDB persisted the run
-        # ------------------------------------------------------------------
+        # Background task completes within the ASGI call; GET reflects final state
         get_resp = await client.get(f"/api/v1/workflows/runs/{run_id}")
         assert get_resp.status_code == 200
         persisted = get_resp.json()

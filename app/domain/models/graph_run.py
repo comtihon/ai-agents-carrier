@@ -12,6 +12,7 @@ class GraphRun(BaseModel):
     user_request: str = ""
     status: Literal["running", "waiting_approval", "completed", "failed", "cancelled"]
     state: dict[str, Any] = {}       # latest graph state snapshot
+    current_step: str | None = None  # id of the node currently active / paused
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
