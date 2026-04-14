@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 import string
 from typing import TYPE_CHECKING, Any, TypedDict
 
 from langchain_core.language_models import BaseChatModel
+
+logger = logging.getLogger(__name__)
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -133,35 +136,54 @@ class YamlGraphRunner:
         raise ValueError(f"Unknown step type '{t}' in graph '{self.id}'")
 
     def _llm_structured_node(self, step: dict[str, Any]):
+        graph_id = self.id
+
         async def node(state: dict) -> dict:
+            step_id = step["id"]
             if not self._when(step, state):
+                logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
                 return {}
+            logger.info("[%s] step '%s' running (llm_structured)", graph_id, step_id)
             output_model = self._build_output_model(step["output"])
             structured = self._llm.with_structured_output(output_model)
             result = await structured.ainvoke([
                 SystemMessage(content=step.get("system_prompt", "")),
                 HumanMessage(content=self._render(step.get("user_template", "{request}"), state)),
             ])
-            return result.model_dump()
+            output = result.model_dump()
+            logger.info("[%s] step '%s' finished: %s", graph_id, step_id, list(output.keys()))
+            return output
         return node
 
     def _llm_node(self, step: dict[str, Any]):
+        graph_id = self.id
+
         async def node(state: dict) -> dict:
+            step_id = step["id"]
             if not self._when(step, state):
+                logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
                 return {}
+            logger.info("[%s] step '%s' running (llm)", graph_id, step_id)
             response = await self._llm.ainvoke([
                 SystemMessage(content=step.get("system_prompt", "")),
                 HumanMessage(content=self._render(step.get("user_template", "{request}"), state)),
             ])
+            logger.info("[%s] step '%s' finished", graph_id, step_id)
             return {step["output_key"]: response.content}
         return node
 
     def _mcp_node(self, step: dict[str, Any]):
+        graph_id = self.id
+
         async def node(state: dict) -> dict:
+            step_id = step["id"]
             if not self._when(step, state):
+                logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
                 return {}
+            logger.info("[%s] step '%s' running (mcp tool='%s')", graph_id, step_id, step["tool"])
             tool = self._mcp.get_tool(step["tool"])
             if not tool:
+                logger.warning("[%s] step '%s' MCP tool '%s' not available", graph_id, step_id, step["tool"])
                 return {step["output_key"]: f"MCP tool '{step['tool']}' not available"}
             tool_input = {
                 k: self._render(v, state)
@@ -169,36 +191,52 @@ class YamlGraphRunner:
             }
             try:
                 result = await tool.ainvoke(tool_input)
+                logger.info("[%s] step '%s' finished", graph_id, step_id)
                 return {step["output_key"]: str(result)}
             except Exception as exc:
+                logger.exception("[%s] step '%s' MCP call failed", graph_id, step_id)
                 return {step["output_key"]: f"Error calling '{step['tool']}': {exc}"}
         return node
 
     def _approval_node(self, step: dict[str, Any]):
+        graph_id = self.id
+
         def node(state: dict) -> dict:
+            step_id = step["id"]
+            logger.info("[%s] step '%s' waiting for approval", graph_id, step_id)
             payload = {
                 k: self._render(v, state)
                 for k, v in step.get("interrupt_payload", {"plan": "{plan}"}).items()
             }
             decision: dict = interrupt(payload)
+            approved = decision.get("approved", False)
+            logger.info("[%s] step '%s' decision: approved=%s", graph_id, step_id, approved)
             return {
-                "approved": decision.get("approved", False),
+                "approved": approved,
                 "reject_reason": decision.get("reason"),
             }
         return node
 
     def _execute_node(self, step: dict[str, Any]):
+        graph_id = self.id
+
         async def node(state: dict) -> dict:
+            step_id = step["id"]
             if not self._when(step, state):
+                logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
                 return {}
             if self._openhands is None:
+                logger.warning("[%s] step '%s' OpenHands not configured", graph_id, step_id)
                 return {step["output_key"]: "OpenHands not configured"}
             repo = self._render(step.get("repo_template", "{repo}"), state)
             instructions = self._render(step.get("instructions_template", "{plan}"), state)
+            logger.info("[%s] step '%s' running (execute repo='%s')", graph_id, step_id, repo)
             try:
                 result = await self._openhands.execute(repo=repo, instructions=instructions)
+                logger.info("[%s] step '%s' finished", graph_id, step_id)
                 return {step["output_key"]: result}
             except Exception as exc:
+                logger.exception("[%s] step '%s' execute failed", graph_id, step_id)
                 return {step["output_key"]: {"error": str(exc)}}
         return node
 

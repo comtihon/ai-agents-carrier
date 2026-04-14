@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import asyncio
+import logging
 from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
@@ -11,6 +11,8 @@ from app.api.dependencies import get_container
 from app.core.container import ApplicationContainer
 from app.domain.models.graph_run import GraphRun
 from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/workflows", tags=["workflows"])
 
@@ -58,13 +60,19 @@ def _get_runner(container: ApplicationContainer, graph_id: str) -> YamlGraphRunn
     return runner
 
 
+def _init_step_statuses(runner: YamlGraphRunner) -> dict[str, str]:
+    return {s["id"]: "pending" for s in runner.steps}
+
+
 def _run_response(run: GraphRun, runner: YamlGraphRunner | None = None) -> dict:
     workflow_name = runner.name if runner else run.graph_id
+    step_statuses = run.step_statuses
     steps = [
         {
             "id": s["id"],
             "type": _STEP_TYPE_MAP.get(s.get("type", "llm"), s.get("type", "llm")),
             "name": s.get("name", s["id"]),
+            "status": step_statuses.get(s["id"], "pending"),
         }
         for s in runner.steps
     ] if runner else []
@@ -91,18 +99,48 @@ def _run_response(run: GraphRun, runner: YamlGraphRunner | None = None) -> dict:
     }
 
 
-async def _execute_graph(
+def _step_status_for_output(output: dict) -> str:
+    """Determine step status from its output: empty dict means skipped."""
+    return "skipped" if output == {} else "finished"
+
+
+async def _stream_graph(
     runner: YamlGraphRunner,
     run: GraphRun,
     container: ApplicationContainer,
+    input_value,
 ) -> None:
-    """Run the graph to its first interrupt (or completion) and persist the result."""
+    """
+    Stream graph execution, updating step_statuses and current_step in the DB
+    after each node completes.  Works for both initial runs and resume-after-approval.
+    """
+    step_ids = [s["id"] for s in runner.steps]
+
     try:
-        await runner.graph.ainvoke({"request": run.user_request}, _config(run.id))
+        async for chunk in runner.graph.astream(
+            input_value, _config(run.id), stream_mode="updates",
+        ):
+            for node_name, output in chunk.items():
+                if node_name in ("__start__", "__end__"):
+                    continue
+                status = _step_status_for_output(output)
+                run.step_statuses[node_name] = status
+                run.current_step = node_name
+                logger.info(
+                    "run %s: step '%s' → %s", run.id, node_name, status,
+                )
+                run.touch()
+                await container.run_repository.update(run)
     except Exception as exc:
+        logger.exception("run %s: graph execution failed", run.id)
+        for sid in step_ids:
+            if run.step_statuses.get(sid) == "pending":
+                run.step_statuses[sid] = "failed"
+                break
         run.status = "failed"
         run.state = {"error": str(exc)}
         run.current_step = None
+        run.touch()
         await container.run_repository.update(run)
         return
 
@@ -110,7 +148,18 @@ async def _execute_graph(
     run.status = _langgraph_status(snap)
     run.current_step = snap.next[0] if snap.next else None
     run.state = snap.values
+    run.touch()
     await container.run_repository.update(run)
+
+
+async def _execute_graph(
+    runner: YamlGraphRunner,
+    run: GraphRun,
+    container: ApplicationContainer,
+) -> None:
+    """Run the graph to its first interrupt (or completion) and persist the result."""
+    run.step_statuses = _init_step_statuses(runner)
+    await _stream_graph(runner, run, container, {"request": run.user_request})
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
@@ -164,13 +213,14 @@ async def approve_run(
         raise HTTPException(status_code=404, detail="Run not found")
     runner = _get_runner(container, run.graph_id)
 
-    await runner.graph.ainvoke(Command(resume={"approved": True}), _config(run_id))
-
-    snap = runner.graph.get_state(_config(run_id))
-    run.status = _langgraph_status(snap)
-    run.current_step = snap.next[0] if snap.next else None
-    run.state = snap.values
+    run.status = "running"
+    run.touch()
     await container.run_repository.update(run)
+
+    await _stream_graph(
+        runner, run, container,
+        Command(resume={"approved": True}),
+    )
 
     return _run_response(run, runner)
 
@@ -186,15 +236,19 @@ async def reject_run(
         raise HTTPException(status_code=404, detail="Run not found")
     runner = _get_runner(container, run.graph_id)
 
-    await runner.graph.ainvoke(
+    run.status = "running"
+    run.touch()
+    await container.run_repository.update(run)
+
+    await _stream_graph(
+        runner, run, container,
         Command(resume={"approved": False, "reason": body.reason if body else None}),
-        _config(run_id),
     )
 
-    snap = runner.graph.get_state(_config(run_id))
-    run.status = "cancelled" if not snap.next else "waiting_approval"
-    run.current_step = snap.next[0] if snap.next else None
-    run.state = snap.values
-    await container.run_repository.update(run)
+    # Override: if no more gates remain after rejection, mark as cancelled
+    if run.status == "completed":
+        run.status = "cancelled"
+        run.touch()
+        await container.run_repository.update(run)
 
     return _run_response(run, runner)
