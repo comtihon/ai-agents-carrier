@@ -14,7 +14,8 @@ class GraphRun(BaseModel):
     parent_run_id: str | None = None  # set when this run was spawned by a workflow step
     state: dict[str, Any] = {}       # latest graph state snapshot
     current_step: str | None = None  # id of the node currently active / paused
-    step_statuses: dict[str, str] = {}  # step_id → pending/running/finished/skipped/failed
+    step_statuses: dict[str, str] = {}   # step_id → pending/running/finished/skipped/failed
+    step_outputs: dict[str, Any] = {}   # step_id → raw node output dict (captured during streaming)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 

@@ -68,12 +68,14 @@ def _init_step_statuses(runner: YamlGraphRunner) -> dict[str, str]:
 def _run_response(run: GraphRun, runner: YamlGraphRunner | None = None) -> dict:
     workflow_name = runner.name if runner else run.graph_id
     step_statuses = run.step_statuses
+    step_outputs = run.step_outputs
     steps = [
         {
             "id": s["id"],
             "type": _STEP_TYPE_MAP.get(s.get("type", "llm"), s.get("type", "llm")),
             "name": s.get("name", s["id"]),
             "status": step_statuses.get(s["id"], "pending"),
+            "output": step_outputs.get(s["id"]),
         }
         for s in runner.steps
     ] if runner else []
@@ -127,6 +129,8 @@ async def _stream_graph(
                 status = _step_status_for_output(output)
                 run.step_statuses[node_name] = status
                 run.current_step = node_name
+                if output:
+                    run.step_outputs[node_name] = output
                 logger.info(
                     "run %s: step '%s' → %s", run.id, node_name, status,
                 )

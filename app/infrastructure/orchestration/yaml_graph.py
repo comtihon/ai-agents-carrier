@@ -71,6 +71,8 @@ async def stream_graph_to_pause(
                 status = "skipped" if output == {} else "finished"
                 run.step_statuses[node_name] = status
                 run.current_step = node_name
+                if output:
+                    run.step_outputs[node_name] = output
                 logger.info("run %s: step '%s' → %s", run.id, node_name, status)
                 run.touch()
                 await run_repository.update(run)
