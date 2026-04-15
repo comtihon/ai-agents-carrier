@@ -1,5 +1,8 @@
 FROM python:3.14-slim
 
+# Install uv (provides uvx) for running stdio MCP servers like mcp-atlassian
+RUN pip install --no-cache-dir uv
+
 WORKDIR /app
 
 COPY pyproject.toml .
