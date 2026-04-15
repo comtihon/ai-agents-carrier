@@ -121,6 +121,7 @@ class YamlGraphRunner:
             system_prompt: "..."       # llm / llm_structured
             user_template: "..."       # {key} placeholders resolved from state
             output_key: <key>          # where to store the result
+            bind_mcp_tools: true       # llm_structured only – set false to hide MCP tools
             output:                    # llm_structured only
               - name: needs_jira
                 type: bool
@@ -231,7 +232,10 @@ class YamlGraphRunner:
                 func=lambda **kwargs: kwargs,  # never actually invoked
             )
 
-            mcp_tools = self._mcp.get_tools()
+            # bind_mcp_tools defaults to True for backward compat; set to false
+            # on steps that only reason about text and should not call MCP tools
+            # (prevents the LLM from invoking unneeded/restricted server tools).
+            mcp_tools = self._mcp.get_tools() if step.get("bind_mcp_tools", True) else []
             llm = self._llm.bind_tools(mcp_tools + [submit_tool])
 
             messages: list = [
@@ -276,13 +280,13 @@ class YamlGraphRunner:
                     if tool:
                         try:
                             result = await tool.ainvoke(tc["args"])
-                            content = str(result)
-                        except Exception as exc:
+                            content = self._extract_mcp_text(result)
+                        except Exception:
                             logger.exception(
                                 "[%s] step '%s' tool '%s'%s failed",
                                 graph_id, step_id, tool_name, server_tag,
                             )
-                            content = f"Error calling '{tool_name}': {exc}"
+                            raise
                     else:
                         logger.warning(
                             "[%s] step '%s' unknown tool requested: '%s'",
@@ -341,7 +345,7 @@ class YamlGraphRunner:
             try:
                 result = await tool.ainvoke(tool_input)
                 logger.info("[%s] step '%s' finished", graph_id, step_id)
-                return {step["output_key"]: str(result)}
+                return {step["output_key"]: self._extract_mcp_text(result)}
             except Exception as exc:
                 logger.exception("[%s] step '%s' MCP tool '%s'%s failed", graph_id, step_id, tool_name, server_tag)
                 return {step["output_key"]: f"Error calling '{tool_name}': {exc}"}
@@ -450,6 +454,23 @@ class YamlGraphRunner:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_mcp_text(result: Any) -> str:
+        """Extract plain text from an MCP tool result.
+
+        langchain_mcp_adapters returns content as a list of typed content blocks
+        e.g. [{'type': 'text', 'text': '...', 'id': 'lc_...'}].
+        This helper joins all text blocks into a single string instead of
+        letting str() produce an ugly Python list repr.
+        """
+        if isinstance(result, list):
+            parts = [
+                item["text"] if isinstance(item, dict) and item.get("type") == "text" else str(item)
+                for item in result
+            ]
+            return "\n".join(parts)
+        return str(result)
 
     @staticmethod
     def _when(step: dict[str, Any], state: dict) -> bool:

@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
 from app.infrastructure.integrations.openhands import OpenHandsAdapter
 from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner
 from app.infrastructure.tools.mcp_client import McpToolsProvider
+
+if TYPE_CHECKING:
+    from app.domain.models.workflow_definition import WorkflowDefinition
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +54,59 @@ class YamlGraphRegistry:
                 ],
             })
         return result
+
+
+def build_registry_from_definitions(
+    definitions: list[WorkflowDefinition],
+    llm: Any,
+    mcp_tools_provider: McpToolsProvider,
+    openhands: OpenHandsAdapter | None = None,
+    run_repository: Any = None,
+) -> YamlGraphRegistry:
+    """Build a YamlGraphRegistry from an already-loaded list of WorkflowDefinitions.
+
+    Used by the application container's startup() to populate the runner registry
+    from whatever backend is configured (local files or MongoDB).
+    """
+    runners: dict[str, YamlGraphRunner] = {}
+    for defn in definitions:
+        try:
+            runner = YamlGraphRunner(
+                defn.to_raw_dict(),
+                llm=llm,
+                mcp_tools_provider=mcp_tools_provider,
+                openhands=openhands,
+            )
+            runners[runner.id] = runner
+            logger.info("Loaded workflow '%s' from backend", runner.id)
+        except Exception:
+            logger.exception("Failed to build runner for workflow '%s'", defn.id)
+
+    registry = YamlGraphRegistry(runners)
+    for runner in runners.values():
+        runner._registry = registry
+        runner._run_repository = run_repository
+    return registry
+
+
+def build_runner_from_definition(
+    definition: WorkflowDefinition,
+    llm: Any,
+    mcp_tools_provider: McpToolsProvider,
+    registry: YamlGraphRegistry,
+    run_repository: Any = None,
+    openhands: OpenHandsAdapter | None = None,
+) -> YamlGraphRunner:
+    """Build a single YamlGraphRunner from a WorkflowDefinition and inject dependencies."""
+    runner = YamlGraphRunner(
+        definition.to_raw_dict(),
+        llm=llm,
+        mcp_tools_provider=mcp_tools_provider,
+        openhands=openhands,
+    )
+    runner._registry = registry
+    runner._run_repository = run_repository
+    return runner
 
 
 def load_yaml_graphs(

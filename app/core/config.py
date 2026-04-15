@@ -49,6 +49,13 @@ class Settings(BaseSettings):
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
     google_api_key: str | None = Field(default=None, alias="GOOGLE_API_KEY")
 
+    # --- Workflow backend ---
+    # "localfiles" — read/write YAML files from graph_definitions_path (default).
+    # "mongodb"    — read/write the workflow_definitions MongoDB collection.
+    workflow_backend_type: Literal["localfiles", "mongodb"] = Field(
+        default="localfiles", alias="WORKFLOW_BACKEND"
+    )
+
     # --- MongoDB ---
     mongodb_uri: str = Field(default="mongodb://localhost:27017", alias="MONGODB_URI")
     mongodb_database: str = Field(default="langgraph_backend", alias="MONGODB_DATABASE")

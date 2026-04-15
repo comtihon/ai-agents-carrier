@@ -12,6 +12,10 @@ class GraphRun(BaseModel):
     user_request: str = ""
     status: Literal["running", "waiting_approval", "completed", "failed", "cancelled"]
     parent_run_id: str | None = None  # set when this run was spawned by a workflow step
+    # Snapshot of the workflow definition at the time the run was started.
+    # Stored so that approval-resume uses the exact same definition even after
+    # the workflow is updated or the registry is refreshed.
+    workflow_definition: dict[str, Any] | None = None
     state: dict[str, Any] = {}       # latest graph state snapshot
     current_step: str | None = None  # id of the node currently active / paused
     step_statuses: dict[str, str] = {}   # step_id → pending/running/finished/skipped/failed
