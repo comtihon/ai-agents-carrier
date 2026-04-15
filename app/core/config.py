@@ -12,9 +12,14 @@ class McpIntegrationConfig(BaseModel):
 
     name: str
     enabled: bool
-    transport: Literal["streamable_http", "sse"]
-    url: str
-    api_key: str | None
+    transport: Literal["streamable_http", "sse", "stdio"]
+    # HTTP transports
+    url: str | None = None
+    api_key: str | None = None
+    # stdio transport
+    command: str | None = None
+    args: list[str] = []
+    env: dict[str, str] = {}
 
 
 class Settings(BaseSettings):
@@ -62,9 +67,14 @@ class Settings(BaseSettings):
 
     # --- Jira MCP ---
     mcp_jira_enabled: bool = Field(default=False, alias="MCP_JIRA_ENABLED")
-    mcp_jira_transport: Literal["streamable_http", "sse"] = Field(default="streamable_http", alias="MCP_JIRA_TRANSPORT")
+    mcp_jira_transport: Literal["streamable_http", "sse", "stdio"] = Field(default="streamable_http", alias="MCP_JIRA_TRANSPORT")
+    # HTTP transport fields
     mcp_jira_url: str = Field(default="", alias="MCP_JIRA_URL")
     mcp_jira_api_key: str | None = Field(default=None, alias="MCP_JIRA_API_KEY")
+    # stdio transport fields (sooperset/mcp-atlassian via uvx)
+    mcp_jira_jira_url: str | None = Field(default=None, alias="MCP_JIRA_JIRA_URL")
+    mcp_jira_username: str | None = Field(default=None, alias="MCP_JIRA_USERNAME")
+    mcp_jira_api_token: str | None = Field(default=None, alias="MCP_JIRA_API_TOKEN")
 
     # --- Miro MCP ---
     mcp_miro_enabled: bool = Field(default=False, alias="MCP_MIRO_ENABLED")
@@ -91,15 +101,28 @@ class Settings(BaseSettings):
         populate_by_name=True,
     )
 
+    def _jira_integration(self) -> dict[str, Any]:
+        if self.mcp_jira_transport == "stdio":
+            env = {k: v for k, v in {
+                "JIRA_URL": self.mcp_jira_jira_url,
+                "JIRA_USERNAME": self.mcp_jira_username,
+                "JIRA_API_TOKEN": self.mcp_jira_api_token,
+            }.items() if v}
+            return dict(name="jira", enabled=self.mcp_jira_enabled, transport="stdio",
+                        command="uvx", args=["mcp-atlassian"], env=env)
+        return dict(name="jira", enabled=self.mcp_jira_enabled, transport=self.mcp_jira_transport,
+                    url=self.mcp_jira_url, api_key=self.mcp_jira_api_key)
+
     def get_mcp_integrations(self) -> list[McpIntegrationConfig]:
         candidates: list[dict[str, Any]] = [
             dict(name="figma",  enabled=self.mcp_figma_enabled,  transport=self.mcp_figma_transport,  url=self.mcp_figma_url,  api_key=self.mcp_figma_api_key),
-            dict(name="jira",   enabled=self.mcp_jira_enabled,   transport=self.mcp_jira_transport,   url=self.mcp_jira_url,   api_key=self.mcp_jira_api_key),
+            self._jira_integration(),
             dict(name="miro",   enabled=self.mcp_miro_enabled,   transport=self.mcp_miro_transport,   url=self.mcp_miro_url,   api_key=self.mcp_miro_api_key),
             dict(name="notion", enabled=self.mcp_notion_enabled, transport=self.mcp_notion_transport, url=self.mcp_notion_url, api_key=self.mcp_notion_api_key),
             dict(name="github", enabled=self.mcp_github_enabled, transport=self.mcp_github_transport, url=self.mcp_github_url, api_key=self.mcp_github_api_key),
         ]
-        return [McpIntegrationConfig(**c) for c in candidates if c["enabled"] and c["url"]]
+        return [McpIntegrationConfig(**c) for c in candidates
+                if c["enabled"] and (c.get("url") or c.get("transport") == "stdio")]
 
 
 @lru_cache(maxsize=1)

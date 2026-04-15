@@ -63,11 +63,20 @@ class McpToolsProvider:
     def _build_server_configs(self) -> dict[str, dict[str, Any]]:
         configs: dict[str, dict[str, Any]] = {}
         for integration in self._settings.get_mcp_integrations():
-            cfg: dict[str, Any] = {
-                "transport": integration.transport,
-                "url": integration.url,
-            }
-            if integration.api_key:
-                cfg["headers"] = {"Authorization": f"Bearer {integration.api_key}"}
+            if integration.transport == "stdio":
+                cfg: dict[str, Any] = {
+                    "transport": "stdio",
+                    "command": integration.command,
+                    "args": integration.args,
+                }
+                if integration.env:
+                    cfg["env"] = integration.env
+            else:
+                cfg = {
+                    "transport": integration.transport,
+                    "url": integration.url,
+                }
+                if integration.api_key:
+                    cfg["headers"] = {"Authorization": f"Bearer {integration.api_key}"}
             configs[integration.name] = cfg
         return configs
