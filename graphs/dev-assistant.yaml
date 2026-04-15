@@ -1,52 +1,50 @@
 id: dev-assistant
 name: Dev Assistant
 description: >
-  Dev assistant: resolves whether Jira/GitHub context is needed, fetches it,
+  Dev assistant: autonomously gathers all Jira and GitHub context from the request,
   produces a plan, waits for human approval, then implements.
 
 steps:
-  - id: resolve_context
+  - id: gather_context
     type: llm_structured
+    bind_mcp_tools: true
     system_prompt: |
-      You are a planning assistant. Given a user request decide whether
-      Jira (issue/ticket context) or GitHub (code, PRs, repos) context
-      is needed to handle it well. Answer with boolean flags only.
+      You are a context-gathering assistant. Your goal is to collect everything
+      needed to implement the user's request. Work through these steps in order:
+
+      1. Extract every Jira ticket ID from the request (e.g. ABC-123) and fetch
+         each one using the Jira MCP.
+      2. For each fetched ticket, inspect its description and linked issues — fetch
+         any additional linked or mentioned Jira tickets as well.
+      3. For each ticket, check if a Jira Compass component is referenced. If so,
+         retrieve the component and find its linked GitHub repository.
+      4. For each GitHub repository discovered (from Compass components or direct
+         mentions in tickets), fetch its relevant code via the GitHub MCP.
+      5. Once you have exhausted all leads, call submit_output with a complete,
+         structured summary of everything you found: tickets, linked tickets,
+         repos, and relevant code.
+
+      Be thorough — follow every link and reference before submitting.
     user_template: "{request}"
     output:
-      - name: needs_jira
-        type: bool
-        description: "True if Jira issue or ticket context is needed"
-      - name: needs_github
-        type: bool
-        description: "True if GitHub repository or code context is needed"
-
-  - id: fetch_jira
-    type: mcp
-    when: needs_jira
-    tool: search_issues
-    tool_input:
-      query: "{request}"
-    output_key: jira_context
-
-  - id: fetch_github
-    type: mcp
-    when: needs_github
-    tool: search_repositories
-    tool_input:
-      query: "{request}"
-    output_key: github_context
+      - name: context
+        type: str
+        description: >
+          Full compiled context: all fetched Jira tickets and their linked tickets,
+          Compass components and their GitHub repositories, and relevant code
+          fetched from those repositories.
 
   - id: plan
     type: llm
     system_prompt: |
       You are a technical planning assistant. Produce a clear, numbered
-      step-by-step implementation plan based on the request and any context provided.
+      step-by-step implementation plan based on the request and the context provided.
+      If multiple repositories are involved, organise the plan by repository.
     user_template: |
       Request: {request}
 
-      Jira context: {jira_context}
-
-      GitHub context: {github_context}
+      Context:
+      {context}
     output_key: plan
 
   - id: approve
@@ -66,7 +64,6 @@ steps:
       Approved plan:
       {plan}
 
-      Jira context: {jira_context}
-
-      GitHub context: {github_context}
+      Context:
+      {context}
     output_key: implementation
