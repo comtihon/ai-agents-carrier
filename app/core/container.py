@@ -132,7 +132,9 @@ def build_llm(settings: Settings) -> BaseChatModel:
 def _build_workflow_backend(settings: Settings) -> WorkflowDefinitionBackend:
     if settings.workflow_backend_type == "mongodb":
         return MongoWorkflowBackend(settings.mongodb_uri, settings.mongodb_database)
-    return LocalFilesWorkflowBackend(settings.graph_definitions_path)
+    # Local-files backend: treat every loaded definition as read-only because
+    # in production the directory is a k8s ConfigMap volume (readOnly: true).
+    return LocalFilesWorkflowBackend(settings.graph_definitions_path, readonly=True)
 
 
 def build_container(settings: Settings) -> ApplicationContainer:

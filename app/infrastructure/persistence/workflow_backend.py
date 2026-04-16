@@ -42,10 +42,18 @@ class WorkflowDefinitionBackend(ABC):
 # ---------------------------------------------------------------------------
 
 class LocalFilesWorkflowBackend(WorkflowDefinitionBackend):
-    """Reads and writes workflow definitions as YAML files in a directory."""
+    """Reads and writes workflow definitions as YAML files in a directory.
 
-    def __init__(self, directory: str) -> None:
+    When *readonly* is True every loaded definition carries readonly=True,
+    and write operations are still allowed at the filesystem level but the
+    API layer will reject them with 403.  Use readonly=True when the
+    directory is a k8s ConfigMap mount that should not be mutated via the
+    API.
+    """
+
+    def __init__(self, directory: str, readonly: bool = False) -> None:
         self._path = Path(directory)
+        self._readonly = readonly
 
     def _file_path(self, workflow_id: str) -> Path:
         return self._path / f"{workflow_id}.yaml"
@@ -59,7 +67,7 @@ class LocalFilesWorkflowBackend(WorkflowDefinitionBackend):
                 name=raw.get("name", ""),
                 description=raw.get("description", ""),
                 steps=raw.get("steps", []),
-                readonly=True,
+                readonly=self._readonly,
                 created_at=datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc),
                 updated_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
             )
