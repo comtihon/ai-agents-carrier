@@ -43,6 +43,11 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
         if step.get("type") == "llm_structured":
             for out_field in step.get("output", []):
                 fields[out_field["name"]] = Any  # type: ignore[assignment]
+        # http trigger carries the raw webhook body; cron trigger carries schedule metadata
+        if step.get("type") == "http":
+            fields["trigger_payload"] = Any  # type: ignore[assignment]
+        if step.get("type") == "cron":
+            fields["trigger_info"] = Any  # type: ignore[assignment]
     return TypedDict("YamlGraphState", fields, total=False)  # type: ignore[misc]
 
 
@@ -116,7 +121,7 @@ class YamlGraphRunner:
         description: "..."
         steps:
           - id: <node-id>
-            type: llm_structured | llm | mcp | human_approval | execute | workflow
+            type: llm_structured | llm | mcp | human_approval | execute | workflow | cron | http
             when: <state-key>          # skip node if state[key] is falsy
             system_prompt: "..."       # llm / llm_structured
             user_template: "..."       # {key} placeholders resolved from state
@@ -133,12 +138,24 @@ class YamlGraphRunner:
             instructions_template: "{plan}"  # execute only
             workflow_id: <id>          # workflow only — child workflow to spawn
             input_template: "{request}"  # workflow only — request passed to child
+            schedule: "0 9 * * 1-5"   # cron only — 5-field cron expression (UTC)
+            request_template: "..."    # cron only — initial request; supports {now}, {date}
 
     Steps are chained sequentially.  ``human_approval`` calls interrupt() and
     expects the caller to resume with {"approved": bool, "reason": str|None}.
 
     ``workflow`` steps fire-and-forget spawn a child workflow run and store
     {"child_run_id": ..., "workflow_id": ..., "status": "started"} in output_key.
+
+    ``cron`` steps are entry-point triggers: the CronScheduler in the container
+    creates a new run on the configured schedule and passes trigger metadata via
+    the ``trigger_info`` state key.  When the node executes it simply returns
+    that metadata under ``output_key``.
+
+    ``http`` steps are entry-point triggers: the ``POST /api/v1/webhooks/{id}``
+    endpoint validates an HMAC-SHA256 signature, then starts a run with the
+    webhook body stored in the ``trigger_payload`` state key.  When the node
+    executes it returns that payload under ``output_key``.
     Registry and run_repository must be injected after construction (done by
     load_yaml_graphs).
     """
@@ -207,6 +224,10 @@ class YamlGraphRunner:
             return self._execute_node(step)
         if t == "workflow":
             return self._workflow_node(step)
+        if t == "cron":
+            return self._cron_trigger_node(step)
+        if t == "http":
+            return self._http_trigger_node(step)
         raise ValueError(f"Unknown step type '{t}' in graph '{self.id}'")
 
     _SUBMIT_TOOL = "submit_output"
@@ -449,6 +470,41 @@ class YamlGraphRunner:
                 graph_id, step_id, child_workflow_id, child_run_id,
             )
             return {output_key: {"child_run_id": child_run_id, "workflow_id": child_workflow_id, "status": "started"}}
+
+        return node
+
+    def _cron_trigger_node(self, step: dict[str, Any]):
+        """Pass-through node for cron-triggered runs.
+
+        The CronScheduler seeds the state with ``trigger_info`` before the graph
+        starts.  This node reads that value and stores it under ``output_key`` so
+        downstream steps can reference when/how the run was triggered.
+        """
+        graph_id = self.id
+        output_key = step.get("output_key", "trigger_info")
+
+        async def node(state: dict) -> dict:
+            step_id = step["id"]
+            logger.info("[%s] step '%s' running (cron trigger)", graph_id, step_id)
+            return {output_key: state.get("trigger_info", {})}
+
+        return node
+
+    def _http_trigger_node(self, step: dict[str, Any]):
+        """Pass-through node for HTTP-triggered runs.
+
+        The webhook endpoint seeds the state with ``trigger_payload`` (the raw
+        request body) before the graph starts.  This node reads that value and
+        stores it under ``output_key`` so downstream steps can reference the
+        incoming data.
+        """
+        graph_id = self.id
+        output_key = step.get("output_key", "trigger_payload")
+
+        async def node(state: dict) -> dict:
+            step_id = step["id"]
+            logger.info("[%s] step '%s' running (http trigger)", graph_id, step_id)
+            return {output_key: state.get("trigger_payload", {})}
 
         return node
 

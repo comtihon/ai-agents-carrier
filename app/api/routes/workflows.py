@@ -26,6 +26,8 @@ _STEP_TYPE_MAP: dict[str, str] = {
     "human_approval": "approval",
     "execute": "execute",
     "workflow": "workflow",
+    "cron": "cron",
+    "http": "http",
 }
 
 

@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import datetime
 import logging
 from dataclasses import dataclass, field
+from uuid import uuid4
 
 from langchain_core.language_models import BaseChatModel
 
 from app.core.config import Settings
+from app.domain.models.graph_run import GraphRun
 from app.infrastructure.config.graph_loader import (
     YamlGraphRegistry,
     build_registry_from_definitions,
+    build_runner_from_definition,
 )
 from app.infrastructure.integrations.openhands import OpenHandsAdapter
-from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner
+from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner, stream_graph_to_pause
 from app.infrastructure.persistence.mongo import MongoClientProvider, MongoGraphRunRepository
 from app.infrastructure.persistence.workflow_backend import (
     LocalFilesWorkflowBackend,
@@ -19,6 +23,7 @@ from app.infrastructure.persistence.workflow_backend import (
     WorkflowDefinitionBackend,
 )
 from app.infrastructure.tools.mcp_client import McpToolsProvider
+from app.infrastructure.triggers.cron_scheduler import CronScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -38,9 +43,11 @@ class ApplicationContainer:
     # Runners keyed by run_id — alive for the duration of the run so that
     # approval-resume uses the exact definition snapshot from run start.
     live_runners: dict[str, YamlGraphRunner] = field(default_factory=dict)
+    cron_scheduler: CronScheduler = field(default_factory=CronScheduler)
 
     async def startup(self) -> None:
         await self.mcp_tools_provider.start()
+        self.cron_scheduler.start()
         if self.workflow_backend is not None:
             await self._load_registry()
 
@@ -60,6 +67,89 @@ class ApplicationContainer:
             run_repository=self.run_repository,
         )
         logger.info("Loaded %d workflow definition(s) from backend", len(definitions))
+        self._setup_all_cron_triggers()
+
+    def _setup_all_cron_triggers(self) -> None:
+        for wf_id in self.yaml_graph_registry.list_ids():
+            runner = self.yaml_graph_registry.get(wf_id)
+            if runner:
+                self._register_cron_steps(runner)
+
+    def _register_cron_steps(self, runner: YamlGraphRunner) -> None:
+        for step in runner.steps:
+            if step.get("type") == "cron":
+                schedule = step.get("schedule", "")
+                if not schedule:
+                    logger.warning(
+                        "Cron step '%s' in workflow '%s' has no schedule — skipping",
+                        step["id"], runner.id,
+                    )
+                    continue
+                request_template = step.get("request_template", f"Scheduled run of {runner.id}")
+                self.cron_scheduler.register(
+                    runner.id,
+                    step["id"],
+                    schedule,
+                    self._make_cron_job(runner.id, request_template),
+                )
+
+    def _make_cron_job(self, workflow_id: str, request_template: str):
+        async def job() -> None:
+            now = datetime.datetime.now(datetime.timezone.utc)
+            request = (
+                request_template
+                .replace("{now}", now.isoformat())
+                .replace("{date}", now.strftime("%Y-%m-%d"))
+            )
+            try:
+                if self.workflow_backend is not None:
+                    defn = await self.workflow_backend.get(workflow_id)
+                    if defn is None:
+                        logger.warning("Cron job: workflow '%s' not found", workflow_id)
+                        return
+                    runner = build_runner_from_definition(
+                        defn,
+                        llm=self.llm,
+                        mcp_tools_provider=self.mcp_tools_provider,
+                        registry=self.yaml_graph_registry,
+                        run_repository=self.run_repository,
+                        openhands=self.openhands,
+                    )
+                    definition_snapshot: dict | None = defn.to_raw_dict()
+                else:
+                    runner = self.yaml_graph_registry.get(workflow_id)
+                    if runner is None:
+                        logger.warning("Cron job: workflow '%s' not found in registry", workflow_id)
+                        return
+                    definition_snapshot = None
+
+                thread_id = str(uuid4())
+                self.live_runners[thread_id] = runner
+
+                run = GraphRun(
+                    id=thread_id,
+                    graph_id=workflow_id,
+                    user_request=request,
+                    status="running",
+                    workflow_definition=definition_snapshot,
+                )
+                await self.run_repository.create(run)
+                run.step_statuses = {s["id"]: "pending" for s in runner.steps}
+
+                trigger_info = {
+                    "triggered_at": now.isoformat(),
+                    "type": "cron",
+                }
+                initial_state = {"request": request, "trigger_info": trigger_info}
+                await stream_graph_to_pause(runner, run, self.run_repository, initial_state)
+
+                if run.status in ("completed", "failed", "cancelled"):
+                    self.live_runners.pop(thread_id, None)
+
+            except Exception:
+                logger.exception("Cron job execution failed for workflow '%s'", workflow_id)
+
+        return job
 
     async def refresh_runner(self, workflow_id: str) -> None:
         """Rebuild the registry runner for *workflow_id* after a definition change.
@@ -69,9 +159,10 @@ class ApplicationContainer:
         """
         if self.workflow_backend is None:
             return
+        # Always clear stale cron jobs for this workflow first
+        self.cron_scheduler.unregister_workflow(workflow_id)
         defn = await self.workflow_backend.get(workflow_id)
         if defn is not None:
-            from app.infrastructure.config.graph_loader import build_runner_from_definition
             runner = build_runner_from_definition(
                 defn,
                 llm=self.llm,
@@ -81,12 +172,14 @@ class ApplicationContainer:
                 openhands=self.openhands,
             )
             self.yaml_graph_registry._runners[workflow_id] = runner
+            self._register_cron_steps(runner)
             logger.info("Registry runner refreshed for workflow '%s'", workflow_id)
         else:
             self.yaml_graph_registry._runners.pop(workflow_id, None)
             logger.info("Registry runner removed for workflow '%s'", workflow_id)
 
     async def shutdown(self) -> None:
+        self.cron_scheduler.stop()
         await self.mcp_tools_provider.stop()
         await self.mongo_provider.close()
         if isinstance(self.workflow_backend, MongoWorkflowBackend):

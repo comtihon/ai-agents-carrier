@@ -35,6 +35,9 @@ class Settings(BaseSettings):
         alias="ALLOWED_ORIGINS",
     )
 
+    # --- Webhook / HTTP trigger ---
+    webhook_secret: str | None = Field(default=None, alias="WEBHOOK_SECRET")
+
     # --- OAuth ---
     oauth_enabled: bool = Field(default=False, alias="OAUTH_ENABLED")
     oauth_jwks_url: str | None = Field(default=None, alias="OAUTH_JWKS_URL")
