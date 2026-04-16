@@ -281,12 +281,12 @@ class YamlGraphRunner:
                         try:
                             result = await tool.ainvoke(tc["args"])
                             content = self._extract_mcp_text(result)
-                        except Exception:
+                        except Exception as exc:
                             logger.exception(
                                 "[%s] step '%s' tool '%s'%s failed",
                                 graph_id, step_id, tool_name, server_tag,
                             )
-                            raise
+                            content = str(exc)
                     else:
                         logger.warning(
                             "[%s] step '%s' unknown tool requested: '%s'",
