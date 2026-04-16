@@ -157,6 +157,7 @@ class YamlGraphRunner:
             self.id.replace("-", " ").replace("_", " ").title(),
         )
         self.description: str = definition.get("description", "")
+        self.readonly: bool = False  # Set post-construction by build_registry_from_definitions
         self._steps: list[dict[str, Any]] = definition["steps"]
         self._llm = llm
         self._mcp = mcp_tools_provider

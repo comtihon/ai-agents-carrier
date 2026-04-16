@@ -443,6 +443,8 @@ async def update_workflow(
     existing = await container.workflow_backend.get(workflow_id)
     if existing is None:
         raise HTTPException(status_code=404, detail=f"Workflow '{workflow_id}' not found")
+    if existing.readonly:
+        raise HTTPException(status_code=403, detail=f"Workflow '{workflow_id}' is read-only")
 
     defn = WorkflowDefinition(
         id=workflow_id,
@@ -468,6 +470,8 @@ async def delete_workflow(
     existing = await container.workflow_backend.get(workflow_id)
     if existing is None:
         raise HTTPException(status_code=404, detail=f"Workflow '{workflow_id}' not found")
+    if existing.readonly:
+        raise HTTPException(status_code=403, detail=f"Workflow '{workflow_id}' is read-only")
 
     await container.workflow_backend.delete(workflow_id)
     await container.refresh_runner(workflow_id)

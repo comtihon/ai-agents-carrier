@@ -43,6 +43,7 @@ class YamlGraphRegistry:
                 "id": runner.id,
                 "name": runner.name,
                 "description": runner.description,
+                "readonly": runner.readonly,
                 "steps": [
                     {
                         "id": s["id"],
@@ -77,6 +78,7 @@ def build_registry_from_definitions(
                 mcp_tools_provider=mcp_tools_provider,
                 openhands=openhands,
             )
+            runner.readonly = defn.readonly
             runners[runner.id] = runner
             logger.info("Loaded workflow '%s' from backend", runner.id)
         except Exception:
