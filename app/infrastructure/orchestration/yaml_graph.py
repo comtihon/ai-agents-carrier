@@ -464,12 +464,12 @@ class YamlGraphRunner:
         This helper joins all text blocks into a single string instead of
         letting str() produce an ugly Python list repr.
         """
-        if isinstance(result, list):
-            parts = [
-                item["text"] if isinstance(item, dict) and item.get("type") == "text" else str(item)
-                for item in result
-            ]
-            return "\n".join(parts)
+        if (
+            isinstance(result, list)
+            and result
+            and all(isinstance(item, dict) and item.get("type") == "text" for item in result)
+        ):
+            return "\n".join(item.get("text", str(item)) for item in result)
         return str(result)
 
     @staticmethod
