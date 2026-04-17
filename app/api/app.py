@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from langgraph.types import Command
 
 from app.api.middleware.auth import OAuthMiddleware
+from app.api.routes.callbacks import router as callbacks_router
 from app.api.routes.chat import router as chat_router
 from app.api.routes.health import router as health_router
 from app.api.routes.webhooks import router as webhooks_router
@@ -231,4 +232,5 @@ def create_app() -> FastAPI:
     app.include_router(workflows_router, prefix=settings.api_prefix)
     app.include_router(chat_router, prefix=settings.api_prefix)
     app.include_router(webhooks_router, prefix=settings.api_prefix)
+    app.include_router(callbacks_router, prefix=settings.api_prefix)
     return app

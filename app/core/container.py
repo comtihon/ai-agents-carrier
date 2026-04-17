@@ -144,7 +144,7 @@ class ApplicationContainer:
                     "type": "cron",
                 }
                 initial_state = {"request": request, "trigger_info": trigger_info}
-                await stream_graph_to_pause(runner, run, self.run_repository, initial_state)
+                await stream_graph_to_pause(runner, run, self.run_repository, initial_state, base_url=self.settings.base_url)
 
                 if run.status in ("completed", "failed", "cancelled"):
                     self.live_runners.pop(thread_id, None)

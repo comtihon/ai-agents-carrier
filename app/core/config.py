@@ -35,6 +35,9 @@ class Settings(BaseSettings):
         alias="ALLOWED_ORIGINS",
     )
 
+    # --- Public base URL (used to build callback URLs in approval notifications) ---
+    base_url: str = Field(default="http://localhost:8000", alias="BASE_URL")
+
     # --- Webhook / HTTP trigger ---
     webhook_secret: str | None = Field(default=None, alias="WEBHOOK_SECRET")
 

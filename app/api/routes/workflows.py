@@ -173,6 +173,7 @@ async def _stream_graph(
     run: GraphRun,
     container: ApplicationContainer,
     input_value: Any,
+    base_url: str | None = None,
 ) -> None:
     """Stream graph execution, updating step statuses in DB after each node."""
     step_ids = [s["id"] for s in runner.steps]
@@ -225,6 +226,12 @@ async def _stream_graph(
     run.touch()
     await container.run_repository.update(run)
 
+    if run.status == "waiting_approval" and base_url and run.current_step:
+        from app.infrastructure.notifications.webhook_notifier import send_approval_notification
+        step = next((s for s in runner.steps if s["id"] == run.current_step), None)
+        if step and step.get("notify"):
+            await send_approval_notification(step["notify"], run.id, snap.values, base_url)
+
 
 async def _execute_graph(
     runner: YamlGraphRunner,
@@ -233,7 +240,7 @@ async def _execute_graph(
 ) -> None:
     """Run the graph to its first interrupt (or completion) and persist the result."""
     run.step_statuses = _init_step_statuses(runner)
-    await _stream_graph(runner, run, container, {"request": run.user_request})
+    await _stream_graph(runner, run, container, {"request": run.user_request}, base_url=container.settings.base_url)
     # Remove from live_runners when run reaches a terminal or waiting state.
     # waiting_approval is kept — resume needs the runner with its MemorySaver state.
     if run.status in ("completed", "failed", "cancelled"):

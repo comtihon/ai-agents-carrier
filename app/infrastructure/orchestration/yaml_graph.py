@@ -10,6 +10,7 @@ from uuid import uuid4
 import httpx
 
 from langchain_core.language_models import BaseChatModel
+from app.infrastructure.notifications.webhook_notifier import send_approval_notification
 
 logger = logging.getLogger(__name__)
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
@@ -63,6 +64,7 @@ async def stream_graph_to_pause(
     run: GraphRun,
     run_repository: Any,
     input_value: Any,
+    base_url: str | None = None,
 ) -> None:
     """
     Stream *runner* from *input_value* until it reaches an interrupt or END,
@@ -116,6 +118,11 @@ async def stream_graph_to_pause(
     run.touch()
     await run_repository.update(run)
 
+    if run.status == "waiting_approval" and base_url and run.current_step:
+        step = next((s for s in runner.steps if s["id"] == run.current_step), None)
+        if step and step.get("notify"):
+            await send_approval_notification(step["notify"], run.id, snap.values, base_url)
+
 
 # ---------------------------------------------------------------------------
 # YAML graph runner
@@ -161,6 +168,28 @@ class YamlGraphRunner:
               issue_key: "{ticket_id}"
             code: |                    # python only — executed with ``state`` dict in scope;
               output = state["x"] + 1  #   set ``output`` variable to store the result
+
+    ``human_approval`` steps additionally support an optional ``notify`` field
+    that fires an HTTP request when the run reaches ``waiting_approval``:
+
+        notify:
+          url: "https://hooks.example.com/approval"  # required
+          method: POST                                # optional, default POST
+          headers:                                    # optional
+            X-Custom: "value"
+          auth:                                       # optional
+            type: bearer                              # bearer | basic
+            token: "..."                              # bearer only
+            username: "..."                           # basic only
+            password: "..."                           # basic only
+          payload:                                    # optional JSON body
+            text: "Approval needed: {plan}"
+            approve_url: "{approve_url}"
+            reject_url: "{reject_url}"
+            run_id: "{run_id}"
+
+    Template variables in payload / header values / url: {run_id}, {approve_url},
+    {reject_url}, and any key from the current graph state.
 
     Steps are chained sequentially.  ``human_approval`` calls interrupt() and
     expects the caller to resume with {"approved": bool, "reason": str|None}.
