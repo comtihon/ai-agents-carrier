@@ -1,0 +1,130 @@
+id: example-ticket-execution
+name: Example Ticket Execution
+description: >
+  Full end-to-end example: an HTTP webhook fires when a Jira ticket is created
+  or updated, the workflow gathers Jira + GitHub context via MCP tools, an LLM
+  produces an implementation plan, a human approves it, and OpenHands executes
+  the code changes in the target repository.
+
+  Copy and adapt this as a starting point for your own ticket-driven workflows.
+
+steps:
+
+  # ── 1. HTTP trigger ─────────────────────────────────────────────────────────
+  # Receives the raw webhook body (e.g. a Jira issue-created event).
+  # The payload is stored in state under `webhook_data` for use by later steps.
+  # Webhook endpoint: POST /api/v1/webhooks/<graph-id>
+  # The secret used for HMAC-SHA256 signature validation is configured in the
+  # graph settings (webhook_secret field).
+  - id: trigger
+    type: http
+    output_key: webhook_data
+
+  # ── 2. Context gathering (agentic, MCP-powered) ───────────────────────────
+  # The LLM loops, calling Jira and GitHub MCP tools, until it has enough
+  # context to fill the structured output fields, then calls submit_output.
+  - id: gather_context
+    type: llm_structured
+    bind_mcp_tools: true
+    max_iterations: 25
+    system_prompt: |
+      You are a context-gathering assistant. Your goal is to collect everything
+      needed to implement the request described in the incoming webhook payload.
+      Work through these steps in order:
+
+      1. Parse the webhook payload to identify the Jira ticket ID (e.g. PROJ-123)
+         and any other relevant identifiers.
+      2. Fetch the Jira ticket using the Jira MCP tool, then fetch any linked or
+         mentioned tickets as well.
+      3. For every ticket, call jira_get_issue_development_info to get the linked
+         GitHub repository URL from the Jira development panel — this is the most
+         reliable source for the correct repo.
+      4. For each discovered GitHub repository, fetch the relevant source files
+         and code sections via the GitHub MCP tool.
+      5. Once you have located the directly relevant files and code, call
+         submit_output immediately with a concise summary.
+
+      The GitHub organisation for all repositories is `example-github-org`.
+      Always use this as the `owner` parameter in GitHub tool calls.
+
+      ## Stopping rules
+
+      - Call submit_output as soon as you have found the relevant code —
+        do NOT fetch extra files for completeness.
+      - If a code search returns 0 results, move on without retrying.
+      - If you hit a GitHub rate-limit error, stop all GitHub searches and
+        call submit_output with what you have gathered so far.
+      - Never say "I have all the context I need" and then make another tool
+        call. If you have reached that conclusion, your next action must be
+        submit_output.
+    user_template: |
+      Webhook payload:
+      {webhook_data}
+    output:
+      - name: ticket_id
+        type: str
+        description: >
+          The primary Jira ticket ID extracted from the webhook (e.g. PROJ-123).
+      - name: repo
+        type: str
+        description: >
+          GitHub repository in owner/repo format (e.g. example-github-org/my-service).
+          Use the value from jira_get_issue_development_info when available.
+      - name: context
+        type: str
+        description: >
+          Concise summary (3-6 paragraphs) covering: the ticket description and
+          acceptance criteria, any linked tickets, the relevant repository and
+          branch, and the key files / code sections that need to change.
+          Write a summary — do NOT paste raw file contents into this field.
+
+  # ── 3. Planning (single LLM call) ────────────────────────────────────────
+  # Produces a numbered, step-by-step implementation plan from the gathered
+  # context. No tools — purely reasoning.
+  - id: plan
+    type: llm
+    system_prompt: |
+      You are a technical planning assistant. Produce a clear, numbered
+      step-by-step implementation plan based on the ticket and the context
+      provided. If multiple repositories are involved, organise the plan by
+      repository. Be specific about file paths and the changes required.
+    user_template: |
+      Ticket: {ticket_id}
+
+      Context:
+      {context}
+    output_key: plan
+
+  # ── 4. Human approval (interrupt) ────────────────────────────────────────
+  # Pauses the workflow and surfaces the plan to a human reviewer.
+  # Resume the run via the API with {"approved": true} or
+  # {"approved": false, "reason": "..."}.
+  # The `approved` and `reject_reason` keys are written into state automatically.
+  - id: approve
+    type: human_approval
+    interrupt_payload:
+      ticket: "{ticket_id}"
+      repo: "{repo}"
+      plan: "{plan}"
+      context: "{context}"
+
+  # ── 5. Execution (OpenHands) ─────────────────────────────────────────────
+  # Only runs when the human approved the plan (when: approved).
+  # OpenHands clones the repository and implements the plan autonomously.
+  # The result (PR URL, diff summary, or error) is stored in `implementation`.
+  - id: implement
+    type: execute
+    when: approved
+    repo_template: "{repo}"
+    instructions_template: |
+      You are implementing the changes described in Jira ticket {ticket_id}.
+
+      ## Context
+      {context}
+
+      ## Approved implementation plan
+      {plan}
+
+      Follow the plan exactly. Commit your changes with a message referencing
+      the ticket ID, and open a pull request when done.
+    output_key: implementation
