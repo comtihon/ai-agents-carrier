@@ -40,6 +40,7 @@ jobs:
             "pyjwt[crypto]" \
             motor
           pip install langchain-mcp-adapters langchain-google-genai "starlette<0.47.0"
+          pip install "apscheduler>=3.10,<4.0" "pyyaml>=6.0.3" pymongo
           pip install --no-deps -e .
           pip install pytest pytest-asyncio asgi-lifespan
 
