@@ -302,6 +302,7 @@ def build_llm(settings: Settings) -> BaseChatModel:
         return ChatAnthropic(
             model=settings.llm_model or _ANTHROPIC_DEFAULT_MODEL,
             api_key=settings.anthropic_api_key,  # type: ignore[arg-type]
+            max_tokens=16000,
         )
 
     if provider == "openai":
@@ -309,6 +310,7 @@ def build_llm(settings: Settings) -> BaseChatModel:
         return ChatOpenAI(
             model=settings.llm_model or _OPENAI_DEFAULT_MODEL,
             api_key=settings.openai_api_key,  # type: ignore[arg-type]
+            max_tokens=16000,
         )
 
     if provider == "google":
@@ -316,6 +318,7 @@ def build_llm(settings: Settings) -> BaseChatModel:
         return ChatGoogleGenerativeAI(
             model=settings.llm_model or _GOOGLE_DEFAULT_MODEL,
             google_api_key=settings.google_api_key,  # type: ignore[arg-type]
+            max_output_tokens=16000,
         )
 
     from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
