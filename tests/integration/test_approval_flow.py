@@ -118,6 +118,79 @@ async def test_approve_runs_implement_step() -> None:
 
 
 @pytest.mark.asyncio
+async def test_callback_approve_unblocks_workflow() -> None:
+    """
+    POST /api/v1/callbacks/{run_id}/approve (no auth) should resume the run
+    exactly like the authenticated /approve endpoint.
+    """
+    llm = make_mock_llm(text_responses=["the plan", "the implementation"])
+    client, mongo = await build_int_client(_GRAPH, llm)
+    try:
+        start = await client.post(
+            "/api/v1/workflows/runs",
+            json={"workflow_id": _GRAPH_ID, "user_request": "implement feature CB"},
+        )
+        assert start.status_code == 200
+        run_id = start.json()["id"]
+
+        # Verify paused
+        get_resp = await client.get(f"/api/v1/workflows/runs/{run_id}")
+        assert get_resp.json()["status"] == "waiting_approval"
+
+        approve = await client.post(f"/api/v1/callbacks/{run_id}/approve")
+        assert approve.status_code == 200, approve.text
+        body = approve.json()
+
+        assert body["status"] == "completed"
+        assert body["run_id"] == run_id
+
+        # MongoDB reflects completed status
+        get_resp = await client.get(f"/api/v1/workflows/runs/{run_id}")
+        result = get_resp.json()
+        assert result["status"] == "completed"
+        assert result["intermediate_outputs"]["approved"] is True
+        assert result["intermediate_outputs"]["implementation"] == "the implementation"
+    finally:
+        await mongo.close()
+
+
+@pytest.mark.asyncio
+async def test_callback_reject_unblocks_workflow() -> None:
+    """
+    POST /api/v1/callbacks/{run_id}/reject should cancel the run and skip
+    conditional steps, matching the behaviour of the authenticated /reject endpoint.
+    """
+    llm = make_mock_llm(text_responses=["the plan"])
+    client, mongo = await build_int_client(_GRAPH, llm)
+    try:
+        start = await client.post(
+            "/api/v1/workflows/runs",
+            json={"workflow_id": _GRAPH_ID, "user_request": "implement feature CB-reject"},
+        )
+        assert start.status_code == 200
+        run_id = start.json()["id"]
+
+        reject = await client.post(
+            f"/api/v1/callbacks/{run_id}/reject",
+            json={"reason": "not ready"},
+        )
+        assert reject.status_code == 200, reject.text
+        body = reject.json()
+
+        assert body["status"] == "cancelled"
+        assert body["run_id"] == run_id
+
+        get_resp = await client.get(f"/api/v1/workflows/runs/{run_id}")
+        result = get_resp.json()
+        assert result["status"] == "cancelled"
+        assert result["intermediate_outputs"]["approved"] is False
+        assert result["intermediate_outputs"]["reject_reason"] == "not ready"
+        assert "implementation" not in result["intermediate_outputs"]
+    finally:
+        await mongo.close()
+
+
+@pytest.mark.asyncio
 async def test_reject_skips_implement_step() -> None:
     """
     Submit → reject → implement step is skipped (when: approved=False) →
