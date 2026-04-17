@@ -292,11 +292,27 @@ class YamlGraphRunner:
                     continue
 
                 # Check for submit_output before executing side-effect tools
-                for tc in tool_calls:
-                    if tc["name"] == self._SUBMIT_TOOL:
-                        output = tc["args"]
-                        logger.info("[%s] step '%s' finished: %s", graph_id, step_id, output)
-                        return output
+                submit_tc = next((tc for tc in tool_calls if tc["name"] == self._SUBMIT_TOOL), None)
+                if submit_tc is not None:
+                    args = submit_tc["args"]
+                    required_fields = [o["name"] for o in step.get("output", [])]
+                    missing = [f for f in required_fields if not args.get(f)]
+                    if missing:
+                        logger.warning(
+                            "[%s] step '%s' submit_output rejected — missing/empty fields: %s",
+                            graph_id, step_id, missing,
+                        )
+                        messages.append(ToolMessage(
+                            content=(
+                                f"submit_output rejected: the following required fields are "
+                                f"missing or empty: {missing}. "
+                                f"Please call submit_output again with all fields filled in."
+                            ),
+                            tool_call_id=submit_tc["id"],
+                        ))
+                        continue
+                    logger.info("[%s] step '%s' finished: %s", graph_id, step_id, args)
+                    return args
 
                 # Execute MCP tool calls and feed results back
                 for tc in tool_calls:
