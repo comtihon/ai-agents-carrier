@@ -29,7 +29,18 @@ steps:
       The GitHub organisation is always `example-org` — use this
       as the owner for all GitHub tool calls. Never guess or search for the org name.
 
-      Be thorough — follow every link and reference before submitting.
+      ## Stopping rules — read carefully
+
+      - As soon as you have located the files and code snippets directly relevant
+        to the request, call submit_output immediately. Do NOT fetch additional
+        files "for completeness" or to double-check things you already know.
+      - If a search returns 0 results, move on — do not retry with slightly
+        different terms more than once.
+      - If you receive a rate-limit error from GitHub, stop all GitHub searches
+        and call submit_output with whatever you have gathered so far.
+      - Never say "I now have all the context I need" and then make another tool
+        call. If you have said that (or thought it), your very next action must
+        be submit_output.
     user_template: "{request}"
     output:
       - name: context
