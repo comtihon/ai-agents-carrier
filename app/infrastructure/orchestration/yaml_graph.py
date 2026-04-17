@@ -231,7 +231,7 @@ class YamlGraphRunner:
         raise ValueError(f"Unknown step type '{t}' in graph '{self.id}'")
 
     _SUBMIT_TOOL = "submit_output"
-    _MAX_ITERATIONS = 10
+    _MAX_ITERATIONS = 25
 
     def _llm_structured_node(self, step: dict[str, Any]):
         graph_id = self.id
