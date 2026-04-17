@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import datetime
 import logging
 from dataclasses import dataclass, field
+from typing import Any
 from uuid import uuid4
 
 from langchain_core.language_models import BaseChatModel
@@ -50,6 +52,7 @@ class ApplicationContainer:
         self.cron_scheduler.start()
         if self.workflow_backend is not None:
             await self._load_registry()
+        await self._recover_incomplete_runs()
 
     async def _load_registry(self) -> None:
         """Populate yaml_graph_registry from the configured backend."""
@@ -177,6 +180,106 @@ class ApplicationContainer:
         else:
             self.yaml_graph_registry._runners.pop(workflow_id, None)
             logger.info("Registry runner removed for workflow '%s'", workflow_id)
+
+    async def _recover_incomplete_runs(self) -> None:
+        """On startup, find runs still marked running/waiting_approval and restore them."""
+        try:
+            incomplete = await self.run_repository.list_incomplete()
+        except Exception:
+            logger.exception("Failed to query incomplete runs for recovery")
+            return
+        if not incomplete:
+            return
+        logger.info("Recovering %d incomplete run(s) after restart", len(incomplete))
+        for run in incomplete:
+            try:
+                await self._recover_run(run)
+            except Exception:
+                logger.exception("Failed to recover run %s", run.id)
+
+    async def _recover_run(self, run: GraphRun) -> None:
+        runner = self._build_runner_for_recovery(run)
+        if runner is None:
+            logger.warning("run %s: cannot recover — workflow '%s' not available", run.id, run.graph_id)
+            run.status = "failed"
+            run.state = {"error": "Workflow definition not available after server restart"}
+            run.touch()
+            await self.run_repository.update(run)
+            return
+
+        # Reconstruct accumulated state from persisted step outputs (in step order)
+        accumulated: dict[str, Any] = {"request": run.user_request}
+        last_done: str | None = None
+        for step in runner.steps:
+            sid = step["id"]
+            if run.step_statuses.get(sid) in ("finished", "skipped"):
+                last_done = sid
+                output = run.step_outputs.get(sid)
+                if output and isinstance(output, dict):
+                    accumulated.update(output)
+
+        config = {"configurable": {"thread_id": run.id}}
+
+        if last_done is not None:
+            try:
+                runner.graph.update_state(config, accumulated, as_node=last_done)
+            except Exception:
+                logger.exception("run %s: update_state failed during recovery", run.id)
+                run.status = "failed"
+                run.state = {"error": "State recovery failed after server restart"}
+                run.touch()
+                await self.run_repository.update(run)
+                return
+
+        # Input for the next astream call: None resumes from checkpoint; dict starts fresh
+        resume_input: Any = None if last_done else accumulated
+
+        if run.status == "waiting_approval":
+            # Re-execute the approval node to re-arm the interrupt in the new MemorySaver
+            try:
+                async for _ in runner.graph.astream(resume_input, config, stream_mode="updates"):
+                    pass
+            except Exception:
+                logger.exception("run %s: approval interrupt refire failed", run.id)
+                run.status = "failed"
+                run.state = {"error": "Approval state recovery failed after server restart"}
+                run.touch()
+                await self.run_repository.update(run)
+                return
+            self.live_runners[run.id] = runner
+            logger.info("run %s: waiting_approval re-armed (approval_step=%s)", run.id, run.current_step)
+
+        else:  # "running"
+            self.live_runners[run.id] = runner
+            asyncio.create_task(self._resume_run(runner, run, resume_input))
+            logger.info("run %s: resuming execution from last completed step=%s", run.id, last_done)
+
+    async def _resume_run(self, runner: YamlGraphRunner, run: GraphRun, input_value: Any) -> None:
+        try:
+            await stream_graph_to_pause(runner, run, self.run_repository, input_value)
+        except Exception:
+            logger.exception("run %s: resumed execution failed", run.id)
+        finally:
+            if run.status in ("completed", "failed", "cancelled"):
+                self.live_runners.pop(run.id, None)
+
+    def _build_runner_for_recovery(self, run: GraphRun) -> YamlGraphRunner | None:
+        if run.workflow_definition is not None:
+            # Build from the exact definition snapshot stored at run-start time
+            try:
+                runner = YamlGraphRunner(
+                    run.workflow_definition,
+                    llm=self.llm,
+                    mcp_tools_provider=self.mcp_tools_provider,
+                    openhands=self.openhands,
+                )
+                runner._registry = self.yaml_graph_registry
+                runner._run_repository = self.run_repository
+                return runner
+            except Exception:
+                logger.exception("run %s: failed to build runner from definition snapshot", run.id)
+        # Fall back to the live registry (e.g. legacy runs without a snapshot)
+        return self.yaml_graph_registry.get(run.graph_id)
 
     async def shutdown(self) -> None:
         self.cron_scheduler.stop()

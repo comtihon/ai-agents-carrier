@@ -24,6 +24,11 @@ class MongoGraphRunRepository:
         doc = await self._collection.find_one({"_id": run_id})
         return self._from_doc(doc) if doc else None
 
+    async def list_incomplete(self) -> list[GraphRun]:
+        cursor = self._collection.find({"status": {"$in": ["running", "waiting_approval"]}})
+        docs = await cursor.to_list(length=None)
+        return [self._from_doc(doc) for doc in docs]
+
     @staticmethod
     def _to_doc(run: GraphRun) -> dict[str, Any]:
         data = run.model_dump(mode="python")
