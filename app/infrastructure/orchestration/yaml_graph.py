@@ -260,19 +260,25 @@ class YamlGraphRunner:
             mcp_tools = self._mcp.get_tools() if step.get("bind_mcp_tools", True) else []
             llm = self._llm.bind_tools(mcp_tools + [submit_tool])
 
+            system_prompt = step.get("system_prompt", "")
+            user_message = self._render(step.get("user_template", "{request}"), state)
             messages: list = [
-                SystemMessage(content=step.get("system_prompt", "")),
-                HumanMessage(content=self._render(step.get("user_template", "{request}"), state)),
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_message),
             ]
-            logger.debug("[%s] step '%s' LLM input: %s", graph_id, step_id, [m.content for m in messages])
+            logger.info(
+                "[%s] step '%s' → LLM | system: %s | user: %s",
+                graph_id, step_id, system_prompt, user_message,
+            )
 
             for iteration in range(1, self._MAX_ITERATIONS + 1):
                 response = await llm.ainvoke(messages)
                 messages.append(response)
                 tool_calls = response.tool_calls or []
-                logger.debug(
-                    "[%s] step '%s' iteration %d tool_calls: %s",
-                    graph_id, step_id, iteration, [tc["name"] for tc in tool_calls],
+                logger.info(
+                    "[%s] step '%s' ← LLM (iter %d) | content: %r | tool_calls: %s",
+                    graph_id, step_id, iteration, response.content,
+                    [{"name": tc["name"], "args": tc["args"]} for tc in tool_calls],
                 )
 
                 if not tool_calls:
@@ -289,8 +295,7 @@ class YamlGraphRunner:
                 for tc in tool_calls:
                     if tc["name"] == self._SUBMIT_TOOL:
                         output = tc["args"]
-                        logger.debug("[%s] step '%s' LLM output: %s", graph_id, step_id, output)
-                        logger.info("[%s] step '%s' finished: %s", graph_id, step_id, list(output.keys()))
+                        logger.info("[%s] step '%s' finished: %s", graph_id, step_id, output)
                         return output
 
                 # Execute MCP tool calls and feed results back
@@ -300,6 +305,10 @@ class YamlGraphRunner:
                     server_tag = f" (server: {server})" if server else ""
                     tool = self._mcp.get_tool(tool_name)
                     if tool:
+                        logger.info(
+                            "[%s] step '%s' → tool '%s'%s | args: %s",
+                            graph_id, step_id, tool_name, server_tag, tc["args"],
+                        )
                         try:
                             result = await tool.ainvoke(tc["args"])
                             content = self._extract_mcp_text(result)
@@ -315,7 +324,10 @@ class YamlGraphRunner:
                             graph_id, step_id, tool_name,
                         )
                         content = f"Tool '{tool_name}' is not available"
-                    logger.debug("[%s] step '%s' tool '%s'%s result: %s", graph_id, step_id, tool_name, server_tag, content)
+                    logger.info(
+                        "[%s] step '%s' ← tool '%s'%s | result: %s",
+                        graph_id, step_id, tool_name, server_tag, content,
+                    )
                     messages.append(ToolMessage(content=content, tool_call_id=tc["id"]))
 
             raise ValueError(
@@ -333,13 +345,18 @@ class YamlGraphRunner:
                 logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
                 return {}
             logger.info("[%s] step '%s' running (llm)", graph_id, step_id)
+            system_prompt = step.get("system_prompt", "")
+            user_message = self._render(step.get("user_template", "{request}"), state)
             messages = [
-                SystemMessage(content=step.get("system_prompt", "")),
-                HumanMessage(content=self._render(step.get("user_template", "{request}"), state)),
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_message),
             ]
-            logger.debug("[%s] step '%s' LLM input: %s", graph_id, step_id, [m.content for m in messages])
+            logger.info(
+                "[%s] step '%s' → LLM | system: %s | user: %s",
+                graph_id, step_id, system_prompt, user_message,
+            )
             response = await self._llm.ainvoke(messages)
-            logger.debug("[%s] step '%s' LLM output: %s", graph_id, step_id, response.content)
+            logger.info("[%s] step '%s' ← LLM | content: %r", graph_id, step_id, response.content)
             logger.info("[%s] step '%s' finished", graph_id, step_id)
             return {step["output_key"]: response.content}
         return node
