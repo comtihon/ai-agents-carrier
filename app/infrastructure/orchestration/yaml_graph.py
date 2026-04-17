@@ -547,22 +547,37 @@ class YamlGraphRunner:
     # Helpers
     # ------------------------------------------------------------------
 
+    _MAX_TOOL_RESULT_CHARS = 20_000
+
     @staticmethod
     def _extract_mcp_text(result: Any) -> str:
         """Extract plain text from an MCP tool result.
 
-        langchain_mcp_adapters returns content as a list of typed content blocks
-        e.g. [{'type': 'text', 'text': '...', 'id': 'lc_...'}].
-        This helper joins all text blocks into a single string instead of
-        letting str() produce an ugly Python list repr.
+        langchain_mcp_adapters returns content as a list of typed content blocks.
+        Handles mixed text/file blocks: text blocks are joined, binary file blocks
+        are replaced with a short placeholder so base64 blobs never reach the LLM.
+        The final string is capped at _MAX_TOOL_RESULT_CHARS to prevent context overflow.
         """
-        if (
-            isinstance(result, list)
-            and result
-            and all(isinstance(item, dict) and item.get("type") == "text" for item in result)
-        ):
-            return "\n".join(item.get("text", str(item)) for item in result)
-        return str(result)
+        if isinstance(result, list) and result:
+            parts: list[str] = []
+            for item in result:
+                if not isinstance(item, dict):
+                    parts.append(str(item))
+                elif item.get("type") == "text":
+                    parts.append(item.get("text", ""))
+                elif item.get("type") == "file":
+                    mime = item.get("mime_type", "unknown")
+                    parts.append(f"[binary file attachment: {mime}]")
+                else:
+                    parts.append(str(item))
+            content = "\n".join(parts)
+        else:
+            content = str(result)
+
+        if len(content) > YamlGraphRunner._MAX_TOOL_RESULT_CHARS:
+            kept = YamlGraphRunner._MAX_TOOL_RESULT_CHARS
+            content = content[:kept] + f"\n[truncated — {len(content) - kept} chars omitted]"
+        return content
 
     @staticmethod
     def _when(step: dict[str, Any], state: dict) -> bool:
