@@ -26,6 +26,9 @@ RUN pip install --no-cache-dir --upgrade pip \
         langchain-mcp-adapters \
         langchain-google-genai \
         "starlette<0.47.0" \
+        "apscheduler>=3.10,<4.0" \
+        "pyyaml>=6.0.3" \
+        pymongo \
     && mkdir -p app && touch app/__init__.py \
     && pip install --no-cache-dir --no-deps . \
     && rm -rf app
