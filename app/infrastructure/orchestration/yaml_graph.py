@@ -127,6 +127,7 @@ class YamlGraphRunner:
             user_template: "..."       # {key} placeholders resolved from state
             output_key: <key>          # where to store the result
             bind_mcp_tools: true       # llm_structured only – set false to hide MCP tools
+            max_iterations: 25         # llm_structured only – override default iteration cap
             output:                    # llm_structured only
               - name: needs_jira
                 type: bool
@@ -271,7 +272,8 @@ class YamlGraphRunner:
                 graph_id, step_id, system_prompt, user_message,
             )
 
-            for iteration in range(1, self._MAX_ITERATIONS + 1):
+            max_iterations = step.get("max_iterations", self._MAX_ITERATIONS)
+            for iteration in range(1, max_iterations + 1):
                 response = await llm.ainvoke(messages)
                 messages.append(response)
                 tool_calls = response.tool_calls or []
@@ -347,7 +349,7 @@ class YamlGraphRunner:
                     messages.append(ToolMessage(content=content, tool_call_id=tc["id"]))
 
             raise ValueError(
-                f"[{graph_id}] step '{step_id}': reached {self._MAX_ITERATIONS} iterations without structured output"
+                f"[{graph_id}] step '{step_id}': reached {max_iterations} iterations without structured output"
             )
 
         return node
