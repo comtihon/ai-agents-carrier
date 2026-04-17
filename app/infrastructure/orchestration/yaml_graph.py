@@ -68,7 +68,14 @@ async def stream_graph_to_pause(
     Callers should initialise ``run.step_statuses`` before calling this.
     """
     config = {"configurable": {"thread_id": run.id}}
-    current_state: dict = dict(input_value) if isinstance(input_value, dict) else {}
+    if isinstance(input_value, dict):
+        current_state: dict = dict(input_value)
+    else:
+        try:
+            snap = runner.graph.get_state(config)
+            current_state = dict(snap.values) if snap and snap.values else {}
+        except Exception:
+            current_state = {}
     try:
         async for chunk in runner.graph.astream(input_value, config, stream_mode="updates"):
             for node_name, output in chunk.items():
@@ -308,7 +315,9 @@ class YamlGraphRunner:
                             content=(
                                 f"submit_output rejected: the following required fields are "
                                 f"missing or empty: {missing}. "
-                                f"Please call submit_output again with all fields filled in."
+                                f"Call submit_output again and fill in EVERY required field. "
+                                f"Write SHORT summaries (3–5 sentences each) — do NOT try to "
+                                f"copy raw file contents into the fields. Summarise what you found."
                             ),
                             tool_call_id=submit_tc["id"],
                         ))
@@ -547,7 +556,7 @@ class YamlGraphRunner:
     # Helpers
     # ------------------------------------------------------------------
 
-    _MAX_TOOL_RESULT_CHARS = 20_000
+    _MAX_TOOL_RESULT_CHARS = 4_000
 
     @staticmethod
     def _extract_mcp_text(result: Any) -> str:
