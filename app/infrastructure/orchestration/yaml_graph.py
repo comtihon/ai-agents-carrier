@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import string
 from typing import TYPE_CHECKING, Any, TypedDict
@@ -558,13 +559,20 @@ class YamlGraphRunner:
 
     _MAX_TOOL_RESULT_CHARS = 4_000
 
+    # MIME type prefixes whose content should be decoded and passed to the LLM.
+    # Everything else (images, PDFs, office docs, …) stays as a placeholder.
+    _TEXT_MIME_PREFIXES = ("text/",)
+
     @staticmethod
     def _extract_mcp_text(result: Any) -> str:
         """Extract plain text from an MCP tool result.
 
         langchain_mcp_adapters returns content as a list of typed content blocks.
-        Handles mixed text/file blocks: text blocks are joined, binary file blocks
-        are replaced with a short placeholder so base64 blobs never reach the LLM.
+        - text blocks: included as-is.
+        - file blocks with a text/* MIME type (e.g. text/html, text/plain): the
+          base64-encoded ``data`` field is decoded and included so that e.g. Jira
+          HTML attachments reach the LLM as readable content.
+        - file blocks with binary MIME types: replaced with a short placeholder.
         The final string is capped at _MAX_TOOL_RESULT_CHARS to prevent context overflow.
         """
         # Only treat the list as MCP content blocks when every dict item carries
@@ -581,7 +589,22 @@ class YamlGraphRunner:
                     parts.append(item.get("text", ""))
                 else:  # file
                     mime = item.get("mime_type", "unknown")
-                    parts.append(f"[binary file attachment: {mime}]")
+                    is_text_mime = any(
+                        mime.startswith(prefix)
+                        for prefix in YamlGraphRunner._TEXT_MIME_PREFIXES
+                    )
+                    if is_text_mime:
+                        raw = item.get("data", "") or item.get("text", "")
+                        if raw:
+                            try:
+                                decoded = base64.b64decode(raw).decode("utf-8", errors="replace")
+                            except Exception:
+                                decoded = raw  # already plain text, not base64
+                            parts.append(f"[attachment: {mime}]\n{decoded}")
+                        else:
+                            parts.append(f"[attachment: {mime} — no content]")
+                    else:
+                        parts.append(f"[binary file attachment: {mime}]")
             content = "\n".join(parts)
         else:
             content = str(result)
