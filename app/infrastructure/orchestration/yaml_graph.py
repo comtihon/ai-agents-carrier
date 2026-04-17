@@ -7,6 +7,8 @@ import string
 from typing import TYPE_CHECKING, Any, TypedDict
 from uuid import uuid4
 
+import httpx
+
 from langchain_core.language_models import BaseChatModel
 
 logger = logging.getLogger(__name__)
@@ -129,7 +131,7 @@ class YamlGraphRunner:
         description: "..."
         steps:
           - id: <node-id>
-            type: llm_structured | llm | mcp | human_approval | execute | workflow | cron | http
+            type: llm_structured | llm | mcp | human_approval | execute | workflow | cron | http | http_call | python
             when: <state-key>          # skip node if state[key] is falsy
             system_prompt: "..."       # llm / llm_structured
             user_template: "..."       # {key} placeholders resolved from state
@@ -151,6 +153,14 @@ class YamlGraphRunner:
             input_template: "{request}"  # workflow only — request passed to child
             schedule: "0 9 * * 1-5"   # cron only — 5-field cron expression (UTC)
             request_template: "..."    # cron only — initial request; supports {now}, {date}
+            url: "https://..."         # http_call only — endpoint; {key} templates resolved
+            method: POST               # http_call only — GET | POST | PUT | PATCH | DELETE
+            headers:                   # http_call only — request headers; values support {key}
+              Authorization: "Bearer {token}"
+            body:                      # http_call only — JSON body; values support {key}
+              issue_key: "{ticket_id}"
+            code: |                    # python only — executed with ``state`` dict in scope;
+              output = state["x"] + 1  #   set ``output`` variable to store the result
 
     Steps are chained sequentially.  ``human_approval`` calls interrupt() and
     expects the caller to resume with {"approved": bool, "reason": str|None}.
@@ -239,6 +249,10 @@ class YamlGraphRunner:
             return self._cron_trigger_node(step)
         if t == "http":
             return self._http_trigger_node(step)
+        if t == "http_call":
+            return self._http_call_node(step)
+        if t == "python":
+            return self._python_node(step)
         raise ValueError(f"Unknown step type '{t}' in graph '{self.id}'")
 
     _SUBMIT_TOOL = "submit_output"
@@ -560,6 +574,89 @@ class YamlGraphRunner:
             step_id = step["id"]
             logger.info("[%s] step '%s' running (http trigger)", graph_id, step_id)
             return {output_key: state.get("trigger_payload", {})}
+
+        return node
+
+    def _http_call_node(self, step: dict[str, Any]):
+        """Make an outbound HTTP request.
+
+        Response is stored as ``{"status": <int>, "body": <str>}`` under
+        ``output_key`` (defaults to the step id).  All string fields in
+        ``url``, ``headers`` values, and ``body`` values are rendered with
+        ``{key}`` placeholders resolved from state before the request is sent.
+        """
+        graph_id = self.id
+
+        async def node(state: dict) -> dict:
+            step_id = step["id"]
+            if not self._when(step, state):
+                logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
+                return {}
+
+            url = self._render(step.get("url", ""), state)
+            method = step.get("method", "GET").upper()
+            headers = {k: self._render(str(v), state) for k, v in step.get("headers", {}).items()}
+            raw_body = step.get("body", {})
+            body = {k: self._render(str(v), state) for k, v in raw_body.items()} if raw_body else None
+            output_key = step.get("output_key") or step_id
+
+            logger.info("[%s] step '%s' running (http_call %s %s)", graph_id, step_id, method, url)
+            try:
+                async with httpx.AsyncClient(timeout=60) as client:
+                    if method in ("GET", "DELETE", "HEAD"):
+                        resp = await client.request(method, url, headers=headers)
+                    else:
+                        resp = await client.request(method, url, headers=headers, json=body)
+                result: dict[str, Any] = {"status": resp.status_code, "body": resp.text}
+                logger.info("[%s] step '%s' finished (status=%d)", graph_id, step_id, resp.status_code)
+                return {output_key: result}
+            except Exception as exc:
+                logger.exception("[%s] step '%s' http_call failed", graph_id, step_id)
+                return {output_key: {"error": str(exc)}}
+
+        return node
+
+    def _python_node(self, step: dict[str, Any]):
+        """Execute inline Python code.
+
+        The code runs with a ``state`` dict injected as a local variable so
+        that any state value can be read via ``state["key"]``.  The code
+        should assign an ``output`` variable; its value is stored under
+        ``output_key`` (defaults to the step id).
+
+        The step runs in a thread-pool executor to avoid blocking the event
+        loop.  Standard-library imports are available; builtins are not
+        restricted (the workflow is trusted infrastructure code).
+        """
+        graph_id = self.id
+
+        async def node(state: dict) -> dict:
+            step_id = step["id"]
+            if not self._when(step, state):
+                logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
+                return {}
+
+            code = step.get("code", "")
+            output_key = step.get("output_key") or step_id
+
+            logger.info("[%s] step '%s' running (python)", graph_id, step_id)
+            local_vars: dict[str, Any] = {"state": dict(state), "output": None}
+            compiled = compile(code, f"<workflow:{graph_id}:{step_id}>", "exec")
+
+            def _run() -> None:
+                exec(compiled, {"__builtins__": __builtins__}, local_vars)  # noqa: S102
+
+            loop = asyncio.get_event_loop()
+            try:
+                await loop.run_in_executor(None, _run)
+            except Exception as exc:
+                raise ValueError(
+                    f"[{graph_id}] Python step '{step_id}' raised: {exc}"
+                ) from exc
+
+            result = local_vars.get("output")
+            logger.info("[%s] step '%s' finished", graph_id, step_id)
+            return {output_key: result}
 
         return node
 
