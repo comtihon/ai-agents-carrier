@@ -460,7 +460,9 @@ class YamlGraphRunner:
             tool = self._mcp.get_tool(tool_name)
             if not tool:
                 logger.warning("[%s] step '%s' MCP tool '%s' not available", graph_id, step_id, tool_name)
-                return {step["output_key"]: f"MCP tool '{tool_name}' not available"}
+                if "output_key" in step:
+                    return {step["output_key"]: f"MCP tool '{tool_name}' not available"}
+                return {}
             tool_input = {
                 k: self._render(v, state)
                 for k, v in step.get("tool_input", {}).items()
@@ -468,10 +470,14 @@ class YamlGraphRunner:
             try:
                 result = await tool.ainvoke(tool_input)
                 logger.info("[%s] step '%s' finished", graph_id, step_id)
-                return {step["output_key"]: self._extract_mcp_text(result)}
+                if "output_key" in step:
+                    return {step["output_key"]: self._extract_mcp_text(result)}
+                return {}
             except Exception as exc:
                 logger.exception("[%s] step '%s' MCP tool '%s'%s failed", graph_id, step_id, tool_name, server_tag)
-                return {step["output_key"]: f"Error calling '{tool_name}': {exc}"}
+                if "output_key" in step:
+                    return {step["output_key"]: f"Error calling '{tool_name}': {exc}"}
+                return {}
         return node
 
     def _approval_node(self, step: dict[str, Any]):

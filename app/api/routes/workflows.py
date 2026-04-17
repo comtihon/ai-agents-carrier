@@ -416,6 +416,78 @@ async def reject_run(
     return _run_response(run, runner)
 
 
+@router.post("/runs/{run_id}/retry")
+async def retry_run(
+    run_id: str,
+    background_tasks: BackgroundTasks,
+    container: ApplicationContainer = Depends(get_container),
+):
+    """Retry a failed run from the last completed step, skipping already-finished steps."""
+    run = await container.run_repository.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run.status != "failed":
+        raise HTTPException(
+            status_code=409, detail=f"Run is not in failed state (status={run.status})"
+        )
+
+    runner = container._build_runner_for_recovery(run)
+    if runner is None:
+        raise HTTPException(
+            status_code=409, detail="Workflow definition not available for retry"
+        )
+
+    # Reconstruct accumulated state from already-completed steps (in step order)
+    accumulated: dict[str, Any] = {"request": run.user_request}
+    last_done: str | None = None
+    for step in runner.steps:
+        sid = step["id"]
+        if run.step_statuses.get(sid) in ("finished", "skipped"):
+            last_done = sid
+            output = run.step_outputs.get(sid)
+            if output and isinstance(output, dict):
+                accumulated.update(output)
+
+    # Reset failed step and all subsequent steps back to "pending"
+    found_failed = False
+    for step in runner.steps:
+        sid = step["id"]
+        if not found_failed and run.step_statuses.get(sid) == "failed":
+            found_failed = True
+        if found_failed:
+            run.step_statuses[sid] = "pending"
+
+    # Seed the LangGraph checkpoint at the last completed step
+    config = _config(run.id)
+    if last_done is not None:
+        runner.graph.update_state(config, accumulated, as_node=last_done)
+        resume_input: Any = None  # resume from checkpoint
+    else:
+        resume_input = accumulated  # no completed steps — start fresh
+
+    run.status = "running"
+    run.current_step = None
+    run.state = accumulated
+    run.touch()
+    await container.run_repository.update(run)
+
+    container.live_runners[run.id] = runner
+    background_tasks.add_task(_retry_graph, runner, run, container, resume_input)
+
+    return _run_response(run, runner)
+
+
+async def _retry_graph(
+    runner: YamlGraphRunner,
+    run: GraphRun,
+    container: ApplicationContainer,
+    resume_input: Any,
+) -> None:
+    await _stream_graph(runner, run, container, resume_input, base_url=container.settings.base_url)
+    if run.status in ("completed", "failed", "cancelled"):
+        container.live_runners.pop(run.id, None)
+
+
 # ─── Workflow definition detail / update / delete ─────────────────────────────
 # These routes use {workflow_id} path parameters and MUST be registered AFTER
 # the /runs/... routes above so Starlette does not match "runs" as a {workflow_id}.
