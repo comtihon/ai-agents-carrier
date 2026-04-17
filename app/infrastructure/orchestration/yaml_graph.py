@@ -136,6 +136,8 @@ class YamlGraphRunner:
             output_key: <key>          # where to store the result
             bind_mcp_tools: true       # llm_structured only – set false to hide MCP tools
             max_iterations: 25         # llm_structured only – override default iteration cap
+            fail_if_false:             # llm_structured only – fail the run if any listed bool
+              - success                #   output field is False (uses 'error'/'summary' as detail)
             output:                    # llm_structured only
               - name: needs_jira
                 type: bool
@@ -324,6 +326,14 @@ class YamlGraphRunner:
                         ))
                         continue
                     logger.info("[%s] step '%s' finished: %s", graph_id, step_id, args)
+                    # fail_if_false: list of bool output fields that must be True
+                    for field in step.get("fail_if_false", []):
+                        if field in args and not args[field]:
+                            detail = args.get("error") or args.get("summary") or ""
+                            raise ValueError(
+                                f"[{graph_id}] step '{step_id}' failed: "
+                                f"'{field}' is false. {detail}".strip()
+                            )
                     return args
 
                 # Execute MCP tool calls and feed results back
