@@ -52,6 +52,9 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
             fields["trigger_payload"] = Any  # type: ignore[assignment]
         if step.get("type") == "cron":
             fields["trigger_info"] = Any  # type: ignore[assignment]
+        # human_approval with a custom output_key writes the bool result there
+        if step.get("type") == "human_approval" and "output_key" in step:
+            fields[step["output_key"]] = Any  # type: ignore[assignment]
     return TypedDict("YamlGraphState", fields, total=False)  # type: ignore[misc]
 
 
@@ -473,6 +476,9 @@ class YamlGraphRunner:
 
     def _approval_node(self, step: dict[str, Any]):
         graph_id = self.id
+        # output_key lets workflows with multiple approvals write to distinct state keys.
+        # Defaults to "approved" for backward compatibility.
+        approved_key = step.get("output_key", "approved")
 
         def node(state: dict) -> dict:
             step_id = step["id"]
@@ -485,7 +491,7 @@ class YamlGraphRunner:
             approved = decision.get("approved", False)
             logger.info("[%s] step '%s' decision: approved=%s", graph_id, step_id, approved)
             return {
-                "approved": approved,
+                approved_key: approved,
                 "reject_reason": decision.get("reason"),
             }
         return node
