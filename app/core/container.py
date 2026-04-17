@@ -52,7 +52,7 @@ class ApplicationContainer:
         self.cron_scheduler.start()
         if self.workflow_backend is not None:
             await self._load_registry()
-        await self._recover_incomplete_runs()
+        asyncio.create_task(self._recover_incomplete_runs())
 
     async def _load_registry(self) -> None:
         """Populate yaml_graph_registry from the configured backend."""
