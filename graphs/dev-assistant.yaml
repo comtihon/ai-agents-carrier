@@ -26,6 +26,9 @@ steps:
          structured summary of everything you found: tickets, linked tickets,
          repos, and relevant code.
 
+      The GitHub organisation is always `example-org` — use this
+      as the owner for all GitHub tool calls. Never guess or search for the org name.
+
       Be thorough — follow every link and reference before submitting.
     user_template: "{request}"
     output:
