@@ -16,9 +16,11 @@ steps:
          each one using the Jira MCP.
       2. For each fetched ticket, inspect its description and linked issues — fetch
          any additional linked or mentioned Jira tickets as well.
-      3. For each ticket, check if a Jira Compass component is referenced. If so,
-         retrieve the component and find its linked GitHub repository.
-      4. For each GitHub repository discovered (from Compass components or direct
+      3. For every ticket, call jira_get_issue_development_info to get the linked
+         GitHub repository URL directly from the Jira development panel. This is
+         the most reliable way to find the correct repo — always do this before
+         searching GitHub manually.
+      4. For each GitHub repository discovered (from development info or direct
          mentions in tickets), fetch its relevant code via the GitHub MCP.
       5. Once you have exhausted all leads, call submit_output with a complete,
          structured summary of everything you found: tickets, linked tickets,
