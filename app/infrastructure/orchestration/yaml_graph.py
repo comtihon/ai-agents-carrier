@@ -558,18 +558,21 @@ class YamlGraphRunner:
         are replaced with a short placeholder so base64 blobs never reach the LLM.
         The final string is capped at _MAX_TOOL_RESULT_CHARS to prevent context overflow.
         """
-        if isinstance(result, list) and result:
+        # Only treat the list as MCP content blocks when every dict item carries
+        # a recognised "type" field ("text" or "file").  Plain data lists (e.g.
+        # mock tool returns in tests) fall through to the str() path unchanged.
+        if (
+            isinstance(result, list)
+            and result
+            and all(isinstance(item, dict) and item.get("type") in ("text", "file") for item in result)
+        ):
             parts: list[str] = []
             for item in result:
-                if not isinstance(item, dict):
-                    parts.append(str(item))
-                elif item.get("type") == "text":
+                if item.get("type") == "text":
                     parts.append(item.get("text", ""))
-                elif item.get("type") == "file":
+                else:  # file
                     mime = item.get("mime_type", "unknown")
                     parts.append(f"[binary file attachment: {mime}]")
-                else:
-                    parts.append(str(item))
             content = "\n".join(parts)
         else:
             content = str(result)
