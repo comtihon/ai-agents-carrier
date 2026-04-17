@@ -19,11 +19,25 @@ def _render(template: str, ctx: dict) -> str:
         return template
 
 
-def _render_value(value: Any, ctx: dict) -> Any:
+# Slack section/input block text elements are capped at 3000 chars.
+_SLACK_BLOCK_TEXT_LIMIT = 2900
+
+
+def _truncate(value: str, limit: int = _SLACK_BLOCK_TEXT_LIMIT) -> str:
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "\n…(truncated)"
+
+
+def _render_value(value: Any, ctx: dict, _in_block_text: bool = False) -> Any:
     if isinstance(value, str):
-        return _render(value, ctx)
+        rendered = _render(value, ctx)
+        return _truncate(rendered) if _in_block_text else rendered
     if isinstance(value, dict):
-        return {k: _render_value(v, ctx) for k, v in value.items()}
+        # Detect a Slack block text object: {"type": "mrkdwn"|"plain_text", "text": "..."}
+        is_block_text = value.get("type") in ("mrkdwn", "plain_text") and "text" in value
+        return {k: _render_value(v, ctx, _in_block_text=is_block_text and k == "text")
+                for k, v in value.items()}
     if isinstance(value, list):
         return [_render_value(v, ctx) for v in value]
     return value
