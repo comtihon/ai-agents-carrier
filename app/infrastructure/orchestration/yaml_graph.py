@@ -296,7 +296,7 @@ class YamlGraphRunner:
                 if submit_tc is not None:
                     args = submit_tc["args"]
                     required_fields = [o["name"] for o in step.get("output", [])]
-                    missing = [f for f in required_fields if not args.get(f)]
+                    missing = [f for f in required_fields if f not in args or args[f] is None or args[f] == ""]
                     if missing:
                         logger.warning(
                             "[%s] step '%s' submit_output rejected — missing/empty fields: %s",
