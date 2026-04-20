@@ -69,7 +69,9 @@ class Settings(BaseSettings):
     # --- OpenHands ---
     openhands_base_url: str = Field(default="http://openhands:3000", alias="OPENHANDS_BASE_URL")
     openhands_api_key: str | None = Field(default=None, alias="OPENHANDS_API_KEY")
-    openhands_timeout_seconds: float = Field(default=60.0, alias="OPENHANDS_TIMEOUT_SECONDS")
+    openhands_timeout_seconds: float = Field(default=30.0, alias="OPENHANDS_TIMEOUT_SECONDS")
+    openhands_task_timeout_seconds: float = Field(default=1800.0, alias="OPENHANDS_TASK_TIMEOUT_SECONDS")
+    openhands_poll_interval_seconds: float = Field(default=10.0, alias="OPENHANDS_POLL_INTERVAL_SECONDS")
     openhands_mock_mode: bool = Field(default=True, alias="OPENHANDS_MOCK_MODE")
 
     # --- Figma MCP ---

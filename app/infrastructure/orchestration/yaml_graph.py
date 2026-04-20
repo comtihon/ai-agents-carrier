@@ -55,6 +55,9 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
         # human_approval with a custom output_key writes the bool result there
         if step.get("type") == "human_approval" and "output_key" in step:
             fields[step["output_key"]] = Any  # type: ignore[assignment]
+        # execute steps persist their OpenHands conversation ID for restart resumption
+        if step.get("type") == "execute":
+            fields[f"_openhands_conv_{step['id']}"] = Any  # type: ignore[assignment]
     return TypedDict("YamlGraphState", fields, total=False)  # type: ignore[misc]
 
 
@@ -75,6 +78,9 @@ async def stream_graph_to_pause(
 
     Callers should initialise ``run.step_statuses`` before calling this.
     """
+    runner._current_run = run
+    runner._current_run_repository = run_repository
+
     config = {"configurable": {"thread_id": run.id}}
     if isinstance(input_value, dict):
         current_state: dict = dict(input_value)
@@ -108,7 +114,9 @@ async def stream_graph_to_pause(
                 run.step_statuses[sid] = "failed"
                 break
         run.status = "failed"
-        run.state = {"error": str(exc)}
+        # Preserve any persisted OpenHands conversation IDs so retry can resume polling
+        preserved = {k: v for k, v in (run.state or {}).items() if k.startswith("_openhands_conv_")}
+        run.state = {"error": str(exc), **preserved}
         run.current_step = None
         run.touch()
         await run_repository.update(run)
@@ -235,6 +243,9 @@ class YamlGraphRunner:
         # Injected post-construction by load_yaml_graphs
         self._registry: Any = None
         self._run_repository: Any = None
+        # Set by stream_graph_to_pause to enable mid-run persistence from nodes
+        self._current_run: Any = None
+        self._current_run_repository: Any = None
         self._state_schema = _build_state_schema(self._steps)
         self.graph = self._build()
 
@@ -515,11 +526,29 @@ class YamlGraphRunner:
                 return {step["output_key"]: "OpenHands not configured"}
             repo = self._render(step.get("repo_template", "{repo}"), state)
             instructions = self._render(step.get("instructions_template", "{plan}"), state)
-            logger.info("[%s] step '%s' running (execute repo='%s')", graph_id, step_id, repo)
+            conv_id_key = f"_openhands_conv_{step_id}"
+            existing_conv_id: str | None = state.get(conv_id_key)
+
+            async def _save_conv_id(conv_id: str) -> None:
+                if self._current_run is not None and self._current_run_repository is not None:
+                    self._current_run.state = {**(self._current_run.state or {}), conv_id_key: conv_id}
+                    self._current_run.touch()
+                    await self._current_run_repository.update(self._current_run)
+
+            logger.info("[%s] step '%s' running (execute repo='%s'%s)", graph_id, step_id, repo,
+                        f", resuming conv {existing_conv_id}" if existing_conv_id else "")
             try:
-                result = await self._openhands.execute(repo=repo, instructions=instructions)
+                result = await self._openhands.execute(
+                    repo=repo,
+                    instructions=instructions,
+                    existing_conv_id=existing_conv_id,
+                    conv_id_callback=_save_conv_id,
+                )
                 logger.info("[%s] step '%s' finished", graph_id, step_id)
-                return {step["output_key"]: result}
+                output = {step["output_key"]: result}
+                if result.get("conversation_id"):
+                    output[conv_id_key] = result["conversation_id"]
+                return output
             except Exception as exc:
                 logger.exception("[%s] step '%s' execute failed", graph_id, step_id)
                 return {step["output_key"]: {"error": str(exc)}}
