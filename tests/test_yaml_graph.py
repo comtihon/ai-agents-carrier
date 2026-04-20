@@ -121,7 +121,11 @@ async def test_execute_node_calls_openhands():
     runner = YamlGraphRunner(definition, llm=llm, mcp_tools_provider=mcp, openhands=openhands)
     state = await runner.graph.ainvoke({"request": "build feature"}, {"configurable": {"thread_id": "t8"}})
     assert state["result"]["status"] == "success"
-    openhands.execute.assert_called_once_with(repo="org/repo", instructions="build feature")
+    call_kwargs = openhands.execute.call_args.kwargs
+    assert call_kwargs["repo"] == "org/repo"
+    assert call_kwargs["instructions"] == "build feature"
+    assert call_kwargs["existing_conv_id"] is None
+    assert callable(call_kwargs["conv_id_callback"])
 
 
 @pytest.mark.asyncio
