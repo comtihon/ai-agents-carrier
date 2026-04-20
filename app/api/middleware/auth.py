@@ -19,7 +19,7 @@ _UNPROTECTED_PATHS = {"/health", "/ready"}
 # own authenticated calls.  Secure at the network / API-gateway level instead.
 # /api/v1/callbacks are approval callback URLs sent to external systems (Slack, etc.)
 # where the caller has no credentials; the run_id UUID in the path is the secret.
-_UNPROTECTED_PREFIXES = ("/copilotkit", "/api/v1/callbacks/")
+_UNPROTECTED_PREFIXES = ("/copilotkit", "/api/v1/callbacks/", "/api/v1/webhooks/")
 
 
 class OAuthMiddleware(BaseHTTPMiddleware):
