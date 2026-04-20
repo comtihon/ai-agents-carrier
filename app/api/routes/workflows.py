@@ -42,7 +42,6 @@ class RunRequest(BaseModel):
 
 
 class ApproveRequest(BaseModel):
-    feedback: str | None = None
     corrections: dict[str, Any] | None = None
 
 
