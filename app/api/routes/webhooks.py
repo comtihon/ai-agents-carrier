@@ -86,7 +86,10 @@ async def receive_webhook(
         auth_header = request.headers.get("Authorization", "")
         provided_token = auth_header.removeprefix("Bearer ").strip()
         if not hmac.compare_digest(provided_token, expected_token):
-            logger.warning("Bearer token validation failed for workflow '%s'", workflow_id)
+            logger.warning(
+                "Bearer token validation failed for workflow '%s' — received Authorization: %r",
+                workflow_id, auth_header[:60] if auth_header else "(none)",
+            )
             raise HTTPException(status_code=403, detail="Invalid or missing Bearer token")
     else:
         per_workflow_secret = (http_step or {}).get("webhook_secret") or None
