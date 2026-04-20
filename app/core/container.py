@@ -35,7 +35,6 @@ logger = logging.getLogger(__name__)
 class ApplicationContainer:
     settings: Settings
     llm: BaseChatModel
-    llm_factory: Callable[[str | None, str | None], BaseChatModel]
     mcp_tools_provider: McpToolsProvider
     yaml_graph_registry: YamlGraphRegistry
     mongo_provider: MongoClientProvider
@@ -44,6 +43,8 @@ class ApplicationContainer:
     # Workflow definition backend — None only in legacy test setups that
     # inject the registry directly (backward compat).
     workflow_backend: WorkflowDefinitionBackend | None = None
+    # Factory for per-step LLM overrides; None in legacy test setups.
+    llm_factory: Callable[[str | None, str | None], BaseChatModel] | None = None
     # Runners keyed by run_id — alive for the duration of the run so that
     # approval-resume uses the exact definition snapshot from run start.
     live_runners: dict[str, YamlGraphRunner] = field(default_factory=dict)
