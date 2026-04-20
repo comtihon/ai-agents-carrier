@@ -535,11 +535,17 @@ class YamlGraphRunner:
             }
             decision: dict = interrupt(payload)
             approved = decision.get("approved", False)
-            logger.info("[%s] step '%s' decision: approved=%s", graph_id, step_id, approved)
-            return {
+            corrections: dict = decision.get("corrections") or {}
+            logger.info(
+                "[%s] step '%s' decision: approved=%s corrections=%s",
+                graph_id, step_id, approved, list(corrections.keys()),
+            )
+            result: dict = {
                 approved_key: approved,
                 "reject_reason": decision.get("reason"),
             }
+            result.update(corrections)
+            return result
         return node
 
     def _execute_node(self, step: dict[str, Any]):

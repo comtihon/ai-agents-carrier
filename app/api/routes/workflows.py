@@ -43,6 +43,7 @@ class RunRequest(BaseModel):
 
 class ApproveRequest(BaseModel):
     feedback: str | None = None
+    corrections: dict[str, Any] | None = None
 
 
 class RejectRequest(BaseModel):
@@ -135,8 +136,24 @@ def _get_runner_for_run(run: GraphRun, container: ApplicationContainer) -> YamlG
     return runner
 
 
+def _get_interrupt_payload(runner: YamlGraphRunner | None, run: GraphRun) -> dict:
+    """Extract the rendered interrupt payload from the paused LangGraph snapshot."""
+    if run.status != "waiting_approval" or runner is None:
+        return {}
+    try:
+        snap = runner.graph.get_state(_config(run.id))
+        for task in snap.tasks:
+            for intr in task.interrupts:
+                if isinstance(intr.value, dict):
+                    return intr.value
+    except Exception:
+        pass
+    return {}
+
+
 def _run_response(run: GraphRun, runner: YamlGraphRunner | None = None) -> dict:
     workflow_name, steps = _steps_from_definition(run, runner)
+    interrupt_payload = _get_interrupt_payload(runner, run)
     return {
         "id": run.id,
         "workflow_id": run.graph_id,
@@ -153,6 +170,7 @@ def _run_response(run: GraphRun, runner: YamlGraphRunner | None = None) -> dict:
         "action_results": [],
         "execution_results": [],
         "intermediate_outputs": run.state,
+        "interrupt_payload": interrupt_payload,
         "error": run.state.get("error") if run.status == "failed" else None,
         "metadata": {},
         "created_at": run.created_at.isoformat(),
@@ -388,7 +406,11 @@ async def approve_run(
     run.touch()
     await container.run_repository.update(run)
 
-    await _stream_graph(runner, run, container, Command(resume={"approved": True}))
+    corrections = body.corrections if body else None
+    await _stream_graph(
+        runner, run, container,
+        Command(resume={"approved": True, "corrections": corrections}),
+    )
 
     if run.status in ("completed", "failed", "cancelled"):
         container.live_runners.pop(run_id, None)
