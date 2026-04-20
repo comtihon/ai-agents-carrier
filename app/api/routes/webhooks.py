@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 from uuid import uuid4
@@ -73,19 +74,29 @@ async def receive_webhook(
         definition_snapshot = None
         steps = runner.steps
 
-    per_workflow_secret = next(
-        (s.get("webhook_secret") for s in steps if s.get("type") == "http" and s.get("webhook_secret")),
-        None,
-    )
-    secret = per_workflow_secret or container.settings.webhook_secret
-    if not secret:
-        raise HTTPException(status_code=503, detail="Webhook secret not configured (set WEBHOOK_SECRET or per-workflow webhook_secret)")
+    http_step = next((s for s in steps if s.get("type") == "http"), None)
+    auth_mode = (http_step or {}).get("auth_mode", "hmac")
 
     body = await request.body()
-    signature = request.headers.get(_SIGNATURE_HEADER, "")
-    if not signature or not validate_webhook_signature(body, signature, secret):
-        logger.warning("Webhook signature validation failed for workflow '%s'", workflow_id)
-        raise HTTPException(status_code=403, detail="Invalid or missing webhook signature")
+
+    if auth_mode == "bearer":
+        expected_token = (http_step or {}).get("bearer_token", "")
+        if not expected_token:
+            raise HTTPException(status_code=503, detail="Bearer token not configured on the http trigger step")
+        auth_header = request.headers.get("Authorization", "")
+        provided_token = auth_header.removeprefix("Bearer ").strip()
+        if not hmac.compare_digest(provided_token, expected_token):
+            logger.warning("Bearer token validation failed for workflow '%s'", workflow_id)
+            raise HTTPException(status_code=403, detail="Invalid or missing Bearer token")
+    else:
+        per_workflow_secret = (http_step or {}).get("webhook_secret") or None
+        secret = per_workflow_secret or container.settings.webhook_secret
+        if not secret:
+            raise HTTPException(status_code=503, detail="Webhook secret not configured (set WEBHOOK_SECRET or per-workflow webhook_secret)")
+        signature = request.headers.get(_SIGNATURE_HEADER, "")
+        if not signature or not validate_webhook_signature(body, signature, secret):
+            logger.warning("Webhook signature validation failed for workflow '%s'", workflow_id)
+            raise HTTPException(status_code=403, detail="Invalid or missing webhook signature")
 
     try:
         payload: dict = json.loads(body)
