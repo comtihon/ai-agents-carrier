@@ -43,26 +43,14 @@ async def receive_webhook(
     """Receive an HMAC-authenticated HTTP trigger and start a workflow run.
 
     The caller must include a ``X-Webhook-Signature`` header whose value is the
-    HMAC-SHA256 hex digest of the raw request body, keyed with ``WEBHOOK_SECRET``.
+    HMAC-SHA256 hex digest of the raw request body.  The signing secret is taken
+    from the workflow's ``http`` trigger step (``webhook_secret`` field) when set;
+    otherwise falls back to the global ``WEBHOOK_SECRET`` environment variable.
 
     A field named ``request`` in the JSON body is used as the workflow's initial
     request string; if absent, the entire body is JSON-serialised as the request.
     """
-    secret = container.settings.webhook_secret
-    if not secret:
-        raise HTTPException(status_code=503, detail="Webhook secret not configured (set WEBHOOK_SECRET)")
-
-    body = await request.body()
-    signature = request.headers.get(_SIGNATURE_HEADER, "")
-    if not signature or not validate_webhook_signature(body, signature, secret):
-        logger.warning("Webhook signature validation failed for workflow '%s'", workflow_id)
-        raise HTTPException(status_code=403, detail="Invalid or missing webhook signature")
-
-    try:
-        payload: dict = json.loads(body)
-    except Exception:
-        payload = {"raw": body.decode("utf-8", errors="replace")}
-
+    # Load the workflow first so we can read its per-workflow secret.
     if container.workflow_backend is not None:
         defn = await container.workflow_backend.get(workflow_id)
         if defn is None:
@@ -76,11 +64,32 @@ async def receive_webhook(
             openhands=container.openhands,
         )
         definition_snapshot: dict | None = defn.to_raw_dict()
+        steps = defn.steps
     else:
         runner = container.yaml_graph_registry.get(workflow_id)
         if runner is None:
             raise HTTPException(status_code=404, detail=f"Workflow '{workflow_id}' not found")
         definition_snapshot = None
+        steps = runner.steps
+
+    per_workflow_secret = next(
+        (s.get("webhook_secret") for s in steps if s.get("type") == "http" and s.get("webhook_secret")),
+        None,
+    )
+    secret = per_workflow_secret or container.settings.webhook_secret
+    if not secret:
+        raise HTTPException(status_code=503, detail="Webhook secret not configured (set WEBHOOK_SECRET or per-workflow webhook_secret)")
+
+    body = await request.body()
+    signature = request.headers.get(_SIGNATURE_HEADER, "")
+    if not signature or not validate_webhook_signature(body, signature, secret):
+        logger.warning("Webhook signature validation failed for workflow '%s'", workflow_id)
+        raise HTTPException(status_code=403, detail="Invalid or missing webhook signature")
+
+    try:
+        payload: dict = json.loads(body)
+    except Exception:
+        payload = {"raw": body.decode("utf-8", errors="replace")}
 
     user_request: str = payload.get("request", "") if isinstance(payload, dict) else ""
     if not user_request:
