@@ -39,6 +39,7 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
         "request": str,
         "approved": bool,
         "reject_reason": str,
+        "_conv_map": Any,  # type: ignore[assignment]
     }
     for step in steps:
         # Regular output nodes store their result under output_key
@@ -65,6 +66,18 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
 # ---------------------------------------------------------------------------
 # Shared graph streaming helper (used by workflow steps and default_workflow)
 # ---------------------------------------------------------------------------
+
+async def _close_openhands_conversations(runner: YamlGraphRunner, state: dict) -> None:
+    if runner._openhands is None:
+        return
+    conv_map: dict = dict((state or {}).get("_conv_map") or {})
+    for name, oh_id in conv_map.items():
+        try:
+            await runner._openhands.close_conversation(oh_id)
+            logger.info("run closed OpenHands conversation '%s' (%s)", name, oh_id)
+        except Exception:
+            logger.warning("Failed to close OpenHands conversation '%s' (%s)", name, oh_id)
+
 
 async def stream_graph_to_pause(
     runner: YamlGraphRunner,
@@ -121,6 +134,7 @@ async def stream_graph_to_pause(
         run.current_step = None
         run.touch()
         await run_repository.update(run)
+        await _close_openhands_conversations(runner, current_state)
         return
 
     snap = runner.graph.get_state(config)
@@ -129,6 +143,8 @@ async def stream_graph_to_pause(
     run.state = snap.values
     run.touch()
     await run_repository.update(run)
+    if run.status == "completed":
+        await _close_openhands_conversations(runner, snap.values)
 
     if run.status == "waiting_approval" and base_url and run.current_step:
         step = next((s for s in runner.steps if s["id"] == run.current_step), None)
@@ -540,13 +556,24 @@ class YamlGraphRunner:
             repo = self._render(step.get("repo_template", "{repo}"), state)
             instructions = self._render(step.get("instructions_template", "{plan}"), state)
             conv_id_key = f"_openhands_conv_{step_id}"
-            existing_conv_id: str | None = state.get(conv_id_key)
+            conversation_id: str | None = step.get("conversation_id")
+            conv_map: dict = dict(state.get("_conv_map") or {})
 
-            async def _save_conv_id(conv_id: str) -> None:
-                if self._current_run is not None and self._current_run_repository is not None:
-                    self._current_run.state = {**(self._current_run.state or {}), conv_id_key: conv_id}
-                    self._current_run.touch()
-                    await self._current_run_repository.update(self._current_run)
+            if conversation_id:
+                existing_conv_id: str | None = conv_map.get(conversation_id)
+            else:
+                existing_conv_id = state.get(conv_id_key)
+
+            async def _save_conv_id(oh_id: str) -> None:
+                if self._current_run is None or self._current_run_repository is None:
+                    return
+                update: dict = {conv_id_key: oh_id}
+                if conversation_id:
+                    current_map = dict((self._current_run.state or {}).get("_conv_map") or {})
+                    update["_conv_map"] = {**current_map, conversation_id: oh_id}
+                self._current_run.state = {**(self._current_run.state or {}), **update}
+                self._current_run.touch()
+                await self._current_run_repository.update(self._current_run)
 
             logger.info("[%s] step '%s' running (execute repo='%s'%s)", graph_id, step_id, repo,
                         f", resuming conv {existing_conv_id}" if existing_conv_id else "")
@@ -558,9 +585,12 @@ class YamlGraphRunner:
                     conv_id_callback=_save_conv_id,
                 )
                 logger.info("[%s] step '%s' finished", graph_id, step_id)
-                output = {step["output_key"]: result}
-                if result.get("conversation_id"):
-                    output[conv_id_key] = result["conversation_id"]
+                output: dict = {step["output_key"]: result}
+                oh_id = result.get("conversation_id")
+                if oh_id:
+                    output[conv_id_key] = oh_id
+                    if conversation_id:
+                        output["_conv_map"] = {**conv_map, conversation_id: oh_id}
                 return output
             except Exception as exc:
                 logger.exception("[%s] step '%s' execute failed", graph_id, step_id)

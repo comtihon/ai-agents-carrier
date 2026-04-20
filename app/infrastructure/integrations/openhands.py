@@ -49,9 +49,15 @@ class OpenHandsAdapter:
 
         async with httpx.AsyncClient(timeout=self._settings.openhands_timeout_seconds, headers=headers) as client:
             if existing_conv_id:
-                logger.info("Resuming OpenHands conversation %s", existing_conv_id)
-                conv_id = existing_conv_id
-            else:
+                resp = await client.get(f"{base_url}/api/v1/app-conversations", params={"ids": existing_conv_id})
+                found = resp.is_success and (resp.json() or [None])[0] is not None
+                if found:
+                    logger.info("Resuming OpenHands conversation %s", existing_conv_id)
+                    conv_id = existing_conv_id
+                else:
+                    logger.warning("OpenHands conversation %s not found, starting a new one", existing_conv_id)
+                    existing_conv_id = None
+            if not existing_conv_id:
                 # Step 1: start the conversation
                 resp = await client.post(
                     f"{base_url}/api/v1/app-conversations",
@@ -117,3 +123,13 @@ class OpenHandsAdapter:
                 "selected_repository": conv.get("selected_repository"),
                 "selected_branch": conv.get("selected_branch"),
             }
+
+    async def close_conversation(self, conv_id: str) -> None:
+        if self._settings.openhands_mock_mode:
+            return
+        headers: dict[str, str] = {}
+        if self._settings.openhands_api_key:
+            headers["Authorization"] = f"Bearer {self._settings.openhands_api_key}"
+        async with httpx.AsyncClient(timeout=self._settings.openhands_timeout_seconds, headers=headers) as client:
+            resp = await client.delete(f"{self._settings.openhands_base_url}/api/v1/app-conversations/{conv_id}")
+            resp.raise_for_status()
