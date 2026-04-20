@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -11,6 +12,7 @@ from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner
 from app.infrastructure.tools.mcp_client import McpToolsProvider
 
 if TYPE_CHECKING:
+    from langchain_core.language_models import BaseChatModel
     from app.domain.models.workflow_definition import WorkflowDefinition
 
 logger = logging.getLogger(__name__)
@@ -65,6 +67,7 @@ def build_registry_from_definitions(
     mcp_tools_provider: McpToolsProvider,
     openhands: OpenHandsAdapter | None = None,
     run_repository: Any = None,
+    llm_factory: Callable[[str | None, str | None], BaseChatModel] | None = None,
 ) -> YamlGraphRegistry:
     """Build a YamlGraphRegistry from an already-loaded list of WorkflowDefinitions.
 
@@ -77,6 +80,7 @@ def build_registry_from_definitions(
             runner = YamlGraphRunner(
                 defn.to_raw_dict(),
                 llm=llm,
+                llm_factory=llm_factory,
                 mcp_tools_provider=mcp_tools_provider,
                 openhands=openhands,
             )
@@ -100,11 +104,13 @@ def build_runner_from_definition(
     registry: YamlGraphRegistry,
     run_repository: Any = None,
     openhands: OpenHandsAdapter | None = None,
+    llm_factory: Callable[[str | None, str | None], BaseChatModel] | None = None,
 ) -> YamlGraphRunner:
     """Build a single YamlGraphRunner from a WorkflowDefinition and inject dependencies."""
     runner = YamlGraphRunner(
         definition.to_raw_dict(),
         llm=llm,
+        llm_factory=llm_factory,
         mcp_tools_provider=mcp_tools_provider,
         openhands=openhands,
     )
@@ -119,6 +125,7 @@ def load_yaml_graphs(
     mcp_tools_provider: McpToolsProvider,
     openhands: OpenHandsAdapter | None = None,
     run_repository: Any = None,
+    llm_factory: Callable[[str | None, str | None], BaseChatModel] | None = None,
 ) -> YamlGraphRegistry:
     path = Path(directory)
     runners: dict[str, YamlGraphRunner] = {}
@@ -133,6 +140,7 @@ def load_yaml_graphs(
             runner = YamlGraphRunner(
                 definition,
                 llm=llm,
+                llm_factory=llm_factory,
                 mcp_tools_provider=mcp_tools_provider,
                 openhands=openhands,
             )

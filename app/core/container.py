@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
@@ -34,6 +35,7 @@ logger = logging.getLogger(__name__)
 class ApplicationContainer:
     settings: Settings
     llm: BaseChatModel
+    llm_factory: Callable[[str | None, str | None], BaseChatModel]
     mcp_tools_provider: McpToolsProvider
     yaml_graph_registry: YamlGraphRegistry
     mongo_provider: MongoClientProvider
@@ -65,6 +67,7 @@ class ApplicationContainer:
         self.yaml_graph_registry = build_registry_from_definitions(
             definitions,
             llm=self.llm,
+            llm_factory=self.llm_factory,
             mcp_tools_provider=self.mcp_tools_provider,
             openhands=self.openhands,
             run_repository=self.run_repository,
@@ -113,6 +116,7 @@ class ApplicationContainer:
                     runner = build_runner_from_definition(
                         defn,
                         llm=self.llm,
+                        llm_factory=self.llm_factory,
                         mcp_tools_provider=self.mcp_tools_provider,
                         registry=self.yaml_graph_registry,
                         run_repository=self.run_repository,
@@ -169,6 +173,7 @@ class ApplicationContainer:
             runner = build_runner_from_definition(
                 defn,
                 llm=self.llm,
+                llm_factory=self.llm_factory,
                 mcp_tools_provider=self.mcp_tools_provider,
                 registry=self.yaml_graph_registry,
                 run_repository=self.run_repository,
@@ -270,6 +275,7 @@ class ApplicationContainer:
                 runner = YamlGraphRunner(
                     run.workflow_definition,
                     llm=self.llm,
+                    llm_factory=self.llm_factory,
                     mcp_tools_provider=self.mcp_tools_provider,
                     openhands=self.openhands,
                 )
@@ -294,38 +300,46 @@ _OPENAI_DEFAULT_MODEL = "gpt-4o"
 _GOOGLE_DEFAULT_MODEL = "gemini-2.0-flash"
 
 
-def build_llm(settings: Settings) -> BaseChatModel:
-    provider = (settings.llm_provider or "").lower()
-
+def build_llm_for(provider: str, model: str | None, settings: Settings) -> BaseChatModel:
+    """Build an LLM for an explicit provider + optional model override."""
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
         return ChatAnthropic(
-            model=settings.llm_model or _ANTHROPIC_DEFAULT_MODEL,
+            model=model or _ANTHROPIC_DEFAULT_MODEL,
             api_key=settings.anthropic_api_key,  # type: ignore[arg-type]
             max_tokens=16000,
         )
-
     if provider == "openai":
         from langchain_openai import ChatOpenAI
         return ChatOpenAI(
-            model=settings.llm_model or _OPENAI_DEFAULT_MODEL,
+            model=model or _OPENAI_DEFAULT_MODEL,
             api_key=settings.openai_api_key,  # type: ignore[arg-type]
             max_tokens=16000,
         )
-
     if provider == "google":
         from langchain_google_genai import ChatGoogleGenerativeAI
         return ChatGoogleGenerativeAI(
-            model=settings.llm_model or _GOOGLE_DEFAULT_MODEL,
+            model=model or _GOOGLE_DEFAULT_MODEL,
             google_api_key=settings.google_api_key,  # type: ignore[arg-type]
             max_output_tokens=16000,
         )
-
     from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
     from langchain_core.messages import AIMessage
     return FakeMessagesListChatModel(
         responses=[AIMessage(content="LLM not configured. Set LLM_PROVIDER and the matching API key.")]
     )
+
+
+def build_llm(settings: Settings) -> BaseChatModel:
+    return build_llm_for((settings.llm_provider or "").lower(), settings.llm_model, settings)
+
+
+def _make_llm_factory(settings: Settings) -> Callable[[str | None, str | None], BaseChatModel]:
+    """Return a factory that builds an LLM with optional per-step provider/model overrides."""
+    def factory(provider: str | None, model: str | None) -> BaseChatModel:
+        effective_provider = (provider or settings.llm_provider or "").lower()
+        return build_llm_for(effective_provider, model, settings)
+    return factory
 
 
 def _build_workflow_backend(settings: Settings) -> WorkflowDefinitionBackend:
@@ -338,6 +352,7 @@ def _build_workflow_backend(settings: Settings) -> WorkflowDefinitionBackend:
 
 def build_container(settings: Settings) -> ApplicationContainer:
     llm = build_llm(settings)
+    llm_factory = _make_llm_factory(settings)
     mcp_tools_provider = McpToolsProvider(settings)
     openhands = OpenHandsAdapter(settings)
     mongo_provider = MongoClientProvider(settings)
@@ -347,6 +362,7 @@ def build_container(settings: Settings) -> ApplicationContainer:
     return ApplicationContainer(
         settings=settings,
         llm=llm,
+        llm_factory=llm_factory,
         mcp_tools_provider=mcp_tools_provider,
         yaml_graph_registry=YamlGraphRegistry({}),
         mongo_provider=mongo_provider,

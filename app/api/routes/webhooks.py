@@ -58,6 +58,7 @@ async def receive_webhook(
         runner = build_runner_from_definition(
             defn,
             llm=container.llm,
+            llm_factory=container.llm_factory,
             mcp_tools_provider=container.mcp_tools_provider,
             registry=container.yaml_graph_registry,
             run_repository=container.run_repository,

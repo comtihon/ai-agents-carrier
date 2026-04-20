@@ -4,6 +4,7 @@ import asyncio
 import base64
 import logging
 import string
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, TypedDict
 from uuid import uuid4
 
@@ -227,6 +228,7 @@ class YamlGraphRunner:
         llm: BaseChatModel,
         mcp_tools_provider: McpToolsProvider,
         openhands: OpenHandsAdapter | None = None,
+        llm_factory: Callable[[str | None, str | None], BaseChatModel] | None = None,
     ) -> None:
         self.id: str = definition["id"]
         # Human-readable name; fall back to title-casing the id
@@ -238,6 +240,7 @@ class YamlGraphRunner:
         self.readonly: bool = False  # Set post-construction by build_registry_from_definitions
         self._steps: list[dict[str, Any]] = definition["steps"]
         self._llm = llm
+        self._llm_factory = llm_factory
         self._mcp = mcp_tools_provider
         self._openhands = openhands
         # Injected post-construction by load_yaml_graphs
@@ -274,6 +277,14 @@ class YamlGraphRunner:
     # Node factories
     # ------------------------------------------------------------------
 
+    def _get_llm_for_step(self, step: dict[str, Any]) -> BaseChatModel:
+        """Return the LLM to use for a step, applying per-step provider/model overrides."""
+        provider: str | None = step.get("llm_provider") or None
+        model: str | None = step.get("model") or None
+        if (provider or model) and self._llm_factory is not None:
+            return self._llm_factory(provider, model)
+        return self._llm
+
     def _make_node(self, step: dict[str, Any]):
         t = step["type"]
         if t == "llm_structured":
@@ -303,6 +314,7 @@ class YamlGraphRunner:
 
     def _llm_structured_node(self, step: dict[str, Any]):
         graph_id = self.id
+        base_llm = self._get_llm_for_step(step)
 
         async def node(state: dict) -> dict:
             step_id = step["id"]
@@ -326,7 +338,7 @@ class YamlGraphRunner:
             # on steps that only reason about text and should not call MCP tools
             # (prevents the LLM from invoking unneeded/restricted server tools).
             mcp_tools = self._mcp.get_tools() if step.get("bind_mcp_tools", True) else []
-            llm = self._llm.bind_tools(mcp_tools + [submit_tool])
+            llm = base_llm.bind_tools(mcp_tools + [submit_tool])
 
             system_prompt = step.get("system_prompt", "")
             user_message = self._render(step.get("user_template", "{request}"), state)
@@ -433,6 +445,7 @@ class YamlGraphRunner:
 
     def _llm_node(self, step: dict[str, Any]):
         graph_id = self.id
+        llm = self._get_llm_for_step(step)
 
         async def node(state: dict) -> dict:
             step_id = step["id"]
@@ -450,7 +463,7 @@ class YamlGraphRunner:
                 "[%s] step '%s' → LLM | system: %s | user: %s",
                 graph_id, step_id, system_prompt, user_message,
             )
-            response = await self._llm.ainvoke(messages)
+            response = await llm.ainvoke(messages)
             logger.info("[%s] step '%s' ← LLM | content: %r", graph_id, step_id, response.content)
             logger.info("[%s] step '%s' finished", graph_id, step_id)
             return {step["output_key"]: response.content}
