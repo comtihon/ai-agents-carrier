@@ -296,6 +296,17 @@ async def create_workflow(
 # IMPORTANT: these routes MUST be registered before /{workflow_id} routes so
 # that Starlette does not match "runs" as a {workflow_id} path parameter.
 
+@router.get("/runs")
+async def list_runs(
+    limit: int = 50,
+    workflow_id: str | None = None,
+    container: ApplicationContainer = Depends(get_container),
+):
+    """List recent workflow runs, newest first."""
+    runs = await container.run_repository.list_recent(limit=limit, workflow_id=workflow_id)
+    return [_run_response(run, _get_runner_for_run(run, container)) for run in runs]
+
+
 @router.post("/runs")
 async def start_run(
     body: RunRequest,

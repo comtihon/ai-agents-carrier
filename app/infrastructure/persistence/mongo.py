@@ -29,6 +29,14 @@ class MongoGraphRunRepository:
         docs = await cursor.to_list(length=None)
         return [self._from_doc(doc) for doc in docs]
 
+    async def list_recent(self, limit: int = 50, workflow_id: str | None = None) -> list[GraphRun]:
+        query: dict = {}
+        if workflow_id:
+            query["graph_id"] = workflow_id
+        cursor = self._collection.find(query).sort("created_at", -1).limit(limit)
+        docs = await cursor.to_list(length=limit)
+        return [self._from_doc(doc) for doc in docs]
+
     @staticmethod
     def _to_doc(run: GraphRun) -> dict[str, Any]:
         data = run.model_dump(mode="python")
