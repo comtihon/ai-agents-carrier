@@ -317,10 +317,18 @@ async def create_workflow(
 async def list_runs(
     limit: int = 50,
     workflow_id: str | None = None,
+    status: str | None = None,
+    search: str | None = None,
     container: ApplicationContainer = Depends(get_container),
 ):
-    """List recent workflow runs, newest first."""
-    runs = await container.run_repository.list_recent(limit=limit, workflow_id=workflow_id)
+    """List recent workflow runs, newest first.
+
+    Optional filters: workflow_id, status (running|waiting_approval|completed|failed|cancelled),
+    search (case-insensitive substring match on user_request).
+    """
+    runs = await container.run_repository.list_recent(
+        limit=limit, workflow_id=workflow_id, status=status, search=search
+    )
     return [_run_response(run, _get_runner_for_run(run, container)) for run in runs]
 
 

@@ -29,10 +29,20 @@ class MongoGraphRunRepository:
         docs = await cursor.to_list(length=None)
         return [self._from_doc(doc) for doc in docs]
 
-    async def list_recent(self, limit: int = 50, workflow_id: str | None = None) -> list[GraphRun]:
+    async def list_recent(
+        self,
+        limit: int = 50,
+        workflow_id: str | None = None,
+        status: str | None = None,
+        search: str | None = None,
+    ) -> list[GraphRun]:
         query: dict = {}
         if workflow_id:
             query["graph_id"] = workflow_id
+        if status:
+            query["status"] = status
+        if search:
+            query["user_request"] = {"$regex": search, "$options": "i"}
         cursor = self._collection.find(query).sort("created_at", -1).limit(limit)
         docs = await cursor.to_list(length=limit)
         return [self._from_doc(doc) for doc in docs]

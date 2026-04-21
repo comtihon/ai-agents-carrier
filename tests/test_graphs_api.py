@@ -145,3 +145,58 @@ async def test_get_run_not_found(client):
     container.run_repository.get = AsyncMock(return_value=None)
     resp = await c.get("/api/v1/workflows/runs/missing")
     assert resp.status_code == 404
+
+
+# ─── Filter tests ─────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_list_runs_no_filter(client):
+    c, container = client
+    container.run_repository.list_recent = AsyncMock(return_value=[])
+    resp = await c.get("/api/v1/workflows/runs")
+    assert resp.status_code == 200
+    assert resp.json() == []
+    container.run_repository.list_recent.assert_called_once_with(
+        limit=50, workflow_id=None, status=None, search=None
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_runs_status_filter(client):
+    c, container = client
+    run = GraphRun(id="r1", graph_id="simple", user_request="build feature", status="running")
+    container.run_repository.list_recent = AsyncMock(return_value=[run])
+    resp = await c.get("/api/v1/workflows/runs?status=running")
+    assert resp.status_code == 200
+    container.run_repository.list_recent.assert_called_once_with(
+        limit=50, workflow_id=None, status="running", search=None
+    )
+    data = resp.json()
+    assert len(data) == 1
+    assert data[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_list_runs_search_filter(client):
+    c, container = client
+    container.run_repository.list_recent = AsyncMock(return_value=[])
+    resp = await c.get("/api/v1/workflows/runs?search=dark+mode")
+    assert resp.status_code == 200
+    container.run_repository.list_recent.assert_called_once_with(
+        limit=50, workflow_id=None, status=None, search="dark mode"
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_runs_combined_filters(client):
+    c, container = client
+    run = GraphRun(id="r2", graph_id="simple", user_request="build feature", status="completed")
+    container.run_repository.list_recent = AsyncMock(return_value=[run])
+    resp = await c.get(
+        "/api/v1/workflows/runs?workflow_id=simple&status=completed&search=build&limit=10"
+    )
+    assert resp.status_code == 200
+    container.run_repository.list_recent.assert_called_once_with(
+        limit=10, workflow_id="simple", status="completed", search="build"
+    )
+    assert len(resp.json()) == 1
