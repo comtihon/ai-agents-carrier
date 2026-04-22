@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import string
 from collections.abc import Callable
@@ -787,6 +788,12 @@ class YamlGraphRunner:
         request body) before the graph starts.  This node reads that value and
         stores it under ``output_key`` so downstream steps can reference the
         incoming data.
+
+        When a non-empty payload arrives and ``request`` is not already set in
+        state (i.e. the run was webhook-triggered rather than manually invoked),
+        ``request`` is also populated with the JSON-serialised payload so that
+        downstream steps using ``{request}`` work uniformly for both invocation
+        paths.
         """
         graph_id = self.id
         output_key = step.get("output_key", "trigger_payload")
@@ -794,7 +801,11 @@ class YamlGraphRunner:
         async def node(state: dict) -> dict:
             step_id = step["id"]
             logger.info("[%s] step '%s' running (http trigger)", graph_id, step_id)
-            return {output_key: state.get("trigger_payload", {})}
+            payload = state.get("trigger_payload", {})
+            updates: dict[str, Any] = {output_key: payload}
+            if payload and not state.get("request"):
+                updates["request"] = json.dumps(payload) if isinstance(payload, dict) else str(payload)
+            return updates
 
         return node
 
