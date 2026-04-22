@@ -292,16 +292,33 @@ class YamlGraphRunner:
 
         sg.add_edge(START, step_ids[0])
 
+        _MULTI_OUTPUT_TYPES = frozenset({"llm_structured", "switch"})
+
         for i, step in enumerate(self._steps):
             sid = step["id"]
+            step_type = step.get("type")
+
+            # parallel: unconditional fan-out to all targets
+            if step_type == "parallel":
+                targets = step.get("targets") or []
+                for t in targets:
+                    sg.add_edge(sid, t if t in all_ids else END)
+                if not targets:
+                    # no targets configured — connect sequentially or to END
+                    if i < len(self._steps) - 1:
+                        sg.add_edge(sid, step_ids[i + 1])
+                    else:
+                        sg.add_edge(sid, END)
+                continue
+
             routes = step.get("routes") or []
             next_val = step.get("next")
 
             if routes:
-                if step.get("type") != "llm_structured" and len(routes) > 1:
+                if step_type not in _MULTI_OUTPUT_TYPES and len(routes) > 1:
                     raise ValueError(
-                        f"Step '{sid}' (type={step.get('type')}) cannot have more than "
-                        f"1 route; only llm_structured supports multiple routes."
+                        f"Step '{sid}' (type={step_type}) cannot have more than "
+                        f"1 route; only llm_structured and switch support multiple routes."
                     )
                 if len(routes) == 1 and "when" not in routes[0]:
                     dest = routes[0]["next"]
@@ -356,11 +373,17 @@ class YamlGraphRunner:
             fn = self._http_call_node(step)
         elif t == "python":
             fn = self._python_node(step)
+        elif t == "parallel":
+            fn = self._parallel_node(step)
+        elif t == "join":
+            fn = self._join_node(step)
+        elif t == "switch":
+            fn = self._switch_node(step)
         else:
             raise ValueError(f"Unknown step type '{t}' in graph '{self.id}'")
         return self._wrap_with_loop_guard(step, fn)
 
-    _NO_LOOP_GUARD_TYPES: frozenset = frozenset({"human_approval", "cron", "http"})
+    _NO_LOOP_GUARD_TYPES: frozenset = frozenset({"human_approval", "cron", "http", "parallel", "join", "switch"})
 
     def _wrap_with_loop_guard(self, step: dict[str, Any], fn: Callable) -> Callable:
         """Wrap a node function to track visit counts and enforce max_loops."""
@@ -856,6 +879,24 @@ class YamlGraphRunner:
             logger.info("[%s] step '%s' finished", graph_id, step_id)
             return {output_key: result}
 
+        return node
+
+    @staticmethod
+    def _parallel_node(step: dict[str, Any]) -> Callable:
+        async def node(state: dict) -> dict:
+            return {}
+        return node
+
+    @staticmethod
+    def _join_node(step: dict[str, Any]) -> Callable:
+        async def node(state: dict) -> dict:
+            return {}
+        return node
+
+    @staticmethod
+    def _switch_node(step: dict[str, Any]) -> Callable:
+        async def node(state: dict) -> dict:
+            return {}
         return node
 
     # ------------------------------------------------------------------
