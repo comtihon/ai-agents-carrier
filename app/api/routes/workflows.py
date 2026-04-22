@@ -139,16 +139,28 @@ def _get_runner_for_run(run: GraphRun, container: ApplicationContainer) -> YamlG
 
 def _get_interrupt_payload(runner: YamlGraphRunner | None, run: GraphRun) -> dict:
     """Extract the rendered interrupt payload from the paused LangGraph snapshot."""
-    if run.status != "waiting_approval" or runner is None:
+    if run.status != "waiting_approval":
         return {}
-    try:
-        snap = runner.graph.get_state(_config(run.id))
-        for task in snap.tasks:
-            for intr in task.interrupts:
+    # Primary: read from the live MemorySaver checkpoint (works when runner is in live_runners)
+    if runner is not None:
+        try:
+            snap = runner.graph.get_state(_config(run.id))
+            for task in snap.tasks:
+                for intr in task.interrupts:
+                    if isinstance(intr.value, dict):
+                        return intr.value
+            # Also check top-level snap.interrupts (LangGraph 0.5+)
+            for intr in getattr(snap, "interrupts", ()):
                 if isinstance(intr.value, dict):
                     return intr.value
-    except Exception:
-        pass
+        except Exception:
+            logger.exception("run %s: failed to read interrupt from MemorySaver", run.id)
+    # Fallback: use the __interrupt__ chunk persisted to step_outputs during streaming
+    raw = (run.step_outputs or {}).get("__interrupt__")
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict) and isinstance(item.get("value"), dict):
+                return item["value"]
     return {}
 
 
