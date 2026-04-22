@@ -634,7 +634,7 @@ class YamlGraphRunner:
             logger.info("[%s] step '%s' waiting for approval", graph_id, step_id)
             payload = {
                 k: self._render(v, state)
-                for k, v in step.get("interrupt_payload", {"plan": "{plan}"}).items()
+                for k, v in (step.get("interrupt_payload") or {"plan": "{plan}"}).items()
             }
             decision: dict = interrupt(payload)
             approved = decision.get("approved", False)
