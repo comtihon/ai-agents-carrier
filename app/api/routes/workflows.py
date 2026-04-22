@@ -6,7 +6,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from langgraph.types import Command
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.api.dependencies import get_container
 from app.core.container import ApplicationContainer
@@ -54,12 +54,14 @@ class WorkflowDefinitionRequest(BaseModel):
     name: str = ""
     description: str = ""
     steps: list[dict[str, Any]] = []
+    ui: dict[str, Any] = Field(default_factory=dict)
 
 
 class WorkflowDefinitionUpdateRequest(BaseModel):
     name: str = ""
     description: str = ""
     steps: list[dict[str, Any]] = []
+    ui: dict[str, Any] = Field(default_factory=dict)
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -303,6 +305,7 @@ async def create_workflow(
         name=body.name,
         description=body.description,
         steps=body.steps,
+        ui=body.ui,
     )
     saved = await container.workflow_backend.create(defn)
     await container.refresh_runner(body.id)
@@ -580,6 +583,7 @@ async def update_workflow(
         name=body.name,
         description=body.description,
         steps=body.steps,
+        ui=body.ui,
         created_at=existing.created_at,
     )
     saved = await container.workflow_backend.update(workflow_id, defn)

@@ -67,6 +67,7 @@ class LocalFilesWorkflowBackend(WorkflowDefinitionBackend):
                 name=raw.get("name", ""),
                 description=raw.get("description", ""),
                 steps=raw.get("steps", []),
+                ui=raw.get("ui", {}),
                 readonly=self._readonly,
                 created_at=datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc),
                 updated_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
@@ -115,6 +116,8 @@ class LocalFilesWorkflowBackend(WorkflowDefinitionBackend):
             "description": definition.description,
             "steps": definition.steps,
         }
+        if definition.ui:
+            data["ui"] = definition.ui
         self._file_path(definition.id).write_text(
             yaml.dump(data, default_flow_style=False, allow_unicode=True, sort_keys=False)
         )

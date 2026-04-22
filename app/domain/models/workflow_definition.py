@@ -11,6 +11,7 @@ class WorkflowDefinition(BaseModel):
     name: str = ""
     description: str = ""
     steps: list[dict[str, Any]] = []
+    ui: dict[str, Any] = Field(default_factory=dict)
     readonly: bool = False
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -20,9 +21,12 @@ class WorkflowDefinition(BaseModel):
 
     def to_raw_dict(self) -> dict[str, Any]:
         """Return the raw definition dict as expected by YamlGraphRunner."""
-        return {
+        d: dict[str, Any] = {
             "id": self.id,
             "name": self.name,
             "description": self.description,
             "steps": self.steps,
         }
+        if self.ui:
+            d["ui"] = self.ui
+        return d
