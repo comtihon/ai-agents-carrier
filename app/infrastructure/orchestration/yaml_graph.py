@@ -40,6 +40,7 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
         "approved": bool,
         "reject_reason": str,
         "_conv_map": Any,  # type: ignore[assignment]
+        "_visit_counts": Any,  # type: ignore[assignment]
     }
     for step in steps:
         # Regular output nodes store their result under output_key
@@ -253,6 +254,7 @@ class YamlGraphRunner:
             self.id.replace("-", " ").replace("_", " ").title(),
         )
         self.description: str = definition.get("description", "")
+        self._max_iterations: int = definition.get("max_iterations", 10)
         self.readonly: bool = False  # Set post-construction by build_registry_from_definitions
         self._steps: list[dict[str, Any]] = definition["steps"]
         self._llm = llm
@@ -278,15 +280,46 @@ class YamlGraphRunner:
 
     def _build(self):
         sg = StateGraph(self._state_schema)
+        step_ids = [s["id"] for s in self._steps]
+        all_ids = set(step_ids)
 
-        prev = START
         for step in self._steps:
-            node_fn = self._make_node(step)
-            sg.add_node(step["id"], node_fn)
-            sg.add_edge(prev, step["id"])
-            prev = step["id"]
+            sg.add_node(step["id"], self._make_node(step))
 
-        sg.add_edge(prev, END)
+        if not step_ids:
+            sg.add_edge(START, END)
+            return sg.compile(checkpointer=MemorySaver())
+
+        sg.add_edge(START, step_ids[0])
+
+        for i, step in enumerate(self._steps):
+            sid = step["id"]
+            routes = step.get("routes") or []
+            next_val = step.get("next")
+
+            if routes:
+                if step.get("type") != "llm_structured" and len(routes) > 1:
+                    raise ValueError(
+                        f"Step '{sid}' (type={step.get('type')}) cannot have more than "
+                        f"1 route; only llm_structured supports multiple routes."
+                    )
+                if len(routes) == 1 and "when" not in routes[0]:
+                    dest = routes[0]["next"]
+                    sg.add_edge(sid, dest if dest in all_ids else END)
+                else:
+                    route_map = {
+                        r["next"]: (r["next"] if r["next"] in all_ids else END)
+                        for r in routes
+                        if "next" in r
+                    }
+                    sg.add_conditional_edges(sid, self._make_router_fn(routes), route_map)
+            elif next_val:
+                sg.add_edge(sid, next_val if next_val in all_ids else END)
+            elif i < len(self._steps) - 1:
+                sg.add_edge(sid, step_ids[i + 1])
+            else:
+                sg.add_edge(sid, END)
+
         return sg.compile(checkpointer=MemorySaver())
 
     # ------------------------------------------------------------------
@@ -304,26 +337,72 @@ class YamlGraphRunner:
     def _make_node(self, step: dict[str, Any]):
         t = step["type"]
         if t == "llm_structured":
-            return self._llm_structured_node(step)
-        if t == "llm":
-            return self._llm_node(step)
-        if t == "mcp":
-            return self._mcp_node(step)
-        if t == "human_approval":
-            return self._approval_node(step)
-        if t == "execute":
-            return self._execute_node(step)
-        if t == "workflow":
-            return self._workflow_node(step)
-        if t == "cron":
-            return self._cron_trigger_node(step)
-        if t == "http":
-            return self._http_trigger_node(step)
-        if t == "http_call":
-            return self._http_call_node(step)
-        if t == "python":
-            return self._python_node(step)
-        raise ValueError(f"Unknown step type '{t}' in graph '{self.id}'")
+            fn = self._llm_structured_node(step)
+        elif t == "llm":
+            fn = self._llm_node(step)
+        elif t == "mcp":
+            fn = self._mcp_node(step)
+        elif t == "human_approval":
+            fn = self._approval_node(step)
+        elif t == "execute":
+            fn = self._execute_node(step)
+        elif t == "workflow":
+            fn = self._workflow_node(step)
+        elif t == "cron":
+            fn = self._cron_trigger_node(step)
+        elif t == "http":
+            fn = self._http_trigger_node(step)
+        elif t == "http_call":
+            fn = self._http_call_node(step)
+        elif t == "python":
+            fn = self._python_node(step)
+        else:
+            raise ValueError(f"Unknown step type '{t}' in graph '{self.id}'")
+        return self._wrap_with_loop_guard(step, fn)
+
+    _NO_LOOP_GUARD_TYPES: frozenset = frozenset({"human_approval", "cron", "http"})
+
+    def _wrap_with_loop_guard(self, step: dict[str, Any], fn: Callable) -> Callable:
+        """Wrap a node function to track visit counts and enforce max_loops."""
+        if step.get("type") in self._NO_LOOP_GUARD_TYPES:
+            return fn
+        step_id = step["id"]
+        max_loops = step.get("max_loops", self._max_iterations)
+        is_async = asyncio.iscoroutinefunction(fn)
+        graph_id = self.id
+
+        async def _guarded(state: dict) -> dict:
+            result = (await fn(state)) if is_async else fn(state)
+            if not result:  # node was skipped (returned {})
+                return result
+            counts: dict = dict(state.get("_visit_counts") or {})
+            counts[step_id] = counts.get(step_id, 0) + 1
+            if counts[step_id] > max_loops:
+                raise ValueError(
+                    f"[{graph_id}] step '{step_id}' exceeded max_loops={max_loops} "
+                    f"(ran {counts[step_id]} times)"
+                )
+            return {**result, "_visit_counts": counts}
+
+        return _guarded
+
+    @staticmethod
+    def _make_router_fn(routes: list[dict[str, Any]]) -> Callable[[dict], str]:
+        """Return a routing function for add_conditional_edges."""
+        def router(state: dict) -> str:
+            for route in routes:
+                when = route.get("when")
+                if when is None:
+                    return route["next"]
+                negate = isinstance(when, str) and when.startswith("!")
+                key = when[1:] if negate else when
+                val = bool(state.get(key))
+                if negate:
+                    val = not val
+                if val:
+                    return route["next"]
+            return routes[-1]["next"]
+        return router
 
     _SUBMIT_TOOL = "submit_output"
     _MAX_ITERATIONS = 25

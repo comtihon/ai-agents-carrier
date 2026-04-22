@@ -1,0 +1,52 @@
+id: code-review-loop
+name: "Code Review Loop"
+description: "Plan → Execute → Code Review with revision loop. Code review routes back to execute on failure."
+max_iterations: 3
+
+steps:
+  - id: plan
+    type: llm
+    output_key: plan
+    system_prompt: "You are a planning assistant. Create a concise implementation plan."
+    user_template: "{request}"
+
+  - id: execute
+    type: llm_structured
+    max_loops: 3
+    system_prompt: >
+      You are a software engineer. Implement the plan.
+      Previous feedback (if any): {feedback}
+    user_template: "Plan: {plan}\nPrevious feedback: {feedback}"
+    output:
+      - name: result
+        type: str
+        description: "Description of what was implemented"
+      - name: code
+        type: str
+        description: "The code written"
+
+  - id: code_review
+    type: llm_structured
+    max_loops: 3
+    system_prompt: "You are a code reviewer. Review the implementation against the plan."
+    user_template: "Plan: {plan}\nImplementation: {result}\nCode:\n{code}"
+    output:
+      - name: feedback
+        type: str
+        description: "Review feedback. If passing, confirm what was done well."
+      - name: passed
+        type: bool
+        description: "True if the implementation passes review, False if it needs revision"
+    routes:
+      - when: passed
+        next: notify
+      - next: execute
+
+  - id: notify
+    type: http_call
+    url: "https://example.com/notify"
+    method: POST
+    body:
+      result: "{result}"
+      feedback: "{feedback}"
+    output_key: notification

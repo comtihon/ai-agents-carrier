@@ -489,11 +489,12 @@ async def retry_run(
             if output and isinstance(output, dict):
                 accumulated.update(output)
 
-    # Seed any persisted OpenHands conversation IDs so the execute node can resume polling
+    # Seed mid-execution state keys persisted before step completion (but NOT _visit_counts
+    # so that retried runs start with a fresh loop counter).
     if run.state and isinstance(run.state, dict):
         for k, v in run.state.items():
-            if k.startswith("_openhands_conv_") and v:
-                accumulated[k] = v
+            if k.startswith("_") and k != "_visit_counts" and v is not None:
+                accumulated.setdefault(k, v)
 
     # Reset failed step and all subsequent steps back to "pending"
     found_failed = False

@@ -224,6 +224,14 @@ class ApplicationContainer:
                 if output and isinstance(output, dict):
                     accumulated.update(output)
 
+        # Seed internal state keys (e.g. _openhands_conv_*, _conv_map) persisted
+        # mid-step by _save_conv_id — these exist in run.state but not yet in
+        # step_outputs when the server crashed before the step completed.
+        if run.state and isinstance(run.state, dict):
+            for k, v in run.state.items():
+                if k.startswith("_") and v is not None:
+                    accumulated.setdefault(k, v)
+
         config = {"configurable": {"thread_id": run.id}}
 
         if last_done is not None:
