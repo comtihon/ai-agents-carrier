@@ -129,12 +129,16 @@ def _get_runner_for_run(run: GraphRun, container: ApplicationContainer) -> YamlG
     """Return the runner for an existing run.
 
     Checks live_runners first (in-flight run with its original definition),
-    then falls back to the registry (post-completion or legacy test setup).
+    then falls back to the registry only when no definition snapshot exists.
+    When a snapshot is stored we skip the registry fallback so that a newer
+    definition (updated after the run started) does not leak into the response.
     """
     runner = container.live_runners.get(run.id)
-    if runner is None:
-        runner = container.yaml_graph_registry.get(run.graph_id)
-    return runner
+    if runner is not None:
+        return runner
+    if run.workflow_definition is None:
+        return container.yaml_graph_registry.get(run.graph_id)
+    return None
 
 
 def _get_interrupt_payload(runner: YamlGraphRunner | None, run: GraphRun) -> dict:
