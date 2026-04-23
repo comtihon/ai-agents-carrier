@@ -103,16 +103,15 @@ async def test_approve_runs_implement_step() -> None:
 
         approve = await client.post(f"/api/v1/workflows/runs/{run_id}/approve")
         assert approve.status_code == 200, approve.text
-        body = approve.json()
+
+        # Background task completes; GET reflects final state
+        get_resp = await client.get(f"/api/v1/workflows/runs/{run_id}")
+        body = get_resp.json()
 
         assert body["status"] == "completed"
         assert body["intermediate_outputs"]["plan"] == "the plan"
         assert body["intermediate_outputs"]["implementation"] == "the implementation"
         assert body["intermediate_outputs"]["approved"] is True
-
-        # MongoDB reflects completed status
-        get_resp = await client.get(f"/api/v1/workflows/runs/{run_id}")
-        assert get_resp.json()["status"] == "completed"
     finally:
         await mongo.close()
 
@@ -210,7 +209,10 @@ async def test_reject_skips_implement_step() -> None:
             json={"reason": "plan looks wrong"},
         )
         assert reject.status_code == 200, reject.text
-        body = reject.json()
+
+        # Background task completes; GET reflects final state
+        get_resp = await client.get(f"/api/v1/workflows/runs/{run_id}")
+        body = get_resp.json()
 
         assert body["status"] == "cancelled"
         assert body["intermediate_outputs"]["approved"] is False

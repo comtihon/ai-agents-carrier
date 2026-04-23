@@ -100,7 +100,10 @@ async def test_two_sequential_approvals_complete() -> None:
         # ---- approve gate 1 ----
         approve1 = await client.post(f"/api/v1/workflows/runs/{run_id}/approve")
         assert approve1.status_code == 200, approve1.text
-        body = approve1.json()
+
+        # Background task completes; GET reflects state after gate 1 (paused at gate 2)
+        get1 = await client.get(f"/api/v1/workflows/runs/{run_id}")
+        body = get1.json()
 
         # graph ran plan step then paused at gate 2
         assert body["status"] == "waiting_approval"
@@ -111,7 +114,10 @@ async def test_two_sequential_approvals_complete() -> None:
         # ---- approve gate 2 ----
         approve2 = await client.post(f"/api/v1/workflows/runs/{run_id}/approve")
         assert approve2.status_code == 200, approve2.text
-        body = approve2.json()
+
+        # Background task completes; GET reflects final state
+        get2 = await client.get(f"/api/v1/workflows/runs/{run_id}")
+        body = get2.json()
 
         assert body["status"] == "completed"
         assert body["intermediate_outputs"]["implementation"] == "implementation done"
@@ -141,7 +147,10 @@ async def test_reject_at_gate_1_skips_plan_and_impl() -> None:
             json={"reason": "design not good enough"},
         )
         assert rej.status_code == 200, rej.text
-        body = rej.json()
+
+        # Background task completes; GET reflects state after gate 1 rejection
+        get_rej = await client.get(f"/api/v1/workflows/runs/{run_id}")
+        body = get_rej.json()
 
         # plan step skipped — approved=False — then hits gate 2
         assert body["status"] == "waiting_approval"
@@ -151,7 +160,11 @@ async def test_reject_at_gate_1_skips_plan_and_impl() -> None:
 
         # ---- approve gate 2 (now approved=True) → implement runs ----
         approve2 = await client.post(f"/api/v1/workflows/runs/{run_id}/approve")
-        body = approve2.json()
+        assert approve2.status_code == 200, approve2.text
+
+        # Background task completes; GET reflects final state
+        get2 = await client.get(f"/api/v1/workflows/runs/{run_id}")
+        body = get2.json()
 
         assert body["status"] == "completed"
         assert body["intermediate_outputs"]["approved"] is True

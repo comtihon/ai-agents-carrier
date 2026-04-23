@@ -155,7 +155,10 @@ async def test_waiting_approval_survives_restart() -> None:
             # ── 4. Approve ────────────────────────────────────────────────────
             approve_resp = await client.post(f"/api/v1/workflows/runs/{run_id}/approve")
             assert approve_resp.status_code == 200, approve_resp.text
-            body = approve_resp.json()
+
+            # Background task completes; GET reflects final state
+            get_resp = await client.get(f"/api/v1/workflows/runs/{run_id}")
+            body = get_resp.json()
 
             assert body["status"] == "completed"
             assert body["intermediate_outputs"]["plan"] == "the plan"
@@ -213,7 +216,10 @@ async def test_rejection_survives_restart() -> None:
                 json={"reason": "not ready"},
             )
             assert reject_resp.status_code == 200, reject_resp.text
-            body = reject_resp.json()
+
+            # Background task completes; GET reflects final state
+            get_resp = await client.get(f"/api/v1/workflows/runs/{run_id}")
+            body = get_resp.json()
 
             assert body["status"] == "cancelled"
             assert body["intermediate_outputs"]["approved"] is False
@@ -266,6 +272,9 @@ async def test_startup_recover_incomplete_runs() -> None:
 
             approve_resp = await client.post(f"/api/v1/workflows/runs/{run_id}/approve")
             assert approve_resp.status_code == 200, approve_resp.text
-            assert approve_resp.json()["status"] == "completed"
+
+            # Background task completes; GET reflects final state
+            get_resp = await client.get(f"/api/v1/workflows/runs/{run_id}")
+            assert get_resp.json()["status"] == "completed"
     finally:
         await mongo_provider.close()

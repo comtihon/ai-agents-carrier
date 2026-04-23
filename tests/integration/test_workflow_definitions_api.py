@@ -403,9 +403,12 @@ class TestLocalFilesWorkflowDefinitionsAPI:
             # Step 3: Approve the V1 run — should still work with V1 runner
             approve_resp = await client.post(f"/api/v1/workflows/runs/{run_id}/approve")
             assert approve_resp.status_code == 200, approve_resp.text
-            assert approve_resp.json()["status"] == "completed"
-            # Response steps should reflect V1 definition (3 steps, no new_step_v2)
-            step_ids = [s["id"] for s in approve_resp.json()["steps"]]
+
+            # Background task completes; GET reflects final state
+            get_approve = await client.get(f"/api/v1/workflows/runs/{run_id}")
+            assert get_approve.json()["status"] == "completed"
+            # Steps should reflect V1 definition (3 steps, no new_step_v2)
+            step_ids = [s["id"] for s in get_approve.json()["steps"]]
             assert "new_step_v2" not in step_ids
             assert "execute" in step_ids
 
