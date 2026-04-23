@@ -416,6 +416,7 @@ async def get_run(
 @router.post("/runs/{run_id}/approve")
 async def approve_run(
     run_id: str,
+    background_tasks: BackgroundTasks,
     body: ApproveRequest | None = None,
     container: ApplicationContainer = Depends(get_container),
 ):
@@ -429,20 +430,30 @@ async def approve_run(
     await container.run_repository.update(run)
 
     corrections = body.corrections if body else None
+    background_tasks.add_task(_resume_approved, runner, run, container, corrections)
+
+    return _run_response(run, runner)
+
+
+async def _resume_approved(
+    runner: YamlGraphRunner,
+    run: GraphRun,
+    container: ApplicationContainer,
+    corrections: dict | None,
+) -> None:
     await _stream_graph(
         runner, run, container,
         Command(resume={"approved": True, "corrections": corrections}),
+        base_url=container.settings.base_url,
     )
-
     if run.status in ("completed", "failed", "cancelled"):
-        container.live_runners.pop(run_id, None)
-
-    return _run_response(run, runner)
+        container.live_runners.pop(run.id, None)
 
 
 @router.post("/runs/{run_id}/reject")
 async def reject_run(
     run_id: str,
+    background_tasks: BackgroundTasks,
     body: RejectRequest | None = None,
     container: ApplicationContainer = Depends(get_container),
 ):
@@ -455,21 +466,27 @@ async def reject_run(
     run.touch()
     await container.run_repository.update(run)
 
+    background_tasks.add_task(_resume_rejected, runner, run, container, body.reason if body else None)
+
+    return _run_response(run, runner)
+
+
+async def _resume_rejected(
+    runner: YamlGraphRunner,
+    run: GraphRun,
+    container: ApplicationContainer,
+    reason: str | None,
+) -> None:
     await _stream_graph(
         runner, run, container,
-        Command(resume={"approved": False, "reason": body.reason if body else None}),
+        Command(resume={"approved": False, "reason": reason}),
     )
-
-    # Override: if no more gates remain after rejection, mark as cancelled
     if run.status == "completed":
         run.status = "cancelled"
         run.touch()
         await container.run_repository.update(run)
-
     if run.status in ("completed", "failed", "cancelled"):
-        container.live_runners.pop(run_id, None)
-
-    return _run_response(run, runner)
+        container.live_runners.pop(run.id, None)
 
 
 @router.post("/runs/{run_id}/retry")
