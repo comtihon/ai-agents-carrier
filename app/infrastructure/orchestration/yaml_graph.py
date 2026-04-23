@@ -653,15 +653,16 @@ class YamlGraphRunner:
 
     def _execute_node(self, step: dict[str, Any]):
         graph_id = self.id
+        step_id = step["id"]
+        output_key = step.get("output_key", f"{step_id}_result")
 
         async def node(state: dict) -> dict:
-            step_id = step["id"]
             if not self._when(step, state):
                 logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
                 return {}
             if self._openhands is None:
                 logger.warning("[%s] step '%s' OpenHands not configured", graph_id, step_id)
-                return {step["output_key"]: "OpenHands not configured"}
+                return {output_key: "OpenHands not configured"}
             repo = self._render(step.get("repo_template", "{repo}"), state)
             instructions = self._render(step.get("instructions_template", "{plan}"), state)
             conv_id_key = f"_openhands_conv_{step_id}"
@@ -694,7 +695,7 @@ class YamlGraphRunner:
                     conv_id_callback=_save_conv_id,
                 )
                 logger.info("[%s] step '%s' finished", graph_id, step_id)
-                output: dict = {step["output_key"]: result}
+                output: dict = {output_key: result}
                 oh_id = result.get("conversation_id")
                 if oh_id:
                     output[conv_id_key] = oh_id
@@ -703,7 +704,7 @@ class YamlGraphRunner:
                 return output
             except Exception as exc:
                 logger.exception("[%s] step '%s' execute failed", graph_id, step_id)
-                return {step["output_key"]: {"error": str(exc)}}
+                return {output_key: {"error": str(exc)}}
         return node
 
     def _workflow_node(self, step: dict[str, Any]):
