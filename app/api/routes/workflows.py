@@ -222,6 +222,8 @@ async def _stream_graph(
         except Exception:
             current_state = {}
 
+    # Track the last node fully handled in this call to identify the failing step precisely.
+    last_processed: str | None = None
     try:
         async for chunk in runner.graph.astream(
             input_value, _config(run.id), stream_mode="updates",
@@ -238,17 +240,28 @@ async def _stream_graph(
                     if isinstance(output, dict):
                         current_state.update(output)
                 logger.info("run %s: step '%s' → %s", run.id, node_name, status)
+                last_processed = node_name
                 run.touch()
                 await container.run_repository.update(run)
     except Exception as exc:
         logger.exception("run %s: graph execution failed", run.id)
+        # Find the failing step: the first pending step after the last successfully
+        # processed node in this call.  Using last_processed (not run.current_step)
+        # avoids confusion when run.current_step was set by a prior stream call.
+        past_last = last_processed is None
         for sid in step_ids:
+            if not past_last:
+                if sid == last_processed:
+                    past_last = True
+                continue
             if run.step_statuses.get(sid) == "pending":
                 run.step_inputs[sid] = dict(current_state)
                 run.step_statuses[sid] = "failed"
                 break
         run.status = "failed"
-        run.state = {"error": str(exc)}
+        # Preserve accumulated step outputs so retry can recover OpenHands conv IDs
+        # and other intermediate state without needing to re-run completed steps.
+        run.state = {**current_state, "error": str(exc)}
         run.current_step = None
         run.touch()
         await container.run_repository.update(run)

@@ -106,6 +106,8 @@ async def stream_graph_to_pause(
             current_state = dict(snap.values) if snap and snap.values else {}
         except Exception:
             current_state = {}
+
+    last_processed: str | None = None
     try:
         async for chunk in runner.graph.astream(input_value, config, stream_mode="updates"):
             for node_name, output in chunk.items():
@@ -120,19 +122,26 @@ async def stream_graph_to_pause(
                     if isinstance(output, dict):
                         current_state.update(output)
                 logger.info("run %s: step '%s' → %s", run.id, node_name, status)
+                last_processed = node_name
                 run.touch()
                 await run_repository.update(run)
     except Exception as exc:
         logger.exception("run %s: graph execution failed", run.id)
+        past_last = last_processed is None
         for sid in run.step_statuses:
+            if not past_last:
+                if sid == last_processed:
+                    past_last = True
+                continue
             if run.step_statuses.get(sid) == "pending":
                 run.step_inputs[sid] = dict(current_state)
                 run.step_statuses[sid] = "failed"
                 break
         run.status = "failed"
-        # Preserve any persisted OpenHands conversation IDs so retry can resume polling
-        preserved = {k: v for k, v in (run.state or {}).items() if k.startswith("_openhands_conv_")}
-        run.state = {"error": str(exc), **preserved}
+        # Preserve accumulated step outputs AND any internal state keys written
+        # mid-step by _save_conv_id (e.g. _openhands_conv_*, _conv_map).
+        mid_run = {k: v for k, v in (run.state or {}).items() if k.startswith("_")}
+        run.state = {**current_state, **mid_run, "error": str(exc)}
         run.current_step = None
         run.touch()
         await run_repository.update(run)
