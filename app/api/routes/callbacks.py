@@ -6,8 +6,9 @@ import json
 import logging
 import re
 import time
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from langgraph.types import Command
 from pydantic import BaseModel
@@ -192,13 +193,14 @@ async def callback_reject_get(
 @router.post("/slack/interactive")
 async def slack_interactive(
     request: Request,
+    background_tasks: BackgroundTasks,
     container: ApplicationContainer = Depends(get_container),
 ):
     """Handle Slack interactive component payloads (block action button clicks).
 
     The Slack app's Interactivity Request URL must point here.
     Buttons should have action_id "approve" or "reject" with value set to the run_id.
-    The original Slack message is updated in-place with the decision outcome.
+    The approval is processed in the background so Slack's 3-second timeout is met.
     """
     body = await request.body()
 
@@ -230,21 +232,15 @@ async def slack_interactive(
     if not run_id:
         raise HTTPException(status_code=400, detail="Missing run_id in action value")
 
-    try:
-        if action_id == "approve":
-            await _do_approve(run_id, container, approver_slack_id=user_id)
-            update_text = f"✅ Approved by {user_name}"
-        elif action_id == "reject":
-            await _do_reject(run_id, reason=None, container=container)
-            update_text = f"🚫 Rejected by {user_name}"
-        else:
-            logger.warning("slack_interactive: unknown action_id '%s'", action_id)
-            return JSONResponse(content={})
-    except HTTPException as exc:
-        if exc.status_code == 409:
-            update_text = "ℹ️ This run has already been actioned."
-        else:
-            raise
+    if action_id == "approve":
+        background_tasks.add_task(_do_approve, run_id, container, approver_slack_id=user_id)
+        update_text = f"✅ Approved by {user_name}"
+    elif action_id == "reject":
+        background_tasks.add_task(_do_reject, run_id, None, container)
+        update_text = f"🚫 Rejected by {user_name}"
+    else:
+        logger.warning("slack_interactive: unknown action_id '%s'", action_id)
+        return JSONResponse(content={})
 
     return JSONResponse(content={"replace_original": True, "text": update_text})
 
@@ -273,6 +269,7 @@ def _parse_slack_answers(text: str, n_questions: int) -> dict[str, str]:
 @router.post("/slack/events")
 async def slack_events(
     request: Request,
+    background_tasks: BackgroundTasks,
     container: ApplicationContainer = Depends(get_container),
 ):
     """Handle Slack Events API callbacks.
@@ -340,11 +337,18 @@ async def slack_events(
         logger.warning("run %s: no runner found for Slack ask_context resume", run.id)
         return JSONResponse({})
 
+    background_tasks.add_task(
+        _resume_ask_context, run, runner, answers, container, settings.base_url
+    )
+    return JSONResponse({})
+
+
+async def _resume_ask_context(run: Any, runner: Any, answers: dict, container: ApplicationContainer, base_url: str) -> None:
     run.status = "running"
     run.touch()
     await container.run_repository.update(run)
     await stream_graph_to_pause(
         runner, run, container.run_repository,
         Command(resume={"approved": True, "corrections": answers}),
-        base_url=settings.base_url,
+        base_url=base_url,
     )
