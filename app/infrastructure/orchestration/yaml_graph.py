@@ -635,14 +635,26 @@ class YamlGraphRunner:
         return node
 
     def _ask_context_node(self, step: dict[str, Any]):
+        """
+        Pause execution and present questions to the user.
+
+        Questions come from a previous step via ``questions_key`` (the state key
+        that holds a list of strings).  Alternatively they can be hardcoded in
+        the YAML via ``questions`` (a list of strings, supports {key} templates).
+        Answers are written to ``output_key`` as a dict {str(index): answer}.
+        """
         graph_id = self.id
-        output_key = step.get("output_key", f"{step['id']}_answers")
-        raw_questions: list[str] = step.get("questions") or []
+        step_id = step["id"]
+        output_key = step.get("output_key", f"{step_id}_answers")
+        questions_key: str | None = step.get("questions_key")
+        static_questions: list[str] = step.get("questions") or []
 
         def node(state: dict) -> dict:
-            step_id = step["id"]
-            questions = [self._render(q, state) for q in raw_questions]
-            logger.info("[%s] step '%s' asking %d context question(s)", graph_id, step_id, len(questions))
+            if questions_key:
+                questions = list(state.get(questions_key) or [])
+            else:
+                questions = [self._render(q, state) for q in static_questions]
+            logger.info("[%s] step '%s' presenting %d question(s)", graph_id, step_id, len(questions))
             answers: dict = interrupt({"type": "ask_context", "questions": questions})
             return {output_key: answers}
         return node
