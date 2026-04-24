@@ -139,6 +139,64 @@ async def test_develop_feature_spawns_child_workflow():
 # ── test: direct reply, no workflow ──────────────────────────────────────────
 
 @pytest.mark.asyncio
+async def test_ask_context_pauses_and_resumes():
+    """
+    Input  : "do the thing" (ambiguous)
+    LLM 1  : RouterDecision(action="ask_context", questions=["Which thing?"])
+    Resume : answers={"0": "deploy the app"}
+    LLM 2  : RouterDecision(action="reply", reply_text="Got it!")
+    Expect : graph pauses at ask_context node with interrupt payload,
+             then resumes to produce AIMessage("Got it!").
+    """
+    from langgraph.types import Command
+
+    questions = ["Which thing?"]
+    ask_decision = RouterDecision(action="ask_context", questions=questions)
+    reply_decision = RouterDecision(action="reply", reply_text="Got it!")
+
+    structured = AsyncMock()
+    # First structured call → ask_context; second call (after resume) → reply
+    structured.ainvoke = AsyncMock(side_effect=[ask_decision, reply_decision])
+
+    llm = MagicMock()
+    llm.with_structured_output = MagicMock(return_value=structured)
+    llm.astream = MagicMock(side_effect=lambda msgs: _astream_chunks("Got it!"))
+
+    registry = _fake_registry(["develop-a-ticket"])
+    repo = _fake_repo()
+
+    graph = build_default_workflow(llm, registry, repo)
+    config = {"configurable": {"thread_id": "test-ask-context-thread"}}
+
+    with patch(_STREAM_FN, new_callable=AsyncMock):
+        await graph.ainvoke(
+            {**_BASE_STATE, "messages": [HumanMessage(content="do the thing")]},
+            config,
+        )
+
+    # Graph should have paused; check that the interrupt is recorded in checkpoint
+    snap = graph.get_state(config)
+    interrupt_vals = [
+        intr.value
+        for task in snap.tasks
+        for intr in getattr(task, "interrupts", [])
+    ]
+    assert any(
+        isinstance(v, dict) and v.get("type") == "ask_context" for v in interrupt_vals
+    ), f"Expected ask_context interrupt, got: {interrupt_vals}"
+
+    # Resume with user answers
+    with patch(_STREAM_FN, new_callable=AsyncMock):
+        result2 = await graph.ainvoke(Command(resume={"0": "deploy the app"}), config)
+        await asyncio.sleep(0)
+
+    # Should have received the reply message
+    ai_msgs = [m for m in result2["messages"] if isinstance(m, AIMessage)]
+    assert ai_msgs, "Expected at least one AIMessage after resume"
+    assert ai_msgs[-1].content == "Got it!"
+
+
+@pytest.mark.asyncio
 async def test_arithmetic_question_returns_direct_reply():
     """
     Input  : "2+2"

@@ -15,10 +15,10 @@ from uuid import uuid4
 
 from copilotkit import CopilotKitState
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import RunnableConfig
+from langgraph.types import RunnableConfig, interrupt
 from pydantic import BaseModel, Field
 
 from app.domain.models.graph_run import GraphRun
@@ -36,10 +36,11 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class RouterDecision(BaseModel):
-    action: Literal["reply", "run_workflow"] = Field(
+    action: Literal["reply", "run_workflow", "ask_context"] = Field(
         description=(
             "Choose 'reply' to answer the user directly. "
-            "Choose 'run_workflow' to start a workflow that handles the request."
+            "Choose 'run_workflow' to start a workflow that handles the request. "
+            "Choose 'ask_context' when you need more information from the user before deciding."
         )
     )
     reply_text: str | None = Field(
@@ -57,6 +58,13 @@ class RouterDecision(BaseModel):
             "(required when action='run_workflow')."
         ),
     )
+    questions: list[str] | None = Field(
+        None,
+        description=(
+            "1–3 focused questions to ask the user (required when action='ask_context'). "
+            "Each question should be concise and target a specific missing piece of information."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +77,7 @@ from typing import TypedDict  # noqa: E402
 class DefaultWorkflowState(CopilotKitState, total=False):  # type: ignore[misc]
     decision: Any          # RouterDecision, typed loosely to satisfy TypedDict constraints
     spawned_workflow: Any  # populated by spawn_workflow node: {workflow_id, workflow_name, run_id}
+    # no extra fields needed — questions live in decision.questions
 
 
 # ---------------------------------------------------------------------------
@@ -102,12 +111,15 @@ For each user message, decide ONE of:
 1. **reply** — answer the question, explain a workflow, or have a general conversation.
 2. **run_workflow** — the user wants to start an automated task; pick the best matching \
 workflow and craft a detailed `workflow_request`.
+3. **ask_context** — you genuinely cannot determine what to do or which workflow fits \
+without more information. Ask 1–3 focused questions via the `questions` field.
 
 Rules:
 - Use `run_workflow` only when the user clearly wants work to be done (e.g. "implement \
 ticket X", "develop feature Y").
 - For questions, greetings, status checks, or anything that doesn't require running a \
 workflow, use `reply`.
+- Use `ask_context` sparingly — only when the request is too ambiguous to act on.
 - `workflow_request` must be self-contained — include all details the workflow needs.
 """
 
@@ -190,16 +202,28 @@ workflow, use `reply`.
             },
         }
 
+    async def ask_context_node(state: DefaultWorkflowState, config: RunnableConfig) -> dict:
+        """Pause execution and ask the user clarifying questions via interrupt()."""
+        decision: RouterDecision = state["decision"]  # type: ignore[index]
+        questions: list[str] = decision.questions or []
+        # interrupt() pauses the graph; resumes when Command(resume=answers) is invoked.
+        # answers: dict mapping str(question_index) → answer text
+        answers: dict = interrupt({"type": "ask_context", "questions": questions})
+        answer_text = "\n".join(
+            f"Q: {q}\nA: {answers.get(str(i), '').strip()}"
+            for i, q in enumerate(questions)
+        )
+        return {"messages": [HumanMessage(content=f"Additional context provided:\n{answer_text}")]}
+
     # ── routing ──────────────────────────────────────────────────────────────
 
     def route(state: DefaultWorkflowState) -> str:
         decision: RouterDecision | None = state.get("decision")  # type: ignore[assignment]
-        if (
-            decision is not None
-            and getattr(decision, "action", None) == "run_workflow"
-            and getattr(decision, "workflow_id", None)
-        ):
+        action = getattr(decision, "action", None) if decision is not None else None
+        if action == "run_workflow" and getattr(decision, "workflow_id", None):
             return "spawn_workflow"
+        if action == "ask_context":
+            return "ask_context"
         return "reply"
 
     # ── graph ────────────────────────────────────────────────────────────────
@@ -208,10 +232,16 @@ workflow, use `reply`.
     sg.add_node("decide", decide)
     sg.add_node("reply", reply)
     sg.add_node("spawn_workflow", spawn_workflow)
+    sg.add_node("ask_context", ask_context_node)
 
     sg.add_edge(START, "decide")
-    sg.add_conditional_edges("decide", route, {"reply": "reply", "spawn_workflow": "spawn_workflow"})
+    sg.add_conditional_edges(
+        "decide",
+        route,
+        {"reply": "reply", "spawn_workflow": "spawn_workflow", "ask_context": "ask_context"},
+    )
     sg.add_edge("reply", END)
     sg.add_edge("spawn_workflow", END)
+    sg.add_edge("ask_context", "decide")  # re-decide after user answers
 
     return sg.compile(checkpointer=MemorySaver())
