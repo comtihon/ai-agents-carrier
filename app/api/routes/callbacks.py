@@ -242,7 +242,8 @@ async def slack_interactive(
         logger.warning("slack_interactive: unknown action_id '%s'", action_id)
         return JSONResponse(content={})
 
-    return JSONResponse(content={"replace_original": True, "text": update_text})
+    # blocks:[] explicitly clears the original blocks so only the text is shown
+    return JSONResponse(content={"replace_original": True, "text": update_text, "blocks": []})
 
 
 # ── Slack Events API endpoint (thread replies resume ask_context) ──────────────
