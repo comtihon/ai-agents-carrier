@@ -369,6 +369,8 @@ class YamlGraphRunner:
             fn = self._llm_node(step)
         elif t == "mcp":
             fn = self._mcp_node(step)
+        elif t == "ask_context":
+            fn = self._ask_context_node(step)
         elif t == "human_approval":
             fn = self._approval_node(step)
         elif t == "execute":
@@ -393,7 +395,7 @@ class YamlGraphRunner:
             raise ValueError(f"Unknown step type '{t}' in graph '{self.id}'")
         return self._wrap_with_loop_guard(step, fn)
 
-    _NO_LOOP_GUARD_TYPES: frozenset = frozenset({"human_approval", "cron", "http", "parallel", "join", "switch"})
+    _NO_LOOP_GUARD_TYPES: frozenset = frozenset({"ask_context", "human_approval", "cron", "http", "parallel", "join", "switch"})
 
     def _wrap_with_loop_guard(self, step: dict[str, Any], fn: Callable) -> Callable:
         """Wrap a node function to track visit counts and enforce max_loops."""
@@ -630,6 +632,19 @@ class YamlGraphRunner:
                 if "output_key" in step:
                     return {step["output_key"]: f"Error calling '{tool_name}': {exc}"}
                 return {}
+        return node
+
+    def _ask_context_node(self, step: dict[str, Any]):
+        graph_id = self.id
+        output_key = step.get("output_key", f"{step['id']}_answers")
+        raw_questions: list[str] = step.get("questions") or []
+
+        def node(state: dict) -> dict:
+            step_id = step["id"]
+            questions = [self._render(q, state) for q in raw_questions]
+            logger.info("[%s] step '%s' asking %d context question(s)", graph_id, step_id, len(questions))
+            answers: dict = interrupt({"type": "ask_context", "questions": questions})
+            return {output_key: answers}
         return node
 
     def _approval_node(self, step: dict[str, Any]):
