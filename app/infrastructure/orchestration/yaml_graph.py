@@ -651,7 +651,12 @@ class YamlGraphRunner:
 
         def node(state: dict) -> dict:
             if questions_key:
-                questions = list(state.get(questions_key) or [])
+                raw = state.get(questions_key) or []
+                # llm_structured outputs str, not list — split on newlines if needed
+                if isinstance(raw, str):
+                    questions = [q.strip() for q in raw.splitlines() if q.strip()]
+                else:
+                    questions = list(raw)
             else:
                 questions = [self._render(q, state) for q in static_questions]
             logger.info("[%s] step '%s' presenting %d question(s)", graph_id, step_id, len(questions))
