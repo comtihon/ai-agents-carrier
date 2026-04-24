@@ -44,6 +44,7 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
         "_visit_counts": Any,  # type: ignore[assignment]
         "_slack_thread_ts": Any,  # type: ignore[assignment]
         "_slack_channel": Any,  # type: ignore[assignment]
+        "_slack_approver_id": Any,  # type: ignore[assignment]
     }
     for step in steps:
         # Regular output nodes store their result under output_key

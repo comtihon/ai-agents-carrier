@@ -69,6 +69,7 @@ class Settings(BaseSettings):
     # --- Slack ---
     slack_signing_secret: str = Field(default="", alias="SLACK_SIGNING_SECRET")
     slack_bot_token: str = Field(default="", alias="SLACK_BOT_TOKEN")
+    slack_approvals_channel: str = Field(default="", alias="SLACK_APPROVALS_CHANNEL")
 
     # --- OpenHands ---
     openhands_base_url: str = Field(default="http://openhands:3000", alias="OPENHANDS_BASE_URL")

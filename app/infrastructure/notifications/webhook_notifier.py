@@ -52,15 +52,24 @@ async def send_approval_notification(
     """POST an approval notification to a configured URL.
 
     Template variables available in ``payload`` values, header values, and the URL:
-      {run_id}       — the workflow run ID
-      {approve_url}  — callback URL to approve the run
-      {reject_url}   — callback URL to reject the run
+      {run_id}                  — the workflow run ID
+      {approve_url}             — callback URL to approve the run
+      {reject_url}              — callback URL to reject the run
+      {slack_bot_token}         — injected from SLACK_BOT_TOKEN setting
+      {slack_approvals_channel} — injected from SLACK_APPROVALS_CHANNEL setting
       Any key from the current graph state (e.g. {plan}, {request}).
 
     Returns the parsed JSON response body if the endpoint returned one, otherwise None.
     When using the Slack Web API (chat.postMessage), the response contains ``ts`` and
     ``channel`` which callers can use to post follow-up messages in the same thread.
+
+    Threading: when ``_slack_thread_ts`` is already in state, a chat.postMessage call
+    will automatically be sent as a thread reply.  If ``_slack_approver_id`` is also
+    in state the approver is tagged at the start of the message.
     """
+    from app.core.config import get_settings
+    settings = get_settings()
+
     url = notify.get("url")
     if not url:
         logger.warning("run %s: notify config missing 'url', skipping", run_id)
@@ -71,6 +80,10 @@ async def send_approval_notification(
     base = base_url.rstrip("/")
     ctx["approve_url"] = f"{base}/api/v1/callbacks/{run_id}/approve"
     ctx["reject_url"] = f"{base}/api/v1/callbacks/{run_id}/reject"
+    # Inject Slack credentials so notify configs can reference them as {slack_bot_token}
+    # and {slack_approvals_channel} without storing sensitive values in the database.
+    ctx.setdefault("slack_bot_token", settings.slack_bot_token)
+    ctx.setdefault("slack_approvals_channel", settings.slack_approvals_channel)
 
     url = _render(url, ctx)
     method = notify.get("method", "POST").upper()
@@ -92,6 +105,22 @@ async def send_approval_notification(
         httpx_auth = (username, password)
 
     payload = _render_value(notify.get("payload", {}), ctx)
+
+    # For Slack chat.postMessage: if a previous approval already created a thread,
+    # reply in that thread and tag whoever approved it.
+    if "slack.com/api/chat.postMessage" in url:
+        thread_ts = state.get("_slack_thread_ts")
+        approver_id = state.get("_slack_approver_id") or ""
+        if thread_ts:
+            payload["thread_ts"] = thread_ts
+            if approver_id:
+                mention = f"<@{approver_id}> "
+                payload["text"] = mention + payload.get("text", "")
+                # Also prepend to the first mrkdwn section block so rich formatting includes it
+                for block in payload.get("blocks", []):
+                    if block.get("type") == "section" and isinstance(block.get("text"), dict):
+                        block["text"]["text"] = mention + block["text"].get("text", "")
+                        break
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:

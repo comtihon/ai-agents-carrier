@@ -70,7 +70,7 @@ def _html(title: str, emoji: str, body: str) -> HTMLResponse:
     return HTMLResponse(content=content)
 
 
-async def _do_approve(run_id: str, container: ApplicationContainer) -> str:
+async def _do_approve(run_id: str, container: ApplicationContainer, approver_slack_id: str = "") -> str:
     run = await container.run_repository.get(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -81,13 +81,18 @@ async def _do_approve(run_id: str, container: ApplicationContainer) -> str:
     if runner is None:
         raise HTTPException(status_code=404, detail=f"Runner for workflow '{run.graph_id}' not found")
 
+    if approver_slack_id:
+        config = {"configurable": {"thread_id": run_id}}
+        await runner.graph.aupdate_state(config, {"_slack_approver_id": approver_slack_id})
+        run.state = {**run.state, "_slack_approver_id": approver_slack_id}
+
     run.status = "running"
     run.touch()
     await container.run_repository.update(run)
     await stream_graph_to_pause(runner, run, container.run_repository, Command(resume={"approved": True}))
     if run.status in ("completed", "failed", "cancelled"):
         container.live_runners.pop(run_id, None)
-    logger.info("run %s: approved via callback", run_id)
+    logger.info("run %s: approved via callback (approver=%s)", run_id, approver_slack_id or "unknown")
     return run.status
 
 
@@ -217,14 +222,16 @@ async def slack_interactive(
     action = actions[0]
     action_id: str = action.get("action_id", "")
     run_id: str = action.get("value", "")
-    user_name: str = payload.get("user", {}).get("name") or "someone"
+    slack_user = payload.get("user", {})
+    user_name: str = slack_user.get("name") or "someone"
+    user_id: str = slack_user.get("id", "")
 
     if not run_id:
         raise HTTPException(status_code=400, detail="Missing run_id in action value")
 
     try:
         if action_id == "approve":
-            await _do_approve(run_id, container)
+            await _do_approve(run_id, container, approver_slack_id=user_id)
             update_text = f"✅ Approved by {user_name}"
         elif action_id == "reject":
             await _do_reject(run_id, reason=None, container=container)
