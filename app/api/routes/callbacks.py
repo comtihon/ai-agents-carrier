@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -246,3 +247,104 @@ async def slack_interactive(
             raise
 
     return JSONResponse(content={"replace_original": True, "text": update_text})
+
+
+# ── Slack Events API endpoint (thread replies resume ask_context) ──────────────
+
+def _parse_slack_answers(text: str, n_questions: int) -> dict[str, str]:
+    """Parse a Slack thread reply into {str(index): answer} for ask_context.
+
+    Accepts numbered lines ("1. answer", "2) answer") or plain lines in order.
+    """
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    # Try to detect numbered answers: lines starting with digits
+    numbered = [(int(m.group(1)) - 1, re.sub(r"^\d+[.)]\s*", "", l))
+                for l in lines if (m := re.match(r"^(\d+)[.)]\s*", l))]
+    if numbered:
+        answers = {str(i): "" for i in range(n_questions)}
+        for idx, ans in numbered:
+            if 0 <= idx < n_questions:
+                answers[str(idx)] = ans
+        return answers
+    # Plain lines — map in order
+    return {str(i): lines[i] if i < len(lines) else "" for i in range(max(n_questions, 1))}
+
+
+@router.post("/slack/events")
+async def slack_events(
+    request: Request,
+    container: ApplicationContainer = Depends(get_container),
+):
+    """Handle Slack Events API callbacks.
+
+    Configured in the Slack app's Event Subscriptions as the Request URL.
+    Subscribes to ``message.channels`` (or ``message.groups`` for private channels).
+    Thread replies under an ask_context message resume the paused run.
+    """
+    body = await request.body()
+
+    settings = get_settings()
+    if settings.slack_signing_secret:
+        timestamp = request.headers.get("X-Slack-Request-Timestamp", "")
+        signature = request.headers.get("X-Slack-Signature", "")
+        if not _verify_slack_signature(settings.slack_signing_secret, timestamp, body, signature):
+            raise HTTPException(status_code=403, detail="Invalid Slack signature")
+
+    try:
+        data = json.loads(body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    # Slack sends a one-time verification challenge when the URL is first configured
+    if data.get("type") == "url_verification":
+        return JSONResponse({"challenge": data.get("challenge")})
+
+    if data.get("type") != "event_callback":
+        return JSONResponse({})
+
+    event = data.get("event", {})
+
+    # Only handle thread replies to messages (not root-level posts, edits, or bot messages)
+    if event.get("type") != "message" or event.get("subtype") or event.get("bot_id"):
+        return JSONResponse({})
+
+    thread_ts: str | None = event.get("thread_ts")
+    msg_ts: str | None = event.get("ts")
+    if not thread_ts or thread_ts == msg_ts:
+        return JSONResponse({})  # root-level message, not a reply
+
+    # Look up the paused run whose ask_context message has this thread_ts
+    run = await container.run_repository.find_by_ask_context_ts(thread_ts)
+    if not run:
+        return JSONResponse({})
+
+    # Get question count from the interrupt payload
+    runner = container.live_runners.get(run.id) or container.yaml_graph_registry.get(run.graph_id)
+    n_questions = 1
+    if runner:
+        try:
+            snap = runner.graph.get_state({"configurable": {"thread_id": run.id}})
+            for task in snap.tasks:
+                for intr in task.interrupts:
+                    if isinstance(intr.value, dict) and intr.value.get("type") == "ask_context":
+                        n_questions = len(intr.value.get("questions") or [1])
+        except Exception:
+            pass
+
+    text: str = event.get("text", "").strip()
+    answers = _parse_slack_answers(text, n_questions)
+
+    logger.info("run %s: resuming ask_context via Slack thread reply (n=%d)", run.id, n_questions)
+
+    if runner is None:
+        logger.warning("run %s: no runner found for Slack ask_context resume", run.id)
+        return JSONResponse({})
+
+    run.status = "running"
+    run.touch()
+    await container.run_repository.update(run)
+    await stream_graph_to_pause(
+        runner, run, container.run_repository,
+        Command(resume={"approved": True, "corrections": answers}),
+        base_url=settings.base_url,
+    )

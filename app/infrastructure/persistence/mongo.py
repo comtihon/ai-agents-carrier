@@ -24,6 +24,13 @@ class MongoGraphRunRepository:
         doc = await self._collection.find_one({"_id": run_id})
         return self._from_doc(doc) if doc else None
 
+    async def find_by_ask_context_ts(self, thread_ts: str) -> GraphRun | None:
+        doc = await self._collection.find_one({
+            "status": "waiting_approval",
+            "state._slack_ask_context_ts": thread_ts,
+        })
+        return self._from_doc(doc) if doc else None
+
     async def list_incomplete(self) -> list[GraphRun]:
         cursor = self._collection.find({"status": {"$in": ["running", "waiting_approval"]}})
         docs = await cursor.to_list(length=None)

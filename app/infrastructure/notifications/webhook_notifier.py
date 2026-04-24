@@ -165,3 +165,39 @@ async def post_slack_thread_questions(
                 logger.warning("Slack thread post failed: %s", data.get("error"))
     except Exception:
         logger.exception("Failed to post ask_context questions to Slack thread")
+
+
+async def post_slack_ask_context(
+    bot_token: str,
+    channel: str,
+    questions: list[str],
+    run_id: str,
+    state: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Post ask_context questions as a new root-level Slack message.
+
+    Returns the Slack API response (contains ``ts`` and ``channel``).
+    """
+    if not questions:
+        return None
+    ticket_id = state.get("ticket_id") or run_id
+    lines = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions))
+    n = len(questions)
+    hint = "Reply in this thread with your answer." if n == 1 else \
+        f"Reply in this thread with {n} numbered answers, one per line."
+    text = f"*Context needed for `{ticket_id}`*\n\n{lines}\n\n_{hint}_"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                "https://slack.com/api/chat.postMessage",
+                headers={"Authorization": f"Bearer {bot_token}"},
+                json={"channel": channel, "text": text},
+            )
+            data = response.json()
+            if not data.get("ok"):
+                logger.warning("Slack ask_context post failed: %s", data.get("error"))
+                return None
+            return data
+    except Exception:
+        logger.exception("Failed to post ask_context questions to Slack")
+        return None

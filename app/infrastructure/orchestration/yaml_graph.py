@@ -45,6 +45,8 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
         "_slack_thread_ts": Any,  # type: ignore[assignment]
         "_slack_channel": Any,  # type: ignore[assignment]
         "_slack_approver_id": Any,  # type: ignore[assignment]
+        "_slack_ask_context_ts": Any,  # type: ignore[assignment]
+        "_slack_ask_context_channel": Any,  # type: ignore[assignment]
     }
     for step in steps:
         # Regular output nodes store their result under output_key
@@ -175,6 +177,34 @@ async def stream_graph_to_pause(
                     run.state = {**run.state, "_slack_thread_ts": ts, "_slack_channel": channel}
                     run.touch()
                     await run_repository.update(run)
+
+        elif step and step.get("type") == "ask_context" and not snap.values.get("_slack_ask_context_ts"):
+            from app.core.config import get_settings
+            from app.infrastructure.notifications.webhook_notifier import post_slack_ask_context
+            settings = get_settings()
+            if settings.slack_bot_token and settings.slack_approvals_channel:
+                questions: list[str] = []
+                for task in snap.tasks:
+                    for intr in task.interrupts:
+                        if isinstance(intr.value, dict) and intr.value.get("type") == "ask_context":
+                            questions = intr.value.get("questions", [])
+                if questions:
+                    notif_resp = await post_slack_ask_context(
+                        settings.slack_bot_token, settings.slack_approvals_channel,
+                        questions, run.id, snap.values,
+                    )
+                    if notif_resp and notif_resp.get("ok"):
+                        ts = notif_resp.get("ts")
+                        channel = notif_resp.get("channel")
+                        if ts and channel:
+                            config = {"configurable": {"thread_id": run.id}}
+                            await runner.graph.aupdate_state(config, {
+                                "_slack_ask_context_ts": ts,
+                                "_slack_ask_context_channel": channel,
+                            })
+                            run.state = {**run.state, "_slack_ask_context_ts": ts, "_slack_ask_context_channel": channel}
+                            run.touch()
+                            await run_repository.update(run)
 
 
 # ---------------------------------------------------------------------------
@@ -656,10 +686,10 @@ class YamlGraphRunner:
         that holds a list of strings).  Alternatively they can be hardcoded in
         the YAML via ``questions`` (a list of strings, supports {key} templates).
         Answers are written to ``output_key`` as a dict {str(index): answer}.
-        """
-        from app.core.config import get_settings
-        from app.infrastructure.notifications.webhook_notifier import post_slack_thread_questions
 
+        Slack notification (root-level message + read reply from thread) is handled
+        in stream_graph_to_pause after the interrupt fires.
+        """
         graph_id = self.id
         step_id = step["id"]
         output_key = step.get("output_key", f"{step_id}_answers")
@@ -677,19 +707,6 @@ class YamlGraphRunner:
             else:
                 questions = [self._render(q, state) for q in static_questions]
             logger.info("[%s] step '%s' presenting %d question(s)", graph_id, step_id, len(questions))
-
-            # If a Slack approval thread exists, post the questions there so the user
-            # can see them in context without switching to the chat UI.
-            slack_ts: str | None = state.get("_slack_thread_ts")
-            slack_channel: str | None = state.get("_slack_channel")
-            settings = get_settings()
-            if slack_ts and slack_channel and settings.slack_bot_token:
-                try:
-                    await post_slack_thread_questions(
-                        settings.slack_bot_token, slack_channel, slack_ts, questions
-                    )
-                except Exception:
-                    logger.warning("[%s] step '%s' failed to post to Slack thread", graph_id, step_id)
 
             answers: dict = interrupt({"type": "ask_context", "questions": questions})
             return {output_key: answers}
