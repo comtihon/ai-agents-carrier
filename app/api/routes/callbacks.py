@@ -1,17 +1,33 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import logging
+import time
 
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 from langgraph.types import Command
 from pydantic import BaseModel
 
 from app.api.dependencies import get_container
+from app.core.config import get_settings
 from app.core.container import ApplicationContainer
 from app.infrastructure.orchestration.yaml_graph import stream_graph_to_pause
 
 logger = logging.getLogger(__name__)
+
+
+def _verify_slack_signature(signing_secret: str, timestamp: str, body: bytes, signature: str) -> bool:
+    try:
+        if abs(time.time() - float(timestamp)) > 300:
+            return False
+        sig_base = f"v0:{timestamp}:{body.decode('utf-8')}"
+        mac = hmac.new(signing_secret.encode("utf-8"), sig_base.encode("utf-8"), hashlib.sha256)
+        return hmac.compare_digest("v0=" + mac.hexdigest(), signature)
+    except Exception:
+        return False
 
 router = APIRouter(prefix="/callbacks", tags=["callbacks"])
 
@@ -163,3 +179,63 @@ async def callback_reject_get(
             )
         raise
     return _html("Rejected", "🚫", "The workflow run has been rejected and will not continue.")
+
+
+# ── Slack interactive endpoint (button clicks update the message in-channel) ──
+
+@router.post("/slack/interactive")
+async def slack_interactive(
+    request: Request,
+    container: ApplicationContainer = Depends(get_container),
+):
+    """Handle Slack interactive component payloads (block action button clicks).
+
+    The Slack app's Interactivity Request URL must point here.
+    Buttons should have action_id "approve" or "reject" with value set to the run_id.
+    The original Slack message is updated in-place with the decision outcome.
+    """
+    body = await request.body()
+
+    settings = get_settings()
+    if settings.slack_signing_secret:
+        timestamp = request.headers.get("X-Slack-Request-Timestamp", "")
+        signature = request.headers.get("X-Slack-Signature", "")
+        if not _verify_slack_signature(settings.slack_signing_secret, timestamp, body, signature):
+            raise HTTPException(status_code=403, detail="Invalid Slack signature")
+
+    form = await request.form()
+    payload_str = form.get("payload") or ""
+    try:
+        payload = json.loads(payload_str)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid payload")
+
+    actions = payload.get("actions") or []
+    if not actions:
+        return JSONResponse(content={})
+
+    action = actions[0]
+    action_id: str = action.get("action_id", "")
+    run_id: str = action.get("value", "")
+    user_name: str = payload.get("user", {}).get("name") or "someone"
+
+    if not run_id:
+        raise HTTPException(status_code=400, detail="Missing run_id in action value")
+
+    try:
+        if action_id == "approve":
+            await _do_approve(run_id, container)
+            update_text = f"✅ Approved by {user_name}"
+        elif action_id == "reject":
+            await _do_reject(run_id, reason=None, container=container)
+            update_text = f"🚫 Rejected by {user_name}"
+        else:
+            logger.warning("slack_interactive: unknown action_id '%s'", action_id)
+            return JSONResponse(content={})
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            update_text = "ℹ️ This run has already been actioned."
+        else:
+            raise
+
+    return JSONResponse(content={"replace_original": True, "text": update_text})

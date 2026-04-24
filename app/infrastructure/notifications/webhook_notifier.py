@@ -48,7 +48,7 @@ async def send_approval_notification(
     run_id: str,
     state: dict[str, Any],
     base_url: str,
-) -> None:
+) -> dict[str, Any] | None:
     """POST an approval notification to a configured URL.
 
     Template variables available in ``payload`` values, header values, and the URL:
@@ -56,11 +56,15 @@ async def send_approval_notification(
       {approve_url}  — callback URL to approve the run
       {reject_url}   — callback URL to reject the run
       Any key from the current graph state (e.g. {plan}, {request}).
+
+    Returns the parsed JSON response body if the endpoint returned one, otherwise None.
+    When using the Slack Web API (chat.postMessage), the response contains ``ts`` and
+    ``channel`` which callers can use to post follow-up messages in the same thread.
     """
     url = notify.get("url")
     if not url:
         logger.warning("run %s: notify config missing 'url', skipping", run_id)
-        return
+        return None
 
     ctx: dict[str, Any] = dict(state)
     ctx["run_id"] = run_id
@@ -100,5 +104,35 @@ async def send_approval_notification(
             )
             response.raise_for_status()
             logger.info("run %s: approval notification sent (HTTP %d)", run_id, response.status_code)
+            try:
+                return response.json()
+            except Exception:
+                return None
     except Exception:
         logger.exception("run %s: failed to send approval notification", run_id)
+        return None
+
+
+async def post_slack_thread_questions(
+    bot_token: str,
+    channel: str,
+    thread_ts: str,
+    questions: list[str],
+) -> None:
+    """Post ask_context questions as a reply in an existing Slack thread."""
+    if not questions:
+        return
+    lines = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions))
+    text = f"I need a bit more information to proceed:\n\n{lines}"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                "https://slack.com/api/chat.postMessage",
+                headers={"Authorization": f"Bearer {bot_token}"},
+                json={"channel": channel, "thread_ts": thread_ts, "text": text},
+            )
+            data = response.json()
+            if not data.get("ok"):
+                logger.warning("Slack thread post failed: %s", data.get("error"))
+    except Exception:
+        logger.exception("Failed to post ask_context questions to Slack thread")

@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     mongodb_uri: str = Field(default="mongodb://localhost:27017", alias="MONGODB_URI")
     mongodb_database: str = Field(default="langgraph_backend", alias="MONGODB_DATABASE")
 
+    # --- Slack ---
+    slack_signing_secret: str = Field(default="", alias="SLACK_SIGNING_SECRET")
+    slack_bot_token: str = Field(default="", alias="SLACK_BOT_TOKEN")
+
     # --- OpenHands ---
     openhands_base_url: str = Field(default="http://openhands:3000", alias="OPENHANDS_BASE_URL")
     openhands_api_key: str | None = Field(default=None, alias="OPENHANDS_API_KEY")

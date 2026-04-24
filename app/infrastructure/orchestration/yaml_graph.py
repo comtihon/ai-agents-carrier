@@ -42,6 +42,8 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
         "reject_reason": str,
         "_conv_map": Any,  # type: ignore[assignment]
         "_visit_counts": Any,  # type: ignore[assignment]
+        "_slack_thread_ts": Any,  # type: ignore[assignment]
+        "_slack_channel": Any,  # type: ignore[assignment]
     }
     for step in steps:
         # Regular output nodes store their result under output_key
@@ -160,7 +162,18 @@ async def stream_graph_to_pause(
     if run.status == "waiting_approval" and base_url and run.current_step:
         step = next((s for s in runner.steps if s["id"] == run.current_step), None)
         if step and step.get("notify"):
-            await send_approval_notification(step["notify"], run.id, snap.values, base_url)
+            notif_resp = await send_approval_notification(step["notify"], run.id, snap.values, base_url)
+            # If the notify endpoint was the Slack Web API (chat.postMessage), capture
+            # the message ts + channel so ask_context can reply in the same thread.
+            if notif_resp and notif_resp.get("ok"):
+                ts = notif_resp.get("ts")
+                channel = notif_resp.get("channel")
+                if ts and channel:
+                    config = {"configurable": {"thread_id": run.id}}
+                    await runner.graph.aupdate_state(config, {"_slack_thread_ts": ts, "_slack_channel": channel})
+                    run.state = {**run.state, "_slack_thread_ts": ts, "_slack_channel": channel}
+                    run.touch()
+                    await run_repository.update(run)
 
 
 # ---------------------------------------------------------------------------
@@ -643,13 +656,16 @@ class YamlGraphRunner:
         the YAML via ``questions`` (a list of strings, supports {key} templates).
         Answers are written to ``output_key`` as a dict {str(index): answer}.
         """
+        from app.core.config import get_settings
+        from app.infrastructure.notifications.webhook_notifier import post_slack_thread_questions
+
         graph_id = self.id
         step_id = step["id"]
         output_key = step.get("output_key", f"{step_id}_answers")
         questions_key: str | None = step.get("questions_key")
         static_questions: list[str] = step.get("questions") or []
 
-        def node(state: dict) -> dict:
+        async def node(state: dict) -> dict:
             if questions_key:
                 raw = state.get(questions_key) or []
                 # llm_structured outputs str, not list — split on newlines if needed
@@ -660,6 +676,20 @@ class YamlGraphRunner:
             else:
                 questions = [self._render(q, state) for q in static_questions]
             logger.info("[%s] step '%s' presenting %d question(s)", graph_id, step_id, len(questions))
+
+            # If a Slack approval thread exists, post the questions there so the user
+            # can see them in context without switching to the chat UI.
+            slack_ts: str | None = state.get("_slack_thread_ts")
+            slack_channel: str | None = state.get("_slack_channel")
+            settings = get_settings()
+            if slack_ts and slack_channel and settings.slack_bot_token:
+                try:
+                    await post_slack_thread_questions(
+                        settings.slack_bot_token, slack_channel, slack_ts, questions
+                    )
+                except Exception:
+                    logger.warning("[%s] step '%s' failed to post to Slack thread", graph_id, step_id)
+
             answers: dict = interrupt({"type": "ask_context", "questions": questions})
             return {output_key: answers}
         return node
