@@ -353,6 +353,6 @@ async def _resume_ask_context(run: Any, runner: Any, answers: dict, container: A
     await container.run_repository.update(run)
     await stream_graph_to_pause(
         runner, run, container.run_repository,
-        Command(resume={"approved": True, "corrections": answers}),
+        Command(resume=answers),
         base_url=base_url,
     )

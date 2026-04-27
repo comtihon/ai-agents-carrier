@@ -164,21 +164,7 @@ async def stream_graph_to_pause(
 
     if run.status == "waiting_approval" and base_url and run.current_step:
         step = next((s for s in runner.steps if s["id"] == run.current_step), None)
-        if step and step.get("notify"):
-            notif_resp = await send_approval_notification(step["notify"], run.id, snap.values, base_url)
-            # If the notify endpoint was the Slack Web API (chat.postMessage), capture
-            # the message ts + channel so ask_context can reply in the same thread.
-            if notif_resp and notif_resp.get("ok"):
-                ts = notif_resp.get("ts")
-                channel = notif_resp.get("channel")
-                if ts and channel:
-                    config = {"configurable": {"thread_id": run.id}}
-                    await runner.graph.aupdate_state(config, {"_slack_thread_ts": ts, "_slack_channel": channel})
-                    run.state = {**run.state, "_slack_thread_ts": ts, "_slack_channel": channel}
-                    run.touch()
-                    await run_repository.update(run)
-
-        elif step and step.get("type") == "ask_context" and not snap.values.get("_slack_ask_context_ts"):
+        if step and step.get("type") == "ask_context" and not snap.values.get("_slack_ask_context_ts"):
             from app.core.config import get_settings
             from app.infrastructure.notifications.webhook_notifier import post_slack_ask_context
             settings = get_settings()
@@ -205,6 +191,18 @@ async def stream_graph_to_pause(
                             run.state = {**run.state, "_slack_ask_context_ts": ts, "_slack_ask_context_channel": channel}
                             run.touch()
                             await run_repository.update(run)
+
+        elif step and step.get("notify"):
+            notif_resp = await send_approval_notification(step["notify"], run.id, snap.values, base_url)
+            if notif_resp and notif_resp.get("ok"):
+                ts = notif_resp.get("ts")
+                channel = notif_resp.get("channel")
+                if ts and channel:
+                    config = {"configurable": {"thread_id": run.id}}
+                    await runner.graph.aupdate_state(config, {"_slack_thread_ts": ts, "_slack_channel": channel})
+                    run.state = {**run.state, "_slack_thread_ts": ts, "_slack_channel": channel}
+                    run.touch()
+                    await run_repository.update(run)
 
 
 # ---------------------------------------------------------------------------
