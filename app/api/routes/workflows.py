@@ -276,9 +276,11 @@ async def _stream_graph(
 
     if run.status == "waiting_approval" and base_url and run.current_step:
         step = next((s for s in runner.steps if s["id"] == run.current_step), None)
-        if step and step.get("type") == "ask_context" and not snap.values.get("_slack_ask_context_ts"):
+        if step and step.get("type") == "ask_context":
             from app.core.config import get_settings
-            from app.infrastructure.notifications.webhook_notifier import post_slack_ask_context
+            from app.infrastructure.notifications.webhook_notifier import (
+                post_slack_ask_context, post_slack_thread_questions,
+            )
             settings = get_settings()
             if settings.slack_bot_token and settings.slack_approvals_channel:
                 questions: list[str] = []
@@ -286,22 +288,34 @@ async def _stream_graph(
                     for intr in task.interrupts:
                         if isinstance(intr.value, dict) and intr.value.get("type") == "ask_context":
                             questions = intr.value.get("questions", [])
+                if not questions:
+                    for intr in getattr(snap, "interrupts", ()):
+                        if isinstance(intr.value, dict) and intr.value.get("type") == "ask_context":
+                            questions = intr.value.get("questions", [])
+                existing_ts = snap.values.get("_slack_ask_context_ts")
+                existing_channel = snap.values.get("_slack_ask_context_channel")
                 if questions:
-                    notif_resp = await post_slack_ask_context(
-                        settings.slack_bot_token, settings.slack_approvals_channel,
-                        questions, run.id, snap.values,
-                    )
-                    if notif_resp and notif_resp.get("ok"):
-                        ts = notif_resp.get("ts")
-                        channel = notif_resp.get("channel")
-                        if ts and channel:
-                            await runner.graph.aupdate_state(_config(run.id), {
-                                "_slack_ask_context_ts": ts,
-                                "_slack_ask_context_channel": channel,
-                            })
-                            run.state = {**run.state, "_slack_ask_context_ts": ts, "_slack_ask_context_channel": channel}
-                            run.touch()
-                            await container.run_repository.update(run)
+                    if existing_ts and existing_channel:
+                        # Loop-back: post new questions as a reply in the existing thread
+                        await post_slack_thread_questions(
+                            settings.slack_bot_token, existing_channel, existing_ts, questions,
+                        )
+                    else:
+                        notif_resp = await post_slack_ask_context(
+                            settings.slack_bot_token, settings.slack_approvals_channel,
+                            questions, run.id, snap.values,
+                        )
+                        if notif_resp and notif_resp.get("ok"):
+                            ts = notif_resp.get("ts")
+                            channel = notif_resp.get("channel")
+                            if ts and channel:
+                                await runner.graph.aupdate_state(_config(run.id), {
+                                    "_slack_ask_context_ts": ts,
+                                    "_slack_ask_context_channel": channel,
+                                })
+                                run.state = {**run.state, "_slack_ask_context_ts": ts, "_slack_ask_context_channel": channel}
+                                run.touch()
+                                await container.run_repository.update(run)
         elif step and step.get("notify"):
             from app.infrastructure.notifications.webhook_notifier import send_approval_notification
             notif_resp = await send_approval_notification(step["notify"], run.id, snap.values, base_url)

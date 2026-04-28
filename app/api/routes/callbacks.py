@@ -325,12 +325,35 @@ async def slack_events(
     if runner:
         try:
             snap = runner.graph.get_state({"configurable": {"thread_id": run.id}})
+            questions_list = None
             for task in snap.tasks:
                 for intr in task.interrupts:
                     if isinstance(intr.value, dict) and intr.value.get("type") == "ask_context":
-                        n_questions = len(intr.value.get("questions") or [1])
+                        questions_list = intr.value.get("questions")
+                        break
+                if questions_list is not None:
+                    break
+            # LangGraph 0.5+: interrupts live on snap.interrupts, not snap.tasks[].interrupts
+            if questions_list is None:
+                for intr in getattr(snap, "interrupts", ()):
+                    if isinstance(intr.value, dict) and intr.value.get("type") == "ask_context":
+                        questions_list = intr.value.get("questions")
+                        break
+            if questions_list is not None:
+                n_questions = max(len(questions_list), 1)
         except Exception:
             pass
+    # Fallback: read from persisted __interrupt__ chunk (survives pod restarts)
+    if n_questions == 1:
+        raw = (run.step_outputs or {}).get("__interrupt__")
+        if isinstance(raw, list):
+            for item in raw:
+                val = item.get("value") if isinstance(item, dict) else None
+                if isinstance(val, dict) and val.get("type") == "ask_context":
+                    qs = val.get("questions")
+                    if qs:
+                        n_questions = max(len(qs), 1)
+                        break
 
     text: str = event.get("text", "").strip()
     answers = _parse_slack_answers(text, n_questions)
