@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import logging
+import re
 import string
 from typing import Any
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+def _md_to_slack(text: str) -> str:
+    """Convert common GitHub-flavoured markdown to Slack mrkdwn."""
+    return re.sub(r'\*\*(.+?)\*\*', r'*\1*', text, flags=re.DOTALL)
 
 
 def _render(template: str, ctx: dict) -> str:
@@ -142,6 +148,22 @@ async def send_approval_notification(
         return None
 
 
+def _format_questions(questions: list[str]) -> str:
+    """Format a list of questions for Slack mrkdwn.
+
+    Converts **bold** to *bold*, and only prepends a counter when the question
+    does not already start with its own number (e.g. "1. Are you...").
+    """
+    lines: list[str] = []
+    for i, q in enumerate(questions):
+        q = _md_to_slack(q)
+        if re.match(r"^\d+[.)]\s", q.lstrip()):
+            lines.append(q)
+        else:
+            lines.append(f"{i + 1}. {q}")
+    return "\n".join(lines)
+
+
 async def post_slack_thread_questions(
     bot_token: str,
     channel: str,
@@ -151,8 +173,7 @@ async def post_slack_thread_questions(
     """Post ask_context questions as a reply in an existing Slack thread."""
     if not questions:
         return
-    lines = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions))
-    text = f"I need a bit more information to proceed:\n\n{lines}"
+    text = f"I need a bit more information to proceed:\n\n{_format_questions(questions)}"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(
@@ -181,11 +202,10 @@ async def post_slack_ask_context(
     if not questions:
         return None
     ticket_id = state.get("ticket_id") or run_id
-    lines = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions))
     n = len(questions)
     hint = "Reply in this thread with your answer." if n == 1 else \
         f"Reply in this thread with {n} numbered answers, one per line."
-    text = f"*Context needed for `{ticket_id}`*\n\n{lines}\n\n_{hint}_"
+    text = f"*Context needed for `{ticket_id}`*\n\n{_format_questions(questions)}\n\n_{hint}_"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(

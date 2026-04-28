@@ -275,10 +275,44 @@ async def _stream_graph(
     await container.run_repository.update(run)
 
     if run.status == "waiting_approval" and base_url and run.current_step:
-        from app.infrastructure.notifications.webhook_notifier import send_approval_notification
         step = next((s for s in runner.steps if s["id"] == run.current_step), None)
-        if step and step.get("notify"):
-            await send_approval_notification(step["notify"], run.id, snap.values, base_url)
+        if step and step.get("type") == "ask_context" and not snap.values.get("_slack_ask_context_ts"):
+            from app.core.config import get_settings
+            from app.infrastructure.notifications.webhook_notifier import post_slack_ask_context
+            settings = get_settings()
+            if settings.slack_bot_token and settings.slack_approvals_channel:
+                questions: list[str] = []
+                for task in snap.tasks:
+                    for intr in task.interrupts:
+                        if isinstance(intr.value, dict) and intr.value.get("type") == "ask_context":
+                            questions = intr.value.get("questions", [])
+                if questions:
+                    notif_resp = await post_slack_ask_context(
+                        settings.slack_bot_token, settings.slack_approvals_channel,
+                        questions, run.id, snap.values,
+                    )
+                    if notif_resp and notif_resp.get("ok"):
+                        ts = notif_resp.get("ts")
+                        channel = notif_resp.get("channel")
+                        if ts and channel:
+                            await runner.graph.aupdate_state(_config(run.id), {
+                                "_slack_ask_context_ts": ts,
+                                "_slack_ask_context_channel": channel,
+                            })
+                            run.state = {**run.state, "_slack_ask_context_ts": ts, "_slack_ask_context_channel": channel}
+                            run.touch()
+                            await container.run_repository.update(run)
+        elif step and step.get("notify"):
+            from app.infrastructure.notifications.webhook_notifier import send_approval_notification
+            notif_resp = await send_approval_notification(step["notify"], run.id, snap.values, base_url)
+            if notif_resp and notif_resp.get("ok"):
+                ts = notif_resp.get("ts")
+                channel = notif_resp.get("channel")
+                if ts and channel:
+                    await runner.graph.aupdate_state(_config(run.id), {"_slack_thread_ts": ts, "_slack_channel": channel})
+                    run.state = {**run.state, "_slack_thread_ts": ts, "_slack_channel": channel}
+                    run.touch()
+                    await container.run_repository.update(run)
 
 
 async def _execute_graph(
