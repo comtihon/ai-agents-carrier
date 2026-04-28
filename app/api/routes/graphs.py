@@ -67,7 +67,7 @@ async def start_run(
         await container.run_repository.update(run)
         raise
 
-    snap = runner.graph.get_state(_config(thread_id))
+    snap = await runner.graph.aget_state(_config(thread_id))
     run.status = _langgraph_status(snap)
     run.state = snap.values
     await container.run_repository.update(run)
@@ -102,7 +102,7 @@ async def approve_run(
 
     await runner.graph.ainvoke(Command(resume={"approved": True}), _config(thread_id))
 
-    snap = runner.graph.get_state(_config(thread_id))
+    snap = await runner.graph.aget_state(_config(thread_id))
     run.status = _langgraph_status(snap)
     run.state = snap.values
     await container.run_repository.update(run)
@@ -127,7 +127,7 @@ async def reject_run(
         _config(thread_id),
     )
 
-    snap = runner.graph.get_state(_config(thread_id))
+    snap = await runner.graph.aget_state(_config(thread_id))
     run.status = _langgraph_status(snap)
     run.state = snap.values
     await container.run_repository.update(run)

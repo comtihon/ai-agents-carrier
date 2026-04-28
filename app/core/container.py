@@ -9,6 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from langchain_core.language_models import BaseChatModel
+from pymongo import MongoClient
 
 from app.core.config import Settings
 from app.domain.models.graph_run import GraphRun
@@ -18,6 +19,7 @@ from app.infrastructure.config.graph_loader import (
     build_runner_from_definition,
 )
 from app.infrastructure.integrations.openhands import OpenHandsAdapter
+from app.infrastructure.orchestration.checkpointer import MongoDBCheckpointSaver
 from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner, stream_graph_to_pause
 from app.infrastructure.persistence.mongo import MongoClientProvider, MongoGraphRunRepository
 from app.infrastructure.persistence.workflow_backend import (
@@ -40,6 +42,7 @@ class ApplicationContainer:
     mongo_provider: MongoClientProvider
     run_repository: MongoGraphRunRepository
     openhands: OpenHandsAdapter
+    checkpointer: MongoDBCheckpointSaver | None = None
     # Workflow definition backend — None only in legacy test setups that
     # inject the registry directly (backward compat).
     workflow_backend: WorkflowDefinitionBackend | None = None
@@ -72,6 +75,7 @@ class ApplicationContainer:
             mcp_tools_provider=self.mcp_tools_provider,
             openhands=self.openhands,
             run_repository=self.run_repository,
+            checkpointer=self.checkpointer,
         )
         logger.info("Loaded %d workflow definition(s) from backend", len(definitions))
         self._setup_all_cron_triggers()
@@ -122,6 +126,7 @@ class ApplicationContainer:
                         registry=self.yaml_graph_registry,
                         run_repository=self.run_repository,
                         openhands=self.openhands,
+                        checkpointer=self.checkpointer,
                     )
                     definition_snapshot: dict | None = defn.to_raw_dict()
                 else:
@@ -179,6 +184,7 @@ class ApplicationContainer:
                 registry=self.yaml_graph_registry,
                 run_repository=self.run_repository,
                 openhands=self.openhands,
+                checkpointer=self.checkpointer,
             )
             self.yaml_graph_registry._runners[workflow_id] = runner
             self._register_cron_steps(runner)
@@ -234,22 +240,33 @@ class ApplicationContainer:
 
         config = {"configurable": {"thread_id": run.id}}
 
-        if last_done is not None:
+        if run.status == "waiting_approval":
+            # With MongoDB checkpointer the interrupt state is already persisted.
+            # Check for a valid checkpoint before falling back to re-execution.
             try:
-                runner.graph.update_state(config, accumulated, as_node=last_done)
+                snap = await runner.graph.aget_state(config)
+                has_checkpoint = bool(snap.next) or bool(getattr(snap, "interrupts", ()))
             except Exception:
-                logger.exception("run %s: update_state failed during recovery", run.id)
-                run.status = "failed"
-                run.state = {"error": "State recovery failed after server restart"}
-                run.touch()
-                await self.run_repository.update(run)
+                has_checkpoint = False
+
+            if has_checkpoint:
+                self.live_runners[run.id] = runner
+                logger.info("run %s: waiting_approval restored from MongoDB checkpoint", run.id)
                 return
 
-        # Input for the next astream call: None resumes from checkpoint; dict starts fresh
-        resume_input: Any = None if last_done else accumulated
+            # No checkpoint (pre-MongoDB run) — fall back to re-execution
+            if last_done is not None:
+                try:
+                    await runner.graph.aupdate_state(config, accumulated, as_node=last_done)
+                except Exception:
+                    logger.exception("run %s: aupdate_state failed during recovery", run.id)
+                    run.status = "failed"
+                    run.state = {"error": "State recovery failed after server restart"}
+                    run.touch()
+                    await self.run_repository.update(run)
+                    return
 
-        if run.status == "waiting_approval":
-            # Re-execute the approval node to re-arm the interrupt in the new MemorySaver
+            resume_input: Any = None if last_done else accumulated
             try:
                 async for _ in runner.graph.astream(resume_input, config, stream_mode="updates"):
                     pass
@@ -264,6 +281,18 @@ class ApplicationContainer:
             logger.info("run %s: waiting_approval re-armed (approval_step=%s)", run.id, run.current_step)
 
         else:  # "running"
+            if last_done is not None:
+                try:
+                    await runner.graph.aupdate_state(config, accumulated, as_node=last_done)
+                except Exception:
+                    logger.exception("run %s: aupdate_state failed during recovery", run.id)
+                    run.status = "failed"
+                    run.state = {"error": "State recovery failed after server restart"}
+                    run.touch()
+                    await self.run_repository.update(run)
+                    return
+
+            resume_input = None if last_done else accumulated
             self.live_runners[run.id] = runner
             asyncio.create_task(self._resume_run(runner, run, resume_input))
             logger.info("run %s: resuming execution from last completed step=%s", run.id, last_done)
@@ -287,6 +316,7 @@ class ApplicationContainer:
                     llm_factory=self.llm_factory,
                     mcp_tools_provider=self.mcp_tools_provider,
                     openhands=self.openhands,
+                    checkpointer=self.checkpointer,
                 )
                 runner._registry = self.yaml_graph_registry
                 runner._run_repository = self.run_repository
@@ -300,6 +330,8 @@ class ApplicationContainer:
         self.cron_scheduler.stop()
         await self.mcp_tools_provider.stop()
         await self.mongo_provider.close()
+        if self.checkpointer is not None:
+            self.checkpointer.close()
         if isinstance(self.workflow_backend, MongoWorkflowBackend):
             await self.workflow_backend.close()
 
@@ -367,6 +399,10 @@ def build_container(settings: Settings) -> ApplicationContainer:
     mongo_provider = MongoClientProvider(settings)
     run_repository = mongo_provider.get_repository()
     workflow_backend = _build_workflow_backend(settings)
+    checkpointer = MongoDBCheckpointSaver(
+        MongoClient(settings.mongodb_uri),
+        db_name=settings.mongodb_database,
+    )
     # Registry starts empty; populated asynchronously in startup().
     return ApplicationContainer(
         settings=settings,
@@ -378,4 +414,5 @@ def build_container(settings: Settings) -> ApplicationContainer:
         run_repository=run_repository,
         openhands=openhands,
         workflow_backend=workflow_backend,
+        checkpointer=checkpointer,
     )

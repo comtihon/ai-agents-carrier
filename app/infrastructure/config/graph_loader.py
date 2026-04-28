@@ -13,6 +13,7 @@ from app.infrastructure.tools.mcp_client import McpToolsProvider
 
 if TYPE_CHECKING:
     from langchain_core.language_models import BaseChatModel
+    from langgraph.checkpoint.base import BaseCheckpointSaver
     from app.domain.models.workflow_definition import WorkflowDefinition
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,7 @@ def build_registry_from_definitions(
     openhands: OpenHandsAdapter | None = None,
     run_repository: Any = None,
     llm_factory: Callable[[str | None, str | None], BaseChatModel] | None = None,
+    checkpointer: BaseCheckpointSaver | None = None,
 ) -> YamlGraphRegistry:
     """Build a YamlGraphRegistry from an already-loaded list of WorkflowDefinitions.
 
@@ -83,6 +85,7 @@ def build_registry_from_definitions(
                 llm_factory=llm_factory,
                 mcp_tools_provider=mcp_tools_provider,
                 openhands=openhands,
+                checkpointer=checkpointer,
             )
             runner.readonly = defn.readonly
             runners[runner.id] = runner
@@ -105,6 +108,7 @@ def build_runner_from_definition(
     run_repository: Any = None,
     openhands: OpenHandsAdapter | None = None,
     llm_factory: Callable[[str | None, str | None], BaseChatModel] | None = None,
+    checkpointer: BaseCheckpointSaver | None = None,
 ) -> YamlGraphRunner:
     """Build a single YamlGraphRunner from a WorkflowDefinition and inject dependencies."""
     runner = YamlGraphRunner(
@@ -113,6 +117,7 @@ def build_runner_from_definition(
         llm_factory=llm_factory,
         mcp_tools_provider=mcp_tools_provider,
         openhands=openhands,
+        checkpointer=checkpointer,
     )
     runner._registry = registry
     runner._run_repository = run_repository
@@ -126,6 +131,7 @@ def load_yaml_graphs(
     openhands: OpenHandsAdapter | None = None,
     run_repository: Any = None,
     llm_factory: Callable[[str | None, str | None], BaseChatModel] | None = None,
+    checkpointer: BaseCheckpointSaver | None = None,
 ) -> YamlGraphRegistry:
     path = Path(directory)
     runners: dict[str, YamlGraphRunner] = {}
@@ -143,6 +149,7 @@ def load_yaml_graphs(
                 llm_factory=llm_factory,
                 mcp_tools_provider=mcp_tools_provider,
                 openhands=openhands,
+                checkpointer=checkpointer,
             )
             runners[runner.id] = runner
             logger.info("Loaded YAML graph '%s' from %s", runner.id, yaml_file.name)

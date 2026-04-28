@@ -17,6 +17,7 @@ from app.infrastructure.notifications.webhook_notifier import send_approval_noti
 logger = logging.getLogger(__name__)
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
@@ -107,7 +108,7 @@ async def stream_graph_to_pause(
         current_state: dict = dict(input_value)
     else:
         try:
-            snap = runner.graph.get_state(config)
+            snap = await runner.graph.aget_state(config)
             current_state = dict(snap.values) if snap and snap.values else {}
         except Exception:
             current_state = {}
@@ -153,7 +154,7 @@ async def stream_graph_to_pause(
         await _close_openhands_conversations(runner, current_state)
         return
 
-    snap = runner.graph.get_state(config)
+    snap = await runner.graph.aget_state(config)
     run.status = "waiting_approval" if snap.next else "completed"
     run.current_step = snap.next[0] if snap.next else None
     run.state = snap.values
@@ -313,6 +314,7 @@ class YamlGraphRunner:
         mcp_tools_provider: McpToolsProvider,
         openhands: OpenHandsAdapter | None = None,
         llm_factory: Callable[[str | None, str | None], BaseChatModel] | None = None,
+        checkpointer: BaseCheckpointSaver | None = None,
     ) -> None:
         self.id: str = definition["id"]
         # Human-readable name; fall back to title-casing the id
@@ -328,6 +330,7 @@ class YamlGraphRunner:
         self._llm_factory = llm_factory
         self._mcp = mcp_tools_provider
         self._openhands = openhands
+        self._checkpointer: BaseCheckpointSaver = checkpointer or MemorySaver()
         # Injected post-construction by load_yaml_graphs
         self._registry: Any = None
         self._run_repository: Any = None
@@ -355,7 +358,7 @@ class YamlGraphRunner:
 
         if not step_ids:
             sg.add_edge(START, END)
-            return sg.compile(checkpointer=MemorySaver())
+            return sg.compile(checkpointer=self._checkpointer)
 
         sg.add_edge(START, step_ids[0])
 
@@ -404,7 +407,7 @@ class YamlGraphRunner:
             else:
                 sg.add_edge(sid, END)
 
-        return sg.compile(checkpointer=MemorySaver())
+        return sg.compile(checkpointer=self._checkpointer)
 
     # ------------------------------------------------------------------
     # Node factories

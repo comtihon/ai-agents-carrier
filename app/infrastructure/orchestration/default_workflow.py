@@ -16,6 +16,7 @@ from uuid import uuid4
 from copilotkit import CopilotKitState
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import RunnableConfig, interrupt
@@ -88,6 +89,7 @@ def build_default_workflow(
     llm: BaseChatModel,
     registry: YamlGraphRegistry,
     run_repository: MongoGraphRunRepository,
+    checkpointer: BaseCheckpointSaver | None = None,
 ):
     """Build and compile the default CopilotKit LangGraph agent."""
 
@@ -244,4 +246,4 @@ workflow, use `reply`.
     sg.add_edge("spawn_workflow", END)
     sg.add_edge("ask_context", "decide")  # re-decide after user answers
 
-    return sg.compile(checkpointer=MemorySaver())
+    return sg.compile(checkpointer=checkpointer or MemorySaver())

@@ -7,28 +7,23 @@ WORKDIR /app
 
 COPY pyproject.toml .
 
-# Install dependencies in two passes to work around a version conflict:
-# copilotkit pins langchain<0.4 (langchain-core<1.0); langchain-mcp-adapters
-# needs langchain-core>=1.0. Installing copilotkit's ecosystem first then
-# upgrading langchain-core via mcp-adapters produces a working environment.
-# copilotkit transitively pulls langchain/langchain-anthropic/langchain-openai/fastapi/httpx.
-# langgraph<0.6.0 keeps langgraph-sdk in the <0.2.0 range required by copilotkit.
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir \
-        copilotkit \
-        "langgraph<0.6.0" \
+        "langgraph>=1.1.0,<2.0.0" \
+        "langchain>=1.2.0,<2.0.0" \
+        "copilotkit>=0.1.87,<1.0.0" \
         "starlette<0.47.0" \
         "uvicorn[standard]" \
         pydantic-settings \
         "pyjwt[crypto]" \
         motor \
+        "pymongo>=4.12.0,<4.16.0" \
     && pip install --no-cache-dir \
         langchain-mcp-adapters \
         langchain-google-genai \
         "starlette<0.47.0" \
         "apscheduler>=3.10,<4.0" \
         "pyyaml>=6.0.3" \
-        pymongo \
     && mkdir -p app && touch app/__init__.py \
     && pip install --no-cache-dir --no-deps . \
     && rm -rf app

@@ -340,7 +340,7 @@ async def slack_events(
     n_questions = 1
     if runner:
         try:
-            snap = runner.graph.get_state({"configurable": {"thread_id": run.id}})
+            snap = await runner.graph.aget_state({"configurable": {"thread_id": run.id}})
             questions_list = None
             for task in snap.tasks:
                 for intr in task.interrupts:

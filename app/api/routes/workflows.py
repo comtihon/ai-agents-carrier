@@ -141,36 +141,35 @@ def _get_runner_for_run(run: GraphRun, container: ApplicationContainer) -> YamlG
     return None
 
 
-def _get_interrupt_payload(runner: YamlGraphRunner | None, run: GraphRun) -> dict:
+async def _get_interrupt_payload(runner: YamlGraphRunner | None, run: GraphRun) -> dict:
     """Extract the rendered interrupt payload from the paused LangGraph snapshot."""
     if run.status != "waiting_approval":
         return {}
-    # Primary: read from the live MemorySaver checkpoint (works when runner is in live_runners)
-    if runner is not None:
-        try:
-            snap = runner.graph.get_state(_config(run.id))
-            for task in snap.tasks:
-                for intr in task.interrupts:
-                    if isinstance(intr.value, dict):
-                        return intr.value
-            # Also check top-level snap.interrupts (LangGraph 0.5+)
-            for intr in getattr(snap, "interrupts", ()):
-                if isinstance(intr.value, dict):
-                    return intr.value
-        except Exception:
-            logger.exception("run %s: failed to read interrupt from MemorySaver", run.id)
-    # Fallback: use the __interrupt__ chunk persisted to step_outputs during streaming
+    # Primary: use the __interrupt__ chunk persisted to step_outputs during streaming
     raw = (run.step_outputs or {}).get("__interrupt__")
     if isinstance(raw, list):
         for item in raw:
             if isinstance(item, dict) and isinstance(item.get("value"), dict):
                 return item["value"]
+    # Fallback: query the MongoDB checkpoint (covers cases where step_outputs is absent)
+    if runner is not None:
+        try:
+            snap = await runner.graph.aget_state(_config(run.id))
+            for task in snap.tasks:
+                for intr in task.interrupts:
+                    if isinstance(intr.value, dict):
+                        return intr.value
+            for intr in getattr(snap, "interrupts", ()):
+                if isinstance(intr.value, dict):
+                    return intr.value
+        except Exception:
+            logger.exception("run %s: failed to read interrupt from checkpoint", run.id)
     return {}
 
 
-def _run_response(run: GraphRun, runner: YamlGraphRunner | None = None) -> dict:
+async def _run_response(run: GraphRun, runner: YamlGraphRunner | None = None) -> dict:
     workflow_name, steps = _steps_from_definition(run, runner)
-    interrupt_payload = _get_interrupt_payload(runner, run)
+    interrupt_payload = await _get_interrupt_payload(runner, run)
     return {
         "id": run.id,
         "workflow_id": run.graph_id,
@@ -217,7 +216,7 @@ async def _stream_graph(
         current_state: dict = dict(input_value)
     else:
         try:
-            snap = runner.graph.get_state(_config(run.id))
+            snap = await runner.graph.aget_state(_config(run.id))
             current_state = dict(snap.values) if snap.values else {}
         except Exception:
             current_state = {}
@@ -267,7 +266,7 @@ async def _stream_graph(
         await container.run_repository.update(run)
         return
 
-    snap = runner.graph.get_state(_config(run.id))
+    snap = await runner.graph.aget_state(_config(run.id))
     run.status = _langgraph_status(snap)
     run.current_step = snap.next[0] if snap.next else None
     run.state = snap.values
@@ -409,7 +408,10 @@ async def list_runs(
     runs = await container.run_repository.list_recent(
         limit=limit, workflow_id=workflow_id, status=status, search=search
     )
-    return [_run_response(run, _get_runner_for_run(run, container)) for run in runs]
+    responses = []
+    for run in runs:
+        responses.append(await _run_response(run, _get_runner_for_run(run, container)))
+    return responses
 
 
 @router.post("/runs")
@@ -463,7 +465,7 @@ async def start_run(
     await container.run_repository.create(run)
     background_tasks.add_task(_execute_graph, runner, run, container)
 
-    return _run_response(run, runner)
+    return await _run_response(run, runner)
 
 
 @router.get("/runs/{run_id}")
@@ -475,7 +477,7 @@ async def get_run(
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
     runner = _get_runner_for_run(run, container)
-    return _run_response(run, runner)
+    return await _run_response(run, runner)
 
 
 @router.post("/runs/{run_id}/approve")
@@ -497,7 +499,7 @@ async def approve_run(
     corrections = body.corrections if body else None
     background_tasks.add_task(_resume_approved, runner, run, container, corrections)
 
-    return _run_response(run, runner)
+    return await _run_response(run, runner)
 
 
 async def _resume_approved(
@@ -533,7 +535,7 @@ async def reject_run(
 
     background_tasks.add_task(_resume_rejected, runner, run, container, body.reason if body else None)
 
-    return _run_response(run, runner)
+    return await _run_response(run, runner)
 
 
 async def _resume_rejected(
@@ -605,7 +607,7 @@ async def retry_run(
     # Seed the LangGraph checkpoint at the last completed step
     config = _config(run.id)
     if last_done is not None:
-        runner.graph.update_state(config, accumulated, as_node=last_done)
+        await runner.graph.aupdate_state(config, accumulated, as_node=last_done)
         resume_input: Any = None  # resume from checkpoint
     else:
         resume_input = accumulated  # no completed steps — start fresh
@@ -619,7 +621,7 @@ async def retry_run(
     container.live_runners[run.id] = runner
     background_tasks.add_task(_retry_graph, runner, run, container, resume_input)
 
-    return _run_response(run, runner)
+    return await _run_response(run, runner)
 
 
 async def _retry_graph(

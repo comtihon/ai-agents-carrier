@@ -63,7 +63,7 @@ def _build_actions(container: ApplicationContainer) -> list[Action]:
             run.status = "failed"
             await container.run_repository.update(run)
             return {"error": str(exc)}
-        snap = runner.graph.get_state(_config(thread_id))
+        snap = await runner.graph.aget_state(_config(thread_id))
         run.status = _langgraph_status(snap)
         run.state = snap.values
         await container.run_repository.update(run)
@@ -83,7 +83,7 @@ def _build_actions(container: ApplicationContainer) -> list[Action]:
         if run is None:
             return {"error": "Run not found"}
         await runner.graph.ainvoke(Command(resume={"approved": True}), _config(thread_id))
-        snap = runner.graph.get_state(_config(thread_id))
+        snap = await runner.graph.aget_state(_config(thread_id))
         run.status = _langgraph_status(snap)
         run.state = snap.values
         await container.run_repository.update(run)
@@ -102,7 +102,7 @@ def _build_actions(container: ApplicationContainer) -> list[Action]:
             Command(resume={"approved": False, "reason": reason or None}),
             _config(thread_id),
         )
-        snap = runner.graph.get_state(_config(thread_id))
+        snap = await runner.graph.aget_state(_config(thread_id))
         run.status = _langgraph_status(snap)
         run.state = snap.values
         await container.run_repository.update(run)
@@ -166,6 +166,7 @@ async def lifespan(app: FastAPI):
         container.llm,
         container.yaml_graph_registry,
         container.run_repository,
+        checkpointer=container.checkpointer,
     )
     sdk = CopilotKitRemoteEndpoint(
         agents=[
