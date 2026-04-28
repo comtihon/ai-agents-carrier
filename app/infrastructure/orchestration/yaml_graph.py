@@ -139,7 +139,7 @@ async def stream_graph_to_pause(
                 if sid == last_processed:
                     past_last = True
                 continue
-            if run.step_statuses.get(sid) == "pending":
+            if run.step_statuses.get(sid) in ("pending", "running"):
                 run.step_inputs[sid] = dict(current_state)
                 run.step_statuses[sid] = "failed"
                 break
@@ -453,9 +453,39 @@ class YamlGraphRunner:
             fn = self._switch_node(step)
         else:
             raise ValueError(f"Unknown step type '{t}' in graph '{self.id}'")
-        return self._wrap_with_loop_guard(step, fn)
+        return self._wrap_with_status_running(self._wrap_with_loop_guard(step, fn), step)
 
     _NO_LOOP_GUARD_TYPES: frozenset = frozenset({"ask_context", "human_approval", "cron", "http", "parallel", "join", "switch"})
+
+    def _wrap_with_status_running(self, fn: Callable, step: dict[str, Any]) -> Callable:
+        """Persist step_status="running" + current_step before the node executes.
+
+        Without this, step_statuses keeps the value from the previous pass
+        through the same node (typically "finished"), so the API can't tell
+        a UI which node is actually live during a loop-back. With this hook
+        every node briefly publishes "running" before its real result is
+        written by stream_graph_to_pause's chunk handler.
+        """
+        step_id = step["id"]
+        is_async = asyncio.iscoroutinefunction(fn)
+
+        async def _wrapped(state: dict) -> dict:
+            run = self._current_run
+            repo = self._current_run_repository
+            if run is not None and repo is not None:
+                run.step_statuses[step_id] = "running"
+                run.current_step = step_id
+                run.touch()
+                try:
+                    await repo.update(run)
+                except Exception:
+                    logger.exception(
+                        "[%s] failed to persist 'running' status for step '%s'",
+                        self.id, step_id,
+                    )
+            return (await fn(state)) if is_async else fn(state)
+
+        return _wrapped
 
     def _wrap_with_loop_guard(self, step: dict[str, Any], fn: Callable) -> Callable:
         """Wrap a node function to track visit counts and enforce max_loops."""
