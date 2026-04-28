@@ -86,6 +86,7 @@ jobs:
           PATCH=$(echo "$VERSION" | cut -d. -f3)
           NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
           echo "$NEW_VERSION" > VERSION
+          sed -i "s/^version = \".*\"/version = \"$NEW_VERSION\"/" pyproject.toml
           echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Update Helm image tag
@@ -96,7 +97,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add VERSION helm/values.yaml
+          git add VERSION pyproject.toml helm/values.yaml
           git commit -m "chore: bump version to ${{ steps.bump.outputs.new_version }} [skip ci]"
           git push origin main
 
