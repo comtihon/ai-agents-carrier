@@ -164,6 +164,27 @@ def _format_questions(questions: list[str]) -> str:
     return "\n".join(lines)
 
 
+async def post_slack_thread_reply(
+    bot_token: str,
+    channel: str,
+    thread_ts: str,
+    text: str,
+) -> None:
+    """Post a plain text reply in an existing Slack thread."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                "https://slack.com/api/chat.postMessage",
+                headers={"Authorization": f"Bearer {bot_token}"},
+                json={"channel": channel, "thread_ts": thread_ts, "text": text},
+            )
+            data = response.json()
+            if not data.get("ok"):
+                logger.warning("Slack thread reply failed: %s", data.get("error"))
+    except Exception:
+        logger.exception("Failed to post Slack thread reply")
+
+
 async def post_slack_thread_questions(
     bot_token: str,
     channel: str,

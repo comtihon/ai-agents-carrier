@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from app.api.dependencies import get_container
 from app.core.config import get_settings
 from app.core.container import ApplicationContainer
+from app.infrastructure.notifications.webhook_notifier import post_slack_thread_reply
 from app.infrastructure.orchestration.yaml_graph import stream_graph_to_pause
 
 logger = logging.getLogger(__name__)
@@ -228,6 +229,11 @@ async def slack_interactive(
     slack_user = payload.get("user", {})
     user_name: str = slack_user.get("name") or "someone"
     user_id: str = slack_user.get("id", "")
+    channel_id: str = payload.get("channel", {}).get("id", "")
+    message_ts: str = (
+        payload.get("message", {}).get("ts", "")
+        or payload.get("container", {}).get("message_ts", "")
+    )
 
     if not run_id:
         raise HTTPException(status_code=400, detail="Missing run_id in action value")
@@ -241,6 +247,16 @@ async def slack_interactive(
     else:
         logger.warning("slack_interactive: unknown action_id '%s'", action_id)
         return JSONResponse(content={})
+
+    settings = get_settings()
+    if settings.slack_bot_token and channel_id and message_ts:
+        background_tasks.add_task(
+            post_slack_thread_reply,
+            settings.slack_bot_token,
+            channel_id,
+            message_ts,
+            update_text,
+        )
 
     return JSONResponse(content={
         "replace_original": True,
