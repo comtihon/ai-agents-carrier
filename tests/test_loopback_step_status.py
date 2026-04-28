@@ -28,6 +28,7 @@ from langgraph.types import Command
 from app.domain.models.graph_run import GraphRun
 from app.infrastructure.orchestration.yaml_graph import (
     YamlGraphRunner,
+    _parse_questions_string,
     stream_graph_to_pause,
 )
 from app.infrastructure.tools.mcp_client import McpToolsProvider
@@ -244,3 +245,34 @@ async def test_run_response_payload_identifies_active_step_during_loop():
     assert by_id["approval"]["status"] == "pending"
     assert response["current_step"] == "ask_context"
     assert response["status"] == "running"
+
+
+def test_parse_questions_drops_preamble_when_numbered_list_present():
+    raw = (
+        "The Jira Epic has no description. Based on the codebase ...\n\n"
+        "1. What exactly should it do?\n"
+        "2. Which data source should be used?\n"
+        "3. Should it replace manual drawing?"
+    )
+    assert _parse_questions_string(raw) == [
+        "What exactly should it do?",
+        "Which data source should be used?",
+        "Should it replace manual drawing?",
+    ]
+
+
+def test_parse_questions_handles_paren_form():
+    raw = "1) First?\n2) Second?"
+    assert _parse_questions_string(raw) == ["First?", "Second?"]
+
+
+def test_parse_questions_falls_back_to_lines_when_no_numbering():
+    raw = "Q1\nQ2\nQ3"
+    assert _parse_questions_string(raw) == ["Q1", "Q2", "Q3"]
+
+
+def test_parse_questions_keeps_single_unnumbered_line():
+    # Only one numbered line is ambiguous — a single Q without explicit numbering
+    # should still be presented.
+    raw = "Just one question?"
+    assert _parse_questions_string(raw) == ["Just one question?"]

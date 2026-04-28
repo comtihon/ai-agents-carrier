@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import string
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, TypedDict
@@ -85,6 +86,33 @@ async def _close_openhands_conversations(runner: YamlGraphRunner, state: dict) -
             logger.info("run closed OpenHands conversation '%s' (%s)", name, oh_id)
         except Exception:
             logger.warning("Failed to close OpenHands conversation '%s' (%s)", name, oh_id)
+
+
+_NUMBERED_LINE_RE = re.compile(r"^\s*\d+[.)]\s+(.*)$")
+
+
+def _parse_questions_string(raw: str) -> list[str]:
+    """Extract bare question strings from an LLM-emitted ``questions`` field.
+
+    The LLM tends to emit a preamble paragraph followed by a numbered list
+    (e.g. ``"Please clarify:\\n1. ...\\n2. ..."``). A naive split on newlines
+    treats the preamble as ``question 0``, which then collides with the
+    LLM's own ``1.`` prefix when Slack-formatted, producing two ``1.`` lines.
+
+    When two or more lines start with ``N.``/``N)``, treat those as the
+    real questions and strip their leading number; the unnumbered preamble
+    is dropped. When fewer than two numbered lines are present, fall back
+    to one-question-per-non-empty-line.
+    """
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    numbered: list[str] = []
+    for ln in lines:
+        m = _NUMBERED_LINE_RE.match(ln)
+        if m:
+            numbered.append(m.group(1).strip())
+    if len(numbered) >= 2:
+        return numbered
+    return lines
 
 
 async def stream_graph_to_pause(
@@ -747,7 +775,7 @@ class YamlGraphRunner:
                 raw = state.get(questions_key) or []
                 # llm_structured outputs str, not list — split on newlines if needed
                 if isinstance(raw, str):
-                    questions = [q.strip() for q in raw.splitlines() if q.strip()]
+                    questions = _parse_questions_string(raw)
                 else:
                     questions = list(raw)
             else:
