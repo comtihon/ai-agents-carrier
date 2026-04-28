@@ -25,23 +25,9 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        # copilotkit pins langchain<0.4 (langchain-core<1.0); langchain-mcp-adapters
-        # needs langchain-core>=1.0 — install in two passes so pip doesn't refuse.
-        # copilotkit transitively pulls langchain/langchain-anthropic/langchain-openai/fastapi/httpx.
-        # langgraph<0.6.0 keeps langgraph-sdk in the <0.2.0 range required by copilotkit.
         run: |
           pip install --upgrade pip
-          pip install \
-            copilotkit \
-            "langgraph<0.6.0" \
-            "starlette<0.47.0" \
-            "uvicorn[standard]" \
-            pydantic-settings \
-            "pyjwt[crypto]" \
-            motor
-          pip install langchain-mcp-adapters langchain-google-genai "starlette<0.47.0"
-          pip install "apscheduler>=3.10,<4.0" "pyyaml>=6.0.3" pymongo
-          pip install --no-deps -e .
+          pip install -e .
           pip install pytest pytest-asyncio asgi-lifespan
 
       - name: Run tests
