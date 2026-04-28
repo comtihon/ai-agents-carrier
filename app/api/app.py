@@ -5,7 +5,7 @@ import app.compat  # noqa: F401 — must be first, patches langgraph.graph.graph
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
-from copilotkit import Action, CopilotKitRemoteEndpoint, LangGraphAgent
+from copilotkit import Action, CopilotKitRemoteEndpoint, LangGraphAGUIAgent
 from copilotkit.integrations.fastapi import add_fastapi_endpoint
 from copilotkit.integrations.fastapi import handler as _ck_handler
 from fastapi import FastAPI, Request
@@ -170,7 +170,7 @@ async def lifespan(app: FastAPI):
     )
     sdk = CopilotKitRemoteEndpoint(
         agents=[
-            LangGraphAgent(
+            LangGraphAGUIAgent(
                 name="default",
                 description=(
                     "Intelligent assistant that decides whether to reply directly "
@@ -178,7 +178,7 @@ async def lifespan(app: FastAPI):
                 ),
                 graph=default_graph,
             ),
-            LangGraphAgent(
+            LangGraphAGUIAgent(
                 name="router",
                 description=(
                     "Conversational assistant that explains the workflow platform "
