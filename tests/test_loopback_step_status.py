@@ -276,3 +276,42 @@ def test_parse_questions_keeps_single_unnumbered_line():
     # should still be presented.
     raw = "Just one question?"
     assert _parse_questions_string(raw) == ["Just one question?"]
+
+
+@pytest.mark.asyncio
+async def test_failure_during_loop_back_marks_running_step_not_next():
+    """
+    When gather fails on its second pass (e.g. max_iterations exceeded),
+    the failure handler must mark gather as failed — not approval, which
+    happens to be the next pending step in dict-iteration order.
+    """
+    # Gather always emits insufficient → loop forever until max_iterations.
+    # FakeMessagesListChatModel cycles through responses; emit a non-submit
+    # message so the runner nudges the LLM and eventually exhausts iters.
+    bad_response = AIMessage(content="thinking…")  # no tool_calls → nudge loop
+    llm = _FakeToolCallingChatModel(responses=[bad_response] * 5)
+    mcp = MagicMock(spec=McpToolsProvider)
+    mcp.get_tool = MagicMock(return_value=None)
+    mcp.get_tools = MagicMock(return_value=[])
+    mcp.get_tool_server = MagicMock(return_value=None)
+    steps = [
+        {**WORKFLOW_STEPS[0], "max_iterations": 3},
+        WORKFLOW_STEPS[1],
+        WORKFLOW_STEPS[2],
+    ]
+    runner = YamlGraphRunner(
+        {"id": "loopback-fail", "steps": steps}, llm=llm, mcp_tools_provider=mcp,
+    )
+    run = _make_run()
+    run.id = "loopback-fail-run"
+    repo = AsyncMock()
+
+    await stream_graph_to_pause(runner, run, repo, {"request": "hello"})
+
+    assert run.status == "failed"
+    assert run.step_statuses["gather"] == "failed", (
+        f"gather is the step that failed; got {run.step_statuses!r}"
+    )
+    assert run.step_statuses["approval"] == "pending", (
+        "approval was never reached and must remain pending"
+    )

@@ -161,16 +161,28 @@ async def stream_graph_to_pause(
                 await run_repository.update(run)
     except Exception as exc:
         logger.exception("run %s: graph execution failed", run.id)
-        past_last = last_processed is None
-        for sid in run.step_statuses:
-            if not past_last:
-                if sid == last_processed:
-                    past_last = True
-                continue
-            if run.step_statuses.get(sid) in ("pending", "running"):
-                run.step_inputs[sid] = dict(current_state)
-                run.step_statuses[sid] = "failed"
-                break
+        # The wrapper marks exactly one step as "running" while it executes,
+        # so the failed step is whichever has that status. Fall back to the
+        # next pending step after last_processed only when no running step
+        # exists (e.g. failure in framework wiring before any node started).
+        running_sid = next(
+            (sid for sid, st in run.step_statuses.items() if st == "running"),
+            None,
+        )
+        if running_sid is not None:
+            run.step_inputs[running_sid] = dict(current_state)
+            run.step_statuses[running_sid] = "failed"
+        else:
+            past_last = last_processed is None
+            for sid in run.step_statuses:
+                if not past_last:
+                    if sid == last_processed:
+                        past_last = True
+                    continue
+                if run.step_statuses.get(sid) == "pending":
+                    run.step_inputs[sid] = dict(current_state)
+                    run.step_statuses[sid] = "failed"
+                    break
         run.status = "failed"
         # Preserve accumulated step outputs AND any internal state keys written
         # mid-step by _save_conv_id (e.g. _openhands_conv_*, _conv_map).
