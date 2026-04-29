@@ -239,15 +239,17 @@ async def slack_interactive(
         raise HTTPException(status_code=400, detail="Missing run_id in action value")
 
     if action_id == "approve":
-        background_tasks.add_task(_do_approve, run_id, container, approver_slack_id=user_id)
         update_text = f"✅ Approved by {user_name}"
     elif action_id == "reject":
-        background_tasks.add_task(_do_reject, run_id, None, container)
         update_text = f"🚫 Rejected by {user_name}"
     else:
         logger.warning("slack_interactive: unknown action_id '%s'", action_id)
         return JSONResponse(content={})
 
+    # Queue the thread reply BEFORE the resume task. BackgroundTasks runs
+    # tasks sequentially, and the resume task can block for as long as the
+    # next node takes (e.g. an `execute` step waiting on OpenHands), so the
+    # thread reply must be queued first or it will be delayed indefinitely.
     settings = get_settings()
     if settings.slack_bot_token and channel_id and message_ts:
         background_tasks.add_task(
@@ -257,6 +259,11 @@ async def slack_interactive(
             message_ts,
             update_text,
         )
+
+    if action_id == "approve":
+        background_tasks.add_task(_do_approve, run_id, container, approver_slack_id=user_id)
+    else:
+        background_tasks.add_task(_do_reject, run_id, None, container)
 
     return JSONResponse(content={
         "replace_original": True,
