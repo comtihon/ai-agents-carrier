@@ -490,7 +490,19 @@ async def approve_run(
     run = await container.run_repository.get(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
+    if run.status != "waiting_approval":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Run is not awaiting approval (status: {run.status})",
+        )
     runner = await _get_runner_or_404(run, container)
+
+    # Flip the approval step to finished synchronously so polling clients see
+    # the transition immediately, not after the resume task drains. The
+    # subsequent step's status will be set by the chunk handler in
+    # stream_graph_to_pause when the resumed graph reaches it.
+    if run.current_step:
+        run.step_statuses[run.current_step] = "finished"
 
     run.status = "running"
     run.touch()
@@ -527,7 +539,15 @@ async def reject_run(
     run = await container.run_repository.get(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
+    if run.status != "waiting_approval":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Run is not awaiting approval (status: {run.status})",
+        )
     runner = await _get_runner_or_404(run, container)
+
+    if run.current_step:
+        run.step_statuses[run.current_step] = "finished"
 
     run.status = "running"
     run.touch()

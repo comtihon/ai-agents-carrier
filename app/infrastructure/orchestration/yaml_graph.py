@@ -203,6 +203,20 @@ async def stream_graph_to_pause(
     if run.status == "completed":
         await _close_openhands_conversations(runner, snap.values)
 
+    if run.status == "waiting_approval" and run.current_step:
+        # Reset the approval flag at request time so a loop-back through the
+        # same approval node does not see a stale True from the prior
+        # iteration. The node body sets it back to True on resume.
+        step = next((s for s in runner.steps if s["id"] == run.current_step), None)
+        if step and step.get("type") == "human_approval":
+            approved_key = step.get("output_key", "approved")
+            if (snap.values or {}).get(approved_key) is not False:
+                config = {"configurable": {"thread_id": run.id}}
+                await runner.graph.aupdate_state(config, {approved_key: False})
+                run.state = {**(run.state or {}), approved_key: False}
+                run.touch()
+                await run_repository.update(run)
+
     if run.status == "waiting_approval" and base_url and run.current_step:
         step = next((s for s in runner.steps if s["id"] == run.current_step), None)
         if step and step.get("type") == "ask_context":
