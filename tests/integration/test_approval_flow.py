@@ -117,6 +117,34 @@ async def test_approve_runs_implement_step() -> None:
 
 
 @pytest.mark.asyncio
+async def test_double_approve_returns_409() -> None:
+    """
+    Once a run has been approved, the second /approve POST must 409 instead of
+    re-resuming the graph. Without this guard, multi-clicks in the UI would
+    re-trigger the next node and create duplicate side effects (e.g. duplicate
+    Jira tickets).
+    """
+    llm = make_mock_llm(text_responses=["the plan", "the implementation"])
+    client, mongo = await build_int_client(_GRAPH, llm)
+    try:
+        start = await client.post(
+            "/api/v1/workflows/runs",
+            json={"workflow_id": _GRAPH_ID, "user_request": "implement feature dup"},
+        )
+        assert start.status_code == 200
+        run_id = start.json()["id"]
+
+        first = await client.post(f"/api/v1/workflows/runs/{run_id}/approve")
+        assert first.status_code == 200, first.text
+
+        # Run is now past the approval gate; a second approve must be refused.
+        second = await client.post(f"/api/v1/workflows/runs/{run_id}/approve")
+        assert second.status_code == 409, second.text
+    finally:
+        await mongo.close()
+
+
+@pytest.mark.asyncio
 async def test_callback_approve_unblocks_workflow() -> None:
     """
     POST /api/v1/callbacks/{run_id}/approve (no auth) should resume the run
