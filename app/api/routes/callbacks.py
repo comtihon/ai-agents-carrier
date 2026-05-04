@@ -89,6 +89,12 @@ async def _do_approve(run_id: str, container: ApplicationContainer, approver_sla
         await runner.graph.aupdate_state(config, {"_slack_approver_id": approver_slack_id})
         run.state = {**run.state, "_slack_approver_id": approver_slack_id}
 
+    # Flip the approval step to finished synchronously so polling clients see
+    # the transition immediately. The chunk handler in stream_graph_to_pause
+    # may not yield a chunk for the resumed node in all LangGraph versions.
+    if run.current_step:
+        run.step_statuses[run.current_step] = "finished"
+
     run.status = "running"
     run.touch()
     await container.run_repository.update(run)
@@ -109,6 +115,9 @@ async def _do_reject(run_id: str, reason: str | None, container: ApplicationCont
     runner = container.live_runners.get(run_id) or container.yaml_graph_registry.get(run.graph_id)
     if runner is None:
         raise HTTPException(status_code=404, detail=f"Runner for workflow '{run.graph_id}' not found")
+
+    if run.current_step:
+        run.step_statuses[run.current_step] = "finished"
 
     run.status = "running"
     run.touch()

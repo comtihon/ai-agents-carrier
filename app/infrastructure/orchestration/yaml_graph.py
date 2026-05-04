@@ -49,6 +49,11 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
         "_slack_approver_id": Any,  # type: ignore[assignment]
         "_slack_ask_context_ts": Any,  # type: ignore[assignment]
         "_slack_ask_context_channel": Any,  # type: ignore[assignment]
+        # ID of the most recent step that caught an internal exception and chose
+        # to record the failure in state instead of raising. Read by the chunk
+        # handlers to mark step_statuses["that_step"] = "failed" rather than
+        # the default "finished" inferred from a non-empty output dict.
+        "__failed_step__": Any,  # type: ignore[assignment]
     }
     for step in steps:
         # Regular output nodes store their result under output_key
@@ -86,6 +91,21 @@ async def _close_openhands_conversations(runner: YamlGraphRunner, state: dict) -
             logger.info("run closed OpenHands conversation '%s' (%s)", name, oh_id)
         except Exception:
             logger.warning("Failed to close OpenHands conversation '%s' (%s)", name, oh_id)
+
+
+def step_status_from_output(node_name: str, output: Any) -> str:
+    """Infer step status from the dict a node returned.
+
+    Empty dict → ``skipped``. If the output carries a ``__failed_step__``
+    sentinel matching this node, it caught an internal exception and chose to
+    record the error in state — surface that as ``failed`` so the UI doesn't
+    show a green checkmark over a captured failure. Anything else → ``finished``.
+    """
+    if not output:
+        return "skipped"
+    if isinstance(output, dict) and output.get("__failed_step__") == node_name:
+        return "failed"
+    return "finished"
 
 
 _NUMBERED_LINE_RE = re.compile(r"^\s*\d+[.)]\s+(.*)$")
@@ -147,7 +167,7 @@ async def stream_graph_to_pause(
             for node_name, output in chunk.items():
                 if node_name in ("__start__", "__end__"):
                     continue
-                status = "skipped" if output == {} else "finished"
+                status = step_status_from_output(node_name, output)
                 run.step_inputs[node_name] = dict(current_state)
                 run.step_statuses[node_name] = status
                 run.current_step = node_name
@@ -161,10 +181,13 @@ async def stream_graph_to_pause(
                 await run_repository.update(run)
     except Exception as exc:
         logger.exception("run %s: graph execution failed", run.id)
-        # The wrapper marks exactly one step as "running" while it executes,
-        # so the failed step is whichever has that status. Fall back to the
-        # next pending step after last_processed only when no running step
-        # exists (e.g. failure in framework wiring before any node started).
+        # Attribute the failure to a specific step only when we can identify
+        # one with confidence: either the node body raised mid-execution
+        # (its wrapper left it "running"), or a previous node recorded a
+        # captured failure via the __failed_step__ sentinel. Otherwise leave
+        # step_statuses untouched — the run-level error message is the
+        # authoritative signal, and falsely flagging the next forward step
+        # as failed misleads the UI when the failure is in a retry loop.
         running_sid = next(
             (sid for sid, st in run.step_statuses.items() if st == "running"),
             None,
@@ -173,16 +196,10 @@ async def stream_graph_to_pause(
             run.step_inputs[running_sid] = dict(current_state)
             run.step_statuses[running_sid] = "failed"
         else:
-            past_last = last_processed is None
-            for sid in run.step_statuses:
-                if not past_last:
-                    if sid == last_processed:
-                        past_last = True
-                    continue
-                if run.step_statuses.get(sid) == "pending":
-                    run.step_inputs[sid] = dict(current_state)
-                    run.step_statuses[sid] = "failed"
-                    break
+            failed_sid = current_state.get("__failed_step__") if isinstance(current_state, dict) else None
+            if isinstance(failed_sid, str) and failed_sid in run.step_statuses:
+                run.step_inputs[failed_sid] = dict(current_state)
+                run.step_statuses[failed_sid] = "failed"
         run.status = "failed"
         # Preserve accumulated step outputs AND any internal state keys written
         # mid-step by _save_conv_id (e.g. _openhands_conv_*, _conv_map).
@@ -307,6 +324,11 @@ class YamlGraphRunner:
               query: "{request}"
             repo_template: "{repo}"    # execute only
             instructions_template: "{plan}"  # execute only
+            stop_on_failure: false     # execute only — when true, an exception
+                                       #   inside the node fails the run
+                                       #   immediately. When false (default) the
+                                       #   error is captured under output_key
+                                       #   so the next node can decide to retry.
             workflow_id: <id>          # workflow only — child workflow to spawn
             input_template: "{request}"  # workflow only — request passed to child
             schedule: "0 9 * * 1-5"   # cron only — 5-field cron expression (UTC)
@@ -929,7 +951,13 @@ class YamlGraphRunner:
                 return output
             except Exception as exc:
                 logger.exception("[%s] step '%s' execute failed", graph_id, step_id)
-                return {output_key: {"error": str(exc)}}
+                # stop_on_failure=True: re-raise so the run is marked failed
+                # immediately. Default (False): record the error in state so
+                # the next node (typically a deliver-result LLM) can introspect
+                # it and decide whether to retry or proceed.
+                if step.get("stop_on_failure"):
+                    raise
+                return {output_key: {"error": str(exc)}, "__failed_step__": step_id}
         return node
 
     def _workflow_node(self, step: dict[str, Any]):

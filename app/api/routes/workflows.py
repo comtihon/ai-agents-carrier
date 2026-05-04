@@ -198,8 +198,9 @@ def _init_step_statuses(runner: YamlGraphRunner) -> dict[str, str]:
     return {s["id"]: "pending" for s in runner.steps}
 
 
-def _step_status_for_output(output: dict) -> str:
-    return "skipped" if output == {} else "finished"
+def _step_status_for_output(node_name: str, output: dict) -> str:
+    from app.infrastructure.orchestration.yaml_graph import step_status_from_output
+    return step_status_from_output(node_name, output)
 
 
 async def _stream_graph(
@@ -230,7 +231,7 @@ async def _stream_graph(
             for node_name, output in chunk.items():
                 if node_name in ("__start__", "__end__"):
                     continue
-                status = _step_status_for_output(output)
+                status = _step_status_for_output(node_name, output)
                 run.step_inputs[node_name] = dict(current_state)
                 run.step_statuses[node_name] = status
                 run.current_step = node_name
@@ -244,19 +245,24 @@ async def _stream_graph(
                 await container.run_repository.update(run)
     except Exception as exc:
         logger.exception("run %s: graph execution failed", run.id)
-        # Find the failing step: the first pending step after the last successfully
-        # processed node in this call.  Using last_processed (not run.current_step)
-        # avoids confusion when run.current_step was set by a prior stream call.
-        past_last = last_processed is None
-        for sid in step_ids:
-            if not past_last:
-                if sid == last_processed:
-                    past_last = True
-                continue
-            if run.step_statuses.get(sid) == "pending":
-                run.step_inputs[sid] = dict(current_state)
-                run.step_statuses[sid] = "failed"
-                break
+        # Attribute the failure only to a step we can identify with confidence:
+        # one currently "running" (its wrapper marked it so before raising) or
+        # one tagged via the __failed_step__ sentinel. Anything else (e.g. a
+        # framework-level recursion limit) leaves step_statuses untouched —
+        # promoting the next forward step to "failed" misleads the UI when
+        # the failure was inside a retry loop, not on a yet-to-run node.
+        running_sid = next(
+            (sid for sid, st in run.step_statuses.items() if st == "running"),
+            None,
+        )
+        if running_sid is not None:
+            run.step_inputs[running_sid] = dict(current_state)
+            run.step_statuses[running_sid] = "failed"
+        else:
+            failed_sid = current_state.get("__failed_step__") if isinstance(current_state, dict) else None
+            if isinstance(failed_sid, str) and failed_sid in run.step_statuses:
+                run.step_inputs[failed_sid] = dict(current_state)
+                run.step_statuses[failed_sid] = "failed"
         run.status = "failed"
         # Preserve accumulated step outputs so retry can recover OpenHands conv IDs
         # and other intermediate state without needing to re-run completed steps.
