@@ -912,6 +912,8 @@ class YamlGraphRunner:
                 return {output_key: "OpenHands not configured"}
             repo = self._render(step.get("repo_template", "{repo}"), state)
             instructions = self._render(step.get("instructions_template", "{plan}"), state)
+            branch_template = step.get("branch_template")
+            branch = self._render(branch_template, state) if branch_template else None
             conv_id_key = f"_openhands_conv_{step_id}"
             conversation_id: str | None = step.get("conversation_id")
             conv_map: dict = dict(state.get("_conv_map") or {})
@@ -940,6 +942,7 @@ class YamlGraphRunner:
                     instructions=instructions,
                     existing_conv_id=existing_conv_id,
                     conv_id_callback=_save_conv_id,
+                    branch=branch,
                 )
                 logger.info("[%s] step '%s' finished", graph_id, step_id)
                 output: dict = {output_key: result}
