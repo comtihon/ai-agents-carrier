@@ -6,7 +6,7 @@ import json
 import logging
 import re
 import string
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, TypedDict
 from uuid import uuid4
 
@@ -319,6 +319,11 @@ class YamlGraphRunner:
               issue_key: "{ticket_id}"
             code: |                    # python only — executed with ``state`` dict in scope;
               output = state["x"] + 1  #   set ``output`` variable to store the result
+            routes:                    # llm_structured / switch — multiple branches
+              - when: <state-key>      # route taken when state[key] is truthy
+                next: <node-id>
+                wait_seconds: 60       # optional — sleep before the next node runs
+                                       #   (capped at 3600s; useful for retry back-edges)
 
     ``human_approval`` steps additionally support an optional ``notify`` field
     that fires an HTTP request when the run reaches ``waiting_approval``:
@@ -444,7 +449,10 @@ class YamlGraphRunner:
                         f"Step '{sid}' (type={step_type}) cannot have more than "
                         f"1 route; only llm_structured and switch support multiple routes."
                     )
-                if len(routes) == 1 and "when" not in routes[0]:
+                # A direct edge skips the router, so any route carrying
+                # wait_seconds must go through add_conditional_edges to honor it.
+                any_wait = any(r.get("wait_seconds") for r in routes)
+                if len(routes) == 1 and "when" not in routes[0] and not any_wait:
                     dest = routes[0]["next"]
                     sg.add_edge(sid, dest if dest in all_ids else END)
                 else:
@@ -565,22 +573,50 @@ class YamlGraphRunner:
 
         return _guarded
 
-    @staticmethod
-    def _make_router_fn(routes: list[dict[str, Any]]) -> Callable[[dict], str]:
-        """Return a routing function for add_conditional_edges."""
-        def router(state: dict) -> str:
+    _MAX_ROUTE_WAIT_SECONDS: float = 3600.0
+
+    @classmethod
+    def _make_router_fn(cls, routes: list[dict[str, Any]]) -> Callable[[dict], Awaitable[str]]:
+        """Return an async routing function for add_conditional_edges.
+
+        A route may declare ``wait_seconds: <number>`` to delay the transition
+        to its destination. The wait runs after the route is selected and
+        before the next node executes; it is capped at ``_MAX_ROUTE_WAIT_SECONDS``.
+        """
+        def _select(state: dict) -> dict[str, Any]:
             for route in routes:
                 when = route.get("when")
                 if when is None:
-                    return route["next"]
+                    return route
                 negate = isinstance(when, str) and when.startswith("!")
                 key = when[1:] if negate else when
                 val = bool(state.get(key))
                 if negate:
                     val = not val
                 if val:
-                    return route["next"]
-            return routes[-1]["next"]
+                    return route
+            return routes[-1]
+
+        async def router(state: dict) -> str:
+            chosen = _select(state)
+            wait = chosen.get("wait_seconds")
+            if wait:
+                try:
+                    delay = float(wait)
+                except (TypeError, ValueError):
+                    logger.warning("ignoring non-numeric wait_seconds=%r on route to %s", wait, chosen.get("next"))
+                    delay = 0.0
+                if delay < 0:
+                    logger.warning("ignoring negative wait_seconds=%s on route to %s", delay, chosen.get("next"))
+                    delay = 0.0
+                if delay > cls._MAX_ROUTE_WAIT_SECONDS:
+                    logger.warning("capping wait_seconds=%s at %s on route to %s",
+                                   delay, cls._MAX_ROUTE_WAIT_SECONDS, chosen.get("next"))
+                    delay = cls._MAX_ROUTE_WAIT_SECONDS
+                if delay > 0:
+                    logger.info("waiting %.1fs before transitioning to '%s'", delay, chosen.get("next"))
+                    await asyncio.sleep(delay)
+            return chosen["next"]
         return router
 
     _SUBMIT_TOOL = "submit_output"
