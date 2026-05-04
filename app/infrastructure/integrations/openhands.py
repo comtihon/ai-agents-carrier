@@ -16,6 +16,36 @@ _START_TERMINAL = {"READY", "ERROR"}
 _EXEC_TERMINAL = {"finished", "error", "stuck"}
 
 
+def _build_repo_setup_preface(repo: str | None, branch: str | None) -> str:
+    """Tell the agent to clone the repo(s) itself instead of relying on
+    OpenHands' selected_repository/selected_branch fields.
+
+    Why: when OpenHands V1's start flow performs the clone+checkout it goes
+    through the sandbox bash API with the X-Session-API-Key handshake, which
+    has been returning 401 for non-default branches. Cloning from inside the
+    conversation works because it uses the agent's own GitHub access, so we
+    embed the repo+branch as prompt context and start with an empty workspace.
+    """
+    repos = [r.strip() for r in (repo or "").split(",") if r.strip()]
+    if not repos:
+        return ""
+    if len(repos) == 1:
+        line = f"`{repos[0]}`"
+        if branch:
+            line += f" on branch `{branch}`"
+        return (
+            f"Before doing anything else, clone repository {line} into a "
+            f"sub-directory of the current working directory and `cd` into it."
+        )
+    bullets = "\n".join(f"- `{r}`" for r in repos)
+    branch_note = f"\nUse branch `{branch}` for each repository.\n" if branch else ""
+    return (
+        "Before doing anything else, clone the following repositories into "
+        "sub-directories of the current working directory:\n\n"
+        f"{bullets}{branch_note}"
+    )
+
+
 class OpenHandsAdapter:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -27,15 +57,19 @@ class OpenHandsAdapter:
         context: dict[str, Any] | None = None,
         existing_conv_id: str | None = None,
         conv_id_callback: Callable[[str], Awaitable[None]] | None = None,
+        branch: str | None = None,
     ) -> dict[str, Any]:
         if self._settings.openhands_mock_mode:
             return {
                 "status": "success",
-                "branch": f"feature/openhands-{repo.replace('/', '-')[:20]}",
+                "branch": branch or f"feature/openhands-{repo.replace('/', '-')[:20]}",
                 "summary": f"Mock execution completed for '{repo}'.",
                 "mock": True,
             }
 
+        preface = _build_repo_setup_preface(repo, branch)
+        if preface:
+            instructions = f"{preface}\n\n{instructions}"
         if context:
             instructions = f"{instructions}\n\nContext:\n{context}"
 
@@ -62,8 +96,6 @@ class OpenHandsAdapter:
                 resp = await client.post(
                     f"{base_url}/api/v1/app-conversations",
                     json={
-                        "selected_repository": repo,
-                        "git_provider": "github",
                         "trigger": "openhands_api",
                         "initial_message": {
                             "role": "user",
@@ -120,8 +152,8 @@ class OpenHandsAdapter:
                 "conversation_id": conv_id,
                 "execution_status": conv.get("execution_status"),
                 "conversation_url": conv.get("conversation_url"),
-                "selected_repository": conv.get("selected_repository"),
-                "selected_branch": conv.get("selected_branch"),
+                "selected_repository": repo,
+                "selected_branch": branch,
             }
 
     async def close_conversation(self, conv_id: str) -> None:
