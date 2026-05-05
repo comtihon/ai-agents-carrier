@@ -256,3 +256,64 @@ async def test_approve_returns_404_when_run_missing(client):
     resp = await c.post("/api/v1/workflows/runs/tid1/approve")
 
     assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_stream_graph_rebinds_runner_to_current_run():
+    """
+    `workflows.py::_stream_graph` must rebind `runner._current_run` (and
+    `_current_run_repository`) to the run it was invoked with, *before*
+    streaming begins.
+
+    Why: `_wrap_with_status_running` and `_save_conv_id` write step
+    statuses / OpenHands conversation IDs through `runner._current_run`
+    and persist via `runner._current_run_repository`. After the
+    post-restart recovery path (`stream_graph_to_pause`) those refs are
+    left pointing at the *recovery* run object. A subsequent /approve
+    that re-uses the cached runner would then have its node-body helper
+    saves write the stale recovery state on top of the live run —
+    observably flipping `status` back to `waiting_approval` mid-stream
+    and showing the user the same approval form again right after they
+    submitted.
+
+    This test pins the rebinding so a future refactor can't quietly
+    re-introduce that drift.
+    """
+    from unittest.mock import AsyncMock as AM, MagicMock as MM
+
+    from app.api.routes.workflows import _stream_graph
+    from app.domain.models.graph_run import GraphRun
+
+    async def empty_stream(*_a, **_k):
+        if False:
+            yield  # marks this as an async generator
+
+    snap = MM()
+    snap.next = ()
+    snap.values = {}
+
+    runner = MM()
+    runner.graph = MM()
+    runner.graph.astream = empty_stream
+    runner.graph.aget_state = AM(return_value=snap)
+    runner.steps = []
+
+    # Simulate the stale binding left behind by a prior recovery.
+    stale_run = GraphRun(id="stale", graph_id="g", user_request="x", status="completed")
+    stale_repo = object()
+    runner._current_run = stale_run
+    runner._current_run_repository = stale_repo
+
+    fresh_run = GraphRun(id="fresh", graph_id="g", user_request="y", status="running")
+    container = MM()
+    container.run_repository = AM()
+    container.settings = MM(base_url=None)
+    container.live_runners = {}
+
+    await _stream_graph(runner, fresh_run, container, {"request": "y"})
+
+    assert runner._current_run is fresh_run, (
+        "stream_graph must rebind runner._current_run to the live run "
+        f"(still pointing at {runner._current_run!r})"
+    )
+    assert runner._current_run_repository is container.run_repository

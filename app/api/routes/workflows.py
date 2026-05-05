@@ -218,6 +218,17 @@ async def _stream_graph(
     """Stream graph execution, updating step statuses in DB after each node."""
     step_ids = [s["id"] for s in runner.steps]
 
+    # Bind this run to the runner so node-body helpers
+    # (`_wrap_with_status_running`, `_save_conv_id`) write through to the
+    # *current* run. Without this binding, those helpers reused whatever
+    # run reference was last set on the runner — typically a stale one
+    # left behind by `stream_graph_to_pause` during the post-restart
+    # recovery path — and their saves would clobber the live run with
+    # the stale state (e.g. flipping status back to waiting_approval
+    # mid-stream after the user had already approved).
+    runner._current_run = run
+    runner._current_run_repository = container.run_repository
+
     if isinstance(input_value, dict):
         current_state: dict = dict(input_value)
     else:
