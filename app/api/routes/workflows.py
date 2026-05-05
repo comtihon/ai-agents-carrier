@@ -447,6 +447,7 @@ async def start_run(
             registry=container.yaml_graph_registry,
             run_repository=container.run_repository,
             openhands=container.openhands,
+            checkpointer=container.checkpointer,
         )
         definition_snapshot: dict | None = defn.to_raw_dict()
     else:
