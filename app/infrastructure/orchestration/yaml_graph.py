@@ -894,6 +894,9 @@ class YamlGraphRunner:
         static_questions: list[str] = step.get("questions") or []
 
         async def node(state: dict) -> dict:
+            if not self._when(step, state):
+                logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
+                return {}
             if questions_key:
                 raw = state.get(questions_key) or []
                 # llm_structured outputs str, not list — split on newlines if needed
@@ -917,6 +920,13 @@ class YamlGraphRunner:
 
         def node(state: dict) -> dict:
             step_id = step["id"]
+            # Honour `when:` so a downstream approval gated on an earlier
+            # rejection does not prompt the user. Mirrors llm_structured /
+            # execute / mcp / workflow node bodies, which all early-return
+            # when the predicate is False.
+            if not self._when(step, state):
+                logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
+                return {}
             logger.info("[%s] step '%s' waiting for approval", graph_id, step_id)
             payload = {
                 k: self._render(v, state)

@@ -173,6 +173,94 @@ async def test_reject_at_gate_1_skips_plan_and_impl() -> None:
         await mongo.close()
 
 
+_GRAPH_GATED_APPROVAL = {
+    "id": "gated-approval",
+    "steps": [
+        {
+            "id": "deploy_uat_gate",
+            "type": "human_approval",
+            "output_key": "deploy_approved",
+            "interrupt_payload": {"target": "uat"},
+        },
+        {
+            "id": "deploy_uat",
+            "type": "llm",
+            "when": "deploy_approved",
+            "output_key": "uat_result",
+            "system_prompt": "Deploy.",
+            "user_template": "{request}",
+        },
+        # The gate the user reported as firing-when-it-shouldn't:
+        # `when: deploy_approved` must skip this approval prompt entirely
+        # if the previous gate was rejected, not just skip the deploy step.
+        {
+            "id": "deploy_staging_gate",
+            "type": "human_approval",
+            "output_key": "release_approved",
+            "when": "deploy_approved",
+            "interrupt_payload": {"target": "staging"},
+        },
+        {
+            "id": "deploy_staging",
+            "type": "llm",
+            "when": "release_approved",
+            "output_key": "staging_result",
+            "system_prompt": "Deploy staging.",
+            "user_template": "{request}",
+        },
+    ],
+}
+
+
+@pytest.mark.asyncio
+async def test_rejecting_first_approval_skips_when_gated_second_approval() -> None:
+    """
+    Reproduces the user-reported bug: rejecting the deploy-to-UAT gate
+    skipped the deploy step (correct, `when: deploy_approved`) but the
+    next human_approval (`when: deploy_approved`) STILL prompted. Cause:
+    `_approval_node` did not honour `step.when`, unlike every other node
+    type. After the fix the second approval must skip and the run must
+    reach a terminal state without ever re-entering waiting_approval.
+    """
+    llm = make_mock_llm(text_responses=["unused"])
+    client, mongo = await build_int_client(_GRAPH_GATED_APPROVAL, llm)
+    try:
+        start = await client.post(
+            "/api/v1/workflows/runs",
+            json={"workflow_id": "gated-approval", "user_request": "ship it"},
+        )
+        assert start.status_code == 200, start.text
+        run_id = start.json()["id"]
+
+        # Paused at deploy_uat_gate.
+        first = await client.get(f"/api/v1/workflows/runs/{run_id}")
+        assert first.json()["status"] == "waiting_approval"
+        assert first.json()["current_step"] == "deploy_uat_gate"
+
+        # Reject — deploy_approved becomes False.
+        rej = await client.post(
+            f"/api/v1/workflows/runs/{run_id}/reject",
+            json={"reason": "skip uat"},
+        )
+        assert rej.status_code == 200, rej.text
+
+        # The previously-broken behaviour: status would be waiting_approval
+        # at deploy_staging_gate. With the fix the gate skips and the run
+        # ends (cancelled, because the rejection cascades through the
+        # remaining when-guarded steps).
+        final = await client.get(f"/api/v1/workflows/runs/{run_id}")
+        body = final.json()
+        assert body["status"] in ("completed", "cancelled"), (
+            f"second approval prompted again — current_step={body['current_step']}, "
+            f"status={body['status']}"
+        )
+        assert body["intermediate_outputs"]["deploy_approved"] is False
+        # The release_approved gate must not have prompted, so its key is absent.
+        assert "release_approved" not in body["intermediate_outputs"]
+    finally:
+        await mongo.close()
+
+
 @pytest.mark.asyncio
 async def test_state_persisted_between_gates() -> None:
     """
