@@ -74,11 +74,12 @@ def _html(title: str, emoji: str, body: str) -> HTMLResponse:
 
 
 async def _do_approve(run_id: str, container: ApplicationContainer, approver_slack_id: str = "") -> str:
-    run = await container.run_repository.get(run_id)
+    run = await container.run_repository.claim_for_resume(run_id)
     if run is None:
-        raise HTTPException(status_code=404, detail="Run not found")
-    if run.status != "waiting_approval":
-        raise HTTPException(status_code=409, detail=f"Run is not awaiting approval (status: {run.status})")
+        existing = await container.run_repository.get(run_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        raise HTTPException(status_code=409, detail=f"Run is not awaiting approval (status: {existing.status})")
 
     runner = container.live_runners.get(run_id) or container.yaml_graph_registry.get(run.graph_id)
     if runner is None:
@@ -94,10 +95,8 @@ async def _do_approve(run_id: str, container: ApplicationContainer, approver_sla
     # may not yield a chunk for the resumed node in all LangGraph versions.
     if run.current_step:
         run.step_statuses[run.current_step] = "finished"
-
-    run.status = "running"
-    run.touch()
-    await container.run_repository.update(run)
+        run.touch()
+        await container.run_repository.update(run)
     await stream_graph_to_pause(runner, run, container.run_repository, Command(resume={"approved": True}))
     if run.status in ("completed", "failed", "cancelled"):
         container.live_runners.pop(run_id, None)
@@ -106,11 +105,12 @@ async def _do_approve(run_id: str, container: ApplicationContainer, approver_sla
 
 
 async def _do_reject(run_id: str, reason: str | None, container: ApplicationContainer) -> str:
-    run = await container.run_repository.get(run_id)
+    run = await container.run_repository.claim_for_resume(run_id)
     if run is None:
-        raise HTTPException(status_code=404, detail="Run not found")
-    if run.status != "waiting_approval":
-        raise HTTPException(status_code=409, detail=f"Run is not awaiting approval (status: {run.status})")
+        existing = await container.run_repository.get(run_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        raise HTTPException(status_code=409, detail=f"Run is not awaiting approval (status: {existing.status})")
 
     runner = container.live_runners.get(run_id) or container.yaml_graph_registry.get(run.graph_id)
     if runner is None:
@@ -118,10 +118,8 @@ async def _do_reject(run_id: str, reason: str | None, container: ApplicationCont
 
     if run.current_step:
         run.step_statuses[run.current_step] = "finished"
-
-    run.status = "running"
-    run.touch()
-    await container.run_repository.update(run)
+        run.touch()
+        await container.run_repository.update(run)
     await stream_graph_to_pause(
         runner, run, container.run_repository,
         Command(resume={"approved": False, "reason": reason}),

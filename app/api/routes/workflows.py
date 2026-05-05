@@ -494,13 +494,17 @@ async def approve_run(
     body: ApproveRequest | None = None,
     container: ApplicationContainer = Depends(get_container),
 ):
-    run = await container.run_repository.get(run_id)
+    # Atomic claim. Two concurrent /approve requests must not both schedule
+    # a resume task on the same runner — see claim_for_resume's docstring
+    # for the failure mode that motivated this.
+    run = await container.run_repository.claim_for_resume(run_id)
     if run is None:
-        raise HTTPException(status_code=404, detail="Run not found")
-    if run.status != "waiting_approval":
+        existing = await container.run_repository.get(run_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Run not found")
         raise HTTPException(
             status_code=409,
-            detail=f"Run is not awaiting approval (status: {run.status})",
+            detail=f"Run is not awaiting approval (status: {existing.status})",
         )
     runner = await _get_runner_or_404(run, container)
 
@@ -510,10 +514,8 @@ async def approve_run(
     # stream_graph_to_pause when the resumed graph reaches it.
     if run.current_step:
         run.step_statuses[run.current_step] = "finished"
-
-    run.status = "running"
-    run.touch()
-    await container.run_repository.update(run)
+        run.touch()
+        await container.run_repository.update(run)
 
     corrections = body.corrections if body else None
     background_tasks.add_task(_resume_approved, runner, run, container, corrections)
@@ -543,22 +545,21 @@ async def reject_run(
     body: RejectRequest | None = None,
     container: ApplicationContainer = Depends(get_container),
 ):
-    run = await container.run_repository.get(run_id)
+    run = await container.run_repository.claim_for_resume(run_id)
     if run is None:
-        raise HTTPException(status_code=404, detail="Run not found")
-    if run.status != "waiting_approval":
+        existing = await container.run_repository.get(run_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Run not found")
         raise HTTPException(
             status_code=409,
-            detail=f"Run is not awaiting approval (status: {run.status})",
+            detail=f"Run is not awaiting approval (status: {existing.status})",
         )
     runner = await _get_runner_or_404(run, container)
 
     if run.current_step:
         run.step_statuses[run.current_step] = "finished"
-
-    run.status = "running"
-    run.touch()
-    await container.run_repository.update(run)
+        run.touch()
+        await container.run_repository.update(run)
 
     background_tasks.add_task(_resume_rejected, runner, run, container, body.reason if body else None)
 

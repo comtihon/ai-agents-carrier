@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorCollection
+from pymongo import ReturnDocument
 
 from app.core.config import Settings
 from app.domain.models.graph_run import GraphRun
@@ -22,6 +24,24 @@ class MongoGraphRunRepository:
 
     async def get(self, run_id: str) -> GraphRun | None:
         doc = await self._collection.find_one({"_id": run_id})
+        return self._from_doc(doc) if doc else None
+
+    async def claim_for_resume(self, run_id: str) -> GraphRun | None:
+        """Atomically flip status waiting_approval → running.
+
+        Returns the updated run when the swap succeeds, otherwise None.
+        Without this guard the /approve and /reject handlers had a TOCTOU
+        race: two near-simultaneous clicks would both read status=
+        waiting_approval and both schedule their own resume task on the
+        same langgraph runner, which corrupted state and observably left
+        the run stuck back at waiting_approval after the user had clicked
+        through.
+        """
+        doc = await self._collection.find_one_and_update(
+            {"_id": run_id, "status": "waiting_approval"},
+            {"$set": {"status": "running", "updated_at": datetime.now(timezone.utc)}},
+            return_document=ReturnDocument.AFTER,
+        )
         return self._from_doc(doc) if doc else None
 
     async def find_by_ask_context_ts(self, thread_ts: str) -> GraphRun | None:

@@ -11,6 +11,8 @@ Scenarios
 """
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from tests.integration.conftest import build_int_client, make_mock_llm
@@ -140,6 +142,108 @@ async def test_double_approve_returns_409() -> None:
         # Run is now past the approval gate; a second approve must be refused.
         second = await client.post(f"/api/v1/workflows/runs/{run_id}/approve")
         assert second.status_code == 409, second.text
+    finally:
+        await mongo.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_approve_serialised_no_double_resume() -> None:
+    """
+    Two concurrent POST /approve requests on the same waiting_approval run
+    must serialise: exactly one returns 200, the other 409. The run must
+    end up in a terminal state — never wedged back at waiting_approval.
+
+    Background
+    ──────────
+    Pre-fix the handler did read-then-write on run.status (TOCTOU). Two
+    near-simultaneous clicks both passed `if status != waiting_approval`,
+    both wrote status=running, both scheduled a background resume task on
+    the same langgraph runner. The two resumes raced: one would land its
+    end-of-stream `run.status = waiting_approval if snap.next else completed`
+    write *after* the other had already moved past, leaving the run stuck
+    at waiting_approval — the user-facing symptom was "I press approve but
+    it returns back".
+
+    Fix is `MongoGraphRunRepository.claim_for_resume`, an atomic
+    `find_one_and_update({status: waiting_approval} → {status: running})`.
+    Only one caller observes the swap; the other gets None → 409.
+    """
+    llm = make_mock_llm(text_responses=["the plan", "the implementation"])
+    client, mongo = await build_int_client(_GRAPH, llm)
+    try:
+        start = await client.post(
+            "/api/v1/workflows/runs",
+            json={"workflow_id": _GRAPH_ID, "user_request": "concurrent-approve"},
+        )
+        assert start.status_code == 200
+        run_id = start.json()["id"]
+
+        # Sanity: the run is paused at the approval gate.
+        paused = await client.get(f"/api/v1/workflows/runs/{run_id}")
+        assert paused.json()["status"] == "waiting_approval"
+
+        r1, r2 = await asyncio.gather(
+            client.post(f"/api/v1/workflows/runs/{run_id}/approve"),
+            client.post(f"/api/v1/workflows/runs/{run_id}/approve"),
+        )
+        codes = sorted([r1.status_code, r2.status_code])
+        assert codes == [200, 409], (
+            f"expected one 200 and one 409, got {codes} (r1={r1.text!r}, r2={r2.text!r})"
+        )
+
+        # Run progresses past the gate — never falls back to waiting_approval.
+        final = await client.get(f"/api/v1/workflows/runs/{run_id}")
+        assert final.json()["status"] == "completed", (
+            f"run wedged at status={final.json()['status']}"
+        )
+    finally:
+        await mongo.close()
+
+
+@pytest.mark.asyncio
+async def test_claim_for_resume_atomic_at_repo_level() -> None:
+    """
+    The atomic guarantee lives in the repository, not the handler. Two
+    concurrent claims against the same waiting_approval run must produce
+    exactly one winner — verified directly on the repo to pin the
+    contract independently of the HTTP layer.
+    """
+    from app.core.config import Settings
+    from app.domain.models.graph_run import GraphRun
+    from app.infrastructure.persistence.mongo import MongoClientProvider
+
+    settings = Settings(
+        mongodb_uri="mongodb://localhost:27017",
+        mongodb_database="test_langgraph_integration",
+        environment="test",
+    )
+    mongo = MongoClientProvider(settings)
+    repo = mongo.get_repository()
+    try:
+        await repo._collection.delete_many({})
+        run = GraphRun(
+            id="claim-race",
+            graph_id="approval-test",
+            user_request="x",
+            status="waiting_approval",
+        )
+        await repo.create(run)
+
+        results = await asyncio.gather(
+            repo.claim_for_resume("claim-race"),
+            repo.claim_for_resume("claim-race"),
+            repo.claim_for_resume("claim-race"),
+        )
+        winners = [r for r in results if r is not None]
+        losers = [r for r in results if r is None]
+        assert len(winners) == 1, f"expected exactly one winner, got {len(winners)}"
+        assert len(losers) == 2
+        assert winners[0].status == "running"
+
+        # And after the swap, status is persisted as running — a fourth
+        # claim cannot succeed.
+        again = await repo.claim_for_resume("claim-race")
+        assert again is None
     finally:
         await mongo.close()
 
