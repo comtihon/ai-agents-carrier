@@ -82,53 +82,62 @@ class OpenHandsAdapter:
         deadline = time.monotonic() + self._settings.openhands_task_timeout_seconds
 
         async with httpx.AsyncClient(timeout=self._settings.openhands_timeout_seconds, headers=headers) as client:
+            # Decide whether to resume the caller-supplied conversation. If it
+            # has been GC'd, fall back to a fresh conversation transparently.
+            resume_id: str | None = None
             if existing_conv_id:
                 resp = await client.get(f"{base_url}/api/v1/app-conversations", params={"ids": existing_conv_id})
-                found = resp.is_success and (resp.json() or [None])[0] is not None
-                if found:
+                if resp.is_success and (resp.json() or [None])[0] is not None:
+                    resume_id = existing_conv_id
                     logger.info("Resuming OpenHands conversation %s", existing_conv_id)
-                    conv_id = existing_conv_id
                 else:
                     logger.warning("OpenHands conversation %s not found, starting a new one", existing_conv_id)
-                    existing_conv_id = None
-            if not existing_conv_id:
-                # Step 1: start the conversation
-                resp = await client.post(
-                    f"{base_url}/api/v1/app-conversations",
-                    json={
-                        "trigger": "openhands_api",
-                        "initial_message": {
-                            "role": "user",
-                            "content": [{"type": "text", "text": instructions}],
-                            "run": True,
-                        },
-                    },
+
+            # Step 1: start (new or resumed) conversation. We always go through
+            # this path because it is the only one that ships `instructions` to
+            # OpenHands. Polling a finished conversation without re-posting was
+            # a silent no-op and caused reflection retry loops to spin forever
+            # on the same stale result. Passing `conversation_id` reuses the
+            # existing conversation; omitting it allocates a fresh one.
+            start_payload: dict[str, Any] = {
+                "trigger": "openhands_api",
+                "initial_message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": instructions}],
+                    "run": True,
+                },
+            }
+            if resume_id:
+                start_payload["conversation_id"] = resume_id
+            resp = await client.post(
+                f"{base_url}/api/v1/app-conversations",
+                json=start_payload,
+            )
+            resp.raise_for_status()
+            start_task = resp.json()
+            task_id = start_task["id"]
+
+            # Step 2: poll until sandbox is ready
+            while start_task.get("status") not in _START_TERMINAL:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"OpenHands start task {task_id} did not reach READY within {self._settings.openhands_task_timeout_seconds}s")
+                await asyncio.sleep(poll_interval)
+                resp = await client.get(
+                    f"{base_url}/api/v1/app-conversations/start-tasks",
+                    params={"ids": task_id},
                 )
                 resp.raise_for_status()
-                start_task = resp.json()
-                task_id = start_task["id"]
+                tasks = resp.json()
+                if not tasks or tasks[0] is None:
+                    raise RuntimeError(f"OpenHands start task {task_id} disappeared")
+                start_task = tasks[0]
 
-                # Step 2: poll until sandbox is ready
-                while start_task.get("status") not in _START_TERMINAL:
-                    if time.monotonic() > deadline:
-                        raise TimeoutError(f"OpenHands start task {task_id} did not reach READY within {self._settings.openhands_task_timeout_seconds}s")
-                    await asyncio.sleep(poll_interval)
-                    resp = await client.get(
-                        f"{base_url}/api/v1/app-conversations/start-tasks",
-                        params={"ids": task_id},
-                    )
-                    resp.raise_for_status()
-                    tasks = resp.json()
-                    if not tasks or tasks[0] is None:
-                        raise RuntimeError(f"OpenHands start task {task_id} disappeared")
-                    start_task = tasks[0]
+            if start_task.get("status") == "ERROR":
+                raise RuntimeError(f"OpenHands failed to start conversation: {start_task.get('detail')}")
 
-                if start_task.get("status") == "ERROR":
-                    raise RuntimeError(f"OpenHands failed to start conversation: {start_task.get('detail')}")
-
-                conv_id = start_task["app_conversation_id"]
-                if conv_id_callback:
-                    await conv_id_callback(conv_id)
+            conv_id = start_task["app_conversation_id"]
+            if conv_id_callback:
+                await conv_id_callback(conv_id)
 
             # Step 3: poll until agent finishes
             conv: dict[str, Any] = {}
