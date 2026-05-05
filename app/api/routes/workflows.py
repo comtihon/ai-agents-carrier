@@ -187,6 +187,11 @@ async def _run_response(run: GraphRun, runner: YamlGraphRunner | None = None) ->
         "execution_results": [],
         "intermediate_outputs": run.state,
         "interrupt_payload": interrupt_payload,
+        "waiting_transition": (
+            run.waiting_transition.model_dump(mode="json")
+            if run.waiting_transition is not None
+            else None
+        ),
         "error": run.state.get("error") if run.status == "failed" else None,
         "metadata": {},
         "created_at": run.created_at.isoformat(),

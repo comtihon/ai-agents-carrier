@@ -7,6 +7,7 @@ import logging
 import re
 import string
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, TypedDict
 from uuid import uuid4
 
@@ -483,7 +484,7 @@ class YamlGraphRunner:
                         for r in routes
                         if "next" in r
                     }
-                    sg.add_conditional_edges(sid, self._make_router_fn(routes), route_map)
+                    sg.add_conditional_edges(sid, self._make_router_fn(sid, routes), route_map)
             elif next_val:
                 sg.add_edge(sid, next_val if next_val in all_ids else END)
             elif i < len(self._steps) - 1:
@@ -597,13 +598,17 @@ class YamlGraphRunner:
 
     _MAX_ROUTE_WAIT_SECONDS: float = 3600.0
 
-    @classmethod
-    def _make_router_fn(cls, routes: list[dict[str, Any]]) -> Callable[[dict], Awaitable[str]]:
+    def _make_router_fn(
+        self, source_id: str, routes: list[dict[str, Any]]
+    ) -> Callable[[dict], Awaitable[str]]:
         """Return an async routing function for add_conditional_edges.
 
         A route may declare ``wait_seconds: <number>`` to delay the transition
         to its destination. The wait runs after the route is selected and
         before the next node executes; it is capped at ``_MAX_ROUTE_WAIT_SECONDS``.
+        While sleeping, ``run.waiting_transition`` is set so the UI can
+        visualise the pause; it's cleared in a ``finally`` block so a
+        cancellation or exception doesn't leave a stale waiting indicator.
         """
         def _select(state: dict) -> dict[str, Any]:
             for route in routes:
@@ -631,6 +636,8 @@ class YamlGraphRunner:
                 f"Add a `when: null` route or a condition that covers this case."
             )
 
+        runner = self
+
         async def router(state: dict) -> str:
             chosen = _select(state)
             wait = chosen.get("wait_seconds")
@@ -643,13 +650,33 @@ class YamlGraphRunner:
                 if delay < 0:
                     logger.warning("ignoring negative wait_seconds=%s on route to %s", delay, chosen.get("next"))
                     delay = 0.0
-                if delay > cls._MAX_ROUTE_WAIT_SECONDS:
+                if delay > runner._MAX_ROUTE_WAIT_SECONDS:
                     logger.warning("capping wait_seconds=%s at %s on route to %s",
-                                   delay, cls._MAX_ROUTE_WAIT_SECONDS, chosen.get("next"))
-                    delay = cls._MAX_ROUTE_WAIT_SECONDS
+                                   delay, runner._MAX_ROUTE_WAIT_SECONDS, chosen.get("next"))
+                    delay = runner._MAX_ROUTE_WAIT_SECONDS
                 if delay > 0:
                     logger.info("waiting %.1fs before transitioning to '%s'", delay, chosen.get("next"))
-                    await asyncio.sleep(delay)
+                    run = runner._current_run
+                    repo = runner._current_run_repository
+                    if run is not None:
+                        from app.domain.models.graph_run import WaitingTransition
+                        run.waiting_transition = WaitingTransition(
+                            source=source_id,
+                            target=chosen["next"],
+                            wait_seconds=delay,
+                            started_at=datetime.now(timezone.utc),
+                        )
+                        run.touch()
+                        if repo is not None:
+                            await repo.update(run)
+                    try:
+                        await asyncio.sleep(delay)
+                    finally:
+                        if run is not None:
+                            run.waiting_transition = None
+                            run.touch()
+                            if repo is not None:
+                                await repo.update(run)
             return chosen["next"]
         return router
 
