@@ -617,7 +617,19 @@ class YamlGraphRunner:
                     val = not val
                 if val:
                     return route
-            return routes[-1]
+            # No condition matched and no `when: null` default declared. The
+            # previous behaviour was to silently fall back to routes[-1], but
+            # that hid bugs: e.g. a develop ↔ deliver-result loop where
+            # `success` and `openhands_crashed` both resolved to False got
+            # silently routed back to develop and span forever. Fail loudly
+            # so the workflow author either adds an explicit default or
+            # extends the conditions.
+            checked = [r.get("when") for r in routes]
+            raise ValueError(
+                f"router: no route matched on state and no default "
+                f"(when=null) was declared; checked={checked}. "
+                f"Add a `when: null` route or a condition that covers this case."
+            )
 
         async def router(state: dict) -> str:
             chosen = _select(state)
