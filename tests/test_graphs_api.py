@@ -200,3 +200,59 @@ async def test_list_runs_combined_filters(client):
         limit=10, workflow_id="simple", status="completed", search="build"
     )
     assert len(resp.json()) == 1
+
+
+# ─── Approve handler claims atomically ────────────────────────────────────────
+# These tests pin the contract that the /approve handler relies on
+# `claim_for_resume` (an atomic find_one_and_update) instead of the previous
+# read-then-write on `run.status`. The integration test
+# `test_concurrent_approve_serialised_no_double_resume` exercises the actual
+# race against MongoDB; these unit tests just verify the handler wiring.
+
+@pytest.mark.asyncio
+async def test_approve_uses_claim_for_resume_not_read_then_write(client):
+    """Happy-path approve must go through the atomic claim, not get/update."""
+    c, container = client
+    container.live_runners["tid1"] = list(container.yaml_graph_registry._runners.values())[0]
+    waiting = GraphRun(
+        id="tid1", graph_id="simple", user_request="hello",
+        status="waiting_approval", current_step="step1",
+    )
+    container.run_repository.claim_for_resume = AsyncMock(return_value=waiting)
+    container.run_repository.get = AsyncMock()  # must NOT be called for the gate check
+
+    resp = await c.post("/api/v1/workflows/runs/tid1/approve")
+
+    assert resp.status_code == 200, resp.text
+    container.run_repository.claim_for_resume.assert_awaited_once_with("tid1")
+
+
+@pytest.mark.asyncio
+async def test_approve_returns_409_when_claim_loses_race(client):
+    """When claim_for_resume returns None (someone else claimed first or the
+    run moved past), the second click sees 409 — never schedules a duplicate
+    resume task."""
+    c, container = client
+    container.run_repository.claim_for_resume = AsyncMock(return_value=None)
+    # The handler still queries `get` to differentiate 404 vs 409.
+    container.run_repository.get = AsyncMock(return_value=GraphRun(
+        id="tid1", graph_id="simple", user_request="hello", status="running",
+    ))
+
+    resp = await c.post("/api/v1/workflows/runs/tid1/approve")
+
+    assert resp.status_code == 409, resp.text
+    assert "running" in resp.json().get("detail", "")
+    container.run_repository.claim_for_resume.assert_awaited_once_with("tid1")
+
+
+@pytest.mark.asyncio
+async def test_approve_returns_404_when_run_missing(client):
+    """Claim returns None and there is no run at all — 404 not 409."""
+    c, container = client
+    container.run_repository.claim_for_resume = AsyncMock(return_value=None)
+    container.run_repository.get = AsyncMock(return_value=None)
+
+    resp = await c.post("/api/v1/workflows/runs/tid1/approve")
+
+    assert resp.status_code == 404, resp.text
