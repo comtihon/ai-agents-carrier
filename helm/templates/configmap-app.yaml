@@ -1,4 +1,4 @@
-{{- if .Values.config }}
+{{- if or .Values.config .Values.llmIntegrations }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -6,5 +6,15 @@ metadata:
 data:
 {{- range $key, $val := .Values.config }}
   {{ $key }}: {{ $val | quote }}
+{{- end }}
+{{- if .Values.llmIntegrations }}
+  LLM_INTEGRATIONS: |
+    [
+{{- $last := sub (len .Values.llmIntegrations) 1 }}
+{{- range $i, $cfg := .Values.llmIntegrations }}
+{{- $envName := default (printf "%s_API_KEY" (upper (replace "-" "_" $cfg.name))) $cfg.apiKeyEnv }}
+      {"name": {{ $cfg.name | quote }}, "base_url": {{ $cfg.baseUrl | quote }}, "default_model": {{ $cfg.defaultModel | quote }}, "api_key_env": {{ $envName | quote }}}{{- if ne $i $last }},{{- end }}
+{{- end }}
+    ]
 {{- end }}
 {{- end }}

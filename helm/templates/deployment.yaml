@@ -21,12 +21,12 @@ spec:
           ports:
             - containerPort: 8000
               name: http
-{{- if .Values.config }}
+{{- if or .Values.config .Values.llmIntegrations }}
           envFrom:
             - configMapRef:
                 name: {{ include "langgraph-backend.fullname" . }}-config
 {{- end }}
-{{- if .Values.secrets }}
+{{- if or .Values.secrets .Values.llmIntegrations }}
           env:
 {{- range $envKey, $secret := .Values.secrets }}
             - name: {{ $envKey }}
@@ -34,6 +34,15 @@ spec:
                 secretKeyRef:
                   name: {{ $secret.name }}
                   key: {{ $secret.key }}
+{{- end }}
+{{- range $cfg := .Values.llmIntegrations }}
+{{- if $cfg.apiKeySecret }}
+            - name: {{ default (printf "%s_API_KEY" (upper (replace "-" "_" $cfg.name))) $cfg.apiKeyEnv }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $cfg.apiKeySecret.name }}
+                  key: {{ $cfg.apiKeySecret.key }}
+{{- end }}
 {{- end }}
 {{- end }}
           readinessProbe:

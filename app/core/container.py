@@ -336,50 +336,45 @@ class ApplicationContainer:
             await self.workflow_backend.close()
 
 
-_ANTHROPIC_DEFAULT_MODEL = "claude-opus-4-6"
-_OPENAI_DEFAULT_MODEL = "gpt-4o"
-_GOOGLE_DEFAULT_MODEL = "gemini-2.0-flash"
-
-
-def build_llm_for(provider: str, model: str | None, settings: Settings) -> BaseChatModel:
-    """Build an LLM for an explicit provider + optional model override."""
-    if provider == "anthropic":
-        from langchain_anthropic import ChatAnthropic
-        return ChatAnthropic(
-            model=model or _ANTHROPIC_DEFAULT_MODEL,
-            api_key=settings.anthropic_api_key,  # type: ignore[arg-type]
-            max_tokens=16000,
-        )
-    if provider == "openai":
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
-            model=model or _OPENAI_DEFAULT_MODEL,
-            api_key=settings.openai_api_key,  # type: ignore[arg-type]
-            max_tokens=16000,
-        )
-    if provider == "google":
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        return ChatGoogleGenerativeAI(
-            model=model or _GOOGLE_DEFAULT_MODEL,
-            google_api_key=settings.google_api_key,  # type: ignore[arg-type]
-            max_output_tokens=16000,
-        )
+def _fake_llm(reason: str) -> BaseChatModel:
     from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
     from langchain_core.messages import AIMessage
-    return FakeMessagesListChatModel(
-        responses=[AIMessage(content="LLM not configured. Set LLM_PROVIDER and the matching API key.")]
+    return FakeMessagesListChatModel(responses=[AIMessage(content=reason)])
+
+
+def build_llm_for(provider: str | None, model: str | None, settings: Settings) -> BaseChatModel:
+    """Build an LLM for an integration name + optional model override.
+
+    `provider` is the `name` of an entry in `LLM_INTEGRATIONS`. All integrations
+    are treated as OpenAI/LiteLLM-compatible: a single ChatOpenAI client is
+    constructed with the integration's `base_url`, `api_key`, and `model`.
+
+    Resolution order for the model: step override > integration's `default_model`.
+    """
+    if not provider:
+        return _fake_llm("LLM not configured. Set LLM_PROVIDER to one of the configured LLM_INTEGRATIONS.")
+    integration = settings.get_llm_integration(provider)
+    if integration is None:
+        return _fake_llm(
+            f"LLM integration '{provider}' is not defined in LLM_INTEGRATIONS."
+        )
+    from langchain_openai import ChatOpenAI
+    return ChatOpenAI(
+        model=model or integration.default_model,
+        api_key=integration.resolved_api_key(),  # type: ignore[arg-type]
+        base_url=integration.base_url,
+        max_tokens=16000,
     )
 
 
 def build_llm(settings: Settings) -> BaseChatModel:
-    return build_llm_for((settings.llm_provider or "").lower(), settings.llm_model, settings)
+    return build_llm_for(settings.llm_provider, None, settings)
 
 
 def _make_llm_factory(settings: Settings) -> Callable[[str | None, str | None], BaseChatModel]:
     """Return a factory that builds an LLM with optional per-step provider/model overrides."""
     def factory(provider: str | None, model: str | None) -> BaseChatModel:
-        effective_provider = (provider or settings.llm_provider or "").lower()
-        return build_llm_for(effective_provider, model, settings)
+        return build_llm_for(provider or settings.llm_provider, model, settings)
     return factory
 
 
