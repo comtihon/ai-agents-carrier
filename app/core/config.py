@@ -1,10 +1,34 @@
 from __future__ import annotations
 
+import json
+import os
 from functools import lru_cache
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _default_api_key_env(name: str) -> str:
+    """Derive the env var name that carries the API key for an integration."""
+    return name.upper().replace("-", "_") + "_API_KEY"
+
+
+class LLMIntegrationConfig(BaseModel):
+    """One LLM provider integration — any OpenAI/LiteLLM-compatible endpoint."""
+
+    name: str
+    base_url: str
+    default_model: str
+    # Name of the env var holding the API key. Defaults to `<NAME>_API_KEY`
+    # so a single helm secret-ref is enough for built-in providers.
+    api_key_env: str | None = None
+
+    def resolved_api_key_env(self) -> str:
+        return self.api_key_env or _default_api_key_env(self.name)
+
+    def resolved_api_key(self) -> str | None:
+        return os.environ.get(self.resolved_api_key_env())
 
 
 class McpIntegrationConfig(BaseModel):
@@ -49,11 +73,13 @@ class Settings(BaseSettings):
     oauth_algorithms: list[str] = Field(default=["RS256"], alias="OAUTH_ALGORITHMS")
 
     # --- LLM ---
+    # Name of the integration to use when a step has no explicit `llm_provider`.
+    # Must match one of the entries in `LLM_INTEGRATIONS`.
     llm_provider: str | None = Field(default=None, alias="LLM_PROVIDER")
-    llm_model: str | None = Field(default=None, alias="LLM_MODEL")
-    anthropic_api_key: str | None = Field(default=None, alias="ANTHROPIC_API_KEY")
-    openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
-    google_api_key: str | None = Field(default=None, alias="GOOGLE_API_KEY")
+    # JSON-encoded list of LLM integrations. Each entry: {name, base_url,
+    # default_model, api_key_env?}. Delivered via helm `llmIntegrations` list.
+    # All integrations are treated as OpenAI/LiteLLM-compatible endpoints.
+    llm_integrations_json: str | None = Field(default=None, alias="LLM_INTEGRATIONS")
 
     # --- Workflow backend ---
     # "localfiles" — read/write YAML files from graph_definitions_path (default).
@@ -132,6 +158,23 @@ class Settings(BaseSettings):
                         command="uvx", args=["mcp-atlassian"], env=env)
         return dict(name="jira", enabled=self.mcp_jira_enabled, transport=self.mcp_jira_transport,
                     url=self.mcp_jira_url, api_key=self.mcp_jira_api_key)
+
+    def get_llm_integrations(self) -> list[LLMIntegrationConfig]:
+        """Parse the LLM_INTEGRATIONS JSON env var into a typed list."""
+        if not self.llm_integrations_json:
+            return []
+        raw = json.loads(self.llm_integrations_json)
+        if not isinstance(raw, list):
+            raise ValueError("LLM_INTEGRATIONS must be a JSON array of integration objects")
+        return [LLMIntegrationConfig.model_validate(item) for item in raw]
+
+    def get_llm_integration(self, name: str) -> LLMIntegrationConfig | None:
+        """Look up an integration by name (case-insensitive)."""
+        target = name.lower()
+        for integration in self.get_llm_integrations():
+            if integration.name.lower() == target:
+                return integration
+        return None
 
     def get_mcp_integrations(self) -> list[McpIntegrationConfig]:
         candidates: list[dict[str, Any]] = [

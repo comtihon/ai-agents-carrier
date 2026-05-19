@@ -22,6 +22,36 @@ config: {}
 #     key: ANTHROPIC_API_KEY
 secrets: {}
 
+# LLM provider integrations. Free-form list — any entry that exposes an
+# OpenAI / LiteLLM-compatible HTTP endpoint can be added without code changes.
+# Each entry is rendered into:
+#   ConfigMap: LLM_INTEGRATIONS (JSON-encoded list, minus the secret api key)
+#   Deployment env: <NAME>_API_KEY from the referenced k8s Secret
+#     (NAME uppercased, dashes → underscores)
+# Use `apiKeyEnv` to override the env var name explicitly.
+# Example:
+#   llmIntegrations:
+#     - name: anthropic
+#       baseUrl: https://api.anthropic.com/v1
+#       defaultModel: claude-sonnet-4-6
+#       apiKeySecret:
+#         name: langgraph-backend-secrets
+#         key: ANTHROPIC_API_KEY
+#     - name: openrouter
+#       baseUrl: https://openrouter.ai/api/v1
+#       defaultModel: anthropic/claude-sonnet-4.5
+#       apiKeySecret:
+#         name: langgraph-backend-secrets
+#         key: OPENROUTER_API_KEY
+#     - name: my-litellm-proxy
+#       baseUrl: https://proxy.example.com/v1
+#       defaultModel: some/model
+#       apiKeyEnv: MY_PROXY_KEY        # optional, defaults to MY_LITELLM_PROXY_API_KEY
+#       apiKeySecret:
+#         name: my-proxy-secret
+#         key: API_KEY
+llmIntegrations: []
+
 # Graph definitions mounted as YAML files under GRAPH_DEFINITIONS_PATH.
 # Key becomes the file name (without .yaml extension), value is the YAML content.
 graphs: {}
