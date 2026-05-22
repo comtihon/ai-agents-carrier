@@ -22,6 +22,10 @@ from app.infrastructure.integrations.openhands import OpenHandsAdapter
 from app.infrastructure.orchestration.checkpointer import MongoDBCheckpointSaver
 from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner, stream_graph_to_pause
 from app.infrastructure.persistence.mongo import MongoClientProvider, MongoGraphRunRepository
+from app.infrastructure.persistence.agent_backend import (
+    AgentDefinitionBackend,
+    MongoAgentBackend,
+)
 from app.infrastructure.persistence.workflow_backend import (
     LocalFilesWorkflowBackend,
     MongoWorkflowBackend,
@@ -46,6 +50,9 @@ class ApplicationContainer:
     # Workflow definition backend — None only in legacy test setups that
     # inject the registry directly (backward compat).
     workflow_backend: WorkflowDefinitionBackend | None = None
+    # Agent definition backend — None when MongoDB is not configured or in
+    # legacy test setups.  Required for langgraph-agent / claude-agent steps.
+    agent_backend: AgentDefinitionBackend | None = None
     # Factory for per-step LLM overrides; None in legacy test setups.
     llm_factory: Callable[[str | None, str | None], BaseChatModel] | None = None
     # Runners keyed by run_id — alive for the duration of the run so that
@@ -77,6 +84,14 @@ class ApplicationContainer:
             run_repository=self.run_repository,
             checkpointer=self.checkpointer,
         )
+        # Inject agent_backend and callback_base_url into every runner so that
+        # agent steps can look up AgentDefinitions and build callback URLs.
+        for wf_id in self.yaml_graph_registry.list_ids():
+            runner = self.yaml_graph_registry.get(wf_id)
+            if runner is not None:
+                if self.agent_backend is not None:
+                    runner._agent_backend = self.agent_backend
+                runner._callback_base_url = self.settings.base_url
         logger.info("Loaded %d workflow definition(s) from backend", len(definitions))
         self._setup_all_cron_triggers()
 
@@ -128,6 +143,8 @@ class ApplicationContainer:
                         openhands=self.openhands,
                         checkpointer=self.checkpointer,
                     )
+                    if self.agent_backend is not None:
+                        runner._agent_backend = self.agent_backend
                     definition_snapshot: dict | None = defn.to_raw_dict()
                 else:
                     runner = self.yaml_graph_registry.get(workflow_id)
@@ -186,6 +203,9 @@ class ApplicationContainer:
                 openhands=self.openhands,
                 checkpointer=self.checkpointer,
             )
+            if self.agent_backend is not None:
+                runner._agent_backend = self.agent_backend
+            runner._callback_base_url = self.settings.base_url
             self.yaml_graph_registry._runners[workflow_id] = runner
             self._register_cron_steps(runner)
             logger.info("Registry runner refreshed for workflow '%s'", workflow_id)
@@ -320,6 +340,9 @@ class ApplicationContainer:
                 )
                 runner._registry = self.yaml_graph_registry
                 runner._run_repository = self.run_repository
+                if self.agent_backend is not None:
+                    runner._agent_backend = self.agent_backend
+                runner._callback_base_url = self.settings.base_url
                 return runner
             except Exception:
                 logger.exception("run %s: failed to build runner from definition snapshot", run.id)
@@ -334,6 +357,8 @@ class ApplicationContainer:
             self.checkpointer.close()
         if isinstance(self.workflow_backend, MongoWorkflowBackend):
             await self.workflow_backend.close()
+        if isinstance(self.agent_backend, MongoAgentBackend):
+            await self.agent_backend.close()
 
 
 def _fake_llm(reason: str) -> BaseChatModel:
@@ -383,7 +408,7 @@ def _build_workflow_backend(settings: Settings) -> WorkflowDefinitionBackend:
         return MongoWorkflowBackend(settings.mongodb_uri, settings.mongodb_database)
     # Local-files backend: treat every loaded definition as read-only because
     # in production the directory is a k8s ConfigMap volume (readOnly: true).
-    return LocalFilesWorkflowBackend(settings.graph_definitions_path, readonly=True)
+    return LocalFilesWorkflowBackend(settings.graph_definitions_path, readonly=False)
 
 
 def build_container(settings: Settings) -> ApplicationContainer:
@@ -394,6 +419,8 @@ def build_container(settings: Settings) -> ApplicationContainer:
     mongo_provider = MongoClientProvider(settings)
     run_repository = mongo_provider.get_repository()
     workflow_backend = _build_workflow_backend(settings)
+    # Agent definitions are always stored in MongoDB (no local-files backend).
+    agent_backend = MongoAgentBackend(settings.mongodb_uri, settings.mongodb_database)
     checkpointer = MongoDBCheckpointSaver(
         MongoClient(settings.mongodb_uri),
         db_name=settings.mongodb_database,
@@ -409,5 +436,6 @@ def build_container(settings: Settings) -> ApplicationContainer:
         run_repository=run_repository,
         openhands=openhands,
         workflow_backend=workflow_backend,
+        agent_backend=agent_backend,
         checkpointer=checkpointer,
     )

@@ -1,5 +1,6 @@
 id: example-ticket-execution
 name: Example Ticket Execution
+readonly: true
 description: >
   Full end-to-end example: an HTTP webhook fires when a Jira ticket is created
   or updated, the workflow gathers Jira + GitHub context via MCP tools, an LLM

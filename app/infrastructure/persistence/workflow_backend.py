@@ -68,7 +68,7 @@ class LocalFilesWorkflowBackend(WorkflowDefinitionBackend):
                 description=raw.get("description", ""),
                 steps=raw.get("steps", []),
                 ui=raw.get("ui", {}),
-                readonly=self._readonly,
+                readonly=raw.get("readonly", self._readonly),
                 created_at=datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc),
                 updated_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
             )

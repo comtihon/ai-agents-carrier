@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "langgraph-backend-client"
+version = "0.1.0"
+description = "Example agents and utilities for the langgraph-backend agent runtime."
+readme = "../README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Acme" }]
+
+# Minimal dependencies shared by all agent examples.
+# Individual agents may require additional packages (e.g. langgraph, anthropic).
+dependencies = []
+
+[project.optional-dependencies]
+langgraph = [
+  "langgraph>=1.1.0,<2.0.0",
+  "langchain-openai>=1.0.0,<2.0.0",
+]
+claude = [
+  "anthropic>=0.40.0",
+]
+dev = [
+  "pytest>=9.0.3,<10.0.0",
+  "pytest-asyncio>=1.3.0,<2.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["examples*"]

@@ -75,6 +75,15 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
         # execute steps persist their OpenHands conversation ID for restart resumption
         if step.get("type") == "execute":
             fields[f"_openhands_conv_{step['id']}"] = Any  # type: ignore[assignment]
+        # agent steps (langgraph-agent / claude-agent) store their output under output_key
+        # when output_mapping is absent; the output_key field is already captured by the
+        # generic "output_key" check above, but we also ensure it exists for typing.
+        if step.get("type") in ("langgraph-agent", "claude-agent"):
+            if "output_key" not in step and step.get("output_mapping"):
+                for wf_key in step["output_mapping"].values():
+                    fields[wf_key] = Any  # type: ignore[assignment]
+    # Internal field: agent_url stored while a run is in waiting_agent state
+    fields["_agent_url"] = Any  # type: ignore[assignment]
     return TypedDict("YamlGraphState", fields, total=False)  # type: ignore[misc]
 
 
@@ -213,13 +222,44 @@ async def stream_graph_to_pause(
         return
 
     snap = await runner.graph.aget_state(config)
-    run.status = "waiting_approval" if snap.next else "completed"
+    # Determine whether the run paused at a waiting_agent step or a
+    # waiting_approval step (or completed).
+    if snap.next:
+        current_step_id = snap.next[0]
+        step_def = next((s for s in runner.steps if s["id"] == current_step_id), None)
+        if step_def and step_def.get("type") in ("langgraph-agent", "claude-agent"):
+            run.status = "waiting_agent"
+        else:
+            run.status = "waiting_approval"
+    else:
+        run.status = "completed"
     run.current_step = snap.next[0] if snap.next else None
     run.state = snap.values
     run.touch()
     await run_repository.update(run)
     if run.status == "completed":
         await _close_openhands_conversations(runner, snap.values)
+
+    if run.status == "waiting_agent" and run.current_step:
+        # Extract agent_url from the interrupt payload and persist it on the run
+        # so the agent_callbacks route can find and terminate it if needed.
+        agent_url: str | None = None
+        for task in snap.tasks:
+            for intr in task.interrupts:
+                if isinstance(intr.value, dict) and intr.value.get("type") == "waiting_agent":
+                    agent_url = intr.value.get("agent_url")
+                    break
+            if agent_url:
+                break
+        if not agent_url:
+            for intr in getattr(snap, "interrupts", ()):
+                if isinstance(intr.value, dict) and intr.value.get("type") == "waiting_agent":
+                    agent_url = intr.value.get("agent_url")
+                    break
+        if agent_url:
+            run.agent_url = agent_url
+            run.touch()
+            await run_repository.update(run)
 
     if run.status == "waiting_approval" and run.current_step:
         # Reset the approval flag at request time so a loop-back through the
@@ -416,6 +456,11 @@ class YamlGraphRunner:
         # Injected post-construction by load_yaml_graphs
         self._registry: Any = None
         self._run_repository: Any = None
+        # Injected post-construction by the application container for agent steps
+        self._agent_backend: Any = None
+        # Injected post-construction by the application container so agent steps
+        # can pass the backend's public base URL to spawned agent servers.
+        self._callback_base_url: str = ""
         # Set by stream_graph_to_pause to enable mid-run persistence from nodes
         self._current_run: Any = None
         self._current_run_repository: Any = None
@@ -510,6 +555,8 @@ class YamlGraphRunner:
         t = step["type"]
         if t == "llm_structured":
             fn = self._llm_structured_node(step)
+        elif t in ("langgraph-agent", "claude-agent"):
+            fn = self._agent_node(step)
         elif t == "llm":
             fn = self._llm_node(step)
         elif t == "mcp":
@@ -540,7 +587,7 @@ class YamlGraphRunner:
             raise ValueError(f"Unknown step type '{t}' in graph '{self.id}'")
         return self._wrap_with_status_running(self._wrap_with_loop_guard(step, fn), step)
 
-    _NO_LOOP_GUARD_TYPES: frozenset = frozenset({"ask_context", "human_approval", "cron", "http", "parallel", "join", "switch"})
+    _NO_LOOP_GUARD_TYPES: frozenset = frozenset({"ask_context", "human_approval", "cron", "http", "parallel", "join", "switch", "langgraph-agent", "claude-agent"})
 
     def _wrap_with_status_running(self, fn: Callable, step: dict[str, Any]) -> Callable:
         """Persist step_status="running" + current_step before the node executes.
@@ -683,6 +730,46 @@ class YamlGraphRunner:
     _SUBMIT_TOOL = "submit_output"
     _MAX_ITERATIONS = 25
 
+    def _agent_node(self, step: dict[str, Any]):
+        """Node factory for ``langgraph-agent`` and ``claude-agent`` step types.
+
+        Delegates to ``app.steps.agent_executor.execute_agent_step``.  The
+        agent backend is resolved lazily from ``self._agent_backend``; it is
+        injected post-construction (like ``_registry`` and ``_run_repository``)
+        by the application container's ``build_container`` / ``refresh_runner``
+        path.
+        """
+        graph_id = self.id
+
+        async def node(state: dict) -> dict:
+            step_id = step["id"]
+            if not self._when(step, state):
+                logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
+                return {}
+
+            agent_backend = getattr(self, "_agent_backend", None)
+            if agent_backend is None:
+                logger.error(
+                    "[%s] step '%s': _agent_backend not injected — "
+                    "ensure the ApplicationContainer has an agent_backend configured",
+                    graph_id, step_id,
+                )
+                return {step.get("output_key", step_id): {"error": "agent backend not configured"}}
+
+            run_id: str = self._current_run.id if self._current_run else "unknown"
+            callback_base_url: str = self._callback_base_url or ""
+
+            from app.core.config import get_settings
+            from app.steps.agent_executor import execute_agent_step
+            logger.info("[%s] step '%s' running (%s)", graph_id, step_id, step["type"])
+            return await execute_agent_step(
+                step, state, agent_backend, run_id, callback_base_url,
+                settings=get_settings(),
+            )
+
+        return node
+
+    # DEPRECATED: use langgraph-agent or claude-agent instead
     def _llm_structured_node(self, step: dict[str, Any]):
         graph_id = self.id
         base_llm = self._get_llm_for_step(step)

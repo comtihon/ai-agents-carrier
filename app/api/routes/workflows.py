@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -14,13 +16,14 @@ from app.domain.models.graph_run import GraphRun
 from app.domain.models.workflow_definition import WorkflowDefinition
 from app.infrastructure.config.graph_loader import build_runner_from_definition
 from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner
+from app.infrastructure.tracing.callback_handler import RunTraceAccumulator
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/workflows", tags=["workflows"])
 
 _STEP_TYPE_MAP: dict[str, str] = {
-    "llm_structured": "llm",
+    "llm_structured": "llm",  # DEPRECATED: use langgraph-agent or claude-agent instead
     "llm": "llm",
     "mcp": "fetch",
     "human_approval": "approval",
@@ -28,6 +31,8 @@ _STEP_TYPE_MAP: dict[str, str] = {
     "workflow": "workflow",
     "cron": "cron",
     "http": "http",
+    "langgraph-agent": "agent",
+    "claude-agent": "agent",
 }
 
 
@@ -238,11 +243,28 @@ async def _stream_graph(
         except Exception:
             current_state = {}
 
+    # Set up local trace accumulator (works regardless of LangSmith configuration)
+    trace_accumulator = RunTraceAccumulator()
+    stream_started_at = datetime.now(timezone.utc)
+
+    # Build a streaming config that includes our trace callback
+    stream_config = {
+        **_config(run.id),
+        "callbacks": [trace_accumulator],
+    }
+
+    def _persist_trace(extra_errors: list[str] | None = None) -> None:
+        elapsed = (datetime.now(timezone.utc) - stream_started_at).total_seconds() * 1000
+        td = trace_accumulator.to_trace_data(latency_ms=elapsed)
+        if extra_errors:
+            td["errors"].extend(extra_errors)
+        run.trace_data = td
+
     # Track the last node fully handled in this call to identify the failing step precisely.
     last_processed: str | None = None
     try:
         async for chunk in runner.graph.astream(
-            input_value, _config(run.id), stream_mode="updates",
+            input_value, stream_config, stream_mode="updates",
         ):
             for node_name, output in chunk.items():
                 if node_name in ("__start__", "__end__"):
@@ -257,6 +279,9 @@ async def _stream_graph(
                         current_state.update(output)
                 logger.info("run %s: step '%s' → %s", run.id, node_name, status)
                 last_processed = node_name
+                # Persist partial trace data after each step so polling clients
+                # see live data during execution.
+                _persist_trace()
                 run.touch()
                 await container.run_repository.update(run)
     except Exception as exc:
@@ -284,6 +309,7 @@ async def _stream_graph(
         # and other intermediate state without needing to re-run completed steps.
         run.state = {**current_state, "error": str(exc)}
         run.current_step = None
+        _persist_trace(extra_errors=[str(exc)])
         run.touch()
         await container.run_repository.update(run)
         return
@@ -292,6 +318,7 @@ async def _stream_graph(
     run.status = _langgraph_status(snap)
     run.current_step = snap.next[0] if snap.next else None
     run.state = snap.values
+    _persist_trace()
     run.touch()
     await container.run_repository.update(run)
 
@@ -465,6 +492,8 @@ async def start_run(
             openhands=container.openhands,
             checkpointer=container.checkpointer,
         )
+        if container.agent_backend is not None:
+            runner._agent_backend = container.agent_backend
         definition_snapshot: dict | None = defn.to_raw_dict()
     else:
         # Legacy path: no backend configured, use registry directly (tests).
@@ -489,6 +518,37 @@ async def start_run(
     background_tasks.add_task(_execute_graph, runner, run, container)
 
     return await _run_response(run, runner)
+
+
+@router.get("/runs/{run_id}/trace")
+async def get_run_trace(
+    run_id: str,
+    container: ApplicationContainer = Depends(get_container),
+):
+    """Return the trace data for a run (LLM calls, tool calls, token usage, latency, errors).
+
+    Supports live polling — partial data is returned while the run is still in progress.
+    If LANGCHAIN_TRACING_V2 is enabled and a LangSmith run ID is recorded,
+    a link to the LangSmith UI is included in the response.
+    """
+    run = await container.run_repository.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    langsmith_url: str | None = None
+    if run.langsmith_run_id:
+        project = os.environ.get("LANGCHAIN_PROJECT", "default")
+        langsmith_url = (
+            f"https://smith.langchain.com/projects/{project}/runs/{run.langsmith_run_id}"
+        )
+
+    return {
+        "run_id": run_id,
+        "status": run.status,
+        "trace_data": run.trace_data or {},
+        "langsmith_run_id": run.langsmith_run_id,
+        "langsmith_url": langsmith_url,
+    }
 
 
 @router.get("/runs/{run_id}")

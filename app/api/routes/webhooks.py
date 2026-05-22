@@ -66,6 +66,8 @@ async def receive_webhook(
             openhands=container.openhands,
             checkpointer=container.checkpointer,
         )
+        if container.agent_backend is not None:
+            runner._agent_backend = container.agent_backend
         definition_snapshot: dict | None = defn.to_raw_dict()
         steps = defn.steps
     else:

@@ -13,6 +13,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from langgraph.types import Command
 
 from app.api.middleware.auth import OAuthMiddleware
+from app.api.routes.agent_callbacks import router as agent_callbacks_router
+from app.api.routes.agents import router as agents_router
 from app.api.routes.callbacks import router as callbacks_router
 from app.api.routes.chat import router as chat_router
 from app.api.routes.health import router as health_router
@@ -232,8 +234,12 @@ def create_app() -> FastAPI:
     )
     app.include_router(health_router)
     app.include_router(workflows_router, prefix=settings.api_prefix)
+    app.include_router(agents_router, prefix=settings.api_prefix)
     app.include_router(llm_router, prefix=settings.api_prefix)
     app.include_router(chat_router, prefix=settings.api_prefix)
     app.include_router(webhooks_router, prefix=settings.api_prefix)
     app.include_router(callbacks_router, prefix=settings.api_prefix)
+    # Agent callback routes — registered after callbacks but the /runs prefix
+    # means they don't conflict with the /{run_id} routes in workflows.
+    app.include_router(agent_callbacks_router, prefix=settings.api_prefix)
     return app

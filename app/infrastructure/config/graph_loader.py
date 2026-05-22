@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 _STEP_TYPE_MAP: dict[str, str] = {
-    "llm_structured": "llm",
+    "llm_structured": "llm",  # DEPRECATED: use langgraph-agent or claude-agent instead
     "llm": "llm",
     "mcp": "fetch",
     "human_approval": "approval",
@@ -28,6 +28,8 @@ _STEP_TYPE_MAP: dict[str, str] = {
     "workflow": "workflow",
     "cron": "cron",
     "http": "http",
+    "langgraph-agent": "agent",
+    "claude-agent": "agent",
 }
 
 
@@ -119,6 +121,7 @@ def build_runner_from_definition(
         openhands=openhands,
         checkpointer=checkpointer,
     )
+    runner.readonly = definition.readonly
     runner._registry = registry
     runner._run_repository = run_repository
     return runner
