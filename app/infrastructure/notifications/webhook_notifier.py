@@ -264,11 +264,17 @@ async def post_slack_addon_notification(
     The URL is always ``https://slack.com/api/chat.postMessage``.
     """
     import json as _json
+    from app.core.config import get_settings
+    settings = get_settings()
 
     ctx: dict[str, Any] = dict(state)
     ctx["run_id"] = run_id
     ctx["questions"] = _format_questions(questions) if questions else ""
     ctx.setdefault("request", "")
+    # Inject Slack credentials so payload templates can reference {slack_bot_token}
+    # and {slack_approvals_channel} without storing them in the workflow definition.
+    ctx.setdefault("slack_bot_token", settings.slack_bot_token or "")
+    ctx.setdefault("slack_approvals_channel", settings.slack_approvals_channel or "")
 
     try:
         rendered_str = _render(payload_template, ctx)
