@@ -37,12 +37,63 @@ API at `http://localhost:8000`. Health check: `GET /health`.
 | `OPENHANDS_BASE_URL` | `http://openhands:3000` | OpenHands service URL |
 | `OPENHANDS_API_KEY` | — | OpenHands auth token |
 | `OPENHANDS_MOCK_MODE` | `true` | Return stub results instead of calling OpenHands |
+| `DOCKER_REGISTRY_USERNAME` | — | Registry username for pulling private images (DockerRuntime) |
+| `DOCKER_REGISTRY_PASSWORD` | — | Registry password / token for pulling private images |
+| `META_LLM_PROVIDER` | — | LLM provider for post-agent analysis (`anthropic` or `openai`; defaults to `LLM_PROVIDER`) |
+| `META_LLM_MODEL` | `claude-haiku-4-5-20251001` | Model for post-agent meta-analysis (haiku recommended for cost/speed) |
 
 ### MCP integrations
 
 Each integration is configured with three env vars: `MCP_<NAME>_ENABLED=true`, `MCP_<NAME>_URL`, `MCP_<NAME>_API_KEY`. Supported names: `FIGMA`, `JIRA`, `MIRO`, `NOTION`, `GITHUB`.
 
 Jira also supports a stdio transport via `uvx mcp-atlassian` — set `MCP_JIRA_TRANSPORT=stdio` and provide `MCP_JIRA_JIRA_URL`, `MCP_JIRA_USERNAME`, `MCP_JIRA_API_TOKEN`.
+
+### Docker runtime — private registry auth
+
+When a workflow step uses `runtime: docker`, the backend pulls the agent image via the Docker daemon. For private registries, set credentials via env vars:
+
+| Registry | `DOCKER_REGISTRY_USERNAME` | `DOCKER_REGISTRY_PASSWORD` |
+|---|---|---|
+| Google Artifact Registry | `oauth2accesstoken` | `$(gcloud auth print-access-token)` |
+| AWS ECR | `AWS` | `$(aws ecr get-login-password --region <region>)` |
+| Docker Hub / other | your username | password or personal access token |
+
+No credentials set → pull proceeds without auth (public images, or if the Docker daemon already has credentials configured via `docker login`).
+
+**Local `.env`:**
+```bash
+DOCKER_REGISTRY_USERNAME=oauth2accesstoken
+DOCKER_REGISTRY_PASSWORD=ya29.your-token-here
+```
+
+**Kubernetes secret:**
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: registry-credentials
+stringData:
+  DOCKER_REGISTRY_USERNAME: oauth2accesstoken
+  DOCKER_REGISTRY_PASSWORD: <token>
+```
+Then reference with `envFrom: - secretRef: name: registry-credentials` in the deployment.
+
+### Agent meta-analysis
+
+After each `langgraph-agent` or `claude-agent` step completes, the backend runs a lightweight internal LLM call to decide how to proceed:
+
+- **PROCEED** — agent answered the request; workflow continues normally
+- **ASK_CLARIFICATION** — agent was blocked or needs more info; the UI shows a question form before the workflow continues
+- **ASK_APPROVAL** — output should be reviewed by a human (falls through to the next `human_approval` step)
+
+Configure with a fast, cheap model to minimise cost:
+
+```env
+META_LLM_PROVIDER=anthropic
+META_LLM_MODEL=claude-haiku-4-5-20251001
+```
+
+When `META_LLM_PROVIDER` is not set, the main `LLM_PROVIDER` value is used.
 
 ---
 

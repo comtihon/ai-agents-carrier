@@ -42,6 +42,7 @@ class AgentDefinition(BaseModel):
 
     # Docker-specific (only relevant when default_runtime == "docker"):
     image: str | None = None
+    health_timeout: int = 300  # seconds to wait for /health after container starts
 
     # K8s-specific (only relevant when default_runtime == "k8s"):
     helm_chart: str | None = None

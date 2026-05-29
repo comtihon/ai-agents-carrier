@@ -4,6 +4,8 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
 
+import httpx
+
 from app.runtime.base import AgentRuntime
 
 if TYPE_CHECKING:
@@ -12,7 +14,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _AGENT_PORT = 8000
-_HEALTH_TIMEOUT = 60.0   # seconds to wait for the Helm release to become healthy
+_HEALTH_TIMEOUT = 60.0        # seconds to wait for the Helm release to become healthy
 _HEALTH_POLL_INTERVAL = 2.0
 
 
@@ -36,8 +38,6 @@ class K8sRuntime(AgentRuntime):
     release.  The agent URL is therefore::
 
         http://<release_name>.<namespace>.svc.cluster.local:8000
-
-    TODO items are marked inline below.
     """
 
     def __init__(self, namespace: str = "default") -> None:
@@ -54,6 +54,7 @@ class K8sRuntime(AgentRuntime):
         step: dict[str, Any],
         run_id: str,
         callback_base_url: str,
+        extra_env: dict[str, str] | None = None,
     ) -> str:
         """Deploy the agent via ``helm upgrade --install`` and return its URL.
 
@@ -83,6 +84,8 @@ class K8sRuntime(AgentRuntime):
         set_args += ["--set", f"env.AGENT_PORT={_AGENT_PORT}"]
         set_args += ["--set", f"env.BACKEND_CALLBACK_URL={callback_base_url}"]
         set_args += ["--set", f"env.RUN_ID={run_id}"]
+        for k, v in (extra_env or {}).items():
+            set_args += ["--set-string", f"env.{k}={v}"]
 
         cmd = [
             "helm", "upgrade", "--install",
@@ -115,29 +118,32 @@ class K8sRuntime(AgentRuntime):
         self._releases[agent_url] = release_name
         logger.info("K8sRuntime: release '%s' deployed at %s", release_name, agent_url)
 
-        # TODO: poll GET /health until the agent service is reachable.
+        # Poll GET /health until the agent service is reachable.
         # Inside the cluster the URL above is directly accessible.
-        # For local dev with port-forward, replace agent_url with localhost URL.
-        # Example poll loop (uncomment and adapt):
-        #
-        # import httpx
-        # loop = asyncio.get_event_loop()
-        # deadline = loop.time() + _HEALTH_TIMEOUT
-        # async with httpx.AsyncClient() as client:
-        #     while loop.time() < deadline:
-        #         try:
-        #             resp = await client.get(f"{agent_url}/health", timeout=2.0)
-        #             if resp.status_code == 200:
-        #                 return agent_url
-        #         except Exception:
-        #             pass
-        #         await asyncio.sleep(_HEALTH_POLL_INTERVAL)
-        # raise RuntimeError(f"K8sRuntime: agent at {agent_url} did not become healthy")
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + _HEALTH_TIMEOUT
+        async with httpx.AsyncClient() as client:
+            while loop.time() < deadline:
+                try:
+                    resp = await client.get(f"{agent_url}/health", timeout=2.0)
+                    if resp.status_code == 200:
+                        logger.info(
+                            "K8sRuntime: agent at %s is healthy", agent_url
+                        )
+                        return agent_url
+                except Exception:
+                    pass
+                await asyncio.sleep(_HEALTH_POLL_INTERVAL)
 
-        return agent_url
+        # Agent did not become healthy — clean up and raise.
+        await self.terminate(agent_url)
+        raise RuntimeError(
+            f"K8sRuntime: agent at {agent_url} did not become healthy "
+            f"within {_HEALTH_TIMEOUT}s (run_id={run_id})"
+        )
 
     async def terminate(self, agent_url: str) -> None:
-        """Uninstall the Helm release for the given agent URL."""
+        """Call POST /terminate then uninstall the Helm release."""
         release_name = self._releases.pop(agent_url, None)
         if release_name is None:
             logger.warning(
@@ -147,13 +153,11 @@ class K8sRuntime(AgentRuntime):
             return
 
         # Best-effort graceful shutdown via HTTP first.
-        # TODO: uncomment when the chart exposes /terminate.
-        # import httpx
-        # try:
-        #     async with httpx.AsyncClient() as client:
-        #         await client.post(f"{agent_url}/terminate", timeout=3.0)
-        # except Exception:
-        #     pass
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(f"{agent_url}/terminate", timeout=3.0)
+        except Exception:
+            pass
 
         cmd = [
             "helm", "uninstall", release_name,
@@ -176,12 +180,9 @@ class K8sRuntime(AgentRuntime):
 
     async def is_alive(self, agent_url: str) -> bool:
         """Return True if the agent's /health endpoint responds with 200."""
-        # TODO: implement health check
-        # import httpx
-        # try:
-        #     async with httpx.AsyncClient() as client:
-        #         resp = await client.get(f"{agent_url}/health", timeout=2.0)
-        #         return resp.status_code == 200
-        # except Exception:
-        #     return False
-        return agent_url in self._releases
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(f"{agent_url}/health", timeout=2.0)
+                return resp.status_code == 200
+        except Exception:
+            return False

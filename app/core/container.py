@@ -260,6 +260,24 @@ class ApplicationContainer:
 
         config = {"configurable": {"thread_id": run.id}}
 
+        if run.status == "waiting_agent":
+            # Agent container may still be running after server restart — attempt cleanup.
+            try:
+                from app.runtime.docker import DockerRuntime
+                await DockerRuntime(
+                    registry_username=self.settings.docker_registry_username,
+                    registry_password=self.settings.docker_registry_password,
+                ).terminate_by_run_id(run.id)
+            except Exception:
+                logger.debug("run %s: docker cleanup on recovery failed", run.id, exc_info=True)
+            run.status = "failed"
+            run.agent_url = None
+            run.state = {**(run.state or {}), "error": "Agent container lost due to server restart"}
+            run.touch()
+            await self.run_repository.update(run)
+            logger.info("run %s: waiting_agent on restart — agent terminated and marked failed", run.id)
+            return
+
         if run.status == "waiting_approval":
             # With MongoDB checkpointer the interrupt state is already persisted.
             # Check for a valid checkpoint before falling back to re-execution.
@@ -394,6 +412,56 @@ def build_llm_for(provider: str | None, model: str | None, settings: Settings) -
 
 def build_llm(settings: Settings) -> BaseChatModel:
     return build_llm_for(settings.llm_provider, None, settings)
+
+
+def build_llm_native(
+    provider: str | None,
+    model: str | None,
+    settings: Settings,
+    max_tokens: int = 8096,
+) -> BaseChatModel:
+    """Build an LLM supporting both LLM_INTEGRATIONS and standalone API keys.
+
+    Resolution order:
+    1. LLM_INTEGRATIONS lookup (OpenAI-compatible endpoint) — if a matching
+       integration is configured, use it.
+    2. Native provider via standalone API key fields on Settings.
+       Supported: ``anthropic``, ``openai``, ``google``.
+    3. Falls back to a fake LLM with an informative error message.
+    """
+    resolved_provider = provider or settings.llm_provider
+
+    # 1. Try LLM_INTEGRATIONS first
+    if resolved_provider and settings.get_llm_integration(resolved_provider):
+        return build_llm_for(resolved_provider, model, settings)
+
+    # 2. Native providers via standalone Settings fields
+    if resolved_provider == "anthropic" or (not resolved_provider and settings.anthropic_api_key):
+        from langchain_anthropic import ChatAnthropic
+        return ChatAnthropic(
+            model=model or "claude-opus-4-7",
+            api_key=settings.anthropic_api_key,  # type: ignore[arg-type]
+            max_tokens=max_tokens,
+        )
+    if resolved_provider == "openai" or (not resolved_provider and settings.openai_api_key):
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            model=model or "gpt-4o",
+            api_key=settings.openai_api_key,  # type: ignore[arg-type]
+            max_tokens=max_tokens,
+        )
+    if resolved_provider == "google" or (not resolved_provider and settings.google_api_key):
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        return ChatGoogleGenerativeAI(
+            model=model or "gemini-2.0-flash",
+            google_api_key=settings.google_api_key,
+            max_output_tokens=max_tokens,
+        )
+
+    return _fake_llm(
+        f"No LLM configured for provider '{resolved_provider}'. "
+        "Set LLM_PROVIDER and configure either LLM_INTEGRATIONS or a standalone API key."
+    )
 
 
 def _make_llm_factory(settings: Settings) -> Callable[[str | None, str | None], BaseChatModel]:

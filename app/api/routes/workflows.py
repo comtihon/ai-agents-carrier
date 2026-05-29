@@ -75,8 +75,15 @@ def _config(thread_id: str) -> dict:
     return {"configurable": {"thread_id": thread_id}}
 
 
-def _langgraph_status(snap) -> str:
-    return "waiting_approval" if snap.next else "completed"
+def _langgraph_status(snap, runner: "YamlGraphRunner | None" = None) -> str:
+    if not snap.next:
+        return "completed"
+    if runner is not None:
+        current_step_id = snap.next[0]
+        step_def = next((s for s in runner.steps if s["id"] == current_step_id), None)
+        if step_def and step_def.get("type") in ("langgraph-agent", "claude-agent"):
+            return "waiting_agent"
+    return "waiting_approval"
 
 
 def _require_backend(container: ApplicationContainer) -> None:
@@ -192,6 +199,7 @@ async def _run_response(run: GraphRun, runner: YamlGraphRunner | None = None) ->
         "execution_results": [],
         "intermediate_outputs": run.state,
         "interrupt_payload": interrupt_payload,
+        "pending_question": (run.state or {}).get("_pending_question"),
         "waiting_transition": (
             run.waiting_transition.model_dump(mode="json")
             if run.waiting_transition is not None
@@ -315,16 +323,51 @@ async def _stream_graph(
         return
 
     snap = await runner.graph.aget_state(_config(run.id))
-    run.status = _langgraph_status(snap)
+    run.status = _langgraph_status(snap, runner)
     run.current_step = snap.next[0] if snap.next else None
     run.state = snap.values
+
+    active_interrupt_type: str | None = None
+    for task in snap.tasks:
+        for intr in task.interrupts:
+            if isinstance(intr.value, dict):
+                active_interrupt_type = intr.value.get("type")
+                break
+        if active_interrupt_type:
+            break
+    if not active_interrupt_type:
+        for intr in getattr(snap, "interrupts", ()):
+            if isinstance(intr.value, dict):
+                active_interrupt_type = intr.value.get("type")
+                break
+
+    if run.status == "waiting_agent" and run.current_step:
+        agent_url: str | None = None
+        for task in snap.tasks:
+            for intr in task.interrupts:
+                if isinstance(intr.value, dict) and intr.value.get("type") == "waiting_agent":
+                    agent_url = intr.value.get("agent_url")
+                    break
+            if agent_url:
+                break
+        if not agent_url:
+            for intr in getattr(snap, "interrupts", ()):
+                if isinstance(intr.value, dict) and intr.value.get("type") == "waiting_agent":
+                    agent_url = intr.value.get("agent_url")
+                    break
+        if agent_url:
+            run.agent_url = agent_url
     _persist_trace()
     run.touch()
     await container.run_repository.update(run)
 
     if run.status == "waiting_approval" and base_url and run.current_step:
         step = next((s for s in runner.steps if s["id"] == run.current_step), None)
-        if step and step.get("type") == "ask_context":
+        is_agent_ask_context = (
+            step and step.get("type") in ("langgraph-agent", "claude-agent")
+            and active_interrupt_type == "ask_context"
+        )
+        if (step and (step.get("type") == "ask_context" or step.get("slack_notifications"))) or is_agent_ask_context:
             from app.core.config import get_settings
             from app.infrastructure.notifications.webhook_notifier import (
                 post_slack_ask_context, post_slack_thread_questions,
@@ -494,6 +537,7 @@ async def start_run(
         )
         if container.agent_backend is not None:
             runner._agent_backend = container.agent_backend
+        runner._callback_base_url = container.settings.base_url
         definition_snapshot: dict | None = defn.to_raw_dict()
     else:
         # Legacy path: no backend configured, use registry directly (tests).

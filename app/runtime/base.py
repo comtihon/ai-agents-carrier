@@ -33,6 +33,7 @@ class AgentRuntime(ABC):
         step: dict[str, Any],
         run_id: str,
         callback_base_url: str,
+        extra_env: dict[str, str] | None = None,
     ) -> str:
         """Start the agent HTTP server and return its base URL.
 
@@ -70,6 +71,14 @@ class AgentRuntime(ABC):
         not raise.
         """
         ...
+
+    def rewrite_callback_url(self, callback_base_url: str) -> str:
+        """Rewrite the callback URL for use inside the agent's execution environment.
+
+        Default implementation returns the URL unchanged.  Override in runtimes
+        where the agent cannot reach ``localhost`` (e.g. Docker containers).
+        """
+        return callback_base_url
 
     @abstractmethod
     async def is_alive(self, agent_url: str) -> bool:

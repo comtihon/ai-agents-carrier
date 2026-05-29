@@ -42,6 +42,8 @@ That callback endpoint resumes the paused LangGraph run via
 """
 from __future__ import annotations
 
+import os
+
 import logging
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -56,10 +58,28 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_COMPRESSION_INSTRUCTIONS: dict[str, str] = {
+    "lite": (
+        "Be concise. Drop filler words (just/really/basically/actually/simply). "
+        "Fragments OK. Skip pleasantries and hedging."
+    ),
+    "full": (
+        "Respond terse like a smart caveman. Drop: articles (a/an/the), filler words, "
+        "pleasantries, hedging. Fragments OK. Use short synonyms (big not extensive, "
+        "fix not 'implement a solution for'). Technical terms exact. Code blocks unchanged. "
+        "Pattern: [thing] [action] [reason]. [next step]."
+    ),
+    "ultra": (
+        "Maximum compression. Single words / symbols where possible. "
+        "No articles, no filler, no fluff. Abbreviate freely. Code blocks exact and unchanged."
+    ),
+}
+
 
 def _build_agent_config(
     agent_def: "AgentDefinition",
     settings: "Settings",
+    step: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the ``agent_config`` payload to forward in ``POST /start``.
 
@@ -94,6 +114,16 @@ def _build_agent_config(
     model = agent_input.get("model")
     tools = agent_input.get("tools")
 
+    # Apply compression level from step config (prepend instruction to system prompt)
+    compression_level = (step or {}).get("compression_level", "none")
+    compression_instruction = _COMPRESSION_INSTRUCTIONS.get(compression_level or "none", "")
+    if compression_instruction:
+        system_prompt = (
+            f"{compression_instruction}\n\n{system_prompt}"
+            if system_prompt
+            else compression_instruction
+        )
+
     # --- MCP servers ---
     raw_integrations: list[McpIntegrationConfig] = settings.get_mcp_integrations()
     allowed_tools: set[str] | None = (
@@ -118,6 +148,25 @@ def _build_agent_config(
         key = llm_intg.resolved_api_key()
         if key:
             credentials[llm_intg.resolved_api_key_env()] = key
+    # Also forward standalone API keys set directly (not via LLM_INTEGRATIONS)
+    for key_name, val in settings.get_forwardable_config().items():
+        if key_name not in credentials:
+            credentials[key_name] = val
+
+    # Resolve env_vars from step config
+    env_vars: dict[str, str] = {}
+    if step:
+        forwardable = settings.get_forwardable_config()
+        for entry in (step.get("env_vars") or []):
+            name = entry.get("name", "").strip()
+            if not name:
+                continue
+            if "from_config" in entry:
+                val = forwardable.get(entry["from_config"])
+                if val:
+                    env_vars[name] = val
+            elif "value" in entry:
+                env_vars[name] = str(entry["value"])
 
     return {
         "system_prompt": system_prompt,
@@ -126,6 +175,7 @@ def _build_agent_config(
         "mcp_servers": mcp_servers,
         "credentials": credentials,
         "extra": agent_input,
+        "env_vars": env_vars,
     }
 
 
@@ -151,6 +201,95 @@ def _apply_mapping(
         for workflow_key, agent_key in mapping.items()
         if workflow_key in source
     }
+
+
+async def _meta_llm_decide(
+    raw_output: dict,
+    input_data: dict,
+    step_id: str,
+    settings: "Settings",
+) -> dict:
+    """Call a lightweight LLM to decide how to proceed after an agent step.
+
+    Returns: {"decision": "proceed"|"ask_clarification"|"ask_approval",
+              "questions": list[str], "reason": str}
+    Always returns proceed on any failure (non-blocking).
+    """
+    import json as _json
+    try:
+        from app.core.container import build_llm_native
+        provider = settings.meta_llm_provider or settings.llm_provider
+        model = settings.meta_llm_model
+        llm = build_llm_native(provider, model, settings, max_tokens=512)
+
+        request_text = (
+            input_data.get("request")
+            or input_data.get("task")
+            or input_data.get("prompt")
+            or str(input_data)
+        )
+        output_text = (
+            raw_output.get("result") or raw_output.get("answer") or str(raw_output)
+            if isinstance(raw_output, dict) else str(raw_output)
+        )
+
+        prompt = (
+            "You are an orchestrator analyzing an AI agent's response.\n\n"
+            f"Original request: {request_text}\n\n"
+            f"Agent output:\n{output_text}\n\n"
+            "Decide the next action:\n"
+            "1. Agent successfully answered → PROCEED\n"
+            "2. Agent needs more context that the user can provide → ASK_CLARIFICATION (extract the questions)\n"
+            "3. Output needs human review before continuing → ASK_APPROVAL\n"
+            "4. Agent cannot proceed due to missing tools/credentials/system access → FAIL\n\n"
+            "Use FAIL when the blocker is a hard configuration issue: "
+            "gcloud not authenticated, missing API key/token, tool not installed, "
+            "no access to required system. These cannot be resolved by answering questions.\n"
+            "Use ASK_CLARIFICATION when the user could unblock the agent by providing "
+            "information (e.g. which project, which environment, what format).\n\n"
+            "Respond with ONLY (no preamble):\n"
+            "DECISION: <PROCEED|ASK_CLARIFICATION|ASK_APPROVAL|FAIL>\n"
+            "QUESTIONS: [\"q1\", \"q2\"]  (only when ASK_CLARIFICATION)\n"
+            "REASON: <one sentence>"
+        )
+
+        from langchain_core.messages import HumanMessage
+        response = await llm.ainvoke([HumanMessage(content=prompt)])
+        text = response.content if isinstance(response.content, str) else str(response.content)
+
+        decision = "proceed"
+        questions: list[str] = []
+        reason = ""
+
+        for line in text.strip().splitlines():
+            line = line.strip()
+            if line.startswith("DECISION:"):
+                raw_d = line[len("DECISION:"):].strip().upper()
+                if raw_d == "ASK_CLARIFICATION":
+                    decision = "ask_clarification"
+                elif raw_d == "ASK_APPROVAL":
+                    decision = "ask_approval"
+                elif raw_d == "FAIL":
+                    decision = "fail"
+                else:
+                    decision = "proceed"
+            elif line.startswith("QUESTIONS:"):
+                raw_q = line[len("QUESTIONS:"):].strip()
+                try:
+                    parsed = _json.loads(raw_q)
+                    if isinstance(parsed, list):
+                        questions = [str(q) for q in parsed]
+                except Exception:
+                    pass
+            elif line.startswith("REASON:"):
+                reason = line[len("REASON:"):].strip()
+
+        logger.info("[step '%s'] meta-LLM decision: %s — %s", step_id, decision, reason)
+        return {"decision": decision, "questions": questions, "reason": reason}
+
+    except Exception as exc:
+        logger.warning("[step '%s'] meta-LLM analysis failed: %s — proceeding normally", step_id, exc)
+        return {"decision": "proceed", "questions": [], "reason": str(exc)}
 
 
 async def execute_agent_step(
@@ -231,6 +370,10 @@ async def execute_agent_step(
     # --- 4. Build input from state via input_mapping ---
     input_mapping: dict[str, str] | None = step.get("input_mapping")
     input_data: dict[str, Any] = _apply_mapping(state, input_mapping)
+    # If a previous ask_context interrupt was answered, fold those answers into
+    # the input so the agent can use them as clarifying context.
+    if state.get("_clarification_answers"):
+        input_data = {**input_data, "clarification_context": state["_clarification_answers"]}
 
     # --- 5. Branch on runtime ---
     if runtime_type == "local":
@@ -243,58 +386,107 @@ async def execute_agent_step(
             input_data=input_data,
             settings=settings,
             progress_cb=progress_cb,
+            compression_level=step.get("compression_level", "none"),
         )
         logger.info("[step '%s'] local agent completed, output keys: %s", step_id, list(raw_output))
     else:
         # Docker / K8s: use the HTTP protocol with interrupt-based suspension.
         from app.runtime.factory import get_runtime
 
-        runtime: AgentRuntime = get_runtime(runtime_type)
-        agent_config_payload = _build_agent_config(agent_def, settings)
+        runtime: AgentRuntime = get_runtime(
+            runtime_type,
+            registry_username=settings.docker_registry_username,
+            registry_password=settings.docker_registry_password,
+        )
+        agent_config_payload = _build_agent_config(agent_def, settings, step=step)
+        resolved_env_vars: dict[str, str] = agent_config_payload.get("env_vars") or {}
 
-        # --- 5a. Spawn the agent HTTP server ---
-        agent_url = await runtime.spawn(agent_def, step, run_id, callback_base_url)
-        logger.info("[step '%s'] agent server spawned at %s", step_id, agent_url)
-
-        # --- 5b. Send POST /start to the agent ---
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    f"{agent_url}/start",
-                    json={
-                        "run_id": run_id,
-                        "input": input_data,
-                        "callback_url": callback_base_url,
-                        "agent_config": agent_config_payload,
-                    },
-                    timeout=10.0,
-                )
-                resp.raise_for_status()
-        except Exception as exc:
-            # If /start fails, terminate the agent and propagate the error.
-            try:
-                await runtime.terminate(agent_url)
-            except Exception:
-                pass
-            raise RuntimeError(
-                f"[step '{step_id}'] Failed to start agent at {agent_url}: {exc}"
-            ) from exc
-
-        logger.info(
-            "[step '%s'] agent started — suspending run '%s' until output arrives",
-            step_id, run_id,
+        # LangGraph reruns the node from scratch on resume. Detect this by checking
+        # whether a container already exists for this run (spawned in the first execution).
+        # If so, skip spawn+start — interrupt() will return immediately with the stored output.
+        _is_resume = (
+            hasattr(runtime, "has_container_for_run")
+            and await runtime.has_container_for_run(run_id)
         )
 
+        if not _is_resume:
+            # --- 5a. Spawn the agent HTTP server ---
+            agent_url = await runtime.spawn(agent_def, step, run_id, callback_base_url, extra_env=resolved_env_vars)
+            logger.info("[step '%s'] agent server spawned at %s", step_id, agent_url)
+
+            # For Docker, the agent runs in a container where localhost = itself.
+            container_callback_url = runtime.rewrite_callback_url(callback_base_url)
+
+            # --- 5b. Send POST /start to the agent ---
+            try:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.post(
+                        f"{agent_url}/start",
+                        json={
+                            "run_id": run_id,
+                            "input": input_data,
+                            "callback_url": container_callback_url,
+                            "agent_config": agent_config_payload,
+                        },
+                        timeout=10.0,
+                    )
+                    resp.raise_for_status()
+            except Exception as exc:
+                try:
+                    await runtime.terminate(agent_url)
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"[step '{step_id}'] Failed to start agent at {agent_url}: {exc}"
+                ) from exc
+
+            logger.info(
+                "[step '%s'] agent started — suspending run '%s' until output arrives",
+                step_id, run_id,
+            )
+        else:
+            agent_url = f"<resumed:{run_id}>"
+            logger.info("[step '%s'] resuming run '%s' (container already running)", step_id, run_id)
+
         # --- 5c. Suspend: interrupt() pauses the LangGraph node ---
-        # The run transitions to "waiting_agent" status (handled in stream_graph_to_pause).
-        # Resume comes from POST /api/v1/runs/{run_id}/agent/output via
-        # Command(resume={"output": raw_output}).
+        # On first execution: suspends until POST /agent/output resumes the graph.
+        # On resume (LangGraph reruns node): returns immediately with stored output.
         resume_value: dict = interrupt({"type": "waiting_agent", "agent_url": agent_url})
         raw_output = resume_value.get("output", {})
+
+        # Terminate using run_id label — works whether _containers is populated or not.
+        if hasattr(runtime, "terminate_by_run_id"):
+            await runtime.terminate_by_run_id(run_id)
+        else:
+            try:
+                await runtime.terminate(agent_url)
+            except Exception as _exc:
+                logger.warning("[step '%s'] failed to terminate agent: %s", step_id, _exc)
+
         logger.info(
             "[step '%s'] agent run '%s' resumed, output keys: %s",
             step_id, run_id, list(raw_output),
         )
+
+        # --- 5d. Meta-LLM: decide whether to proceed, ask clarification, approve, or fail ---
+        if settings is not None:
+            _meta = await _meta_llm_decide(raw_output, input_data, step_id, settings)
+            if _meta["decision"] == "fail":
+                raise RuntimeError(
+                    f"[step '{step_id}'] Agent blocked by hard failure: {_meta.get('reason', 'missing credentials or tools')}"
+                )
+            elif _meta["decision"] == "ask_approval":
+                interrupt({"type": "ask_approval", "plan": raw_output, "reason": _meta.get("reason", "")})
+            elif _meta["decision"] == "ask_clarification" and _meta["questions"]:
+                # Pause for user clarification. On resume, answers are returned by interrupt().
+                # They are stored in state so the next agent execution can use them as context.
+                answers = interrupt({"type": "ask_context", "questions": _meta["questions"]})
+                if isinstance(answers, dict) and answers:
+                    # Inject answers into raw_output so downstream state carries them;
+                    # the agent node re-runs from the top on resume and will re-execute
+                    # with the original input — answers are provided as additional context
+                    # via the "_clarification_answers" state key (picked up next run).
+                    raw_output = {**raw_output, "_clarification_answers": answers}
 
     # --- 6. Map output back to workflow state ---
     output_mapping: dict[str, str] | None = step.get("output_mapping")
@@ -309,8 +501,15 @@ async def execute_agent_step(
             if agent_key in raw_output
         }
     elif output_key:
-        # Store the whole output dict under a single state key.
-        result = {output_key: raw_output}
+        if isinstance(raw_output, dict) and "result" in raw_output:
+            # Agent sent {"result": "...", "token_usage": {...}} — extract result key
+            result = {output_key: raw_output["result"]}
+            if "token_usage" in raw_output:
+                result[f"_agent_token_usage_{step_id}"] = raw_output["token_usage"]
+        elif isinstance(raw_output, dict) and len(raw_output) == 1:
+            result = {output_key: next(iter(raw_output.values()))}
+        else:
+            result = {output_key: raw_output}
     else:
         # No mapping configured — merge all agent output keys directly into state.
         result = raw_output

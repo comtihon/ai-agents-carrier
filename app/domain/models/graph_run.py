@@ -27,7 +27,7 @@ class GraphRun(BaseModel):
     workflow_definition: dict[str, Any] | None = None
     state: dict[str, Any] = {}       # latest graph state snapshot
     current_step: str | None = None  # id of the node currently active / paused
-    step_statuses: dict[str, str] = {}   # step_id → pending/running/finished/skipped/failed
+    step_statuses: dict[str, str] = {}   # step_id → pending/running/finished/skipped/failed/waiting_clarification/waiting_approval
     step_inputs: dict[str, Any] = {}    # step_id → state snapshot passed into the node
     step_outputs: dict[str, Any] = {}   # step_id → raw node output dict (captured during streaming)
     waiting_transition: WaitingTransition | None = None

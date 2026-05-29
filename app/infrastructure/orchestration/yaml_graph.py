@@ -8,7 +8,7 @@ import re
 import string
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Annotated, Any, TypedDict
 from uuid import uuid4
 
 import httpx
@@ -32,29 +32,47 @@ if TYPE_CHECKING:
     from app.infrastructure.integrations.openhands import OpenHandsAdapter
 
 
+def _merge_dicts(a: Any, b: Any) -> Any:
+    """Reducer for dict-typed state fields updated by concurrent parallel branches."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        return {**a, **b}
+    return b if b is not None else a
+
+
+def _last_wins(a: Any, b: Any) -> Any:
+    """Reducer that keeps the last non-None write; safe for scalar fields."""
+    return b if b is not None else a
+
+
 def _build_state_schema(steps: list[dict[str, Any]]) -> type:
     """
     Dynamically build a TypedDict (total=False) that includes all output keys
     declared across graph steps plus standard fields.  LangGraph merges node
     return dicts into state key-by-key; any key not in the schema is dropped,
     so we must declare every key upfront.
+
+    Fields that can be updated by multiple concurrent parallel branches must use
+    ``Annotated[type, reducer]`` so LangGraph knows how to merge the updates.
     """
     fields: dict[str, type] = {
         "request": str,
         "approved": bool,
         "reject_reason": str,
-        "_conv_map": Any,  # type: ignore[assignment]
-        "_visit_counts": Any,  # type: ignore[assignment]
-        "_slack_thread_ts": Any,  # type: ignore[assignment]
-        "_slack_channel": Any,  # type: ignore[assignment]
-        "_slack_approver_id": Any,  # type: ignore[assignment]
-        "_slack_ask_context_ts": Any,  # type: ignore[assignment]
-        "_slack_ask_context_channel": Any,  # type: ignore[assignment]
+        # Dict fields updated by every node (loop guard, conversation tracking) —
+        # multiple parallel branches may write simultaneously, so use _merge_dicts.
+        "_conv_map":                  Annotated[Any, _merge_dicts],  # type: ignore[assignment]
+        "_visit_counts":              Annotated[Any, _merge_dicts],  # type: ignore[assignment]
+        "_slack_thread_ts":           Annotated[Any, _last_wins],    # type: ignore[assignment]
+        "_slack_channel":             Annotated[Any, _last_wins],    # type: ignore[assignment]
+        "_slack_approver_id":         Annotated[Any, _last_wins],    # type: ignore[assignment]
+        "_slack_ask_context_ts":      Annotated[Any, _last_wins],    # type: ignore[assignment]
+        "_slack_ask_context_channel": Annotated[Any, _last_wins],    # type: ignore[assignment]
         # ID of the most recent step that caught an internal exception and chose
         # to record the failure in state instead of raising. Read by the chunk
         # handlers to mark step_statuses["that_step"] = "failed" rather than
         # the default "finished" inferred from a non-empty output dict.
-        "__failed_step__": Any,  # type: ignore[assignment]
+        "__failed_step__":            Annotated[Any, _last_wins],    # type: ignore[assignment]
+        "_live_token_usage":          Annotated[Any, _last_wins],    # type: ignore[assignment]
     }
     for step in steps:
         # Regular output nodes store their result under output_key
@@ -82,8 +100,11 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
             if "output_key" not in step and step.get("output_mapping"):
                 for wf_key in step["output_mapping"].values():
                     fields[wf_key] = Any  # type: ignore[assignment]
+            fields[f"_agent_token_usage_{step['id']}"] = Any  # type: ignore[assignment]
     # Internal field: agent_url stored while a run is in waiting_agent state
     fields["_agent_url"] = Any  # type: ignore[assignment]
+    # Internal field: clarification answers from ask_context interrupt, forwarded to agent re-run
+    fields["_clarification_answers"] = Any  # type: ignore[assignment]
     return TypedDict("YamlGraphState", fields, total=False)  # type: ignore[misc]
 
 
@@ -177,6 +198,16 @@ async def stream_graph_to_pause(
             for node_name, output in chunk.items():
                 if node_name in ("__start__", "__end__"):
                     continue
+                # __interrupt__ is a LangGraph internal channel, not a real node.
+                # Store its output for interrupt-payload lookup but don't pollute
+                # step_statuses (it would show up as a phantom "done" step in the UI).
+                if node_name == "__interrupt__":
+                    run.step_inputs[node_name] = dict(current_state)
+                    if output:
+                        run.step_outputs[node_name] = output
+                    run.touch()
+                    await run_repository.update(run)
+                    continue
                 status = step_status_from_output(node_name, output)
                 run.step_inputs[node_name] = dict(current_state)
                 run.step_statuses[node_name] = status
@@ -222,12 +253,42 @@ async def stream_graph_to_pause(
         return
 
     snap = await runner.graph.aget_state(config)
-    # Determine whether the run paused at a waiting_agent step or a
+
+    # Extract the type of the active interrupt (if any) from the snapshot.
+    # This determines whether we're waiting for an agent or for user input,
+    # regardless of which step type raised the interrupt.
+    active_interrupt_type: str | None = None
+    for task in snap.tasks:
+        for intr in task.interrupts:
+            if isinstance(intr.value, dict):
+                active_interrupt_type = intr.value.get("type")
+                break
+        if active_interrupt_type:
+            break
+    if not active_interrupt_type:
+        for intr in getattr(snap, "interrupts", ()):
+            if isinstance(intr.value, dict):
+                active_interrupt_type = intr.value.get("type")
+                break
+
+    # Determine whether the run paused at a waiting_agent step, a
     # waiting_approval step (or completed).
     if snap.next:
         current_step_id = snap.next[0]
         step_def = next((s for s in runner.steps if s["id"] == current_step_id), None)
-        if step_def and step_def.get("type") in ("langgraph-agent", "claude-agent"):
+        step_type = step_def.get("type") if step_def else None
+        if (active_interrupt_type in ("ask_context", "ask_approval")
+                and step_type in ("langgraph-agent", "claude-agent")):
+            # A Docker/K8s agent raised a clarification or approval interrupt
+            # internally (via meta-LLM). Treat as waiting_approval so the UI
+            # can prompt the user, and mark the step accordingly.
+            run.status = "waiting_approval"
+            if current_step_id in run.step_statuses:
+                if active_interrupt_type == "ask_context":
+                    run.step_statuses[current_step_id] = "waiting_clarification"
+                else:
+                    run.step_statuses[current_step_id] = "waiting_approval"
+        elif step_type in ("langgraph-agent", "claude-agent"):
             run.status = "waiting_agent"
         else:
             run.status = "waiting_approval"
@@ -277,7 +338,13 @@ async def stream_graph_to_pause(
 
     if run.status == "waiting_approval" and base_url and run.current_step:
         step = next((s for s in runner.steps if s["id"] == run.current_step), None)
-        if step and step.get("type") == "ask_context":
+        # Fire Slack notification for explicit ask_context steps AND for agent steps
+        # that raised an ask_context interrupt internally via meta-LLM.
+        is_agent_ask_context = (
+            step and step.get("type") in ("langgraph-agent", "claude-agent")
+            and active_interrupt_type == "ask_context"
+        )
+        if (step and (step.get("type") == "ask_context" or step.get("slack_notifications"))) or is_agent_ask_context:
             from app.core.config import get_settings
             from app.infrastructure.notifications.webhook_notifier import (
                 post_slack_ask_context, post_slack_thread_questions,
@@ -657,17 +724,57 @@ class YamlGraphRunner:
         visualise the pause; it's cleared in a ``finally`` block so a
         cancellation or exception doesn't leave a stale waiting indicator.
         """
+        import ast as _ast
+        import builtins as _builtins
+
+        # AST node types that are never safe to execute in a route condition.
+        _UNSAFE_AST = (
+            _ast.Import, _ast.ImportFrom,
+            _ast.FunctionDef, _ast.AsyncFunctionDef,
+            _ast.ClassDef, _ast.Lambda,
+            _ast.Global, _ast.Nonlocal,
+            _ast.Await, _ast.Yield, _ast.YieldFrom,
+            _ast.Delete,
+        )
+
+        def _eval_condition(when: str, state: dict) -> bool:
+            """Parse and evaluate a route condition against the current state.
+
+            Accepts:
+            - Simple state key:  ``approved``
+            - Negation:          ``!approved``
+            - Any Python expression using state vars and stdlib builtins:
+              ``len(hello_out) <= len(world_out)``
+              ``score > 4 and status != "skip"``
+            JS-style ``&&`` / ``||`` / ``===`` / ``!==`` are rewritten to Python.
+            """
+            expr = (
+                str(when)
+                .replace("&&", " and ")
+                .replace("||", " or ")
+                .replace("!==", " != ")
+                .replace("===", " == ")
+            )
+            try:
+                tree = _ast.parse(expr, mode="eval")
+                for node in _ast.walk(tree):
+                    if isinstance(node, _UNSAFE_AST):
+                        raise ValueError(f"unsafe AST node: {type(node).__name__}")
+                code = compile(tree, "<route-condition>", "eval")
+                return bool(eval(code, vars(_builtins), dict(state)))  # noqa: S307
+            except Exception:
+                # Fallback: simple state-key lookup with optional ! negation
+                negate = expr.strip().startswith("!")
+                key = expr.strip()[1:].strip() if negate else expr.strip()
+                val = bool(state.get(key))
+                return not val if negate else val
+
         def _select(state: dict) -> dict[str, Any]:
             for route in routes:
                 when = route.get("when")
                 if when is None:
                     return route
-                negate = isinstance(when, str) and when.startswith("!")
-                key = when[1:] if negate else when
-                val = bool(state.get(key))
-                if negate:
-                    val = not val
-                if val:
+                if _eval_condition(str(when), state):
                     return route
             # No condition matched and no `when: null` default declared. The
             # previous behaviour was to silently fall back to routes[-1], but
@@ -1287,13 +1394,36 @@ class YamlGraphRunner:
 
     @staticmethod
     def _parallel_node(step: dict[str, Any]) -> Callable:
+        max_parallel: int | None = step.get("max_parallel")
+        step_id = step["id"]
+
         async def node(state: dict) -> dict:
+            if max_parallel:
+                # Store the limit in state so branch steps can read it via
+                # _PARALLEL_LIMIT_KEY if they choose to enforce concurrency.
+                return {f"_parallel_limit_{step_id}": max_parallel}
             return {}
         return node
 
     @staticmethod
     def _join_node(step: dict[str, Any]) -> Callable:
+        max_timeout: float | None = (
+            float(step["max_timeout"]) if step.get("max_timeout") else None
+        )
+        step_id = step["id"]
+
         async def node(state: dict) -> dict:
+            # Check if any parallel branches recorded a timeout sentinel.
+            if max_timeout:
+                started_at = state.get(f"_parallel_started_{step_id}")
+                if started_at:
+                    import time
+                    elapsed = time.monotonic() - float(started_at)
+                    if elapsed > max_timeout:
+                        raise TimeoutError(
+                            f"Join '{step_id}' timed out after {elapsed:.1f}s "
+                            f"(max_timeout={max_timeout}s)"
+                        )
             return {}
         return node
 

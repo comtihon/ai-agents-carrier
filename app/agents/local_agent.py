@@ -14,7 +14,6 @@ import subprocess
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
-from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -96,6 +95,7 @@ async def run_local_agent(
     input_data: dict[str, Any],
     settings: "Settings",
     progress_cb: Callable[[str], Awaitable[None]] | None = None,
+    compression_level: str = "none",
 ) -> dict[str, Any]:
     """Run a LangGraph ReAct agent inline and return its output dict.
 
@@ -127,8 +127,14 @@ async def run_local_agent(
             await progress_cb(msg)
 
     # --- Extract config from agent_input ---
-    system_prompt: str = agent_input.get("system_prompt") or _DEFAULT_SYSTEM
-    model: str = agent_input.get("model") or _DEFAULT_MODEL
+    from app.steps.agent_executor import _COMPRESSION_INSTRUCTIONS
+    base_system = agent_input.get("system_prompt") or _DEFAULT_SYSTEM
+    compression_instruction = _COMPRESSION_INSTRUCTIONS.get(compression_level or "none", "")
+    system_prompt: str = (
+        f"{compression_instruction}\n\n{base_system}" if compression_instruction else base_system
+    )
+    provider: str | None = agent_input.get("llm_provider") or agent_input.get("provider")
+    model: str | None = agent_input.get("model") or _DEFAULT_MODEL
     max_tokens: int = int(agent_input.get("max_tokens") or _DEFAULT_MAX_TOKENS)
     allowed_tools_list: list[str] | None = agent_input.get("tools")
     allowed_tools: set[str] | None = (
@@ -145,23 +151,8 @@ async def run_local_agent(
 
     await _progress("Initialising LangGraph ReAct agent…")
 
-    # --- Resolve API key ---
-    api_key: str | None = None
-    for llm_intg in settings.get_llm_integrations():
-        key = llm_intg.resolved_api_key()
-        if key and "anthropic" in llm_intg.name.lower():
-            api_key = key
-            break
-    if api_key is None:
-        # Fall back: check ANTHROPIC_API_KEY directly (env var)
-        import os
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-
-    llm = ChatAnthropic(
-        model=model,
-        api_key=api_key,  # falls back to ANTHROPIC_API_KEY env var if None
-        max_tokens=max_tokens,
-    )
+    from app.core.container import build_llm_native
+    llm = build_llm_native(provider, model, settings, max_tokens=max_tokens)
 
     async with _mcp_tools(settings, allowed_tools) as extra_tools:
         all_tools = [bash, *extra_tools]

@@ -29,3 +29,9 @@ async def list_providers(settings: Settings = Depends(get_settings)) -> LLMProvi
         ],
         default_provider=settings.llm_provider,
     )
+
+
+@router.get("/config/keys")
+def get_config_keys(settings: Settings = Depends(get_settings)) -> dict:
+    """Return names (not values) of forwardable config keys that are currently set."""
+    return {"keys": list(settings.get_forwardable_config().keys())}

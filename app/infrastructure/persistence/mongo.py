@@ -52,7 +52,7 @@ class MongoGraphRunRepository:
         return self._from_doc(doc) if doc else None
 
     async def list_incomplete(self) -> list[GraphRun]:
-        cursor = self._collection.find({"status": {"$in": ["running", "waiting_approval"]}})
+        cursor = self._collection.find({"status": {"$in": ["running", "waiting_approval", "waiting_agent"]}})
         docs = await cursor.to_list(length=None)
         return [self._from_doc(doc) for doc in docs]
 

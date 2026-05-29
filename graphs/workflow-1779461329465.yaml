@@ -1,0 +1,129 @@
+id: workflow-1779461329465
+name: New docker Workflow
+description: ''
+steps:
+- id: node_88f181012586
+  type: langgraph-agent
+  name: researcher
+  agent_id: researcher
+  runtime_override: docker
+  image: ghcr.io/example/langgraph-agent:0.1.5
+  output_key: agent_result
+  env_vars:
+  - name: GOOGLE_APPLICATION_CREDENTIALS_JSON
+    from_config: GOOGLE_APPLICATION_CREDENTIALS_JSON
+  - name: ANTHROPIC_API_KEY
+    from_config: ANTHROPIC_API_KEY
+  next: node_print_result
+- id: node_print_result
+  type: python
+  name: print result
+  code: 'result = state.get("agent_result", "(no result)")
+
+    print(f"Agent result: {result}")
+
+    output = result
+
+    '
+  output_key: printed_result
+  next: node_parallel
+- id: node_parallel
+  type: parallel
+  name: parallel
+  targets:
+  - node_hello
+  - node_world
+- id: node_hello
+  type: python
+  name: hello
+  code: 'print("hello")
+
+    output = "hello"
+
+    '
+  output_key: hello_out
+  next: node_join
+- id: node_world
+  type: python
+  name: world
+  code: 'import time
+
+    time.sleep(5)
+
+    print("world")
+
+    output = "world"
+
+    '
+  output_key: world_out
+  next: node_join
+- id: node_join
+  type: join
+  name: join
+  next: node_decide
+- id: node_decide
+  type: python
+  name: decide
+  code: 'output = bool(state.get("agent_result"))
+
+    '
+  output_key: use_branch_a
+  next: node_switch
+- id: node_switch
+  type: switch
+  name: switch
+  routes:
+  - next: node_branch_a
+    when: len(hello_out) <= len(world_out)
+  - next: node_branch_b
+    when: len(hello_out) > len(world_out)
+- id: node_branch_a
+  type: python
+  name: branch A
+  code: 'print("took branch A (agent had results)")
+
+    output = "branch_a"
+
+    '
+  output_key: branch_result
+- id: node_branch_b
+  type: python
+  name: branch B
+  code: 'print("took branch B (no agent results)")
+
+    output = "branch_b"
+
+    '
+  output_key: branch_result
+ui:
+  nodes:
+    node_88f181012586:
+      x: 20
+      y: 200
+    node_print_result:
+      x: 220
+      y: 200
+    node_parallel:
+      x: 420
+      y: 200
+    node_hello:
+      x: 620
+      y: 100
+    node_world:
+      x: 620
+      y: 300
+    node_join:
+      x: 860
+      y: 200
+    node_decide:
+      x: 1060
+      y: 200
+    node_switch:
+      x: 1260
+      y: 200
+    node_branch_a:
+      x: 1460
+      y: 100
+    node_branch_b:
+      x: 1460
+      y: 300

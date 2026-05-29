@@ -1,0 +1,23 @@
+id: workflow-1779459255107
+name: New Workflow
+description: ''
+steps:
+- id: node_4052e170d4b8
+  type: langgraph-agent
+  name: researcher
+  agent_id: researcher
+  output_key: agent_result
+  next: node_93d3fa34ebcc
+- id: node_93d3fa34ebcc
+  type: human_approval
+  name: Approval
+  interrupt_payload:
+    plan: '{agent_result}'
+ui:
+  nodes:
+    node_4052e170d4b8:
+      x: 20
+      y: 60
+    node_93d3fa34ebcc:
+      x: 205
+      y: 60

@@ -3,7 +3,7 @@ from __future__ import annotations
 from app.runtime.base import AgentRuntime
 
 
-def get_runtime(runtime_type: str) -> AgentRuntime:
+def get_runtime(runtime_type: str, registry_username: str | None = None, registry_password: str | None = None) -> AgentRuntime:
     """Return an ``AgentRuntime`` instance for the given *runtime_type*.
 
     Parameters
@@ -21,7 +21,7 @@ def get_runtime(runtime_type: str) -> AgentRuntime:
         return LocalRuntime()
     if runtime_type == "docker":
         from app.runtime.docker import DockerRuntime
-        return DockerRuntime()
+        return DockerRuntime(registry_username=registry_username, registry_password=registry_password)
     if runtime_type == "k8s":
         from app.runtime.k8s import K8sRuntime
         return K8sRuntime()

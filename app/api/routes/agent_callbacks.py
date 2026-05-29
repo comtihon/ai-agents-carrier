@@ -161,6 +161,10 @@ async def agent_question(
     event.clear()
     _answers.pop(run_id, None)
 
+    run.state = {**(run.state or {}), "_pending_question": {"question": body.question, "options": body.options}}
+    run.touch()
+    await container.run_repository.update(run)
+
     logger.info("run %s: agent asked question: %r", run_id, body.question)
     return {"run_id": run_id, "status": "question_stored"}
 
@@ -214,6 +218,12 @@ async def agent_reply(
     event = _get_or_create_event(run_id)
     event.set()
 
+    run = await container.run_repository.get(run_id)
+    if run:
+        run.state = {k: v for k, v in (run.state or {}).items() if k != "_pending_question"}
+        run.touch()
+        await container.run_repository.update(run)
+
     logger.info("run %s: answer stored and event set", run_id)
     return {"run_id": run_id, "status": "answer_delivered"}
 
@@ -232,6 +242,20 @@ async def agent_progress(
     run = await container.run_repository.get(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
+
+    import json as _json
+
+    # Structured token-update message — store in _live_token_usage, skip progress list
+    if body.message.startswith("__token__:"):
+        try:
+            usage = _json.loads(body.message[len("__token__:"):])
+            run.state = {**(run.state or {}), "_live_token_usage": usage}
+            run.touch()
+            await container.run_repository.update(run)
+        except Exception:
+            pass  # malformed — fall through to append
+        else:
+            return {"run_id": run_id, "status": "token_updated"}
 
     # Append progress message to run state for frontend polling.
     progress_list: list = list(run.state.get("_agent_progress", []))

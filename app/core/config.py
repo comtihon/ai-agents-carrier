@@ -46,6 +46,20 @@ class McpIntegrationConfig(BaseModel):
     env: dict[str, str] = {}
 
 
+# Env vars that look like credentials by suffix but belong to the backend only.
+_SYSTEM_ONLY_ALIASES = {
+    "WEBHOOK_SECRET",
+    "SLACK_BOT_TOKEN",
+    "SLACK_SIGNING_SECRET",
+    "OPENHANDS_API_KEY",
+    "DOCKER_REGISTRY_PASSWORD",
+    "DOCKER_REGISTRY_USERNAME",
+}
+
+# Suffixes that identify credential/secret fields worth forwarding to agents.
+_CREDENTIAL_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_JSON", "_CREDENTIALS")
+
+
 class Settings(BaseSettings):
     app_name: str = "LangGraph Backend"
     environment: str = "local"
@@ -122,6 +136,22 @@ class Settings(BaseSettings):
     mcp_jira_username: str | None = Field(default=None, alias="MCP_JIRA_USERNAME")
     mcp_jira_api_token: str | None = Field(default=None, alias="MCP_JIRA_API_TOKEN")
 
+    # --- Standalone LLM API keys (forwarded to Docker/K8s agent containers) ---
+    anthropic_api_key: str | None = Field(default=None, alias="ANTHROPIC_API_KEY")
+    openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
+    google_api_key: str | None = Field(default=None, alias="GOOGLE_API_KEY")
+    groq_api_key: str | None = Field(default=None, alias="GROQ_API_KEY")
+    mistral_api_key: str | None = Field(default=None, alias="MISTRAL_API_KEY")
+    google_application_credentials_json: str | None = Field(default=None, alias="GOOGLE_APPLICATION_CREDENTIALS_JSON")
+
+    # --- Docker registry auth (used by DockerRuntime to pull private images) ---
+    # Set DOCKER_REGISTRY_USERNAME + DOCKER_REGISTRY_PASSWORD to enable auth.
+    # GAR:    username=oauth2accesstoken  password=$(gcloud auth print-access-token)
+    # ECR:    username=AWS               password=$(aws ecr get-login-password)
+    # Other:  plain username / password or personal access token
+    docker_registry_username: str | None = Field(default=None, alias="DOCKER_REGISTRY_USERNAME")
+    docker_registry_password: str | None = Field(default=None, alias="DOCKER_REGISTRY_PASSWORD")
+
     # --- Miro MCP ---
     mcp_miro_enabled: bool = Field(default=False, alias="MCP_MIRO_ENABLED")
     mcp_miro_transport: Literal["streamable_http", "sse"] = Field(default="streamable_http", alias="MCP_MIRO_TRANSPORT")
@@ -139,6 +169,10 @@ class Settings(BaseSettings):
     mcp_github_transport: Literal["streamable_http", "sse"] = Field(default="streamable_http", alias="MCP_GITHUB_TRANSPORT")
     mcp_github_url: str = Field(default="", alias="MCP_GITHUB_URL")
     mcp_github_api_key: str | None = Field(default=None, alias="MCP_GITHUB_API_KEY")
+
+    # --- Meta-LLM (lightweight analysis after agent steps complete) ---
+    meta_llm_provider: str | None = Field(default=None, alias="META_LLM_PROVIDER")
+    meta_llm_model: str = Field(default="claude-haiku-4-5-20251001", alias="META_LLM_MODEL")
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -175,6 +209,40 @@ class Settings(BaseSettings):
             if integration.name.lower() == target:
                 return integration
         return None
+
+    def get_forwardable_config(self) -> dict[str, str]:
+        """Return {NAME: value} for all credential-like env vars currently set.
+
+        Sources (merged, os.environ wins on collision):
+        - .env file via python-dotenv (covers local dev)
+        - os.environ (covers Docker / K8s injection)
+
+        Any var matching a credential suffix and not in _SYSTEM_ONLY_ALIASES is
+        included.  No Settings field declaration required — users can forward
+        any credential to agents by setting the env var, zero code changes.
+        """
+        from dotenv import dotenv_values
+        env_file = self.model_config.get("env_file", ".env")
+        dot: dict[str, str | None] = {}
+        if env_file:
+            try:
+                dot = dotenv_values(env_file)  # type: ignore[assignment]
+            except Exception:
+                pass
+
+        # os.environ takes precedence over .env file values
+        merged = {k: v for k, v in dot.items() if v is not None}
+        merged.update(os.environ)
+
+        result: dict[str, str] = {}
+        for key, val in merged.items():
+            if not val:
+                continue
+            if key in _SYSTEM_ONLY_ALIASES:
+                continue
+            if any(key.endswith(s) for s in _CREDENTIAL_SUFFIXES):
+                result[key] = val
+        return result
 
     def get_mcp_integrations(self) -> list[McpIntegrationConfig]:
         candidates: list[dict[str, Any]] = [
