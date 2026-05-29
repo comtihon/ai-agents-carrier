@@ -113,6 +113,16 @@ def _build_agent_config(
     system_prompt = agent_input.get("system_prompt")
     model = agent_input.get("model")
     tools = agent_input.get("tools")
+    llm_provider_name = agent_input.get("llm_provider") or settings.llm_provider
+
+    # Resolve provider → inject base_url + api_key_env into extra so the agent
+    # can route to the right LLM without any hardcoded heuristics.
+    extra: dict[str, Any] = dict(agent_input)
+    if llm_provider_name:
+        intg = settings.get_llm_integration(llm_provider_name)
+        if intg:
+            extra["llm_base_url"] = intg.base_url
+            extra["llm_api_key_env"] = intg.resolved_api_key_env()
 
     # Apply compression level from step config (prepend instruction to system prompt)
     compression_level = (step or {}).get("compression_level", "none")
@@ -174,7 +184,7 @@ def _build_agent_config(
         "tools": tools,
         "mcp_servers": mcp_servers,
         "credentials": credentials,
-        "extra": agent_input,
+        "extra": extra,
         "env_vars": env_vars,
     }
 
