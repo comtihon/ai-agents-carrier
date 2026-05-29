@@ -242,3 +242,52 @@ async def post_slack_ask_context(
     except Exception:
         logger.exception("Failed to post ask_context questions to Slack")
         return None
+
+
+_SLACK_POSTMESSAGE_URL = "https://slack.com/api/chat.postMessage"
+
+
+async def post_slack_addon_notification(
+    bot_token: str,
+    payload_template: str,
+    run_id: str,
+    state: dict[str, Any],
+    questions: list[str] | None = None,
+) -> None:
+    """Send a custom Slack message configured on a workflow addon.
+
+    ``payload_template`` is a JSON string with template variables:
+      {run_id}       — workflow run id
+      {request}      — user request from state
+      {questions}    — formatted clarification questions (if any)
+      Any other state key.
+    The URL is always ``https://slack.com/api/chat.postMessage``.
+    """
+    import json as _json
+
+    ctx: dict[str, Any] = dict(state)
+    ctx["run_id"] = run_id
+    ctx["questions"] = _format_questions(questions) if questions else ""
+    ctx.setdefault("request", "")
+
+    try:
+        rendered_str = _render(payload_template, ctx)
+        payload = _json.loads(rendered_str)
+    except Exception as exc:
+        logger.warning("run %s: slack addon payload JSON parse failed: %s", run_id, exc)
+        return
+
+    payload = _render_value(payload, ctx)
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                _SLACK_POSTMESSAGE_URL,
+                headers={"Authorization": f"Bearer {bot_token}"},
+                json=payload,
+            )
+            data = response.json()
+            if not data.get("ok"):
+                logger.warning("run %s: slack addon notification failed: %s", run_id, data.get("error"))
+    except Exception:
+        logger.exception("run %s: failed to send slack addon notification", run_id)

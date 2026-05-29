@@ -399,6 +399,26 @@ async def stream_graph_to_pause(
                     run.touch()
                     await run_repository.update(run)
 
+        # Slack addon: custom per-step token + payload (separate from global ask_context notifications)
+        if step and step.get("slack_token") and step.get("slack_payload"):
+            from app.infrastructure.notifications.webhook_notifier import post_slack_addon_notification
+            addon_questions: list[str] = []
+            for task in snap.tasks:
+                for intr in task.interrupts:
+                    if isinstance(intr.value, dict) and intr.value.get("type") == "ask_context":
+                        addon_questions = intr.value.get("questions", [])
+            if not addon_questions:
+                for intr in getattr(snap, "interrupts", ()):
+                    if isinstance(intr.value, dict) and intr.value.get("type") == "ask_context":
+                        addon_questions = intr.value.get("questions", [])
+            await post_slack_addon_notification(
+                bot_token=step["slack_token"],
+                payload_template=step["slack_payload"],
+                run_id=run.id,
+                state=snap.values or {},
+                questions=addon_questions or None,
+            )
+
 
 # ---------------------------------------------------------------------------
 # YAML graph runner
