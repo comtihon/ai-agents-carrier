@@ -228,6 +228,76 @@ POST /api/v1/callbacks/{run_id}/reject   body: {"reason": "..."}
   output_key: child_result
 ```
 
+### `langgraph-agent` / `claude-agent` — autonomous agent step
+
+Spawns a registered agent, sends the task, suspends until the agent calls back with its result. Supports `local` (in-process), `docker`, and `k8s` runtimes.
+
+```yaml
+- id: researcher
+  type: langgraph-agent          # or claude-agent
+  agent_id: my-researcher        # must exist in /api/v1/agents
+  runtime_override: docker       # local | docker | k8s (defaults to agent's default_runtime)
+  image: myregistry/my-agent:1.0 # Docker image override
+  output_key: agent_result       # stores the agent's text result
+  compression_level: full        # none | lite | full | ultra — caveman-compress the agent's responses
+  env_vars:                      # additional env vars forwarded to the container
+    - name: GOOGLE_APPLICATION_CREDENTIALS_JSON
+      from_config: GOOGLE_APPLICATION_CREDENTIALS_JSON   # from backend config
+    - name: MY_VAR
+      value: custom-value        # literal value
+  output_mapping:                # map individual agent output keys → state keys (optional)
+    result: agent_result
+```
+
+**After the agent completes**, a meta-LLM call analyzes the output and decides:
+- **PROCEED** — result is good, workflow continues
+- **ASK_CLARIFICATION** — agent was blocked; UI shows a question form before proceeding
+- **ASK_APPROVAL** — output needs human sign-off (falls through to the next `human_approval` step)
+
+Configure the meta-LLM via `META_LLM_PROVIDER` / `META_LLM_MODEL` (default: haiku).
+
+### `parallel` — fan-out to concurrent branches
+
+Starts multiple branches in parallel. Each target step runs concurrently; edges define which steps are in the parallel group.
+
+```yaml
+- id: fan_out
+  type: parallel
+  max_parallel: 3      # max concurrent branches (default: unlimited)
+  targets:
+    - branch_a
+    - branch_b
+    - branch_c
+```
+
+### `join` — wait for all parallel branches
+
+Waits for all incoming branches to complete before continuing.
+
+```yaml
+- id: fan_in
+  type: join
+  max_timeout: 300     # fail if branches don't finish within N seconds (default: unlimited)
+```
+
+### `switch` — conditional routing
+
+Routes to one of several targets based on a condition expression. Conditions are evaluated in order; the first truthy condition wins. `when: null` is an unconditional default.
+
+```yaml
+- id: router
+  type: switch
+  routes:
+    - when: "score > 4 and status != 'skip'"   # Python expression; state vars in scope
+      next: high_priority
+    - when: approved                            # simple bool state key
+      next: standard_path
+    - when: null                               # default fallback
+      next: low_priority
+```
+
+**Expression syntax**: any Python expression using state variables. `&&` / `||` / `===` / `!==` are accepted as JS aliases and rewritten to Python equivalents. Available builtins: `len`, `str`, `int`, `float`, `bool`, `abs`, `min`, `max`, `sum`, `round`, `any`, `all`, `sorted`, `isinstance`.
+
 ### `python` — inline Python
 
 ```yaml
@@ -263,6 +333,46 @@ Incoming requests must include an `X-Webhook-Signature` header (HMAC-SHA256 of t
 
 ---
 
+## Agents
+
+Agents are registered persistent definitions that `langgraph-agent` / `claude-agent` steps look up by `agent_id`. Each definition stores the runtime type, Docker image, and the `agent_input` dict (system prompt, model, tools, etc.) forwarded to the agent on every run.
+
+```yaml
+# Example agent definition (managed via API or copilot_ui)
+id: researcher
+name: Researcher
+default_runtime: docker
+image: europe-west4-docker.pkg.dev/myorg/registry/langgraph-agent:0.1.6
+agent_input:
+  system_prompt: "You are a research agent with access to bash and code-search tools."
+  model: claude-opus-4-7
+  max_tokens: 8096
+health_timeout: 300     # seconds to wait for /health after container starts
+```
+
+**Agent HTTP protocol** — the backend calls the agent container:
+
+```
+POST /start     {run_id, input, callback_url, agent_config}  → 202 Accepted
+GET  /health    → 200 when ready
+POST /terminate → graceful shutdown
+```
+
+The agent calls back to the backend:
+
+```
+POST {callback_url}/api/v1/runs/{run_id}/agent/output    {output: {...}}
+POST {callback_url}/api/v1/runs/{run_id}/agent/progress  {message: str}
+POST {callback_url}/api/v1/runs/{run_id}/agent/question  {question, options?}
+GET  {callback_url}/api/v1/runs/{run_id}/agent/input     (long-poll for answer)
+```
+
+Progress messages starting with `__token__:` carry live token counts: `__token__:{"input_tokens":N,"output_tokens":N,"total_tokens":N}` — the backend stores these in `_live_token_usage` and surfaces them in the run response for real-time display.
+
+**Credential forwarding** — any env var in the backend matching a credential suffix (`_API_KEY`, `_TOKEN`, `_JSON`, `_SECRET`, `_CREDENTIALS`) is automatically available to forward to agent containers via the `env_vars` step config. The list is exposed at `GET /api/v1/llm/config/keys` (names only, no values).
+
+---
+
 ## API
 
 ```
@@ -276,8 +386,27 @@ DELETE /api/v1/workflows/{id}                 delete workflow
 # Runs
 POST   /api/v1/workflows/runs                 start a run
 GET    /api/v1/workflows/runs/{id}            get run status
+GET    /api/v1/workflows/runs/{id}/trace      get LangSmith / token trace
 POST   /api/v1/workflows/runs/{id}/approve    approve a paused run
 POST   /api/v1/workflows/runs/{id}/reject     reject a paused run
+
+# Agents
+GET    /api/v1/agents                         list registered agents
+POST   /api/v1/agents                         register an agent
+GET    /api/v1/agents/{id}                    get agent definition
+PUT    /api/v1/agents/{id}                    update agent definition
+DELETE /api/v1/agents/{id}                    delete agent definition
+
+# Agent callbacks (called by running agent containers)
+POST   /api/v1/runs/{id}/agent/output         deliver result, resume run
+POST   /api/v1/runs/{id}/agent/progress       send progress / token update
+POST   /api/v1/runs/{id}/agent/question       ask a clarifying question
+GET    /api/v1/runs/{id}/agent/input          long-poll for answer to question
+POST   /api/v1/runs/{id}/agent/reply          submit answer (from UI)
+
+# Config
+GET    /api/v1/llm/config/keys                list forwardable credential key names
+GET    /api/v1/llm/providers                  list configured LLM providers
 
 # Triggers
 POST   /api/v1/webhooks/{workflow-id}         HTTP webhook trigger
@@ -286,3 +415,30 @@ POST   /api/v1/webhooks/{workflow-id}         HTTP webhook trigger
 POST   /api/v1/callbacks/{run-id}/approve
 POST   /api/v1/callbacks/{run-id}/reject
 ```
+
+---
+
+## Add-ons
+
+### Slack approvals
+
+Set `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, and `SLACK_APPROVALS_CHANNEL` to send approval requests to a Slack channel. The `human_approval` step's `notify` block targets Slack via webhook or the bot token.
+
+### LangSmith tracing
+
+Set `LANGCHAIN_TRACING_V2=true` and `LANGCHAIN_API_KEY` to send all LLM calls to LangSmith. The LangSmith run URL is included in the run trace response (`GET /runs/{id}/trace`).
+
+### OpenHands code execution
+
+Set `OPENHANDS_BASE_URL` and `OPENHANDS_API_KEY` (set `OPENHANDS_MOCK_MODE=false`) to enable the `execute` step type, which delegates coding tasks to an OpenHands instance.
+
+### Custom LLM providers
+
+`LLM_INTEGRATIONS` accepts a JSON array of OpenAI-compatible endpoints:
+
+```bash
+LLM_INTEGRATIONS='[{"name":"ollama","base_url":"http://localhost:11434/v1","default_model":"llama3","api_key_env":"OLLAMA_API_KEY"}]'
+LLM_PROVIDER=ollama
+```
+
+Any entry can be referenced by name in workflow steps via `llm_provider: ollama`.
