@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
@@ -487,23 +488,35 @@ async def create_workflow(
 @router.get("/runs")
 async def list_runs(
     limit: int = 50,
+    offset: int = 0,
     workflow_id: str | None = None,
     status: str | None = None,
     search: str | None = None,
+    exclude_workflow_ids: list[str] | None = Query(default=None),
     container: ApplicationContainer = Depends(get_container),
 ):
     """List recent workflow runs, newest first.
 
     Optional filters: workflow_id, status (running|waiting_approval|completed|failed|cancelled),
-    search (case-insensitive substring match on user_request).
+    search (case-insensitive substring match on user_request),
+    exclude_workflow_ids (exclude runs belonging to these workflow IDs).
+    Supports offset-based pagination via offset + limit.
+    Returns {runs, total}.
     """
-    runs = await container.run_repository.list_recent(
-        limit=limit, workflow_id=workflow_id, status=status, search=search
+    runs, total = await asyncio.gather(
+        container.run_repository.list_recent(
+            limit=limit, offset=offset, workflow_id=workflow_id,
+            status=status, search=search, exclude_workflow_ids=exclude_workflow_ids,
+        ),
+        container.run_repository.count_recent(
+            workflow_id=workflow_id, status=status, search=search,
+            exclude_workflow_ids=exclude_workflow_ids,
+        ),
     )
-    responses = []
-    for run in runs:
-        responses.append(await _run_response(run, _get_runner_for_run(run, container)))
-    return responses
+    run_responses = await asyncio.gather(
+        *[_run_response(run, _get_runner_for_run(run, container)) for run in runs]
+    )
+    return {"runs": list(run_responses), "total": total}
 
 
 @router.post("/runs")

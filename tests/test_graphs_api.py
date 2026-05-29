@@ -153,11 +153,14 @@ async def test_get_run_not_found(client):
 async def test_list_runs_no_filter(client):
     c, container = client
     container.run_repository.list_recent = AsyncMock(return_value=[])
+    container.run_repository.count_recent = AsyncMock(return_value=0)
     resp = await c.get("/api/v1/workflows/runs")
     assert resp.status_code == 200
-    assert resp.json() == []
+    data = resp.json()
+    assert data["runs"] == []
+    assert data["total"] == 0
     container.run_repository.list_recent.assert_called_once_with(
-        limit=50, workflow_id=None, status=None, search=None
+        limit=50, offset=0, workflow_id=None, status=None, search=None, exclude_workflow_ids=None
     )
 
 
@@ -166,24 +169,30 @@ async def test_list_runs_status_filter(client):
     c, container = client
     run = GraphRun(id="r1", graph_id="simple", user_request="build feature", status="running")
     container.run_repository.list_recent = AsyncMock(return_value=[run])
+    container.run_repository.count_recent = AsyncMock(return_value=1)
     resp = await c.get("/api/v1/workflows/runs?status=running")
     assert resp.status_code == 200
     container.run_repository.list_recent.assert_called_once_with(
-        limit=50, workflow_id=None, status="running", search=None
+        limit=50, offset=0, workflow_id=None, status="running", search=None, exclude_workflow_ids=None
     )
     data = resp.json()
-    assert len(data) == 1
-    assert data[0]["status"] == "running"
+    assert data["total"] == 1
+    assert len(data["runs"]) == 1
+    assert data["runs"][0]["status"] == "running"
 
 
 @pytest.mark.asyncio
 async def test_list_runs_search_filter(client):
     c, container = client
     container.run_repository.list_recent = AsyncMock(return_value=[])
+    container.run_repository.count_recent = AsyncMock(return_value=0)
     resp = await c.get("/api/v1/workflows/runs?search=dark+mode")
     assert resp.status_code == 200
+    data = resp.json()
+    assert data["runs"] == []
+    assert data["total"] == 0
     container.run_repository.list_recent.assert_called_once_with(
-        limit=50, workflow_id=None, status=None, search="dark mode"
+        limit=50, offset=0, workflow_id=None, status=None, search="dark mode", exclude_workflow_ids=None
     )
 
 
@@ -192,14 +201,17 @@ async def test_list_runs_combined_filters(client):
     c, container = client
     run = GraphRun(id="r2", graph_id="simple", user_request="build feature", status="completed")
     container.run_repository.list_recent = AsyncMock(return_value=[run])
+    container.run_repository.count_recent = AsyncMock(return_value=1)
     resp = await c.get(
         "/api/v1/workflows/runs?workflow_id=simple&status=completed&search=build&limit=10"
     )
     assert resp.status_code == 200
     container.run_repository.list_recent.assert_called_once_with(
-        limit=10, workflow_id="simple", status="completed", search="build"
+        limit=10, offset=0, workflow_id="simple", status="completed", search="build", exclude_workflow_ids=None
     )
-    assert len(resp.json()) == 1
+    data = resp.json()
+    assert data["total"] == 1
+    assert len(data["runs"]) == 1
 
 
 # ─── Approve handler claims atomically ────────────────────────────────────────

@@ -56,23 +56,52 @@ class MongoGraphRunRepository:
         docs = await cursor.to_list(length=None)
         return [self._from_doc(doc) for doc in docs]
 
-    async def list_recent(
+    def _build_run_query(
         self,
-        limit: int = 50,
         workflow_id: str | None = None,
         status: str | None = None,
         search: str | None = None,
-    ) -> list[GraphRun]:
+        exclude_workflow_ids: list[str] | None = None,
+    ) -> dict:
         query: dict = {}
-        if workflow_id:
+        if workflow_id and not exclude_workflow_ids:
             query["graph_id"] = workflow_id
+        elif exclude_workflow_ids and not workflow_id:
+            query["graph_id"] = {"$nin": exclude_workflow_ids}
+        elif workflow_id and exclude_workflow_ids:
+            query["$and"] = [
+                {"graph_id": workflow_id},
+                {"graph_id": {"$nin": exclude_workflow_ids}},
+            ]
         if status:
             query["status"] = status
         if search:
             query["user_request"] = {"$regex": search, "$options": "i"}
-        cursor = self._collection.find(query).sort("created_at", -1).limit(limit)
-        docs = await cursor.to_list(length=limit)
+        return query
+
+    async def list_recent(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        workflow_id: str | None = None,
+        status: str | None = None,
+        search: str | None = None,
+        exclude_workflow_ids: list[str] | None = None,
+    ) -> list[GraphRun]:
+        query = self._build_run_query(workflow_id, status, search, exclude_workflow_ids)
+        cursor = self._collection.find(query).sort("created_at", -1).skip(offset).limit(limit)
+        docs = await cursor.to_list(length=None)
         return [self._from_doc(doc) for doc in docs]
+
+    async def count_recent(
+        self,
+        workflow_id: str | None = None,
+        status: str | None = None,
+        search: str | None = None,
+        exclude_workflow_ids: list[str] | None = None,
+    ) -> int:
+        query = self._build_run_query(workflow_id, status, search, exclude_workflow_ids)
+        return await self._collection.count_documents(query)
 
     @staticmethod
     def _to_doc(run: GraphRun) -> dict[str, Any]:
