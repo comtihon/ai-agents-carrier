@@ -7,6 +7,7 @@ steps:
   name: researcher
   agent_id: researcher
   output_key: agent_result
+  slack_notifications: true
   next: node_93d3fa34ebcc
 - id: node_93d3fa34ebcc
   type: human_approval
@@ -21,3 +22,13 @@ ui:
     node_93d3fa34ebcc:
       x: 205
       y: 60
+    slack-1780050843960:
+      x: 20
+      y: 108
+  addons:
+  - id: slack-1780050843960
+    type: slack
+    attachedTo: node_4052e170d4b8
+    position:
+      x: 20
+      y: 108

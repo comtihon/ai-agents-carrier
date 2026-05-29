@@ -128,11 +128,11 @@ ui:
     node_branch_b:
       x: 1460
       y: 300
-    slack-1780049866837:
+    slack-1780050830283:
       x: 20
       y: 248
   addons:
-  - id: slack-1780049866837
+  - id: slack-1780050830283
     type: slack
     attachedTo: node_88f181012586
     position:
