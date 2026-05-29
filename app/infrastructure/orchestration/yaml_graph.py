@@ -399,7 +399,9 @@ async def stream_graph_to_pause(
                     run.touch()
                     await run_repository.update(run)
 
-        # Slack addon: custom per-step token + payload (separate from global ask_context notifications)
+        # Slack addon: custom per-step token + payload.
+        # Only fires when there are actual ask_context questions — avoids sending
+        # an empty-questions message when ask_approval fires on the same step.
         if step and step.get("slack_token") and step.get("slack_payload"):
             from app.infrastructure.notifications.webhook_notifier import post_slack_addon_notification
             addon_questions: list[str] = []
@@ -411,13 +413,14 @@ async def stream_graph_to_pause(
                 for intr in getattr(snap, "interrupts", ()):
                     if isinstance(intr.value, dict) and intr.value.get("type") == "ask_context":
                         addon_questions = intr.value.get("questions", [])
-            await post_slack_addon_notification(
-                bot_token=step["slack_token"],
-                payload_template=step["slack_payload"],
-                run_id=run.id,
-                state=snap.values or {},
-                questions=addon_questions or None,
-            )
+            if addon_questions:
+                await post_slack_addon_notification(
+                    bot_token=step["slack_token"],
+                    payload_template=step["slack_payload"],
+                    run_id=run.id,
+                    state=snap.values or {},
+                    questions=addon_questions,
+                )
 
 
 # ---------------------------------------------------------------------------
