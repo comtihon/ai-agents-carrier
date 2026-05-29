@@ -275,8 +275,6 @@ async def post_slack_addon_notification(
     # and {slack_approvals_channel} without storing them in the workflow definition.
     ctx.setdefault("slack_bot_token", settings.slack_bot_token or "")
     ctx.setdefault("slack_approvals_channel", settings.slack_approvals_channel or "")
-    # Alias used in some workflow definitions
-    ctx.setdefault("slack_approvals_achannel", settings.slack_approvals_channel or "")
 
     try:
         rendered_str = _render(payload_template, ctx)

@@ -414,11 +414,17 @@ async def stream_graph_to_pause(
                     if isinstance(intr.value, dict) and intr.value.get("type") == "ask_context":
                         addon_questions = intr.value.get("questions", [])
             if addon_questions:
+                # Merge step-level config vars into state so templates can use them.
+                # slack_topic lets the payload reference the configured channel/topic
+                # without hardcoding it in the backend.
+                extra: dict = {}
+                if step.get("slack_topic"):
+                    extra["slack_topic"] = step["slack_topic"]
                 await post_slack_addon_notification(
                     bot_token=step["slack_token"],
                     payload_template=step["slack_payload"],
                     run_id=run.id,
-                    state=snap.values or {},
+                    state={**(snap.values or {}), **extra},
                     questions=addon_questions,
                 )
 
