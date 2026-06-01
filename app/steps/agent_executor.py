@@ -407,6 +407,7 @@ async def execute_agent_step(
             runtime_type,
             registry_username=settings.docker_registry_username,
             registry_password=settings.docker_registry_password,
+            agent_namespace=settings.agent_namespace,
         )
         agent_config_payload = _build_agent_config(agent_def, settings, step=step)
         resolved_env_vars: dict[str, str] = agent_config_payload.get("env_vars") or {}

@@ -144,6 +144,11 @@ class Settings(BaseSettings):
     mistral_api_key: str | None = Field(default=None, alias="MISTRAL_API_KEY")
     google_application_credentials_json: str | None = Field(default=None, alias="GOOGLE_APPLICATION_CREDENTIALS_JSON")
 
+    # --- K8s agent runtime ---
+    # Namespace where K8sRuntime deploys agent Helm releases.
+    # Must match the namespace the backend pod runs in so its ServiceAccount has RBAC.
+    agent_namespace: str = Field(default="langgraph", alias="AGENT_NAMESPACE")
+
     # --- Docker registry auth (used by DockerRuntime to pull private images) ---
     # Set DOCKER_REGISTRY_USERNAME + DOCKER_REGISTRY_PASSWORD to enable auth.
     # GAR:    username=oauth2accesstoken  password=$(gcloud auth print-access-token)
