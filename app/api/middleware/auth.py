@@ -19,7 +19,15 @@ _UNPROTECTED_PATHS = {"/health", "/ready"}
 # own authenticated calls.  Secure at the network / API-gateway level instead.
 # /api/v1/callbacks are approval callback URLs sent to external systems (Slack, etc.)
 # where the caller has no credentials; the run_id UUID in the path is the secret.
-_UNPROTECTED_PREFIXES = ("/copilotkit", "/api/v1/callbacks/", "/api/v1/webhooks/")
+_UNPROTECTED_PREFIXES = (
+    "/copilotkit",
+    "/api/v1/callbacks/",
+    "/api/v1/webhooks/",
+    # Agent output/progress callbacks — posted by spawned agent containers that
+    # have no user credentials.  The run_id UUID in the path acts as the shared
+    # secret; secure at the network level (cluster-internal traffic only).
+    "/api/v1/runs/",
+)
 
 
 class OAuthMiddleware(BaseHTTPMiddleware):
