@@ -121,8 +121,9 @@ class K8sRuntime(AgentRuntime):
 
         # Poll GET /health until the agent service is reachable.
         # Inside the cluster the URL above is directly accessible.
+        health_timeout = float(agent_def.health_timeout or _HEALTH_TIMEOUT)
         loop = asyncio.get_event_loop()
-        deadline = loop.time() + _HEALTH_TIMEOUT
+        deadline = loop.time() + health_timeout
         async with httpx.AsyncClient() as client:
             while loop.time() < deadline:
                 try:
@@ -140,7 +141,7 @@ class K8sRuntime(AgentRuntime):
         await self.terminate(agent_url)
         raise RuntimeError(
             f"K8sRuntime: agent at {agent_url} did not become healthy "
-            f"within {_HEALTH_TIMEOUT}s (run_id={run_id})"
+            f"within {health_timeout}s (run_id={run_id})"
         )
 
     async def terminate(self, agent_url: str) -> None:
