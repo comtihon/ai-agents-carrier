@@ -73,9 +73,6 @@ class K8sRuntime(AgentRuntime):
             )
 
         release_name = self._release_name(agent_def, run_id)
-        agent_url = (
-            f"http://{release_name}.{self._namespace}.svc.cluster.local:{_AGENT_PORT}"
-        )
 
         # Build --set arguments from helm_values plus runtime overrides.
         set_args: list[str] = []
@@ -116,6 +113,10 @@ class K8sRuntime(AgentRuntime):
                 f"{stderr.decode()}"
             )
 
+        # Discover the Service created by this Helm release.  Helm charts typically
+        # name services as "{release_name}-{chart_name}", so we look up by the
+        # standard app.kubernetes.io/instance label rather than hard-coding the suffix.
+        agent_url = await self._discover_service_url(release_name)
         self._releases[agent_url] = release_name
         logger.info("K8sRuntime: release '%s' deployed at %s", release_name, agent_url)
 
@@ -188,6 +189,43 @@ class K8sRuntime(AgentRuntime):
                 return resp.status_code == 200
         except Exception:
             return False
+
+    async def _discover_service_url(self, release_name: str) -> str:
+        """Return the in-cluster URL for the first Service in the Helm release manifest.
+
+        Helm charts typically name Services as ``{release}-{chart_name}`` rather
+        than exactly ``{release}``.  We parse ``helm get manifest`` to discover
+        the actual Service name without assuming the chart's naming convention.
+
+        Falls back to ``{release_name}.{namespace}`` if parsing fails.
+        """
+        proc = await asyncio.create_subprocess_exec(
+            "helm", "get", "manifest", release_name,
+            "--namespace", self._namespace,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0:
+            import yaml as _yaml
+            try:
+                for doc in _yaml.safe_load_all(stdout.decode()):
+                    if isinstance(doc, dict) and doc.get("kind") == "Service":
+                        svc_name = doc.get("metadata", {}).get("name", "")
+                        if svc_name:
+                            url = f"http://{svc_name}.{self._namespace}.svc.cluster.local:{_AGENT_PORT}"
+                            logger.info(
+                                "K8sRuntime: discovered service '%s' for release '%s'",
+                                svc_name, release_name,
+                            )
+                            return url
+            except Exception:
+                pass
+        logger.warning(
+            "K8sRuntime: could not discover service for release '%s', using release name as fallback",
+            release_name,
+        )
+        return f"http://{release_name}.{self._namespace}.svc.cluster.local:{_AGENT_PORT}"
 
     @staticmethod
     async def _try_oci_registry_login(chart_ref: str) -> None:
