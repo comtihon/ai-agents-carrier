@@ -1,26 +1,31 @@
-"""
-Default CopilotKit agent — the entry point for all chat interactions.
+"""Default chat agent — the entry point for all copilot chat interactions.
 
-On each user message the agent runs a structured LLM call that decides whether
-to reply directly or spawn one of the registered YAML workflows.  All available
-workflows are injected into the system prompt so the model can make an informed
-routing decision.
+A ReAct-style LangGraph agent backed by the bundled workflow_assistant.yaml
+config.  The agent has built-in tools for listing, running, and inspecting
+workflow runs, plus an ask_user tool that pauses execution via interrupt() to
+collect clarifying answers from the user.
+
+The system prompt and LLM provider are loaded from the YAML config so the
+agent can be customised without code changes.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any
 from uuid import uuid4
 
 from copilotkit import CopilotKitState
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.tools import tool
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
 from langgraph.types import RunnableConfig, interrupt
-from pydantic import BaseModel, Field
 
 from app.domain.models.graph_run import GraphRun
 from app.infrastructure.orchestration.yaml_graph import stream_graph_to_pause
@@ -31,54 +36,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Structured output schema for the routing decision
-# ---------------------------------------------------------------------------
-
-class RouterDecision(BaseModel):
-    action: Literal["reply", "run_workflow", "ask_context"] = Field(
-        description=(
-            "Choose 'reply' to answer the user directly. "
-            "Choose 'run_workflow' to start a workflow that handles the request. "
-            "Choose 'ask_context' when you need more information from the user before deciding."
-        )
-    )
-    reply_text: str | None = Field(
-        None,
-        description="The response to send to the user (required when action='reply').",
-    )
-    workflow_id: str | None = Field(
-        None,
-        description="ID of the workflow to start (required when action='run_workflow').",
-    )
-    workflow_request: str | None = Field(
-        None,
-        description=(
-            "Detailed task description to pass to the workflow "
-            "(required when action='run_workflow')."
-        ),
-    )
-    questions: list[str] | None = Field(
-        None,
-        description=(
-            "1–3 focused questions to ask the user (required when action='ask_context'). "
-            "Each question should be concise and target a specific missing piece of information."
-        ),
-    )
+_DEFAULT_SYSTEM_PROMPT = """\
+You are the Workflow Assistant for Acme's workflow automation platform.
+Use your tools to help users run, inspect, and understand workflows.
+"""
 
 
 # ---------------------------------------------------------------------------
-# Extended state (adds routing decision on top of CopilotKit messages)
+# State
 # ---------------------------------------------------------------------------
 
-from typing import TypedDict  # noqa: E402
-
-
-class DefaultWorkflowState(CopilotKitState, total=False):  # type: ignore[misc]
-    decision: Any          # RouterDecision, typed loosely to satisfy TypedDict constraints
-    spawned_workflow: Any  # populated by spawn_workflow node: {workflow_id, workflow_name, run_id}
-    # no extra fields needed — questions live in decision.questions
+class AssistantState(CopilotKitState, total=False):  # type: ignore[misc]
+    messages: Annotated[list, add_messages]
 
 
 # ---------------------------------------------------------------------------
@@ -87,163 +56,184 @@ class DefaultWorkflowState(CopilotKitState, total=False):  # type: ignore[misc]
 
 def build_default_workflow(
     llm: BaseChatModel,
-    registry: YamlGraphRegistry,
-    run_repository: MongoGraphRunRepository,
+    registry: "YamlGraphRegistry",
+    run_repository: "MongoGraphRunRepository",
     checkpointer: BaseCheckpointSaver | None = None,
+    agent_config: dict | None = None,
 ):
-    """Build and compile the default CopilotKit LangGraph agent."""
+    """Build and compile the default ReAct chat agent."""
 
-    # Build the workflows section of the system prompt once at startup.
-    definitions = registry.list_definitions()
-    if definitions:
-        workflow_lines = "\n".join(
-            f"- **{d['id']}**: {(d.get('description') or '').strip()}"
-            for d in definitions
-        )
-        workflows_section = f"Available workflows:\n{workflow_lines}"
-    else:
-        workflows_section = "No workflows are currently configured."
+    config = agent_config or {}
+    system_prompt_template = config.get("system_prompt", _DEFAULT_SYSTEM_PROMPT).strip()
 
-    SYSTEM_PROMPT = f"""\
-You are an intelligent assistant for a software-engineering workflow automation platform.
+    # ── tools ────────────────────────────────────────────────────────────────
 
-{workflows_section}
+    @tool
+    def list_workflows() -> str:
+        """List all available workflow IDs, names, and descriptions."""
+        defs = registry.list_definitions()
+        if not defs:
+            return "No workflows are currently configured."
+        lines = [
+            f"- **{d['id']}** ({d.get('name', d['id'])}): {(d.get('description') or '').strip()}"
+            for d in defs
+        ]
+        return "\n".join(lines)
 
-For each user message, decide ONE of:
-1. **reply** — answer the question, explain a workflow, or have a general conversation.
-2. **run_workflow** — the user wants to start an automated task; pick the best matching \
-workflow and craft a detailed `workflow_request`.
-3. **ask_context** — you genuinely cannot determine what to do or which workflow fits \
-without more information. Ask 1–3 focused questions via the `questions` field.
+    @tool
+    async def run_workflow(workflow_id: str, request: str) -> str:
+        """Start a workflow run.
 
-Rules:
-- Use `run_workflow` only when the user clearly wants work to be done (e.g. "implement \
-ticket X", "develop feature Y").
-- For questions, greetings, status checks, or anything that doesn't require running a \
-workflow, use `reply`.
-- Use `ask_context` sparingly — only when the request is too ambiguous to act on.
-- `workflow_request` must be self-contained — include all details the workflow needs.
-"""
+        Args:
+            workflow_id: The workflow ID (from list_workflows).
+            request: A detailed description of the task to execute.
 
-    # ── nodes ────────────────────────────────────────────────────────────────
-
-    async def decide(state: DefaultWorkflowState, config: RunnableConfig) -> dict:
-        """Run a structured LLM call to decide how to handle the user's message."""
-        messages = list(state.get("messages", []))
-        structured_llm = llm.with_structured_output(RouterDecision)
-        decision: RouterDecision = await structured_llm.ainvoke(
-            [SystemMessage(content=SYSTEM_PROMPT)] + messages
-        )
-        logger.info(
-            "default_workflow: decision action=%s workflow_id=%s",
-            decision.action, decision.workflow_id,
-        )
-        return {"decision": decision}
-
-    async def reply(state: DefaultWorkflowState, config: RunnableConfig) -> dict:
-        """Return the LLM's direct reply to the user."""
-        decision: RouterDecision = state["decision"]
-        text = decision.reply_text or ""
-        if not text:
-            # Use astream so that astream_events captures per-token chunks for
-            # the /chat SSE endpoint.
-            content = ""
-            async for chunk in llm.astream(
-                [SystemMessage(content=SYSTEM_PROMPT)] + list(state.get("messages", []))
-            ):
-                if chunk.content:
-                    content += chunk.content
-            text = content
-        return {"messages": [AIMessage(content=text)]}
-
-    async def spawn_workflow(state: DefaultWorkflowState, config: RunnableConfig) -> dict:
-        """Spawn the chosen workflow as an independent background run."""
-        decision: RouterDecision = state["decision"]
-        workflow_id = decision.workflow_id or ""
-        workflow_request = decision.workflow_request or ""
-
+        Returns:
+            JSON with run_id, workflow_id, workflow_name, and __event__ = workflow_started.
+        """
         runner = registry.get(workflow_id)
         if runner is None:
-            logger.error("default_workflow: workflow '%s' not found in registry", workflow_id)
-            return {
-                "messages": [AIMessage(
-                    content=f"Sorry, I couldn't find the workflow **{workflow_id}**. "
-                            f"Available workflows: {', '.join(registry.list_ids()) or 'none'}."
-                )]
-            }
+            available = ", ".join(registry.list_ids()) or "none"
+            return f"Workflow '{workflow_id}' not found. Available: {available}"
 
-        child_run_id = str(uuid4())
+        run_id = str(uuid4())
         child_run = GraphRun(
-            id=child_run_id,
+            id=run_id,
             graph_id=workflow_id,
-            user_request=workflow_request,
+            user_request=request,
             status="running",
             step_statuses={s["id"]: "pending" for s in runner.steps},
         )
         await run_repository.create(child_run)
-
         asyncio.create_task(
-            stream_graph_to_pause(runner, child_run, run_repository, {"request": workflow_request})
+            stream_graph_to_pause(runner, child_run, run_repository, {"request": request})
         )
+        logger.info("chat_agent: spawned '%s' as run %s", workflow_id, run_id)
+        return json.dumps({
+            "__event__": "workflow_started",
+            "run_id": run_id,
+            "workflow_id": workflow_id,
+            "workflow_name": runner.name,
+        })
 
-        logger.info(
-            "default_workflow: spawned '%s' as run %s", workflow_id, child_run_id
-        )
-        return {
-            "messages": [AIMessage(
-                content=(
-                    f"I've started the **{runner.name}** workflow for you.\n\n"
-                    f"Run ID: `{child_run_id}`\n\n"
-                    f"You can track its progress in the workflow panel."
-                )
-            )],
-            "spawned_workflow": {
-                "workflow_id": workflow_id,
-                "workflow_name": runner.name,
-                "run_id": child_run_id,
-            },
-        }
+    @tool
+    async def list_runs(workflow_id: str | None = None, limit: int = 10) -> str:
+        """List recent workflow runs.
 
-    async def ask_context_node(state: DefaultWorkflowState, config: RunnableConfig) -> dict:
-        """Pause execution and ask the user clarifying questions via interrupt()."""
-        decision: RouterDecision = state["decision"]  # type: ignore[index]
-        questions: list[str] = decision.questions or []
-        # interrupt() pauses the graph; resumes when Command(resume=answers) is invoked.
-        # answers: dict mapping str(question_index) → answer text
+        Args:
+            workflow_id: Filter to a specific workflow (optional).
+            limit: Maximum number of runs to return (default 10).
+        """
+        try:
+            runs = await run_repository.list(
+                workflow_id=workflow_id,
+                limit=min(limit, 20),
+            )
+        except TypeError:
+            # fallback for backends that don't support keyword args
+            runs = await run_repository.list()
+            if workflow_id:
+                runs = [r for r in runs if r.graph_id == workflow_id]
+            runs = runs[:limit]
+
+        if not runs:
+            return "No runs found."
+        lines = [
+            f"- **{r.id}** ({r.graph_id}) — status: {r.status}"
+            + (f", started: {r.created_at}" if getattr(r, "created_at", None) else "")
+            for r in runs
+        ]
+        return "\n".join(lines)
+
+    @tool
+    async def get_run(run_id: str) -> str:
+        """Get detailed status and step-level output for a specific workflow run.
+
+        Args:
+            run_id: The run ID to inspect.
+        """
+        run = await run_repository.get(run_id)
+        if run is None:
+            return f"Run '{run_id}' not found."
+        parts = [
+            f"Run: {run.id}",
+            f"Workflow: {run.graph_id}",
+            f"Status: {run.status}",
+        ]
+        if run.step_statuses:
+            parts.append("Steps:")
+            for step_id, status in run.step_statuses.items():
+                parts.append(f"  - {step_id}: {status}")
+        if run.state:
+            # Include output values for failed/finished steps — skip internal keys
+            output_keys = [k for k in run.state if not k.startswith("_")]
+            if output_keys:
+                parts.append("State keys: " + ", ".join(output_keys))
+                for k in output_keys[:8]:  # cap to avoid huge responses
+                    v = run.state[k]
+                    if isinstance(v, dict) and "error" in v:
+                        parts.append(f"  {k}.error: {v['error'][:300]}")
+                    elif isinstance(v, dict) and "status" in v:
+                        parts.append(f"  {k}.status: {v.get('status')} {str(v.get('body',''))[:200]}")
+        if run.error:
+            parts.append(f"Error: {run.error[:500]}")
+        return "\n".join(parts)
+
+    @tool
+    def ask_user(questions: list[str]) -> str:
+        """Pause and ask the user clarifying questions before proceeding.
+
+        Use this only when you genuinely cannot act without more information.
+        Ask 1-3 focused questions.
+
+        Args:
+            questions: List of questions to ask the user.
+        """
         answers: dict = interrupt({"type": "ask_context", "questions": questions})
-        answer_text = "\n".join(
+        return "\n".join(
             f"Q: {q}\nA: {answers.get(str(i), '').strip()}"
             for i, q in enumerate(questions)
         )
-        return {"messages": [HumanMessage(content=f"Additional context provided:\n{answer_text}")]}
 
-    # ── routing ──────────────────────────────────────────────────────────────
+    tools = [list_workflows, run_workflow, list_runs, get_run, ask_user]
+    llm_with_tools = llm.bind_tools(tools)
 
-    def route(state: DefaultWorkflowState) -> str:
-        decision: RouterDecision | None = state.get("decision")  # type: ignore[assignment]
-        action = getattr(decision, "action", None) if decision is not None else None
-        if action == "run_workflow" and getattr(decision, "workflow_id", None):
-            return "spawn_workflow"
-        if action == "ask_context":
-            return "ask_context"
-        return "reply"
+    # ── nodes ────────────────────────────────────────────────────────────────
+
+    def _build_system_prompt() -> str:
+        """Build system prompt with current workflow list injected."""
+        defs = registry.list_definitions()
+        if defs:
+            workflow_lines = "\n".join(
+                f"- **{d['id']}**: {(d.get('description') or '').strip()}"
+                for d in defs
+            )
+            return f"{system_prompt_template}\n\nAvailable workflows:\n{workflow_lines}"
+        return system_prompt_template
+
+    async def agent(state: AssistantState, config: RunnableConfig) -> dict:
+        from langchain_core.messages import SystemMessage
+        messages = [SystemMessage(content=_build_system_prompt())] + list(state.get("messages", []))
+        response = await llm_with_tools.ainvoke(messages, config)
+        return {"messages": [response]}
+
+    def route(state: AssistantState) -> str:
+        msgs = state.get("messages", [])
+        if not msgs:
+            return END
+        last = msgs[-1]
+        if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
+            return "tools"
+        return END
 
     # ── graph ────────────────────────────────────────────────────────────────
 
-    sg: StateGraph = StateGraph(DefaultWorkflowState)
-    sg.add_node("decide", decide)
-    sg.add_node("reply", reply)
-    sg.add_node("spawn_workflow", spawn_workflow)
-    sg.add_node("ask_context", ask_context_node)
+    sg: StateGraph = StateGraph(AssistantState)
+    sg.add_node("agent", agent)
+    sg.add_node("tools", ToolNode(tools))
 
-    sg.add_edge(START, "decide")
-    sg.add_conditional_edges(
-        "decide",
-        route,
-        {"reply": "reply", "spawn_workflow": "spawn_workflow", "ask_context": "ask_context"},
-    )
-    sg.add_edge("reply", END)
-    sg.add_edge("spawn_workflow", END)
-    sg.add_edge("ask_context", "decide")  # re-decide after user answers
+    sg.add_edge(START, "agent")
+    sg.add_conditional_edges("agent", route, {"tools": "tools", END: END})
+    sg.add_edge("tools", "agent")
 
     return sg.compile(checkpointer=checkpointer or MemorySaver())

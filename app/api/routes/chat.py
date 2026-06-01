@@ -46,35 +46,42 @@ async def _stream_graph(graph, input_value, config: dict, thread_id: str):
       {"type": "done",             "thread_id": "..."}
       {"type": "error",            "message": "..."}
     """
-    reply_had_tokens = False
+    had_tokens = False
     try:
         async for event in graph.astream_events(input_value, config, version="v2"):
             kind = event["event"]
             node = event.get("metadata", {}).get("langgraph_node", "")
 
-            if kind == "on_chat_model_stream" and node == "reply":
+            # Stream LLM tokens from the agent node
+            if kind == "on_chat_model_stream" and node == "agent":
                 chunk = event["data"]["chunk"]
-                if chunk.content:
-                    reply_had_tokens = True
-                    yield f"data: {json.dumps({'type': 'token', 'content': chunk.content})}\n\n"
+                content = chunk.content if hasattr(chunk, "content") else ""
+                if content and isinstance(content, str):
+                    had_tokens = True
+                    yield f"data: {json.dumps({'type': 'token', 'content': content})}\n\n"
 
-            elif kind == "on_chain_end":
-                if node == "reply" and not reply_had_tokens:
-                    output = event["data"].get("output") or {}
-                    for msg in output.get("messages", []):
-                        content = (
-                            msg.content
-                            if hasattr(msg, "content")
-                            else (msg.get("content", "") if isinstance(msg, dict) else "")
-                        )
-                        if content:
-                            yield f"data: {json.dumps({'type': 'token', 'content': content})}\n\n"
+            # Detect workflow_started from run_workflow tool output
+            elif kind == "on_tool_end" and event.get("name") == "run_workflow":
+                raw = event["data"].get("output", "")
+                output_str = raw if isinstance(raw, str) else (raw.content if hasattr(raw, "content") else "")
+                try:
+                    info = json.loads(output_str)
+                    if info.get("__event__") == "workflow_started":
+                        yield f"data: {json.dumps({'type': 'workflow_started', 'run_id': info['run_id'], 'workflow_id': info['workflow_id'], 'workflow_name': info['workflow_name']})}\n\n"
+                except (json.JSONDecodeError, KeyError):
+                    pass
 
-                elif node == "spawn_workflow":
-                    output = event["data"].get("output") or {}
-                    spawned = output.get("spawned_workflow")
-                    if spawned:
-                        yield f"data: {json.dumps({'type': 'workflow_started', **spawned})}\n\n"
+            # Fallback: non-streaming final agent message (some models don't stream)
+            elif kind == "on_chain_end" and node == "agent" and not had_tokens:
+                output = event["data"].get("output") or {}
+                for msg in output.get("messages", []):
+                    content = (
+                        msg.content
+                        if hasattr(msg, "content")
+                        else (msg.get("content", "") if isinstance(msg, dict) else "")
+                    )
+                    if content and isinstance(content, str):
+                        yield f"data: {json.dumps({'type': 'token', 'content': content})}\n\n"
 
         # Check whether the graph paused at an ask_context interrupt
         state = await graph.aget_state(config)

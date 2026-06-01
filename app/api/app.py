@@ -25,6 +25,7 @@ from app.core.config import get_settings
 from app.core.container import ApplicationContainer, build_container
 from app.domain.models.graph_run import GraphRun
 from app.infrastructure.auth.auth_service import AuthService
+from app.infrastructure.orchestration.chat_agent_loader import load_chat_agent_config
 from app.infrastructure.orchestration.default_workflow import build_default_workflow
 from app.infrastructure.orchestration.router_agent import build_router_graph
 
@@ -165,11 +166,26 @@ async def lifespan(app: FastAPI):
     app.state.container = container
 
     router_graph = build_router_graph(container.llm)
+
+    # Load bundled chat agent config (always, regardless of workflow backend type)
+    settings = get_settings()
+    agent_config = load_chat_agent_config(
+        getattr(settings, "chat_agent_config_path", None)
+    )
+
+    # Resolve the LLM for the chat agent — use llm_provider from YAML if set,
+    # otherwise fall back to the container's default LLM.
+    chat_llm = container.llm
+    agent_provider = agent_config.get("llm_provider")
+    if agent_provider and container.llm_factory:
+        chat_llm = container.llm_factory(agent_provider, agent_config.get("model"))
+
     default_graph = build_default_workflow(
-        container.llm,
+        chat_llm,
         container.yaml_graph_registry,
         container.run_repository,
         checkpointer=container.checkpointer,
+        agent_config=agent_config,
     )
     sdk = CopilotKitRemoteEndpoint(
         agents=[
