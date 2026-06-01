@@ -148,6 +148,10 @@ class Settings(BaseSettings):
     # Namespace where K8sRuntime deploys agent Helm releases.
     # Must match the namespace the backend pod runs in so its ServiceAccount has RBAC.
     agent_namespace: str = Field(default="langgraph", alias="AGENT_NAMESPACE")
+    # Override the callback URL passed to K8s agents. Useful when the default
+    # base_url is an OAuth-protected external URL and agents need to call back
+    # via an internal cluster URL instead. Defaults to base_url when not set.
+    agent_callback_url: str | None = Field(default=None, alias="AGENT_CALLBACK_URL")
 
     # --- Docker registry auth (used by DockerRuntime to pull private images) ---
     # Set DOCKER_REGISTRY_USERNAME + DOCKER_REGISTRY_PASSWORD to enable auth.

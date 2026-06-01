@@ -91,7 +91,7 @@ class ApplicationContainer:
             if runner is not None:
                 if self.agent_backend is not None:
                     runner._agent_backend = self.agent_backend
-                runner._callback_base_url = self.settings.base_url
+                runner._callback_base_url = self.settings.agent_callback_url or self.settings.base_url
         logger.info("Loaded %d workflow definition(s) from backend", len(definitions))
         self._setup_all_cron_triggers()
 
@@ -205,7 +205,7 @@ class ApplicationContainer:
             )
             if self.agent_backend is not None:
                 runner._agent_backend = self.agent_backend
-            runner._callback_base_url = self.settings.base_url
+            runner._callback_base_url = self.settings.agent_callback_url or self.settings.base_url
             self.yaml_graph_registry._runners[workflow_id] = runner
             self._register_cron_steps(runner)
             logger.info("Registry runner refreshed for workflow '%s'", workflow_id)
@@ -360,7 +360,7 @@ class ApplicationContainer:
                 runner._run_repository = self.run_repository
                 if self.agent_backend is not None:
                     runner._agent_backend = self.agent_backend
-                runner._callback_base_url = self.settings.base_url
+                runner._callback_base_url = self.settings.agent_callback_url or self.settings.base_url
                 return runner
             except Exception:
                 logger.exception("run %s: failed to build runner from definition snapshot", run.id)
