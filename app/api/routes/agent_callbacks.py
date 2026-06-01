@@ -110,6 +110,18 @@ async def agent_output(
             detail=f"Runner for run '{run_id}' not found (workflow '{run.graph_id}' not in registry)",
         )
 
+    # If the agent reported a failure, propagate it as a run failure instead of
+    # resuming the graph with an error string as output.
+    if "error" in body.output:
+        error_msg = str(body.output["error"])
+        logger.warning("run %s: agent reported error: %s", run_id, error_msg[:200])
+        run.status = "failed"
+        run.state = {**(run.state or {}), "error": f"Agent error: {error_msg}"}
+        run.agent_url = None
+        run.touch()
+        await container.run_repository.update(run)
+        return {"run_id": run_id, "status": "failed"}
+
     # Transition status immediately so the polling client sees the change
     # even before the background task drains.
     run.status = "running"
