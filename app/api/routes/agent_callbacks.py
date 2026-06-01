@@ -101,9 +101,13 @@ async def agent_output(
 
     runner = container.live_runners.get(run_id)
     if runner is None:
+        # Fall back to the workflow registry — covers runs triggered outside this
+        # process (e.g. server restart, multi-replica, or direct DB injection).
+        runner = container.yaml_graph_registry.get(run.graph_id)
+    if runner is None:
         raise HTTPException(
             status_code=404,
-            detail=f"Runner for run '{run_id}' not found (server may have restarted)",
+            detail=f"Runner for run '{run_id}' not found (workflow '{run.graph_id}' not in registry)",
         )
 
     # Transition status immediately so the polling client sees the change
