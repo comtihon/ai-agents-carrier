@@ -630,7 +630,16 @@ class YamlGraphRunner:
                         for r in routes
                         if "next" in r
                     }
-                    sg.add_conditional_edges(sid, self._make_router_fn(sid, routes), route_map)
+                    step_when = step.get("when")
+                    if step_when:
+                        # When the step's own guard is false (step was skipped),
+                        # the router must still fire — add END as a reachable target.
+                        route_map[END] = END
+                    sg.add_conditional_edges(
+                        sid,
+                        self._make_router_fn(sid, routes, step_when=step_when),
+                        route_map,
+                    )
             elif next_val:
                 sg.add_edge(sid, next_val if next_val in all_ids else END)
             elif i < len(self._steps) - 1:
@@ -747,7 +756,7 @@ class YamlGraphRunner:
     _MAX_ROUTE_WAIT_SECONDS: float = 3600.0
 
     def _make_router_fn(
-        self, source_id: str, routes: list[dict[str, Any]]
+        self, source_id: str, routes: list[dict[str, Any]], step_when: str | None = None
     ) -> Callable[[dict], Awaitable[str]]:
         """Return an async routing function for add_conditional_edges.
 
@@ -827,6 +836,11 @@ class YamlGraphRunner:
         runner = self
 
         async def router(state: dict) -> str:
+            # When the enclosing step's own guard is false (step body returned {})
+            # the conditional edge router still fires.  Short-circuit to END so
+            # downstream steps never run after a skipped conditional step.
+            if step_when and not _eval_condition(step_when, state):
+                return END
             chosen = _select(state)
             wait = chosen.get("wait_seconds")
             if wait:
