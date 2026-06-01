@@ -1383,7 +1383,14 @@ class YamlGraphRunner:
                         resp = await client.request(method, url, headers=headers, json=body)
                 result: dict[str, Any] = {"status": resp.status_code, "body": resp.text}
                 logger.info("[%s] step '%s' finished (status=%d)", graph_id, step_id, resp.status_code)
+                if resp.status_code >= 400 and not step.get("ignore_http_errors"):
+                    raise ValueError(
+                        f"HTTP {resp.status_code} from {method} {url}: {resp.text[:500]}"
+                    )
                 return {output_key: result}
+            except ValueError:
+                # Re-raise HTTP error responses so the step is marked failed.
+                raise
             except Exception as exc:
                 logger.exception("[%s] step '%s' http_call failed", graph_id, step_id)
                 return {output_key: {"error": str(exc)}}
