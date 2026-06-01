@@ -92,52 +92,48 @@ def _require_backend(container: ApplicationContainer) -> None:
         raise HTTPException(status_code=501, detail="Workflow backend not configured")
 
 
-def _steps_from_definition(
+def _build_steps(raw_steps: list, run: GraphRun) -> list[dict]:
+    run_error = (run.state or {}).get("error") if run.status == "failed" else None
+    return [
+        {
+            "id": s["id"],
+            "type": _STEP_TYPE_MAP.get(s.get("type", "llm"), s.get("type", "llm")),
+            "name": s.get("name", s["id"]),
+            "status": run.step_statuses.get(s["id"], "pending"),
+            "input": run.step_inputs.get(s["id"]),
+            "output": run.step_outputs.get(s["id"]),
+            "error": run_error if run.step_statuses.get(s["id"]) == "failed" else None,
+        }
+        for s in raw_steps
+    ]
+
+
+async def _steps_from_definition(
     run: GraphRun,
     runner: YamlGraphRunner | None,
+    container: "ApplicationContainer | None" = None,
 ) -> tuple[str, list[dict]]:
     """Return (workflow_name, steps_list) for a run response.
 
     Priority:
     1. Live runner (still in memory with step definitions).
     2. Definition snapshot stored in the run at start time.
-    3. Fallback: empty steps with graph_id as name.
+    3. Workflow backend lookup (for old runs where snapshot is absent).
+    4. Fallback: empty steps with graph_id as name.
     """
     if runner is not None:
-        name = runner.name
-        run_error = (run.state or {}).get("error") if run.status == "failed" else None
-        steps = [
-            {
-                "id": s["id"],
-                "type": _STEP_TYPE_MAP.get(s.get("type", "llm"), s.get("type", "llm")),
-                "name": s.get("name", s["id"]),
-                "status": run.step_statuses.get(s["id"], "pending"),
-                "input": run.step_inputs.get(s["id"]),
-                "output": run.step_outputs.get(s["id"]),
-                "error": run_error if run.step_statuses.get(s["id"]) == "failed" else None,
-            }
-            for s in runner.steps
-        ]
-        return name, steps
+        return runner.name, _build_steps(runner.steps, run)
 
     if run.workflow_definition:
         raw = run.workflow_definition
         raw_name: str = raw.get("name") or ""
         name = raw_name or raw["id"].replace("-", " ").replace("_", " ").title()
-        run_error = (run.state or {}).get("error") if run.status == "failed" else None
-        steps = [
-            {
-                "id": s["id"],
-                "type": _STEP_TYPE_MAP.get(s.get("type", "llm"), s.get("type", "llm")),
-                "name": s.get("name", s["id"]),
-                "status": run.step_statuses.get(s["id"], "pending"),
-                "input": run.step_inputs.get(s["id"]),
-                "output": run.step_outputs.get(s["id"]),
-                "error": run_error if run.step_statuses.get(s["id"]) == "failed" else None,
-            }
-            for s in raw.get("steps", [])
-        ]
-        return name, steps
+        return name, _build_steps(raw.get("steps", []), run)
+
+    if container is not None and container.workflow_backend is not None:
+        defn = await container.workflow_backend.get(run.graph_id)
+        if defn is not None:
+            return defn.name or run.graph_id, _build_steps(defn.steps, run)
 
     return run.graph_id, []
 
