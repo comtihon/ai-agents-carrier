@@ -230,6 +230,7 @@ async def stream_graph_to_pause(
         # step_statuses untouched — the run-level error message is the
         # authoritative signal, and falsely flagging the next forward step
         # as failed misleads the UI when the failure is in a retry loop.
+        error_msg = f"{type(exc).__name__}: {exc}"
         running_sid = next(
             (sid for sid, st in run.step_statuses.items() if st == "running"),
             None,
@@ -237,16 +238,19 @@ async def stream_graph_to_pause(
         if running_sid is not None:
             run.step_inputs[running_sid] = dict(current_state)
             run.step_statuses[running_sid] = "failed"
+            run.step_outputs[running_sid] = {"error": error_msg}
         else:
             failed_sid = current_state.get("__failed_step__") if isinstance(current_state, dict) else None
             if isinstance(failed_sid, str) and failed_sid in run.step_statuses:
                 run.step_inputs[failed_sid] = dict(current_state)
                 run.step_statuses[failed_sid] = "failed"
+                if not run.step_outputs.get(failed_sid):
+                    run.step_outputs[failed_sid] = {"error": error_msg}
         run.status = "failed"
         # Preserve accumulated step outputs AND any internal state keys written
         # mid-step by _save_conv_id (e.g. _openhands_conv_*, _conv_map).
         mid_run = {k: v for k, v in (run.state or {}).items() if k.startswith("_")}
-        run.state = {**current_state, **mid_run, "error": str(exc)}
+        run.state = {**current_state, **mid_run, "error": error_msg}
         run.current_step = None
         run.touch()
         await run_repository.update(run)

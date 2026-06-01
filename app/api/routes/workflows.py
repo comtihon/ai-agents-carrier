@@ -105,6 +105,7 @@ def _steps_from_definition(
     """
     if runner is not None:
         name = runner.name
+        run_error = (run.state or {}).get("error") if run.status == "failed" else None
         steps = [
             {
                 "id": s["id"],
@@ -113,6 +114,7 @@ def _steps_from_definition(
                 "status": run.step_statuses.get(s["id"], "pending"),
                 "input": run.step_inputs.get(s["id"]),
                 "output": run.step_outputs.get(s["id"]),
+                "error": run_error if run.step_statuses.get(s["id"]) == "failed" else None,
             }
             for s in runner.steps
         ]
@@ -122,6 +124,7 @@ def _steps_from_definition(
         raw = run.workflow_definition
         raw_name: str = raw.get("name") or ""
         name = raw_name or raw["id"].replace("-", " ").replace("_", " ").title()
+        run_error = (run.state or {}).get("error") if run.status == "failed" else None
         steps = [
             {
                 "id": s["id"],
@@ -130,6 +133,7 @@ def _steps_from_definition(
                 "status": run.step_statuses.get(s["id"], "pending"),
                 "input": run.step_inputs.get(s["id"]),
                 "output": run.step_outputs.get(s["id"]),
+                "error": run_error if run.step_statuses.get(s["id"]) == "failed" else None,
             }
             for s in raw.get("steps", [])
         ]
