@@ -1373,8 +1373,8 @@ class YamlGraphRunner:
                 url = self._render(step.get("url", ""), state)
                 raw_headers = step.get("headers", {})
                 headers = {k: self._render(str(v), state) for k, v in raw_headers.items()}
-                raw_body = step.get("body", {})
-                body = {k: self._render(str(v), state) for k, v in raw_body.items()} if raw_body else None
+                raw_body = step.get("body")
+                body = self._render_deep(raw_body, state) if raw_body else None
                 logger.info("[%s] step '%s' url=%s", graph_id, step_id, url)
                 async with httpx.AsyncClient(timeout=60) as client:
                     if method in ("GET", "DELETE", "HEAD"):
@@ -1543,15 +1543,29 @@ class YamlGraphRunner:
     def _render(template: str, state: dict) -> str:
         """Render a {key} template against state; missing keys render as empty string.
 
-        Use {env.VAR_NAME} to read from environment variables, e.g. {env.HUBSPOT_TOKEN}.
+        Supports {env.VAR_NAME} and {env[VAR_NAME]} to read environment variables.
+        Chained access like {obj[key1][key2]} renders as empty string when any level is missing.
         """
         class _EnvAccessor:
             def __getattr__(self, name: str) -> str:
                 return os.environ.get(name, "")
+            def __getitem__(self, name: str) -> str:
+                return os.environ.get(name, "")
+
+        class _Safe:
+            """Returned for missing keys; silently absorbs further attribute/item access."""
+            def __getattr__(self, name: str) -> "_Safe":
+                return _Safe()
+            def __getitem__(self, key: object) -> "_Safe":
+                return _Safe()
+            def __format__(self, fmt: str) -> str:
+                return ""
+            def __str__(self) -> str:
+                return ""
 
         class _DefaultDict(dict):
-            def __missing__(self, key: str) -> str:
-                return ""
+            def __missing__(self, key: str) -> "_Safe":
+                return _Safe()
 
         d = _DefaultDict(state)
         d["env"] = _EnvAccessor()
@@ -1559,6 +1573,17 @@ class YamlGraphRunner:
             return string.Formatter().vformat(template, [], d)  # type: ignore[arg-type]
         except ValueError:
             return template
+
+    @classmethod
+    def _render_deep(cls, value: Any, state: dict) -> Any:
+        """Recursively render {key} templates in dicts, lists, and strings."""
+        if isinstance(value, str):
+            return cls._render(value, state)
+        if isinstance(value, dict):
+            return {k: cls._render_deep(v, state) for k, v in value.items()}
+        if isinstance(value, list):
+            return [cls._render_deep(item, state) for item in value]
+        return value
 
     @staticmethod
     def _build_output_model(output_spec: list[dict[str, Any]]) -> type[BaseModel]:
