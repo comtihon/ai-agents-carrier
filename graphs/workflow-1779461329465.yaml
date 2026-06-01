@@ -99,10 +99,10 @@ steps:
 ui:
   nodes:
     node_88f181012586:
-      x: 20
+      x: -60
       y: 200
     node_print_result:
-      x: 220
+      x: 180
       y: 200
     node_parallel:
       x: 420
@@ -117,7 +117,7 @@ ui:
       x: 860
       y: 200
     node_decide:
-      x: 1060
+      x: 1010
       y: 200
     node_switch:
       x: 1260
@@ -129,12 +129,12 @@ ui:
       x: 1460
       y: 300
     slack-1780050830283:
-      x: 20
+      x: -60
       y: 248
   addons:
   - id: slack-1780050830283
     type: slack
     attachedTo: node_88f181012586
     position:
-      x: 20
+      x: -60
       y: 248

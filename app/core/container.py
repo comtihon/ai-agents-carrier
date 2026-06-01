@@ -411,7 +411,7 @@ def build_llm_for(provider: str | None, model: str | None, settings: Settings) -
 
 
 def build_llm(settings: Settings) -> BaseChatModel:
-    return build_llm_for(settings.llm_provider, None, settings)
+    return build_llm_native(settings.llm_provider, None, settings)
 
 
 def build_llm_native(
