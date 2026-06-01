@@ -103,6 +103,8 @@ class K8sRuntime(AgentRuntime):
             release_name, agent_def.helm_chart, run_id,
         )
 
+        await self._try_oci_registry_login(agent_def.helm_chart)
+
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -186,3 +188,52 @@ class K8sRuntime(AgentRuntime):
                 return resp.status_code == 200
         except Exception:
             return False
+
+    @staticmethod
+    async def _try_oci_registry_login(chart_ref: str) -> None:
+        """Authenticate helm to an OCI registry before pulling the chart.
+
+        Extracts the registry hostname from an ``oci://`` chart reference and
+        attempts ``helm registry login`` using an OAuth2 access token obtained
+        from the GCP instance metadata server.  This is the standard approach
+        for GKE workloads accessing Google Artifact Registry.
+
+        Silently skips when:
+        - *chart_ref* is not an OCI reference
+        - the metadata server is unreachable (non-GKE environments)
+        - the login command fails (will surface later in helm upgrade)
+        """
+        if not chart_ref.startswith("oci://"):
+            return
+
+        registry = chart_ref[len("oci://"):].split("/")[0]
+
+        # Fetch an access token from the GCP metadata server (GKE only).
+        try:
+            import json
+            import urllib.request
+            req = urllib.request.Request(
+                "http://metadata.google.internal/computeMetadata/v1"
+                "/instance/service-accounts/default/token",
+                headers={"Metadata-Flavor": "Google"},
+            )
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                access_token: str = json.loads(resp.read())["access_token"]
+        except Exception:
+            return  # Not on GKE or metadata server unavailable — skip silently
+
+        proc = await asyncio.create_subprocess_exec(
+            "helm", "registry", "login", registry,
+            "--username", "oauth2accesstoken",
+            "--password", access_token,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode == 0:
+            logger.info("K8sRuntime: authenticated helm to OCI registry %s", registry)
+        else:
+            logger.warning(
+                "K8sRuntime: helm registry login to %s failed: %s",
+                registry, stderr.decode(),
+            )
