@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import re
 import string
 from collections.abc import Awaitable, Callable
@@ -1043,24 +1044,29 @@ class YamlGraphRunner:
 
         async def node(state: dict) -> dict:
             step_id = step["id"]
+            output_key = step.get("output_key") or step_id
             if not self._when(step, state):
                 logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
                 return {}
             logger.info("[%s] step '%s' running (llm)", graph_id, step_id)
-            system_prompt = step.get("system_prompt", "")
-            user_message = self._render(step.get("user_template", "{request}"), state)
-            messages = [
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=user_message),
-            ]
-            logger.info(
-                "[%s] step '%s' → LLM | system: %s | user: %s",
-                graph_id, step_id, system_prompt, user_message,
-            )
-            response = await llm.ainvoke(messages)
-            logger.info("[%s] step '%s' ← LLM | content: %r", graph_id, step_id, response.content)
-            logger.info("[%s] step '%s' finished", graph_id, step_id)
-            return {step["output_key"]: response.content}
+            try:
+                system_prompt = step.get("system_prompt", "")
+                user_message = self._render(step.get("user_template", "{request}"), state)
+                messages = [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=user_message),
+                ]
+                logger.info(
+                    "[%s] step '%s' → LLM | system: %s | user: %s",
+                    graph_id, step_id, system_prompt, user_message,
+                )
+                response = await llm.ainvoke(messages)
+                logger.info("[%s] step '%s' ← LLM | content: %r", graph_id, step_id, response.content)
+                logger.info("[%s] step '%s' finished", graph_id, step_id)
+                return {output_key: response.content}
+            except Exception as exc:
+                logger.exception("[%s] step '%s' llm failed", graph_id, step_id)
+                return {output_key: {"error": str(exc)}}
         return node
 
     def _mcp_node(self, step: dict[str, Any]):
@@ -1081,11 +1087,11 @@ class YamlGraphRunner:
                 if "output_key" in step:
                     return {step["output_key"]: f"MCP tool '{tool_name}' not available"}
                 return {}
-            tool_input = {
-                k: self._render(v, state)
-                for k, v in step.get("tool_input", {}).items()
-            }
             try:
+                tool_input = {
+                    k: self._render(v, state)
+                    for k, v in step.get("tool_input", {}).items()
+                }
                 result = await tool.ainvoke(tool_input)
                 logger.info("[%s] step '%s' finished", graph_id, step_id)
                 if "output_key" in step:
@@ -1182,10 +1188,6 @@ class YamlGraphRunner:
             if self._openhands is None:
                 logger.warning("[%s] step '%s' OpenHands not configured", graph_id, step_id)
                 return {output_key: "OpenHands not configured"}
-            repo = self._render(step.get("repo_template", "{repo}"), state)
-            instructions = self._render(step.get("instructions_template", "{plan}"), state)
-            branch_template = step.get("branch_template")
-            branch = self._render(branch_template, state) if branch_template else None
             conv_id_key = f"_openhands_conv_{step_id}"
             conversation_id: str | None = step.get("conversation_id")
             conv_map: dict = dict(state.get("_conv_map") or {})
@@ -1206,9 +1208,14 @@ class YamlGraphRunner:
                 self._current_run.touch()
                 await self._current_run_repository.update(self._current_run)
 
-            logger.info("[%s] step '%s' running (execute repo='%s'%s)", graph_id, step_id, repo,
-                        f", resuming conv {existing_conv_id}" if existing_conv_id else "")
+            logger.info("[%s] step '%s' running (execute)", graph_id, step_id)
             try:
+                repo = self._render(step.get("repo_template", "{repo}"), state)
+                instructions = self._render(step.get("instructions_template", "{plan}"), state)
+                branch_template = step.get("branch_template")
+                branch = self._render(branch_template, state) if branch_template else None
+                logger.info("[%s] step '%s' repo='%s'%s", graph_id, step_id, repo,
+                            f", resuming conv {existing_conv_id}" if existing_conv_id else "")
                 result = await self._openhands.execute(
                     repo=repo,
                     instructions=instructions,
@@ -1269,27 +1276,31 @@ class YamlGraphRunner:
                 )
                 return {output_key: {"error": f"workflow '{child_workflow_id}' not found"}}
 
-            child_request = self._render(step.get("input_template", "{request}"), state)
-            child_run_id = str(uuid4())
-            child_run = GraphRun(
-                id=child_run_id,
-                graph_id=child_workflow_id,
-                user_request=child_request,
-                status="running",
-                step_statuses={s["id"]: "pending" for s in child_runner.steps},
-            )
-            await self._run_repository.create(child_run)
+            try:
+                child_request = self._render(step.get("input_template", "{request}"), state)
+                child_run_id = str(uuid4())
+                child_run = GraphRun(
+                    id=child_run_id,
+                    graph_id=child_workflow_id,
+                    user_request=child_request,
+                    status="running",
+                    step_statuses={s["id"]: "pending" for s in child_runner.steps},
+                )
+                await self._run_repository.create(child_run)
 
-            # Fire-and-forget: child runs independently in the background
-            asyncio.create_task(
-                stream_graph_to_pause(child_runner, child_run, self._run_repository, {"request": child_request})
-            )
+                # Fire-and-forget: child runs independently in the background
+                asyncio.create_task(
+                    stream_graph_to_pause(child_runner, child_run, self._run_repository, {"request": child_request})
+                )
 
-            logger.info(
-                "[%s] step '%s' spawned child workflow '%s' as run %s",
-                graph_id, step_id, child_workflow_id, child_run_id,
-            )
-            return {output_key: {"child_run_id": child_run_id, "workflow_id": child_workflow_id, "status": "started"}}
+                logger.info(
+                    "[%s] step '%s' spawned child workflow '%s' as run %s",
+                    graph_id, step_id, child_workflow_id, child_run_id,
+                )
+                return {output_key: {"child_run_id": child_run_id, "workflow_id": child_workflow_id, "status": "started"}}
+            except Exception as exc:
+                logger.exception("[%s] step '%s' workflow spawn failed", graph_id, step_id)
+                return {output_key: {"error": str(exc)}}
 
         return node
 
@@ -1354,15 +1365,17 @@ class YamlGraphRunner:
                 logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
                 return {}
 
-            url = self._render(step.get("url", ""), state)
             method = step.get("method", "GET").upper()
-            headers = {k: self._render(str(v), state) for k, v in step.get("headers", {}).items()}
-            raw_body = step.get("body", {})
-            body = {k: self._render(str(v), state) for k, v in raw_body.items()} if raw_body else None
             output_key = step.get("output_key") or step_id
 
-            logger.info("[%s] step '%s' running (http_call %s %s)", graph_id, step_id, method, url)
+            logger.info("[%s] step '%s' running (http_call %s ...)", graph_id, step_id, method)
             try:
+                url = self._render(step.get("url", ""), state)
+                raw_headers = step.get("headers", {})
+                headers = {k: self._render(str(v), state) for k, v in raw_headers.items()}
+                raw_body = step.get("body", {})
+                body = {k: self._render(str(v), state) for k, v in raw_body.items()} if raw_body else None
+                logger.info("[%s] step '%s' url=%s", graph_id, step_id, url)
                 async with httpx.AsyncClient(timeout=60) as client:
                     if method in ("GET", "DELETE", "HEAD"):
                         resp = await client.request(method, url, headers=headers)
@@ -1401,23 +1414,21 @@ class YamlGraphRunner:
             output_key = step.get("output_key") or step_id
 
             logger.info("[%s] step '%s' running (python)", graph_id, step_id)
-            local_vars: dict[str, Any] = {"state": dict(state), "output": None}
-            compiled = compile(code, f"<workflow:{graph_id}:{step_id}>", "exec")
-
-            def _run() -> None:
-                exec(compiled, {"__builtins__": __builtins__}, local_vars)  # noqa: S102
-
-            loop = asyncio.get_event_loop()
             try:
-                await loop.run_in_executor(None, _run)
-            except Exception as exc:
-                raise ValueError(
-                    f"[{graph_id}] Python step '{step_id}' raised: {exc}"
-                ) from exc
+                local_vars: dict[str, Any] = {"state": dict(state), "output": None}
+                compiled = compile(code, f"<workflow:{graph_id}:{step_id}>", "exec")
 
-            result = local_vars.get("output")
-            logger.info("[%s] step '%s' finished", graph_id, step_id)
-            return {output_key: result}
+                def _run() -> None:
+                    exec(compiled, {"__builtins__": __builtins__}, local_vars)  # noqa: S102
+
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, _run)
+                result = local_vars.get("output")
+                logger.info("[%s] step '%s' finished", graph_id, step_id)
+                return {output_key: result}
+            except Exception as exc:
+                logger.exception("[%s] step '%s' python failed", graph_id, step_id)
+                return {output_key: {"error": str(exc)}}
 
         return node
 
@@ -1530,13 +1541,22 @@ class YamlGraphRunner:
 
     @staticmethod
     def _render(template: str, state: dict) -> str:
-        """Render a {key} template against state; missing keys render as empty string."""
+        """Render a {key} template against state; missing keys render as empty string.
+
+        Use {env.VAR_NAME} to read from environment variables, e.g. {env.HUBSPOT_TOKEN}.
+        """
+        class _EnvAccessor:
+            def __getattr__(self, name: str) -> str:
+                return os.environ.get(name, "")
+
         class _DefaultDict(dict):
             def __missing__(self, key: str) -> str:
                 return ""
 
+        d = _DefaultDict(state)
+        d["env"] = _EnvAccessor()
         try:
-            return string.Formatter().vformat(template, [], _DefaultDict(state))  # type: ignore[arg-type]
+            return string.Formatter().vformat(template, [], d)  # type: ignore[arg-type]
         except ValueError:
             return template
 
