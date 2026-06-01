@@ -92,7 +92,6 @@ class K8sRuntime(AgentRuntime):
             release_name,
             agent_def.helm_chart,
             "--namespace", self._namespace,
-            "--create-namespace",
             "--wait",          # wait for the rollout to complete
             "--timeout", "120s",
             *set_args,
