@@ -906,6 +906,7 @@ class YamlGraphRunner:
             return await execute_agent_step(
                 step, state, agent_backend, run_id, callback_base_url,
                 settings=get_settings(),
+                run_repository=self._current_run_repository,
             )
 
         return node

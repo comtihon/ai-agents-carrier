@@ -181,7 +181,7 @@ async def _get_interrupt_payload(runner: YamlGraphRunner | None, run: GraphRun) 
 
 
 async def _run_response(run: GraphRun, runner: YamlGraphRunner | None = None) -> dict:
-    workflow_name, steps = _steps_from_definition(run, runner)
+    workflow_name, steps = await _steps_from_definition(run, runner)
     interrupt_payload = await _get_interrupt_payload(runner, run)
     return {
         "id": run.id,

@@ -310,6 +310,7 @@ async def execute_agent_step(
     callback_base_url: str,
     settings: "Settings | None" = None,
     progress_cb: Callable[[str], Awaitable[None]] | None = None,
+    run_repository: Any = None,
 ) -> dict[str, Any]:
     """Execute a ``langgraph-agent`` or ``claude-agent`` step.
 
@@ -479,8 +480,42 @@ async def execute_agent_step(
             step_id, run_id, list(raw_output),
         )
 
-        # --- 5d. Meta-LLM: decide whether to proceed, ask clarification, approve, or fail ---
-        if settings is not None:
+        # --- 5d. Surface unanswered clarify-tool question, then meta-LLM ---
+        # If the agent called the clarify tool but nobody answered (timeout or skip),
+        # _pending_question is still set in the run's DB state. Re-surface it as an
+        # ask_context interrupt so the UI and Slack can handle it properly — bypassing
+        # meta-LLM which would otherwise decide "proceed" on the partial output.
+        _surfaced_pending = False
+        if run_repository is not None:
+            try:
+                fresh_run = await run_repository.get(run_id)
+                pending_q = (fresh_run.state or {}).get("_pending_question") if fresh_run else None
+            except Exception:
+                pending_q = None
+            if pending_q:
+                question_text = (
+                    pending_q.get("question", str(pending_q))
+                    if isinstance(pending_q, dict) else str(pending_q)
+                )
+                logger.info(
+                    "[step '%s'] unanswered clarify question detected — surfacing as ask_context",
+                    step_id,
+                )
+                answers = interrupt({"type": "ask_context", "questions": [question_text]})
+                if isinstance(answers, dict) and answers:
+                    raw_output = {**raw_output, "_clarification_answers": answers}
+                # Clear the marker so it doesn't re-trigger on the next resume
+                try:
+                    r2 = await run_repository.get(run_id)
+                    if r2 and "_pending_question" in (r2.state or {}):
+                        r2.state = {k: v for k, v in r2.state.items() if k != "_pending_question"}
+                        r2.touch()
+                        await run_repository.update(r2)
+                except Exception:
+                    pass
+                _surfaced_pending = True
+
+        if not _surfaced_pending and settings is not None:
             _meta = await _meta_llm_decide(raw_output, input_data, step_id, settings)
             if _meta["decision"] == "fail":
                 raise RuntimeError(
@@ -489,14 +524,8 @@ async def execute_agent_step(
             elif _meta["decision"] == "ask_approval":
                 interrupt({"type": "ask_approval", "plan": raw_output, "reason": _meta.get("reason", "")})
             elif _meta["decision"] == "ask_clarification" and _meta["questions"]:
-                # Pause for user clarification. On resume, answers are returned by interrupt().
-                # They are stored in state so the next agent execution can use them as context.
                 answers = interrupt({"type": "ask_context", "questions": _meta["questions"]})
                 if isinstance(answers, dict) and answers:
-                    # Inject answers into raw_output so downstream state carries them;
-                    # the agent node re-runs from the top on resume and will re-execute
-                    # with the original input — answers are provided as additional context
-                    # via the "_clarification_answers" state key (picked up next run).
                     raw_output = {**raw_output, "_clarification_answers": answers}
 
     # --- 6. Map output back to workflow state ---
