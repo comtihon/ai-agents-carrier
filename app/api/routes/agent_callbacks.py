@@ -181,6 +181,32 @@ async def agent_question(
     run.touch()
     await container.run_repository.update(run)
 
+    # Send Slack notification so the user can answer from Slack (thread reply)
+    # or from the UI popup. Only fires once per question (first ask).
+    try:
+        from app.core.config import get_settings
+        from app.infrastructure.notifications.webhook_notifier import post_slack_ask_context
+        settings = get_settings()
+        if settings.slack_bot_token and settings.slack_approvals_channel:
+            existing_ts = (run.state or {}).get("_slack_ask_context_ts")
+            if not existing_ts:
+                notif_resp = await post_slack_ask_context(
+                    settings.slack_bot_token,
+                    settings.slack_approvals_channel,
+                    [body.question],
+                    run_id,
+                    run.state or {},
+                )
+                if notif_resp and notif_resp.get("ok"):
+                    ts = notif_resp.get("ts")
+                    channel = notif_resp.get("channel")
+                    if ts and channel:
+                        run.state = {**run.state, "_slack_ask_context_ts": ts, "_slack_ask_context_channel": channel}
+                        run.touch()
+                        await container.run_repository.update(run)
+    except Exception:
+        logger.exception("run %s: failed to send Slack notification for agent question", run_id)
+
     logger.info("run %s: agent asked question: %r", run_id, body.question)
     return {"run_id": run_id, "status": "question_stored"}
 
