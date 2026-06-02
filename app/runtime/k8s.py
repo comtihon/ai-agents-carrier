@@ -181,6 +181,42 @@ class K8sRuntime(AgentRuntime):
         else:
             logger.info("K8sRuntime: release '%s' uninstalled", release_name)
 
+    async def terminate_by_run_id(self, run_id: str) -> None:
+        """Uninstall all Helm releases for the given run_id (best-effort, never raises)."""
+        try:
+            import json as _json
+            prefix = run_id[:8]
+            result = await asyncio.create_subprocess_exec(
+                "helm", "list", "-n", self._namespace, "--filter", f"agent-.*-{prefix}",
+                "-o", "json",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await result.communicate()
+            releases = _json.loads(stdout or "[]")
+            for rel in releases:
+                release_name = rel.get("name", "")
+                if not release_name:
+                    continue
+                try:
+                    cmd = [
+                        "helm", "uninstall", release_name,
+                        "--namespace", self._namespace,
+                    ]
+                    logger.info("K8sRuntime: helm uninstall '%s' (terminate_by_run_id)", release_name)
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    await proc.communicate()
+                    # Clean up in-memory tracking
+                    self._releases = {k: v for k, v in self._releases.items() if v != release_name}
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     async def is_alive(self, agent_url: str) -> bool:
         """Return True if the agent's /health endpoint responds with 200."""
         try:

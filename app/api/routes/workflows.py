@@ -70,6 +70,10 @@ class WorkflowDefinitionUpdateRequest(BaseModel):
     ui: dict[str, Any] = Field(default_factory=dict)
 
 
+class RestartFromStepRequest(BaseModel):
+    step_id: str
+
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _config(thread_id: str) -> dict:
@@ -782,6 +786,88 @@ async def retry_run(
     container.live_runners[run.id] = runner
     background_tasks.add_task(_retry_graph, runner, run, container, resume_input)
 
+    return await _run_response(run, runner)
+
+
+@router.post("/runs/{run_id}/restart-from-step")
+async def restart_from_step(
+    run_id: str,
+    body: RestartFromStepRequest,
+    background_tasks: BackgroundTasks,
+    container: ApplicationContainer = Depends(get_container),
+):
+    run = await container.run_repository.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run.status == "cancelled":
+        raise HTTPException(status_code=409, detail="Cannot restart a cancelled run")
+    if run.status == "running":
+        raise HTTPException(status_code=409, detail="Cannot restart a currently running workflow")
+
+    runner = container._build_runner_for_recovery(run)
+    if runner is None:
+        raise HTTPException(status_code=409, detail="Workflow definition unavailable")
+
+    step_ids = [s["id"] for s in runner.steps]
+    if body.step_id not in step_ids:
+        raise HTTPException(status_code=409, detail=f"Unknown step_id: {body.step_id}")
+
+    restart_idx = step_ids.index(body.step_id)
+
+    # Terminate any live agent container via the runtime (best-effort).
+    try:
+        from app.runtime.docker import DockerRuntime
+        await DockerRuntime(
+            registry_username=container.settings.docker_registry_username,
+            registry_password=container.settings.docker_registry_password,
+        ).terminate_by_run_id(run_id)
+    except Exception:
+        logger.debug("run %s: docker cleanup on restart-from-step failed", run_id, exc_info=True)
+    container.live_runners.pop(run_id, None)
+
+    # Build accumulated state from steps BEFORE restart_idx
+    accumulated: dict = {"request": run.user_request}
+    # Seed underscore-prefixed internal state keys from run.state (e.g. conv IDs),
+    # excluding _visit_counts so the restarted run gets a fresh loop counter.
+    for k, v in (run.state or {}).items():
+        if k.startswith("_") and k != "_visit_counts":
+            accumulated.setdefault(k, v)
+    last_done: str | None = None
+    for step in runner.steps[:restart_idx]:
+        sid = step["id"]
+        if run.step_statuses.get(sid) in ("finished", "skipped"):
+            output = run.step_outputs.get(sid) or {}
+            for k, v in output.items():
+                if k == "_visit_counts":
+                    continue
+                accumulated.setdefault(k, v)
+            last_done = sid
+
+    # Reset step_statuses, step_inputs, step_outputs for restart_idx and beyond
+    for step in runner.steps[restart_idx:]:
+        sid = step["id"]
+        run.step_statuses[sid] = "pending"
+        run.step_inputs.pop(sid, None)
+        run.step_outputs.pop(sid, None)
+
+    run.current_step = None
+    run.agent_url = None
+    run.status = "running"
+    run.state = accumulated
+
+    run.touch()
+    await container.run_repository.update(run)
+
+    # Re-seed LangGraph checkpoint
+    config = {"configurable": {"thread_id": run_id}}
+    if last_done is not None:
+        await runner.graph.aupdate_state(config, accumulated, as_node=last_done)
+        resume_input: Any = None
+    else:
+        resume_input = accumulated
+
+    container.live_runners[run_id] = runner
+    background_tasks.add_task(_retry_graph, runner, run, container, resume_input)
     return await _run_response(run, runner)
 
 
