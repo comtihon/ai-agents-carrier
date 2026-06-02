@@ -101,6 +101,16 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
             if "output_key" not in step and step.get("output_mapping"):
                 for wf_key in step["output_mapping"].values():
                     fields[wf_key] = Any  # type: ignore[assignment]
+            elif "output_key" not in step and not step.get("output_mapping"):
+                # No output declaration — agent output keys will be silently
+                # dropped by LangGraph's state reducer. Log a warning so this
+                # is caught during development rather than at runtime.
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "step '%s' (type=%s) has no output_key or output_mapping — "
+                    "agent output will not reach workflow state",
+                    step.get("id"), step.get("type"),
+                )
             fields[f"_agent_token_usage_{step['id']}"] = Any  # type: ignore[assignment]
     # Internal field: agent_url stored while a run is in waiting_agent state
     fields["_agent_url"] = Any  # type: ignore[assignment]
