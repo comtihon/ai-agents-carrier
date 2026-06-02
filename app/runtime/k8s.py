@@ -40,10 +40,19 @@ class K8sRuntime(AgentRuntime):
         http://<release_name>.<namespace>.svc.cluster.local:8000
     """
 
-    def __init__(self, namespace: str = "default") -> None:
+    def __init__(self, namespace: str = "default", callback_override_url: str | None = None) -> None:
         self._namespace = namespace
+        self._callback_override_url = callback_override_url
         # Maps agent_url → release_name
         self._releases: dict[str, str] = {}
+
+    def rewrite_callback_url(self, callback_base_url: str) -> str:
+        """Return the effective callback URL for the agent.
+
+        When ``callback_override_url`` is set (e.g. an internal cluster URL),
+        it takes precedence over the externally-visible ``callback_base_url``.
+        """
+        return self._callback_override_url if self._callback_override_url else callback_base_url
 
     def _release_name(self, agent_def: "AgentDefinition", run_id: str) -> str:
         return f"agent-{agent_def.id[:20]}-{run_id[:8]}"
@@ -79,7 +88,8 @@ class K8sRuntime(AgentRuntime):
         for key, value in (agent_def.helm_values or {}).items():
             set_args += ["--set", f"{key}={value}"]
         set_args += ["--set", f"env.AGENT_PORT={_AGENT_PORT}"]
-        set_args += ["--set", f"env.BACKEND_CALLBACK_URL={callback_base_url}"]
+        effective_url = self.rewrite_callback_url(callback_base_url)
+        set_args += ["--set", f"env.BACKEND_CALLBACK_URL={effective_url}"]
         set_args += ["--set", f"env.RUN_ID={run_id}"]
         for k, v in (extra_env or {}).items():
             set_args += ["--set-string", f"env.{k}={v}"]
