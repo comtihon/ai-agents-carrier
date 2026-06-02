@@ -261,7 +261,41 @@ class ApplicationContainer:
         config = {"configurable": {"thread_id": run.id}}
 
         if run.status == "waiting_agent":
-            # Agent container may still be running after server restart — attempt cleanup.
+            # If the agent URL is known, probe it — the pod may still be running.
+            agent_url = run.agent_url
+            agent_alive = False
+            if agent_url:
+                try:
+                    from app.runtime.k8s import K8sRuntime
+                    agent_alive = await K8sRuntime(namespace=self.settings.agent_namespace).is_alive(agent_url)
+                except Exception:
+                    pass
+                if not agent_alive:
+                    try:
+                        from app.runtime.docker import DockerRuntime
+                        agent_alive = await DockerRuntime(
+                            registry_username=self.settings.docker_registry_username,
+                            registry_password=self.settings.docker_registry_password,
+                        ).is_alive(agent_url)
+                    except Exception:
+                        pass
+
+            if agent_alive:
+                # Pod survived the restart — reconnect by restoring the runner so
+                # agent callbacks (/agent/output, /agent/question, etc.) can reach it.
+                self.live_runners[run.id] = runner
+                logger.info(
+                    "run %s: waiting_agent on restart — agent at %s still alive, reconnected",
+                    run.id, agent_url,
+                )
+                return
+
+            # Agent is gone — clean up and mark failed.
+            try:
+                from app.runtime.k8s import K8sRuntime
+                await K8sRuntime(namespace=self.settings.agent_namespace).terminate_by_run_id(run.id)
+            except Exception:
+                logger.debug("run %s: k8s release cleanup on recovery failed", run.id, exc_info=True)
             try:
                 from app.runtime.docker import DockerRuntime
                 await DockerRuntime(
@@ -270,17 +304,12 @@ class ApplicationContainer:
                 ).terminate_by_run_id(run.id)
             except Exception:
                 logger.debug("run %s: docker cleanup on recovery failed", run.id, exc_info=True)
-            try:
-                from app.runtime.k8s import K8sRuntime
-                await K8sRuntime(namespace=self.settings.agent_namespace).terminate_by_run_id(run.id)
-            except Exception:
-                logger.debug("run %s: k8s release cleanup on recovery failed", run.id, exc_info=True)
             run.status = "failed"
             run.agent_url = None
             run.state = {**(run.state or {}), "error": "Agent container lost due to server restart"}
             run.touch()
             await self.run_repository.update(run)
-            logger.info("run %s: waiting_agent on restart — agent terminated and marked failed", run.id)
+            logger.info("run %s: waiting_agent on restart — agent gone, marked failed", run.id)
             return
 
         if run.status == "waiting_approval":
