@@ -227,6 +227,17 @@ async def agent_input(
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
 
+    pending = (run.state or {}).get("_pending_answer")
+    if pending is not None:
+        new_state = {k: v for k, v in (run.state or {}).items() if k != "_pending_answer"}
+        run.state = new_state
+        run.touch()
+        await container.run_repository.update(run)
+        _answers.pop(run_id, None)
+        _answer_events.pop(run_id, None)
+        logger.info("run %s: delivering persisted answer to agent", run_id)
+        return {"answer": pending}
+
     event = _get_or_create_event(run_id)
     try:
         await asyncio.wait_for(event.wait(), timeout=_LONG_POLL_TIMEOUT)
@@ -262,7 +273,10 @@ async def agent_reply(
 
     run = await container.run_repository.get(run_id)
     if run:
-        run.state = {k: v for k, v in (run.state or {}).items() if k != "_pending_question"}
+        run.state = {
+            **{k: v for k, v in (run.state or {}).items() if k != "_pending_question"},
+            "_pending_answer": body.answer,
+        }
         run.touch()
         await container.run_repository.update(run)
 

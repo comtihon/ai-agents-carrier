@@ -270,6 +270,11 @@ class ApplicationContainer:
                 ).terminate_by_run_id(run.id)
             except Exception:
                 logger.debug("run %s: docker cleanup on recovery failed", run.id, exc_info=True)
+            try:
+                from app.runtime.k8s import K8sRuntime
+                await K8sRuntime(namespace=self.settings.agent_namespace).terminate_by_run_id(run.id)
+            except Exception:
+                logger.debug("run %s: k8s release cleanup on recovery failed", run.id, exc_info=True)
             run.status = "failed"
             run.agent_url = None
             run.state = {**(run.state or {}), "error": "Agent container lost due to server restart"}
