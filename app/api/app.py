@@ -186,6 +186,8 @@ async def lifespan(app: FastAPI):
         container.run_repository,
         checkpointer=container.checkpointer,
         agent_config=agent_config,
+        workflow_backend=container.workflow_backend,
+        refresh_runner=container.refresh_runner,
     )
     sdk = CopilotKitRemoteEndpoint(
         agents=[

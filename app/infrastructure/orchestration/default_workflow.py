@@ -31,8 +31,11 @@ from app.domain.models.graph_run import GraphRun
 from app.infrastructure.orchestration.yaml_graph import stream_graph_to_pause
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from app.infrastructure.config.graph_loader import YamlGraphRegistry
     from app.infrastructure.persistence.mongo import MongoGraphRunRepository
+    from app.infrastructure.persistence.workflow_backend import WorkflowDefinitionBackend
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +63,8 @@ def build_default_workflow(
     run_repository: "MongoGraphRunRepository",
     checkpointer: BaseCheckpointSaver | None = None,
     agent_config: dict | None = None,
+    workflow_backend: "WorkflowDefinitionBackend | None" = None,
+    refresh_runner: "Callable[[str], Awaitable[None]] | None" = None,
 ):
     """Build and compile the default ReAct chat agent."""
 
@@ -195,7 +200,107 @@ def build_default_workflow(
             for i, q in enumerate(questions)
         )
 
-    tools = [list_workflows, run_workflow, list_runs, get_run, ask_user]
+    @tool
+    async def create_workflow(workflow_id: str, name: str, description: str, steps_json: str) -> str:
+        """Create a new workflow definition and register it immediately.
+
+        Args:
+            workflow_id: Unique kebab-case identifier (e.g. "send-slack-report").
+            name: Human-readable display name.
+            description: What this workflow does.
+            steps_json: JSON array of step objects. Each step must have "id" and "type".
+                Supported types: http (webhook trigger), cron (scheduled trigger),
+                llm_structured (LLM with structured output), llm (free-form LLM),
+                mcp (single MCP tool call), human_approval (pause for approval),
+                execute (OpenHands code execution), workflow (child workflow),
+                http_call (outbound HTTP), langgraph-agent, claude-agent.
+                Example: [{"id": "trigger", "type": "http"}, {"id": "research", "type": "llm_structured", "system_prompt": "...", "output": [{"name": "summary", "type": "str", "description": "..."}]}]
+        """
+        if workflow_backend is None:
+            return "Workflow creation unavailable: no persistent backend configured."
+        try:
+            steps = json.loads(steps_json)
+        except json.JSONDecodeError as exc:
+            return f"Invalid steps_json: {exc}"
+        if not isinstance(steps, list):
+            return "steps_json must be a JSON array."
+
+        existing = await workflow_backend.get(workflow_id)
+        if existing is not None:
+            return f"Workflow '{workflow_id}' already exists. Use update_workflow to modify it."
+
+        from app.domain.models.workflow_definition import WorkflowDefinition
+        defn = WorkflowDefinition(id=workflow_id, name=name, description=description, steps=steps)
+        await workflow_backend.create(defn)
+        if refresh_runner is not None:
+            await refresh_runner(workflow_id)
+        return f"Workflow '{workflow_id}' created with {len(steps)} step(s)."
+
+    @tool
+    async def update_workflow(
+        workflow_id: str,
+        name: str | None = None,
+        description: str | None = None,
+        steps_json: str | None = None,
+    ) -> str:
+        """Update an existing workflow definition (name, description, and/or steps).
+
+        Args:
+            workflow_id: The workflow ID to update.
+            name: New display name (omit to keep current).
+            description: New description (omit to keep current).
+            steps_json: JSON array replacing ALL steps (omit to keep current).
+        """
+        if workflow_backend is None:
+            return "Workflow updates unavailable: no persistent backend configured."
+
+        defn = await workflow_backend.get(workflow_id)
+        if defn is None:
+            available = ", ".join(registry.list_ids()) or "none"
+            return f"Workflow '{workflow_id}' not found. Available: {available}"
+        if defn.readonly:
+            return f"Workflow '{workflow_id}' is read-only and cannot be modified."
+
+        if name is not None:
+            defn.name = name
+        if description is not None:
+            defn.description = description
+        if steps_json is not None:
+            try:
+                steps = json.loads(steps_json)
+            except json.JSONDecodeError as exc:
+                return f"Invalid steps_json: {exc}"
+            if not isinstance(steps, list):
+                return "steps_json must be a JSON array."
+            defn.steps = steps
+
+        await workflow_backend.update(workflow_id, defn)
+        if refresh_runner is not None:
+            await refresh_runner(workflow_id)
+        return f"Workflow '{workflow_id}' updated."
+
+    @tool
+    async def delete_workflow(workflow_id: str) -> str:
+        """Permanently delete a workflow definition.
+
+        Args:
+            workflow_id: The workflow ID to delete.
+        """
+        if workflow_backend is None:
+            return "Workflow deletion unavailable: no persistent backend configured."
+
+        defn = await workflow_backend.get(workflow_id)
+        if defn is None:
+            return f"Workflow '{workflow_id}' not found."
+        if defn.readonly:
+            return f"Workflow '{workflow_id}' is read-only and cannot be deleted."
+
+        await workflow_backend.delete(workflow_id)
+        registry._runners.pop(workflow_id, None)
+        return f"Workflow '{workflow_id}' deleted."
+
+    tools = [list_workflows, run_workflow, list_runs, get_run, ask_user,
+             create_workflow, update_workflow, delete_workflow]
     llm_with_tools = llm.bind_tools(tools)
 
     # ── nodes ────────────────────────────────────────────────────────────────
