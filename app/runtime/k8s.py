@@ -125,16 +125,28 @@ class K8sRuntime(AgentRuntime):
 
         await self._try_oci_registry_login(agent_def.helm_chart)
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
+        _helm_retries = 3
+        _helm_retry_delay = 10.0
+        for _attempt in range(_helm_retries):
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                break
+            stderr_text = stderr.decode()
+            if "another operation" in stderr_text and _attempt < _helm_retries - 1:
+                logger.warning(
+                    "K8sRuntime: helm upgrade for '%s' blocked by concurrent operation, retrying in %.0fs (attempt %d/%d)",
+                    release_name, _helm_retry_delay, _attempt + 1, _helm_retries,
+                )
+                await asyncio.sleep(_helm_retry_delay)
+                continue
             raise RuntimeError(
                 f"K8sRuntime: helm upgrade failed for release '{release_name}':\n"
-                f"{stderr.decode()}"
+                f"{stderr_text}"
             )
 
         # Discover the Service created by this Helm release.  Helm charts typically
