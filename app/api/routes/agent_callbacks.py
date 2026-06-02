@@ -123,6 +123,20 @@ async def agent_output(
             run.step_outputs = {**(run.step_outputs or {}), run.current_step: {"error": error_msg}}
         run.touch()
         await container.run_repository.update(run)
+        # Terminate agent container (best-effort — pod sent the callback so it's still alive)
+        try:
+            from app.runtime.k8s import K8sRuntime
+            await K8sRuntime(namespace=container.settings.agent_namespace).terminate_by_run_id(run_id)
+        except Exception:
+            logger.debug("run %s: k8s cleanup on agent error failed", run_id, exc_info=True)
+        try:
+            from app.runtime.docker import DockerRuntime
+            await DockerRuntime(
+                registry_username=container.settings.docker_registry_username,
+                registry_password=container.settings.docker_registry_password,
+            ).terminate_by_run_id(run_id)
+        except Exception:
+            logger.debug("run %s: docker cleanup on agent error failed", run_id, exc_info=True)
         return {"run_id": run_id, "status": "failed"}
 
     # Transition status immediately so the polling client sees the change
