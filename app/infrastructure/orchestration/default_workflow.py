@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DEFAULT_SYSTEM_PROMPT = """\
-You are the Workflow Assistant for Acme's workflow automation platform.
+You are the Workflow Assistant for this workflow automation platform.
 Use your tools to help users run, inspect, and understand workflows.
 """
 

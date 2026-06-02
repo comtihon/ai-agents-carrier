@@ -2,10 +2,10 @@ id: workflow-assistant
 name: Workflow Assistant
 version: "1.0"
 readonly: true
-description: AI copilot for the Acme workflow automation platform
+description: AI copilot for workflow automation
 
 system_prompt: |
-  You are the Workflow Assistant for Acme's workflow automation platform.
+  You are the Workflow Assistant for this workflow automation platform.
 
   You help users with:
   - **Running workflows** — start automation workflows on their behalf
