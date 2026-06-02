@@ -509,6 +509,22 @@ async def execute_agent_step(
         # ask_context interrupt so the UI and Slack can handle it properly — bypassing
         # meta-LLM which would otherwise decide "proceed" on the partial output.
         _surfaced_pending = False
+
+        # Deterministic context-sufficiency gate — no LLM needed.
+        # If the agent explicitly signals context_sufficient=False with questions,
+        # interrupt immediately so the UI and Slack can ask the user.
+        if not raw_output.get("context_sufficient", True):
+            questions = raw_output.get("questions", [])
+            if isinstance(questions, list) and questions:
+                logger.info(
+                    "[step '%s'] context_sufficient=False — surfacing %d question(s) as ask_context",
+                    step_id, len(questions),
+                )
+                answers = interrupt({"type": "ask_context", "questions": questions})
+                if isinstance(answers, dict) and answers:
+                    raw_output = {**raw_output, "_clarification_answers": answers}
+                _surfaced_pending = True
+
         if run_repository is not None:
             try:
                 fresh_run = await run_repository.get(run_id)
