@@ -1352,18 +1352,6 @@ class YamlGraphRunner:
             updates: dict[str, Any] = {output_key: payload}
             if payload and not state.get("request"):
                 updates["request"] = json.dumps(payload) if isinstance(payload, dict) else str(payload)
-            # Spread scalar payload fields to top-level state so templates like
-            # {ticket_id} resolve without nested access.
-            if isinstance(payload, dict):
-                updates.update({k: v for k, v in payload.items() if k != output_key})
-            # Fallback: extract a Jira-style ticket ID from the request string
-            # for manually-triggered runs where payload is empty.
-            if not updates.get("ticket_id"):
-                import re as _re
-                request_str = state.get("request", "")
-                m = _re.search(r"\b([A-Z][A-Z0-9_]+-\d+)\b", request_str)
-                if m:
-                    updates["ticket_id"] = m.group(1)
             return updates
 
         return node
