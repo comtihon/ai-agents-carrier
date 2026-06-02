@@ -352,10 +352,13 @@ async def stream_graph_to_pause(
         if (step and (step.get("type") == "ask_context" or step.get("slack_notifications"))) or is_agent_ask_context:
             from app.core.config import get_settings
             from app.infrastructure.notifications.webhook_notifier import (
-                post_slack_ask_context, post_slack_thread_questions,
+                post_slack_ask_context, post_slack_addon_notification, post_slack_thread_questions,
             )
             settings = get_settings()
-            if settings.slack_bot_token and settings.slack_approvals_channel:
+            # Step-level token/channel override global defaults.
+            effective_token = (step.get("slack_token") if step else None) or settings.slack_bot_token
+            effective_channel = (step.get("slack_channel") if step else None) or settings.slack_approvals_channel
+            if effective_token and effective_channel:
                 questions: list[str] = []
                 for task in snap.tasks:
                     for intr in task.interrupts:
@@ -368,15 +371,27 @@ async def stream_graph_to_pause(
                 existing_ts = snap.values.get("_slack_ask_context_ts")
                 existing_channel = snap.values.get("_slack_ask_context_channel")
                 if questions:
-                    if existing_ts and existing_channel:
+                    if step and step.get("slack_payload"):
+                        # Custom payload template — inject step-level channel as {slack_channel}
+                        extra: dict = {}
+                        if step.get("slack_channel"):
+                            extra["slack_channel"] = step["slack_channel"]
+                        await post_slack_addon_notification(
+                            bot_token=effective_token,
+                            payload_template=step["slack_payload"],
+                            run_id=run.id,
+                            state={**(snap.values or {}), **extra},
+                            questions=questions,
+                        )
+                    elif existing_ts and existing_channel:
                         # Loop-back: post new questions as a reply in the same thread
                         await post_slack_thread_questions(
-                            settings.slack_bot_token, existing_channel, existing_ts, questions,
+                            effective_token, existing_channel, existing_ts, questions,
                         )
                     else:
                         # First interrupt: open a new root message
                         notif_resp = await post_slack_ask_context(
-                            settings.slack_bot_token, settings.slack_approvals_channel,
+                            effective_token, effective_channel,
                             questions, run.id, snap.values,
                         )
                         if notif_resp and notif_resp.get("ok"):
@@ -403,35 +418,6 @@ async def stream_graph_to_pause(
                     run.state = {**run.state, "_slack_thread_ts": ts, "_slack_channel": channel}
                     run.touch()
                     await run_repository.update(run)
-
-        # Slack addon: custom per-step token + payload.
-        # Only fires when there are actual ask_context questions — avoids sending
-        # an empty-questions message when ask_approval fires on the same step.
-        if step and step.get("slack_token") and step.get("slack_payload"):
-            from app.infrastructure.notifications.webhook_notifier import post_slack_addon_notification
-            addon_questions: list[str] = []
-            for task in snap.tasks:
-                for intr in task.interrupts:
-                    if isinstance(intr.value, dict) and intr.value.get("type") == "ask_context":
-                        addon_questions = intr.value.get("questions", [])
-            if not addon_questions:
-                for intr in getattr(snap, "interrupts", ()):
-                    if isinstance(intr.value, dict) and intr.value.get("type") == "ask_context":
-                        addon_questions = intr.value.get("questions", [])
-            if addon_questions:
-                # Merge step-level config vars into state so templates can use them.
-                # slack_topic lets the payload reference the configured channel/topic
-                # without hardcoding it in the backend.
-                extra: dict = {}
-                if step.get("slack_topic"):
-                    extra["slack_topic"] = step["slack_topic"]
-                await post_slack_addon_notification(
-                    bot_token=step["slack_token"],
-                    payload_template=step["slack_payload"],
-                    run_id=run.id,
-                    state={**(snap.values or {}), **extra},
-                    questions=addon_questions,
-                )
 
 
 # ---------------------------------------------------------------------------
