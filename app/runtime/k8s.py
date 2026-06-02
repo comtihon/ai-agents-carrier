@@ -253,6 +253,29 @@ class K8sRuntime(AgentRuntime):
         except Exception:
             pass
 
+    async def has_container_for_run(self, run_id: str) -> bool:
+        """Return True if a Helm release for this run_id already exists in the cluster.
+
+        Used by agent_executor to detect whether a pod was already spawned (e.g. by
+        a previous backend instance) so it can resume instead of spawning a duplicate.
+        """
+        try:
+            import json as _json
+            prefix = run_id[:8]
+            proc = await asyncio.create_subprocess_exec(
+                "helm", "list",
+                "-n", self._namespace,
+                "--filter", f"agent-.*-{prefix}",
+                "-o", "json",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await proc.communicate()
+            releases = _json.loads(stdout or "[]")
+            return bool(releases)
+        except Exception:
+            return False
+
     async def is_alive(self, agent_url: str) -> bool:
         """Return True if the agent's /health endpoint responds with 200."""
         try:
