@@ -1102,9 +1102,10 @@ class YamlGraphRunner:
             tool = self._mcp.get_tool(tool_name)
             if not tool:
                 logger.warning("[%s] step '%s' MCP tool '%s' not available", graph_id, step_id, tool_name)
+                err_msg = f"MCP tool '{tool_name}' not available"
                 if "output_key" in step:
-                    return {step["output_key"]: f"MCP tool '{tool_name}' not available"}
-                return {}
+                    return {"__failed_step__": step_id, step["output_key"]: err_msg}
+                return {"__failed_step__": step_id, "error": err_msg}
             try:
                 tool_input = {
                     k: self._render(v, state)
@@ -1117,9 +1118,10 @@ class YamlGraphRunner:
                 return {}
             except Exception as exc:
                 logger.exception("[%s] step '%s' MCP tool '%s'%s failed", graph_id, step_id, tool_name, server_tag)
+                err_msg = f"Error calling '{tool_name}': {exc}"
                 if "output_key" in step:
-                    return {step["output_key"]: f"Error calling '{tool_name}': {exc}"}
-                return {}
+                    return {"__failed_step__": step_id, step["output_key"]: err_msg}
+                return {"__failed_step__": step_id, "error": err_msg}
         return node
 
     def _ask_context_node(self, step: dict[str, Any]):
