@@ -118,6 +118,9 @@ async def agent_output(
         run.status = "failed"
         run.state = {**(run.state or {}), "error": f"Agent error: {error_msg}"}
         run.agent_url = None
+        if run.current_step:
+            run.step_statuses = {**(run.step_statuses or {}), run.current_step: "failed"}
+            run.step_outputs = {**(run.step_outputs or {}), run.current_step: {"error": error_msg}}
         run.touch()
         await container.run_repository.update(run)
         return {"run_id": run_id, "status": "failed"}
