@@ -106,6 +106,7 @@ def _build_steps(raw_steps: list, run: GraphRun) -> list[dict]:
             "status": run.step_statuses.get(s["id"], "pending"),
             "input": run.step_inputs.get(s["id"]),
             "output": run.step_outputs.get(s["id"]),
+            "summary": (run.step_outputs.get(s["id"]) or {}).get("summary"),
             "error": run_error if run.step_statuses.get(s["id"]) == "failed" else None,
         }
         for s in raw_steps
