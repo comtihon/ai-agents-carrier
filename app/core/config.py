@@ -180,7 +180,7 @@ class Settings(BaseSettings):
     mcp_github_api_key: str | None = Field(default=None, alias="MCP_GITHUB_API_KEY")
 
     # --- Meta-LLM (lightweight analysis after agent steps complete) ---
-    meta_llm_provider: str | None = Field(default=None, alias="META_LLM_PROVIDER")
+    meta_llm_provider: str | None = Field(default="anthropic", alias="META_LLM_PROVIDER")
     meta_llm_model: str = Field(default="claude-haiku-4-5-20251001", alias="META_LLM_MODEL")
 
     model_config = SettingsConfigDict(
