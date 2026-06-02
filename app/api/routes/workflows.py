@@ -850,6 +850,10 @@ async def restart_from_step(
         run.step_inputs.pop(sid, None)
         run.step_outputs.pop(sid, None)
 
+    # Clear per-attempt transient keys so they don't suppress new notifications
+    for _k in ("_slack_ask_context_ts", "_slack_ask_context_channel", "_pending_question"):
+        accumulated.pop(_k, None)
+
     run.current_step = None
     run.agent_url = None
     run.status = "running"
