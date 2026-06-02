@@ -116,6 +116,30 @@ class MongoGraphRunRepository:
         return GraphRun.model_validate(data)
 
 
+_PVC_COLLECTION = "pvc_leases"
+
+
+class MongoPvcLeaseRepository:
+    def __init__(self, collection) -> None:
+        self._col = collection
+
+    async def save(self, lease: dict) -> None:
+        await self._col.replace_one({"_id": lease["pvc_name"]}, {**lease, "_id": lease["pvc_name"]}, upsert=True)
+
+    async def get_expired(self, now) -> list[dict]:
+        cursor = self._col.find({"expires_at": {"$lte": now}})
+        return await cursor.to_list(length=1000)
+
+    async def delete(self, pvc_name: str) -> None:
+        await self._col.delete_one({"_id": pvc_name})
+
+    async def delete_by_run(self, run_id: str) -> list[dict]:
+        docs = await self._col.find({"run_id": run_id}).to_list(length=100)
+        if docs:
+            await self._col.delete_many({"run_id": run_id})
+        return docs
+
+
 class MongoClientProvider:
     _COLLECTION = "graph_runs"
 
@@ -128,6 +152,12 @@ class MongoClientProvider:
             self._client = AsyncIOMotorClient(self._settings.mongodb_uri)
         db = self._client[self._settings.mongodb_database]
         return MongoGraphRunRepository(db[self._COLLECTION])
+
+    def get_pvc_lease_repository(self) -> MongoPvcLeaseRepository:
+        if self._client is None:
+            self._client = AsyncIOMotorClient(self._settings.mongodb_uri)
+        db = self._client[self._settings.mongodb_database]
+        return MongoPvcLeaseRepository(db[_PVC_COLLECTION])
 
     async def close(self) -> None:
         if self._client is not None:

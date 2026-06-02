@@ -30,7 +30,8 @@ dependencies = [
   "langchain-google-genai>=4.2.1,<5.0.0",
   "apscheduler>=3.10,<4.0",
   "langsmith>=0.2.0,<1.0.0",
-  "aiodocker>=0.21.0,<1.0.0"
+  "aiodocker>=0.21.0,<1.0.0",
+  "kubernetes>=28.1.0"
 ]
 
 [project.optional-dependencies]

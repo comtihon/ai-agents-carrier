@@ -113,6 +113,18 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
 # Shared graph streaming helper (used by workflow steps and default_workflow)
 # ---------------------------------------------------------------------------
 
+async def _cleanup_pvc(run, lease_repo, namespace: str) -> None:
+    """Delete PVCs for the run immediately and remove their leases."""
+    try:
+        from app.runtime.pvc_manager import PvcManager
+        mgr = PvcManager(namespace)
+        leases = await lease_repo.delete_by_run(run.id)
+        for lease in leases:
+            await mgr.delete_pvc(lease["pvc_name"])
+    except Exception as exc:
+        logger.warning("_cleanup_pvc: run %s: %s", run.id, exc)
+
+
 async def _close_openhands_conversations(runner: YamlGraphRunner, state: dict) -> None:
     if runner._openhands is None:
         return
@@ -255,6 +267,10 @@ async def stream_graph_to_pause(
         run.touch()
         await run_repository.update(run)
         await _close_openhands_conversations(runner, current_state)
+        if runner._pvc_lease_repository is not None:
+            from app.core.config import get_settings as _get_settings
+            _ns = _get_settings().agent_namespace
+            await _cleanup_pvc(run, runner._pvc_lease_repository, _ns)
         return
 
     snap = await runner.graph.aget_state(config)
@@ -305,6 +321,10 @@ async def stream_graph_to_pause(
     await run_repository.update(run)
     if run.status == "completed":
         await _close_openhands_conversations(runner, snap.values)
+        if runner._pvc_lease_repository is not None:
+            from app.core.config import get_settings as _get_settings
+            _ns = _get_settings().agent_namespace
+            await _cleanup_pvc(run, runner._pvc_lease_repository, _ns)
 
     if run.status == "waiting_agent" and run.current_step:
         # Extract agent_url from the interrupt payload and persist it on the run
@@ -548,6 +568,8 @@ class YamlGraphRunner:
         # Injected post-construction by the application container so agent steps
         # can pass the backend's public base URL to spawned agent servers.
         self._callback_base_url: str = ""
+        # Injected post-construction for PVC lease tracking (optional)
+        self._pvc_lease_repository: Any = None
         # Set by stream_graph_to_pause to enable mid-run persistence from nodes
         self._current_run: Any = None
         self._current_run_repository: Any = None
@@ -907,6 +929,7 @@ class YamlGraphRunner:
                 step, state, agent_backend, run_id, callback_base_url,
                 settings=get_settings(),
                 run_repository=self._current_run_repository,
+                pvc_lease_repository=self._pvc_lease_repository,
             )
 
         return node

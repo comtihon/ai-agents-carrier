@@ -311,6 +311,7 @@ async def execute_agent_step(
     settings: "Settings | None" = None,
     progress_cb: Callable[[str], Awaitable[None]] | None = None,
     run_repository: Any = None,
+    pvc_lease_repository: Any = None,
 ) -> dict[str, Any]:
     """Execute a ``langgraph-agent`` or ``claude-agent`` step.
 
@@ -457,6 +458,27 @@ async def execute_agent_step(
                 "[step '%s'] agent started — suspending run '%s' until output arrives",
                 step_id, run_id,
             )
+
+            # Write PVC lease for TTL cleanup
+            pvc_mount_point = step.get("pvc_mount_point")
+            if pvc_mount_point and pvc_lease_repository is not None:
+                from datetime import datetime, timezone
+                from app.runtime.pvc_manager import parse_ttl
+                pvc_name = step.get("pvc_name") or f"pvc-{run_id[:12]}"
+                ttl = parse_ttl(step.get("pvc_ttl", "1h"))
+                expires_at = datetime.now(timezone.utc) + ttl
+                lease = {
+                    "pvc_name": pvc_name,
+                    "namespace": settings.agent_namespace if settings else "default",
+                    "run_id": run_id,
+                    "expires_at": expires_at,
+                    "created_at": datetime.now(timezone.utc),
+                }
+                try:
+                    await pvc_lease_repository.save(lease)
+                except Exception as _exc:
+                    logger.warning("Failed to save PVC lease for %s: %s", pvc_name, _exc)
+
         else:
             agent_url = f"<resumed:{run_id}>"
             logger.info("[step '%s'] resuming run '%s' (container already running)", step_id, run_id)

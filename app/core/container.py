@@ -21,7 +21,7 @@ from app.infrastructure.config.graph_loader import (
 from app.infrastructure.integrations.openhands import OpenHandsAdapter
 from app.infrastructure.orchestration.checkpointer import MongoDBCheckpointSaver
 from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner, stream_graph_to_pause
-from app.infrastructure.persistence.mongo import MongoClientProvider, MongoGraphRunRepository
+from app.infrastructure.persistence.mongo import MongoClientProvider, MongoGraphRunRepository, MongoPvcLeaseRepository
 from app.infrastructure.persistence.agent_backend import (
     AgentDefinitionBackend,
     MongoAgentBackend,
@@ -59,6 +59,7 @@ class ApplicationContainer:
     # approval-resume uses the exact definition snapshot from run start.
     live_runners: dict[str, YamlGraphRunner] = field(default_factory=dict)
     cron_scheduler: CronScheduler = field(default_factory=CronScheduler)
+    pvc_lease_repository: MongoPvcLeaseRepository | None = None
 
     async def startup(self) -> None:
         await self.mcp_tools_provider.start()
@@ -66,6 +67,20 @@ class ApplicationContainer:
         if self.workflow_backend is not None:
             await self._load_registry()
         asyncio.create_task(self._recover_incomplete_runs())
+        # Register 5-minute PVC lease cleanup sweeper
+        if self.pvc_lease_repository is not None:
+            from apscheduler.triggers.interval import IntervalTrigger
+            from app.infrastructure.pvc_cleanup import cleanup_expired_pvcs
+            _lease_repo = self.pvc_lease_repository
+            _namespace = self.settings.agent_namespace
+            async def _pvc_cleanup_job() -> None:
+                await cleanup_expired_pvcs(_lease_repo, _namespace)
+            self.cron_scheduler._scheduler.add_job(
+                _pvc_cleanup_job,
+                IntervalTrigger(minutes=5),
+                id="pvc_lease_cleanup",
+                replace_existing=True,
+            )
 
     async def _load_registry(self) -> None:
         """Populate yaml_graph_registry from the configured backend."""
@@ -92,6 +107,8 @@ class ApplicationContainer:
                 if self.agent_backend is not None:
                     runner._agent_backend = self.agent_backend
                 runner._callback_base_url = self.settings.agent_callback_url or self.settings.base_url
+                if self.pvc_lease_repository is not None:
+                    runner._pvc_lease_repository = self.pvc_lease_repository
         logger.info("Loaded %d workflow definition(s) from backend", len(definitions))
         self._setup_all_cron_triggers()
 
@@ -145,6 +162,8 @@ class ApplicationContainer:
                     )
                     if self.agent_backend is not None:
                         runner._agent_backend = self.agent_backend
+                    if self.pvc_lease_repository is not None:
+                        runner._pvc_lease_repository = self.pvc_lease_repository
                     definition_snapshot: dict | None = defn.to_raw_dict()
                 else:
                     runner = self.yaml_graph_registry.get(workflow_id)
@@ -206,6 +225,8 @@ class ApplicationContainer:
             if self.agent_backend is not None:
                 runner._agent_backend = self.agent_backend
             runner._callback_base_url = self.settings.agent_callback_url or self.settings.base_url
+            if self.pvc_lease_repository is not None:
+                runner._pvc_lease_repository = self.pvc_lease_repository
             self.yaml_graph_registry._runners[workflow_id] = runner
             self._register_cron_steps(runner)
             logger.info("Registry runner refreshed for workflow '%s'", workflow_id)
@@ -395,6 +416,8 @@ class ApplicationContainer:
                 if self.agent_backend is not None:
                     runner._agent_backend = self.agent_backend
                 runner._callback_base_url = self.settings.agent_callback_url or self.settings.base_url
+                if self.pvc_lease_repository is not None:
+                    runner._pvc_lease_repository = self.pvc_lease_repository
                 return runner
             except Exception:
                 logger.exception("run %s: failed to build runner from definition snapshot", run.id)
@@ -520,6 +543,7 @@ def build_container(settings: Settings) -> ApplicationContainer:
     openhands = OpenHandsAdapter(settings)
     mongo_provider = MongoClientProvider(settings)
     run_repository = mongo_provider.get_repository()
+    pvc_lease_repository = mongo_provider.get_pvc_lease_repository()
     workflow_backend = _build_workflow_backend(settings)
     # Agent definitions are always stored in MongoDB (no local-files backend).
     agent_backend = MongoAgentBackend(settings.mongodb_uri, settings.mongodb_database)
@@ -540,4 +564,5 @@ def build_container(settings: Settings) -> ApplicationContainer:
         workflow_backend=workflow_backend,
         agent_backend=agent_backend,
         checkpointer=checkpointer,
+        pvc_lease_repository=pvc_lease_repository,
     )

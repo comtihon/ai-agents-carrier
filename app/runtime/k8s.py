@@ -94,6 +94,20 @@ class K8sRuntime(AgentRuntime):
         for k, v in (extra_env or {}).items():
             set_args += ["--set-string", f"env.{k}={v}"]
 
+        # PVC addon: create PVC and inject volumes/volumeMounts
+        pvc_mount_point = (step or {}).get("pvc_mount_point") if step else None
+        if pvc_mount_point and self._is_k8s_available():
+            pvc_name = (step or {}).get("pvc_name") or f"pvc-{run_id[:12]}"
+            from app.runtime.pvc_manager import PvcManager, is_valid_pvc_name
+            if not is_valid_pvc_name(pvc_name):
+                pvc_name = f"pvc-{run_id[:12]}"
+            await PvcManager(self._namespace).create_pvc(pvc_name)
+            import json as _json
+            volumes_json = _json.dumps([{"name": "pvc-vol", "persistentVolumeClaim": {"claimName": pvc_name}}])
+            mounts_json = _json.dumps([{"name": "pvc-vol", "mountPath": pvc_mount_point}])
+            set_args += ["--set-json", f"volumes={volumes_json}"]
+            set_args += ["--set-json", f"volumeMounts={mounts_json}"]
+
         cmd = [
             "helm", "upgrade", "--install",
             release_name,
@@ -272,6 +286,15 @@ class K8sRuntime(AgentRuntime):
             release_name,
         )
         return f"http://{release_name}.{self._namespace}.svc.cluster.local:{_AGENT_PORT}"
+
+    @staticmethod
+    def _is_k8s_available() -> bool:
+        """Return True if the kubernetes client library is importable."""
+        try:
+            import kubernetes  # type: ignore  # noqa: F401
+            return True
+        except ImportError:
+            return False
 
     @staticmethod
     async def _try_oci_registry_login(chart_ref: str) -> None:
