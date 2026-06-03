@@ -154,13 +154,13 @@ async def test_structured_output_skips_meta_llm():
 
 
 @pytest.mark.asyncio
-async def test_unstructured_output_calls_meta_llm():
-    """When agent returns only 'result' key and step has output_mapping, meta-LLM runs."""
+async def test_unstructured_output_raises_when_output_mapping_unmatched():
+    """When agent returns only 'result' key and step has output_mapping, raises RuntimeError."""
     from app.steps.agent_executor import execute_agent_step
 
     output_mapping = {"ticket_id": "ticket_id", "summary": "summary"}
     step = _make_step(output_mapping=output_mapping)
-    raw_output = {"result": "Some text output", "token_usage": {}}
+    raw_output = {"result": "Some text output that is not parseable as YAML/JSON with matching fields", "token_usage": {}}
 
     fake_agent_def = MagicMock()
     fake_agent_def.agent_input = {"system_prompt": "Research.", "model": "claude-sonnet-4-5"}
@@ -170,11 +170,10 @@ async def test_unstructured_output_calls_meta_llm():
     settings = _make_settings()
 
     with (
-        patch("app.steps.agent_executor._meta_llm_decide", new_callable=AsyncMock) as mock_meta,
         patch("app.runtime.factory.get_runtime") as mock_get_runtime,
         patch("app.steps.agent_executor.interrupt") as mock_interrupt,
+        pytest.raises(RuntimeError, match="unstructured output"),
     ):
-        mock_meta.return_value = {"decision": "proceed", "questions": [], "reason": "ok"}
         mock_interrupt.return_value = {"output": raw_output}
         mock_runtime = MagicMock()
         mock_runtime.has_container_for_run = AsyncMock(return_value=True)
@@ -193,5 +192,3 @@ async def test_unstructured_output_calls_meta_llm():
             settings=settings,
             run_repository=None,
         )
-
-    mock_meta.assert_awaited_once()

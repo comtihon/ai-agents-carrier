@@ -579,7 +579,14 @@ async def execute_agent_step(
             if _parsed_out is None:
                 _parsed_out = _try_parse(_result_text)
 
-            if _parsed_out is not None:
+            if _parsed_out is None:
+                # Log the raw result so we can diagnose why extraction failed.
+                logger.warning(
+                    "[step '%s'] could not extract structured output from 'result' text "
+                    "(output_mapping has %d fields). Raw result (first 500 chars): %r",
+                    step_id, len(_pre_output_mapping), _result_text[:500],
+                )
+            else:
                 logger.info(
                     "[step '%s'] extracted structured output from 'result' text "
                     "(%d/%d output_mapping fields matched)",
@@ -608,8 +615,8 @@ async def execute_agent_step(
             if isinstance(questions, list) and questions:
                 logger.warning(
                     "[step '%s'] context_sufficient=False in final output — agent should use "
-                    "the clarify tool instead of exiting; surfacing %d question(s) as ask_context",
-                    step_id, len(questions),
+                    "the clarify tool instead of exiting; surfacing %d question(s): %s",
+                    step_id, len(questions), questions,
                 )
                 answers = interrupt({"type": "ask_context", "questions": questions})
                 if isinstance(answers, dict) and answers:
@@ -645,40 +652,24 @@ async def execute_agent_step(
                     pass
                 _surfaced_pending = True
 
-        # Skip meta-LLM when the agent returned structured output that matches
-        # the step's output_mapping schema (or explicitly set context_sufficient).
-        # This applies to both langgraph-agent and claude-agent step types.
-        _output_mapping = step.get("output_mapping") or {}
-        _is_structured_output = bool(
-            _output_mapping
-            and (
-                any(k in raw_output for k in _output_mapping)
-                or "context_sufficient" in raw_output
+        # Deterministic fail when output_mapping is set but nothing matched.
+        # The agent returned unstructured output (e.g. {"result": "text"}) AND
+        # YAML/JSON extraction above couldn't find any expected fields.
+        # Better to surface a clear error than to proceed silently with empty
+        # state — that would cause confusing downstream failures.
+        _output_mapping_check = step.get("output_mapping") or {}
+        if (
+            not _surfaced_pending
+            and _output_mapping_check
+            and not any(k in raw_output for k in _output_mapping_check)
+            and "context_sufficient" not in raw_output
+        ):
+            _raw_snippet = str(raw_output.get("result") or raw_output)[:300]
+            raise RuntimeError(
+                f"[step '{step_id}'] Agent returned unstructured output — "
+                f"expected fields {list(_output_mapping_check)} not found. "
+                f"Raw output (truncated): {_raw_snippet}"
             )
-        )
-
-        if not _surfaced_pending and not _is_structured_output and settings is not None:
-            _meta = await _meta_llm_decide(raw_output, input_data, step_id, settings)
-            if _meta["decision"] == "fail":
-                raise RuntimeError(
-                    f"[step '{step_id}'] Agent blocked by hard failure: {_meta.get('reason', 'missing credentials or tools')}"
-                )
-            elif _meta["decision"] == "ask_approval":
-                interrupt({"type": "ask_approval", "plan": raw_output, "reason": _meta.get("reason", "")})
-            elif _meta["decision"] == "ask_clarification":
-                # Use questions from meta-LLM; fall back to the reason when the
-                # LLM omitted the QUESTIONS line or JSON parsing failed.
-                questions_to_ask = _meta["questions"] or [
-                    _meta.get("reason") or "Please provide more context to continue."
-                ]
-                if not _meta["questions"]:
-                    logger.warning(
-                        "[step '%s'] ask_clarification had no questions — using reason as fallback: %r",
-                        step_id, questions_to_ask[0],
-                    )
-                answers = interrupt({"type": "ask_context", "questions": questions_to_ask})
-                if isinstance(answers, dict) and answers:
-                    raw_output = {**raw_output, "_clarification_answers": answers}
 
     # --- 6. Map output back to workflow state ---
     output_mapping: dict[str, str] | None = step.get("output_mapping")
