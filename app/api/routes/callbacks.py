@@ -404,6 +404,70 @@ async def _resume_ask_context(run: Any, runner: Any, answers: dict, container: A
     run.status = "running"
     run.touch()
     await container.run_repository.update(run)
+
+    # LangGraph 1.x multi-interrupt limitation: when an agent node raises two
+    # consecutive interrupts (first waiting_agent to suspend while the K8s pod
+    # runs, then ask_context when meta-LLM needs clarification), Command(resume=
+    # answers) is consumed by the FIRST interrupt (waiting_agent) on the next
+    # node re-run — so the agent receives {} output instead of the user's answers.
+    #
+    # Fix for agent steps: instead of using Command(resume=answers), we
+    # (a) rewind the LangGraph checkpoint to just after the last completed step
+    #     before the agent node (via aupdate_state), injecting _clarification_answers
+    #     into state, and (b) re-invoke the graph normally.  The agent node will
+    #     then spawn a fresh agent pod that receives clarification_context in its
+    #     input, do the research with the user's answers, and return proper output.
+    config = {"configurable": {"thread_id": run.id}}
+    current_step_def = next(
+        (s for s in runner.steps if s["id"] == run.current_step), None
+    )
+    is_agent_step = (
+        current_step_def is not None
+        and current_step_def.get("type") in ("langgraph-agent", "claude-agent")
+    )
+
+    if is_agent_step:
+        # Reconstruct accumulated state from completed steps before the agent step
+        accumulated: dict[str, Any] = {"request": run.user_request}
+        for step in runner.steps:
+            if step["id"] == run.current_step:
+                break
+            if (run.step_statuses or {}).get(step["id"]) in ("finished", "skipped"):
+                output = (run.step_outputs or {}).get(step["id"])
+                if output and isinstance(output, dict):
+                    accumulated.update(output)
+        # Fold in any internal state keys (e.g. _conv_map, _openhands_conv_*)
+        for k, v in (run.state or {}).items():
+            if k.startswith("_") and k not in ("_clarification_answers",) and v is not None:
+                accumulated.setdefault(k, v)
+        accumulated["_clarification_answers"] = answers
+
+        # Find the last step that completed before the agent step
+        last_done: str | None = None
+        for step in runner.steps:
+            if step["id"] == run.current_step:
+                break
+            if (run.step_statuses or {}).get(step["id"]) in ("finished", "skipped"):
+                last_done = step["id"]
+
+        if last_done:
+            await runner.graph.aupdate_state(config, accumulated, as_node=last_done)
+        else:
+            await runner.graph.aupdate_state(config, accumulated)
+
+        logger.info(
+            "run %s: ask_context answered — rewound checkpoint to '%s', "
+            "injected _clarification_answers, re-running agent step '%s'",
+            run.id, last_done, run.current_step,
+        )
+        await stream_graph_to_pause(
+            runner, run, container.run_repository,
+            None,
+            base_url=base_url,
+        )
+        return
+
+    # Non-agent steps (ask_context as a standalone step): normal resume path.
     await stream_graph_to_pause(
         runner, run, container.run_repository,
         Command(resume=answers),

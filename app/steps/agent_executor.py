@@ -536,11 +536,11 @@ async def execute_agent_step(
             step_id, run_id, list(raw_output),
         )
 
-        # --- 5d-pre. Extract structured JSON from free-form "result" text ---
+        # --- 5d-pre. Extract structured output from free-form "result" text ---
         # Agent pod frameworks wrap Claude's response in {"result": "...", "token_usage": {...}}
-        # even when the Output Protocol instructed Claude to return structured JSON.
-        # When the step has output_mapping and the agent returned {"result": "text"},
-        # try to parse the text as JSON so the structured fields reach the output_mapping.
+        # even when the Output Protocol or system prompt instructed Claude to return structured
+        # data.  When the step has output_mapping and the raw output is just {"result": "text"},
+        # try to parse that text as JSON or YAML so the structured fields reach output_mapping.
         _pre_output_mapping = step.get("output_mapping") or {}
         if (
             _pre_output_mapping
@@ -549,23 +549,48 @@ async def execute_agent_step(
         ):
             import json as _json, re as _re
             _result_text = raw_output["result"].strip()
-            # Strip markdown code fences if present
-            _md_match = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", _result_text, _re.DOTALL)
-            _candidates = [_md_match.group(1) if _md_match else None, _result_text]
-            for _candidate in _candidates:
-                if not _candidate:
-                    continue
+
+            def _try_parse(text: str) -> dict | None:
+                """Try JSON then YAML; return dict if any output_mapping key found."""
+                # JSON attempt
                 try:
-                    _parsed = _json.loads(_candidate)
-                    if isinstance(_parsed, dict) and any(k in _parsed for k in _pre_output_mapping):
-                        logger.info(
-                            "[step '%s'] extracted structured output from 'result' text (%d fields match output_mapping)",
-                            step_id, sum(1 for k in _pre_output_mapping if k in _parsed),
-                        )
-                        raw_output = {**_parsed, **{k: v for k, v in raw_output.items() if k not in _parsed and k != "result"}}
-                        break
+                    _p = _json.loads(text)
+                    if isinstance(_p, dict) and any(k in _p for k in _pre_output_mapping):
+                        return _p
                 except Exception:
                     pass
+                # YAML attempt (agent system prompts often instruct YAML output)
+                try:
+                    import yaml as _yaml
+                    _p = _yaml.safe_load(text)
+                    if isinstance(_p, dict) and any(k in _p for k in _pre_output_mapping):
+                        return _p
+                except Exception:
+                    pass
+                return None
+
+            # Try: yaml/json code fence, then raw text
+            _parsed_out: dict | None = None
+            _fence = _re.search(
+                r"```(?:yaml|json)?\s*\n?(.*?)\n?\s*```", _result_text, _re.DOTALL | _re.IGNORECASE
+            )
+            if _fence:
+                _parsed_out = _try_parse(_fence.group(1).strip())
+            if _parsed_out is None:
+                _parsed_out = _try_parse(_result_text)
+
+            if _parsed_out is not None:
+                logger.info(
+                    "[step '%s'] extracted structured output from 'result' text "
+                    "(%d/%d output_mapping fields matched)",
+                    step_id,
+                    sum(1 for k in _pre_output_mapping if k in _parsed_out),
+                    len(_pre_output_mapping),
+                )
+                raw_output = {
+                    **_parsed_out,
+                    **{k: v for k, v in raw_output.items() if k not in _parsed_out and k != "result"},
+                }
 
         # --- 5d. Surface unanswered clarify-tool question, then meta-LLM ---
         # If the agent called the clarify tool but nobody answered (timeout or skip),
