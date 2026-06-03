@@ -216,6 +216,7 @@ async def stream_graph_to_pause(
             current_state = {}
 
     last_processed: str | None = None
+    _stream_interrupt_output: list | None = None  # payload from __interrupt__ chunk if seen
     try:
         async for chunk in runner.graph.astream(input_value, config, stream_mode="updates"):
             for node_name, output in chunk.items():
@@ -225,6 +226,7 @@ async def stream_graph_to_pause(
                 # Store its output for interrupt-payload lookup but don't pollute
                 # step_statuses (it would show up as a phantom "done" step in the UI).
                 if node_name == "__interrupt__":
+                    _stream_interrupt_output = output
                     run.step_inputs[node_name] = dict(current_state)
                     if output:
                         run.step_outputs[node_name] = output
@@ -301,11 +303,38 @@ async def stream_graph_to_pause(
             if isinstance(intr.value, dict):
                 active_interrupt_type = intr.value.get("type")
                 break
+    # LangGraph 1.x: when a resumed node calls interrupt() a second time,
+    # the interrupt is recorded in pending_writes but snap.next is empty
+    # (aget_state sees the checkpoint as post-resume / completed). Fall back
+    # to the __interrupt__ chunk we captured from the stream.
+    if not active_interrupt_type and _stream_interrupt_output:
+        for intr in (_stream_interrupt_output if isinstance(_stream_interrupt_output, list) else []):
+            if isinstance(intr, dict) and isinstance(intr.get("value"), dict):
+                active_interrupt_type = intr["value"].get("type")
+                break
+
+    # When snap.next is empty but we saw an interrupt in the stream, the
+    # graph IS paused — LangGraph just doesn't reflect it in snap.next for
+    # second-interrupt-on-resume scenarios.  Reconstruct the paused step from
+    # whichever step_status is still "running".
+    _snap_next_override: str | None = None
+    if not snap.next and active_interrupt_type:
+        _snap_next_override = next(
+            (sid for sid, st in run.step_statuses.items() if st == "running"),
+            None,
+        )
+        if _snap_next_override:
+            logger.info(
+                "run %s: snap.next empty but interrupt type=%r detected in stream — "
+                "treating step '%s' as paused",
+                run.id, active_interrupt_type, _snap_next_override,
+            )
 
     # Determine whether the run paused at a waiting_agent step, a
     # waiting_approval step (or completed).
-    if snap.next:
-        current_step_id = snap.next[0]
+    _effective_next = snap.next[0] if snap.next else _snap_next_override
+    if _effective_next:
+        current_step_id = _effective_next
         step_def = next((s for s in runner.steps if s["id"] == current_step_id), None)
         step_type = step_def.get("type") if step_def else None
         if (active_interrupt_type in ("ask_context", "ask_approval")
@@ -325,7 +354,7 @@ async def stream_graph_to_pause(
             run.status = "waiting_approval"
     else:
         run.status = "completed"
-    run.current_step = snap.next[0] if snap.next else None
+    run.current_step = _effective_next
     run.state = snap.values
     run.touch()
     await run_repository.update(run)
