@@ -140,17 +140,9 @@ def _build_agent_config(
         field_list = "\n".join(f"- {k}" for k in output_mapping)
         protocol = (
             "\n\n## Output Protocol\n\n"
-            "THIS IS AN INFORMATION-GATHERING STEP — do NOT write code, create branches, "
-            "run tests, or modify any files. Your job is to RESEARCH and REPORT ONLY. "
-            "A separate agent will do the actual implementation.\n\n"
             "Your output MUST include these fields (YAML or JSON — the orchestrator "
             "extracts either format):\n\n"
-            f"{field_list}\n\n"
-            "Rules:\n"
-            "- If you need more information at any point during research: use the `clarify` "
-            "tool to ask your questions and wait for the answers before continuing. "
-            "Do NOT exit early — keep the research session alive.\n"
-            "- Only submit your final output once you have all context (context_sufficient: true)."
+            f"{field_list}"
         )
         system_prompt = f"{system_prompt}{protocol}" if system_prompt else protocol.lstrip()
 
