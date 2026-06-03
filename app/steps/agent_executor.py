@@ -140,16 +140,17 @@ def _build_agent_config(
         field_list = "\n".join(f"- {k}" for k in output_mapping)
         protocol = (
             "\n\n## Output Protocol\n\n"
-            "When you have completed your work, you MUST return your result as a "
-            "JSON object with EXACTLY these fields:\n\n"
+            "THIS IS AN INFORMATION-GATHERING STEP — do NOT write code, create branches, "
+            "run tests, or modify any files. Your job is to RESEARCH and REPORT ONLY. "
+            "A separate agent will do the actual implementation.\n\n"
+            "When you have gathered all the information you need, return a single JSON "
+            "object with EXACTLY these fields:\n\n"
             f"{field_list}\n\n"
-            "IMPORTANT — if you need more information before you can complete the task:\n"
-            "- Use the `clarify` tool to ask your questions and wait for the answers.\n"
+            "If you need more information:\n"
+            "- Use the `clarify` tool to ask questions and wait for the answers.\n"
             "- Do NOT submit output with context_sufficient set to false.\n"
-            "- Only submit your final output once you have all the context you need "
-            "(context_sufficient: true).\n\n"
-            "Do NOT return a plain text \"result\" field. Return the structured "
-            "JSON object directly as your output."
+            "- Only submit once you can populate all fields (context_sufficient: true).\n\n"
+            "Return the JSON object directly — do NOT wrap it in a 'result' field."
         )
         system_prompt = f"{system_prompt}{protocol}" if system_prompt else protocol.lstrip()
 

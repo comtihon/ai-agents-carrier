@@ -42,7 +42,7 @@ def test_output_protocol_injected_when_output_mapping_set():
     assert "ticket_id" in sp
     assert "summary" in sp
     assert "context_sufficient" in sp
-    assert "result" not in sp.lower() or "plain text" in sp  # no plain result field instruction
+    assert "result" not in sp.lower() or "wrap" in sp or "plain text" in sp  # no plain result field instruction
 
 
 def test_no_injection_when_no_output_mapping():
