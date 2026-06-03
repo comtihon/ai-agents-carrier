@@ -143,14 +143,17 @@ def _build_agent_config(
             "THIS IS AN INFORMATION-GATHERING STEP — do NOT write code, create branches, "
             "run tests, or modify any files. Your job is to RESEARCH and REPORT ONLY. "
             "A separate agent will do the actual implementation.\n\n"
-            "When you have gathered all the information you need, return a single JSON "
-            "object with EXACTLY these fields:\n\n"
+            "When you finish, return a single JSON object with EXACTLY these fields:\n\n"
             f"{field_list}\n\n"
-            "If you need more information:\n"
-            "- Use the `clarify` tool to ask questions and wait for the answers.\n"
-            "- Do NOT submit output with context_sufficient set to false.\n"
-            "- Only submit once you can populate all fields (context_sufficient: true).\n\n"
-            "Return the JSON object directly — do NOT wrap it in a 'result' field."
+            "Rules:\n"
+            "- If you have all the context needed: set context_sufficient to true and "
+            "populate all other fields.\n"
+            "- If you need more information from the user: set context_sufficient to false "
+            "and list your specific questions in the questions field. "
+            "Prefer using the `clarify` tool for mid-research questions so you can "
+            "incorporate the answers before submitting — but if you cannot proceed at all, "
+            "returning context_sufficient=false is acceptable.\n"
+            "- Return the JSON object directly — do NOT wrap it in a 'result' field."
         )
         system_prompt = f"{system_prompt}{protocol}" if system_prompt else protocol.lstrip()
 
@@ -655,8 +658,8 @@ async def execute_agent_step(
         # Deterministic fail when output_mapping is set but nothing matched.
         # The agent returned unstructured output (e.g. {"result": "text"}) AND
         # YAML/JSON extraction above couldn't find any expected fields.
-        # Better to surface a clear error than to proceed silently with empty
-        # state — that would cause confusing downstream failures.
+        # Check for empty/minimal output separately — that's an agent execution
+        # failure (max iterations, tool errors), not a contract violation.
         _output_mapping_check = step.get("output_mapping") or {}
         if (
             not _surfaced_pending
@@ -664,7 +667,15 @@ async def execute_agent_step(
             and not any(k in raw_output for k in _output_mapping_check)
             and "context_sufficient" not in raw_output
         ):
-            _raw_snippet = str(raw_output.get("result") or raw_output)[:300]
+            _result_val = raw_output.get("result", "")
+            _raw_snippet = str(_result_val or raw_output)[:300]
+            _is_empty = not _result_val or _result_val.strip() in ("", "(no output)", "None", "null")
+            if _is_empty:
+                raise RuntimeError(
+                    f"[step '{step_id}'] Agent produced no output — "
+                    "it may have exhausted max iterations or failed to gather context. "
+                    f"Token usage: {raw_output.get('token_usage', {})}"
+                )
             raise RuntimeError(
                 f"[step '{step_id}'] Agent returned unstructured output — "
                 f"expected fields {list(_output_mapping_check)} not found. "
