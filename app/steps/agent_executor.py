@@ -536,6 +536,37 @@ async def execute_agent_step(
             step_id, run_id, list(raw_output),
         )
 
+        # --- 5d-pre. Extract structured JSON from free-form "result" text ---
+        # Agent pod frameworks wrap Claude's response in {"result": "...", "token_usage": {...}}
+        # even when the Output Protocol instructed Claude to return structured JSON.
+        # When the step has output_mapping and the agent returned {"result": "text"},
+        # try to parse the text as JSON so the structured fields reach the output_mapping.
+        _pre_output_mapping = step.get("output_mapping") or {}
+        if (
+            _pre_output_mapping
+            and isinstance(raw_output.get("result"), str)
+            and not any(k in raw_output for k in _pre_output_mapping)
+        ):
+            import json as _json, re as _re
+            _result_text = raw_output["result"].strip()
+            # Strip markdown code fences if present
+            _md_match = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", _result_text, _re.DOTALL)
+            _candidates = [_md_match.group(1) if _md_match else None, _result_text]
+            for _candidate in _candidates:
+                if not _candidate:
+                    continue
+                try:
+                    _parsed = _json.loads(_candidate)
+                    if isinstance(_parsed, dict) and any(k in _parsed for k in _pre_output_mapping):
+                        logger.info(
+                            "[step '%s'] extracted structured output from 'result' text (%d fields match output_mapping)",
+                            step_id, sum(1 for k in _pre_output_mapping if k in _parsed),
+                        )
+                        raw_output = {**_parsed, **{k: v for k, v in raw_output.items() if k not in _parsed and k != "result"}}
+                        break
+                except Exception:
+                    pass
+
         # --- 5d. Surface unanswered clarify-tool question, then meta-LLM ---
         # If the agent called the clarify tool but nobody answered (timeout or skip),
         # _pending_question is still set in the run's DB state. Re-surface it as an
