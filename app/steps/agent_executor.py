@@ -134,6 +134,26 @@ def _build_agent_config(
             else compression_instruction
         )
 
+    # Inject Output Protocol when the step declares an output_mapping.
+    output_mapping = (step or {}).get("output_mapping") or {}
+    if output_mapping:
+        field_list = "\n".join(f"- {k}" for k in output_mapping)
+        protocol = (
+            "\n\n## Output Protocol\n\n"
+            "When you have completed your work, you MUST return your result as a "
+            "JSON object with EXACTLY these fields:\n\n"
+            f"{field_list}\n\n"
+            "If you need more context before you can complete the task:\n"
+            "- Set `context_sufficient` to false\n"
+            "- Set `questions` to a list of specific questions\n\n"
+            "If you have all context needed:\n"
+            "- Set `context_sufficient` to true\n"
+            "- Populate all other fields with your findings\n\n"
+            "Do NOT return a plain text \"result\" field. Return the structured "
+            "JSON object directly as your output."
+        )
+        system_prompt = f"{system_prompt}{protocol}" if system_prompt else protocol.lstrip()
+
     # --- MCP servers ---
     raw_integrations: list[McpIntegrationConfig] = settings.get_mcp_integrations()
     allowed_tools: set[str] | None = (
@@ -567,7 +587,19 @@ async def execute_agent_step(
                     pass
                 _surfaced_pending = True
 
-        if not _surfaced_pending and settings is not None:
+        # Skip meta-LLM when the agent returned structured output that matches
+        # the step's output_mapping schema (or explicitly set context_sufficient).
+        # This applies to both langgraph-agent and claude-agent step types.
+        _output_mapping = step.get("output_mapping") or {}
+        _is_structured_output = bool(
+            _output_mapping
+            and (
+                any(k in raw_output for k in _output_mapping)
+                or "context_sufficient" in raw_output
+            )
+        )
+
+        if not _surfaced_pending and not _is_structured_output and settings is not None:
             _meta = await _meta_llm_decide(raw_output, input_data, step_id, settings)
             if _meta["decision"] == "fail":
                 raise RuntimeError(
