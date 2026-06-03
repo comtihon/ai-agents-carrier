@@ -143,12 +143,11 @@ def _build_agent_config(
             "When you have completed your work, you MUST return your result as a "
             "JSON object with EXACTLY these fields:\n\n"
             f"{field_list}\n\n"
-            "If you need more context before you can complete the task:\n"
-            "- Set `context_sufficient` to false\n"
-            "- Set `questions` to a list of specific questions\n\n"
-            "If you have all context needed:\n"
-            "- Set `context_sufficient` to true\n"
-            "- Populate all other fields with your findings\n\n"
+            "IMPORTANT — if you need more information before you can complete the task:\n"
+            "- Use the `clarify` tool to ask your questions and wait for the answers.\n"
+            "- Do NOT submit output with context_sufficient set to false.\n"
+            "- Only submit your final output once you have all the context you need "
+            "(context_sufficient: true).\n\n"
             "Do NOT return a plain text \"result\" field. Return the structured "
             "JSON object directly as your output."
         )
@@ -600,13 +599,15 @@ async def execute_agent_step(
         _surfaced_pending = False
 
         # Deterministic context-sufficiency gate — no LLM needed.
-        # If the agent explicitly signals context_sufficient=False with questions,
-        # interrupt immediately so the UI and Slack can ask the user.
+        # Ideally agents use the clarify tool mid-run so they always exit with
+        # context_sufficient=True.  This gate is a safety net for agents that
+        # still return context_sufficient=False in their final output.
         if not raw_output.get("context_sufficient", True):
             questions = raw_output.get("questions", [])
             if isinstance(questions, list) and questions:
-                logger.info(
-                    "[step '%s'] context_sufficient=False — surfacing %d question(s) as ask_context",
+                logger.warning(
+                    "[step '%s'] context_sufficient=False in final output — agent should use "
+                    "the clarify tool instead of exiting; surfacing %d question(s) as ask_context",
                     step_id, len(questions),
                 )
                 answers = interrupt({"type": "ask_context", "questions": questions})
