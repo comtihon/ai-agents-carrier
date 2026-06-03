@@ -153,7 +153,8 @@ def _build_agent_config(
             "Prefer using the `clarify` tool for mid-research questions so you can "
             "incorporate the answers before submitting — but if you cannot proceed at all, "
             "returning context_sufficient=false is acceptable.\n"
-            "- Return the JSON object directly — do NOT wrap it in a 'result' field."
+            "- Write the JSON/YAML object as your final response text. "
+            "The orchestrator extracts it automatically."
         )
         system_prompt = f"{system_prompt}{protocol}" if system_prompt else protocol.lstrip()
 
@@ -704,6 +705,9 @@ async def execute_agent_step(
             for agent_key, workflow_key in output_mapping.items()
             if agent_key in raw_output
         }
+        # Always preserve token usage regardless of output_mapping declaration.
+        if "token_usage" in raw_output:
+            result[f"_agent_token_usage_{step_id}"] = raw_output["token_usage"]
     elif output_key:
         if isinstance(raw_output, dict) and "result" in raw_output:
             # Agent sent {"result": "...", "token_usage": {...}} — extract result key
