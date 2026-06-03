@@ -290,9 +290,22 @@ async def _meta_llm_decide(
                     if isinstance(parsed, list):
                         questions = [str(q) for q in parsed]
                 except Exception:
-                    pass
+                    # LLM returned non-JSON (e.g. plain text). Treat the
+                    # whole raw value as a single question so it is never lost.
+                    if raw_q:
+                        questions = [raw_q]
             elif line.startswith("REASON:"):
                 reason = line[len("REASON:"):].strip()
+
+        if decision == "ask_clarification" and not questions:
+            # LLM decided clarification is needed but produced no parseable
+            # QUESTIONS line. Log the full response so we can diagnose the
+            # LLM output format; the caller will use reason as a fallback.
+            logger.warning(
+                "[step '%s'] meta-LLM ask_clarification with no parseable questions. "
+                "Full response: %r",
+                step_id, text,
+            )
 
         logger.info("[step '%s'] meta-LLM decision: %s — %s", step_id, decision, reason)
         return {"decision": decision, "questions": questions, "reason": reason}
@@ -562,8 +575,18 @@ async def execute_agent_step(
                 )
             elif _meta["decision"] == "ask_approval":
                 interrupt({"type": "ask_approval", "plan": raw_output, "reason": _meta.get("reason", "")})
-            elif _meta["decision"] == "ask_clarification" and _meta["questions"]:
-                answers = interrupt({"type": "ask_context", "questions": _meta["questions"]})
+            elif _meta["decision"] == "ask_clarification":
+                # Use questions from meta-LLM; fall back to the reason when the
+                # LLM omitted the QUESTIONS line or JSON parsing failed.
+                questions_to_ask = _meta["questions"] or [
+                    _meta.get("reason") or "Please provide more context to continue."
+                ]
+                if not _meta["questions"]:
+                    logger.warning(
+                        "[step '%s'] ask_clarification had no questions — using reason as fallback: %r",
+                        step_id, questions_to_ask[0],
+                    )
+                answers = interrupt({"type": "ask_context", "questions": questions_to_ask})
                 if isinstance(answers, dict) and answers:
                     raw_output = {**raw_output, "_clarification_answers": answers}
 
