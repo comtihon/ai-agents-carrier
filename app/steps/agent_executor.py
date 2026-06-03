@@ -668,13 +668,23 @@ async def execute_agent_step(
             and "context_sufficient" not in raw_output
         ):
             _result_val = raw_output.get("result", "")
-            _raw_snippet = str(_result_val or raw_output)[:300]
-            _is_empty = not _result_val or _result_val.strip() in ("", "(no output)", "None", "null")
-            if _is_empty:
+            _raw_snippet = str(_result_val or raw_output)[:400]
+            _token_usage = raw_output.get("token_usage", {})
+            _output_tokens = _token_usage.get("output_tokens", 0) if isinstance(_token_usage, dict) else 0
+            # "(no output)" is LangGraph's fallback when the ReAct loop ends
+            # without a final AI message (max iterations hit, context overflow, etc.)
+            _is_framework_empty = (not _result_val) or _result_val.strip() in ("", "(no output)", "None", "null")
+            if _is_framework_empty:
+                _extra = (
+                    f"Token usage suggests agent worked ({_output_tokens:,} output tokens) "
+                    "but hit max iterations or context limit before producing structured output. "
+                    if _output_tokens > 100 else
+                    "Agent may not have run successfully. "
+                )
                 raise RuntimeError(
-                    f"[step '{step_id}'] Agent produced no output — "
-                    "it may have exhausted max iterations or failed to gather context. "
-                    f"Token usage: {raw_output.get('token_usage', {})}"
+                    f"[step '{step_id}'] Agent returned no usable output. "
+                    f"{_extra}"
+                    f"Token usage: {_token_usage}"
                 )
             raise RuntimeError(
                 f"[step '{step_id}'] Agent returned unstructured output — "
