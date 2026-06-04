@@ -81,6 +81,14 @@ class ApplicationContainer:
                 id="pvc_lease_cleanup",
                 replace_existing=True,
             )
+        # Register 60-second waiting_agent crash-detection sweeper
+        from apscheduler.triggers.interval import IntervalTrigger as _IT
+        self.cron_scheduler._scheduler.add_job(
+            self._watch_waiting_agents,
+            _IT(seconds=60),
+            id="waiting_agent_watcher",
+            replace_existing=True,
+        )
 
     async def _load_registry(self) -> None:
         """Populate yaml_graph_registry from the configured backend."""
@@ -423,6 +431,59 @@ class ApplicationContainer:
                 logger.exception("run %s: failed to build runner from definition snapshot", run.id)
         # Fall back to the live registry (e.g. legacy runs without a snapshot)
         return self.yaml_graph_registry.get(run.graph_id)
+
+    async def _fail_lost_agent_run(self, run: GraphRun, reason: str) -> None:
+        """Mark a waiting_agent run as failed and best-effort terminate its pod."""
+        run.status = "failed"
+        run.agent_url = None
+        run.state = {**(run.state or {}), "error": reason}
+        if run.current_step:
+            run.step_statuses = {**(run.step_statuses or {}), run.current_step: "failed"}
+            run.step_outputs = {**(run.step_outputs or {}), run.current_step: {"error": reason}}
+        run.touch()
+        await self.run_repository.update(run)
+        try:
+            from app.runtime.k8s import K8sRuntime
+            await K8sRuntime(namespace=self.settings.agent_namespace).terminate_by_run_id(run.id)
+        except Exception:
+            logger.debug("run %s: k8s cleanup in watcher failed", run.id, exc_info=True)
+        try:
+            from app.runtime.docker import DockerRuntime
+            await DockerRuntime(
+                registry_username=self.settings.docker_registry_username,
+                registry_password=self.settings.docker_registry_password,
+            ).terminate_by_run_id(run.id)
+        except Exception:
+            logger.debug("run %s: docker cleanup in watcher failed", run.id, exc_info=True)
+
+    async def _watch_waiting_agents(self) -> None:
+        """Periodic sweep: detect crashed agent pods for waiting_agent runs."""
+        try:
+            runs = await self.run_repository.list_incomplete()
+            candidates = [r for r in runs if r.status == "waiting_agent" and r.agent_url]
+            for run in candidates:
+                try:
+                    import httpx
+                    alive = False
+                    try:
+                        async with httpx.AsyncClient(timeout=5.0) as http:
+                            resp = await http.get(f"{run.agent_url}/health")
+                            alive = resp.is_success
+                    except Exception:
+                        alive = False
+                    if not alive:
+                        # TOCTOU guard: re-fetch before marking failed
+                        fresh = await self.run_repository.get(run.id)
+                        if fresh is not None and fresh.status == "waiting_agent":
+                            logger.info(
+                                "run %s: agent at %s unreachable — marking failed",
+                                run.id, run.agent_url,
+                            )
+                            await self._fail_lost_agent_run(fresh, "Agent pod health check failed")
+                except Exception:
+                    logger.exception("run %s: error in waiting_agent watcher sweep", run.id)
+        except Exception:
+            logger.exception("_watch_waiting_agents sweep failed")
 
     async def shutdown(self) -> None:
         self.cron_scheduler.stop()
