@@ -124,16 +124,40 @@ async def test_structured_output_skips_meta_llm():
 
     settings = _make_settings()
 
+    import httpx
+
+    # Build a mock poll response that returns "finished" with the raw_output as a final output
+    mock_poll_response = MagicMock()
+    mock_poll_response.raise_for_status = MagicMock()
+    mock_poll_response.json.return_value = {
+        "status": "finished",
+        "run_id": "test-run-id",
+        "outputs": [{"id": "x", "type": "final", "content": raw_output}],
+    }
+
+    mock_http_client = AsyncMock()
+    mock_http_client.__aenter__ = AsyncMock(return_value=mock_http_client)
+    mock_http_client.__aexit__ = AsyncMock(return_value=False)
+    mock_http_client.get = AsyncMock(return_value=mock_poll_response)
+    mock_http_client.post = AsyncMock(return_value=mock_poll_response)
+
+    _poll_settings = MagicMock()
+    _poll_settings.agent_poll_interval_seconds = 1
+    _poll_settings.agent_max_loops = 3
+    _poll_settings.anthropic_api_key = "sk-test"
+
     with (
         patch("app.steps.agent_executor._meta_llm_decide", new_callable=AsyncMock) as mock_meta,
         patch("app.runtime.factory.get_runtime") as mock_get_runtime,
-        patch("app.steps.agent_executor.interrupt") as mock_interrupt,
+        patch("asyncio.sleep", new_callable=AsyncMock),
+        patch("httpx.AsyncClient", return_value=mock_http_client),
+        patch("app.steps.agent_executor.get_settings", return_value=_poll_settings),
     ):
-        # Simulate the resume path: interrupt() returns the agent output immediately
-        mock_interrupt.return_value = {"output": raw_output}
         mock_runtime = MagicMock()
         mock_runtime.has_container_for_run = AsyncMock(return_value=True)
         mock_runtime.terminate_by_run_id = AsyncMock()
+        mock_runtime.rewrite_callback_url = MagicMock(return_value="http://localhost")
+        mock_runtime.get_agent_url_for_run = AsyncMock(return_value="http://agent-host:8080")
         mock_get_runtime.return_value = mock_runtime
 
         fake_backend = AsyncMock()
@@ -169,15 +193,37 @@ async def test_unstructured_output_raises_when_output_mapping_unmatched():
 
     settings = _make_settings()
 
+    mock_poll_response = MagicMock()
+    mock_poll_response.raise_for_status = MagicMock()
+    mock_poll_response.json.return_value = {
+        "status": "finished",
+        "run_id": "test-run-id",
+        "outputs": [{"id": "x", "type": "final", "content": raw_output}],
+    }
+
+    mock_http_client = AsyncMock()
+    mock_http_client.__aenter__ = AsyncMock(return_value=mock_http_client)
+    mock_http_client.__aexit__ = AsyncMock(return_value=False)
+    mock_http_client.get = AsyncMock(return_value=mock_poll_response)
+    mock_http_client.post = AsyncMock(return_value=mock_poll_response)
+
+    _poll_settings2 = MagicMock()
+    _poll_settings2.agent_poll_interval_seconds = 1
+    _poll_settings2.agent_max_loops = 3
+    _poll_settings2.anthropic_api_key = "sk-test"
+
     with (
         patch("app.runtime.factory.get_runtime") as mock_get_runtime,
-        patch("app.steps.agent_executor.interrupt") as mock_interrupt,
+        patch("asyncio.sleep", new_callable=AsyncMock),
+        patch("httpx.AsyncClient", return_value=mock_http_client),
+        patch("app.steps.agent_executor.get_settings", return_value=_poll_settings2),
         pytest.raises(RuntimeError, match="unstructured output"),
     ):
-        mock_interrupt.return_value = {"output": raw_output}
         mock_runtime = MagicMock()
         mock_runtime.has_container_for_run = AsyncMock(return_value=True)
         mock_runtime.terminate_by_run_id = AsyncMock()
+        mock_runtime.rewrite_callback_url = MagicMock(return_value="http://localhost")
+        mock_runtime.get_agent_url_for_run = AsyncMock(return_value="http://agent-host:8080")
         mock_get_runtime.return_value = mock_runtime
 
         fake_backend = AsyncMock()

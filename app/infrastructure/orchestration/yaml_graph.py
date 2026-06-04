@@ -612,6 +612,8 @@ class YamlGraphRunner:
         self._callback_base_url: str = ""
         # Injected post-construction for PVC lease tracking (optional)
         self._pvc_lease_repository: Any = None
+        # Injected post-construction for agent task tracking (optional)
+        self._agent_task_repository: Any = None
         # Set by stream_graph_to_pause to enable mid-run persistence from nodes
         self._current_run: Any = None
         self._current_run_repository: Any = None
@@ -972,6 +974,7 @@ class YamlGraphRunner:
                 settings=get_settings(),
                 run_repository=self._current_run_repository,
                 pvc_lease_repository=self._pvc_lease_repository,
+                agent_task_repository=self._agent_task_repository,
             )
 
         return node

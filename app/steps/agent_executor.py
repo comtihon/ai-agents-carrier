@@ -42,6 +42,7 @@ That callback endpoint resumes the paused LangGraph run via
 """
 from __future__ import annotations
 
+import asyncio
 import os
 
 import logging
@@ -49,6 +50,8 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import httpx
 from langgraph.types import interrupt
+
+from app.core.config import get_settings
 
 if TYPE_CHECKING:
     from app.core.config import Settings
@@ -339,6 +342,7 @@ async def execute_agent_step(
     progress_cb: Callable[[str], Awaitable[None]] | None = None,
     run_repository: Any = None,
     pvc_lease_repository: Any = None,
+    agent_task_repository: Any = None,
 ) -> dict[str, Any]:
     """Execute a ``langgraph-agent`` or ``claude-agent`` step.
 
@@ -401,9 +405,8 @@ async def execute_agent_step(
         step_id, agent_id, runtime_type, run_id,
     )
 
-    # --- 3. Resolve settings (lazy-import to avoid circular imports at module load) ---
+    # --- 3. Resolve settings ---
     if settings is None:
-        from app.core.config import get_settings
         settings = get_settings()
 
     # --- 4. Build input from state via input_mapping ---
@@ -450,6 +453,7 @@ async def execute_agent_step(
             and await runtime.has_container_for_run(run_id)
         )
 
+        container_callback_url = callback_base_url  # default; overridden below for docker/non-resume
         if not _is_resume:
             # --- 5a. Spawn the agent HTTP server ---
             agent_url = await runtime.spawn(agent_def, step, run_id, callback_base_url, extra_env=resolved_env_vars)
@@ -482,9 +486,32 @@ async def execute_agent_step(
                 ) from exc
 
             logger.info(
-                "[step '%s'] agent started — suspending run '%s' until output arrives",
+                "[step '%s'] agent started — polling run '%s' until output arrives",
                 step_id, run_id,
             )
+
+            # Write task entity to MongoDB for poll-based tracking
+            if agent_task_repository is not None:
+                from datetime import datetime, timezone
+                _task_doc = {
+                    "_id": f"{run_id}_{step_id}",
+                    "run_id": run_id,
+                    "step_id": step_id,
+                    "agent_id": agent_id,
+                    "agent_url": agent_url,
+                    "input": input_data,
+                    "agent_config": agent_config_payload if isinstance(agent_config_payload, dict) else {},
+                    "status": "pending",
+                    "loop_count": 0,
+                    "max_loops": get_settings().agent_max_loops,
+                    "outputs": [],
+                    "created_at": datetime.now(timezone.utc),
+                    "updated_at": datetime.now(timezone.utc),
+                }
+                try:
+                    await agent_task_repository.save_task(_task_doc)
+                except Exception as _e:
+                    logger.warning("[step '%s'] failed to save agent task: %s", step_id, _e)
 
             # Write PVC lease for TTL cleanup
             pvc_mount_point = step.get("pvc_mount_point")
@@ -507,14 +534,107 @@ async def execute_agent_step(
                     logger.warning("Failed to save PVC lease for %s: %s", pvc_name, _exc)
 
         else:
-            agent_url = f"<resumed:{run_id}>"
+            # Retrieve real agent_url from task repository for resume path
+            _stored_task = None
+            if agent_task_repository is not None:
+                _stored_task = await agent_task_repository.get_task(f"{run_id}_{step_id}")
+            if _stored_task and _stored_task.get("agent_url"):
+                agent_url = _stored_task["agent_url"]
+            else:
+                # Fall back to runtime lookup (only if method is a coroutine function)
+                import inspect as _inspect
+                _get_url_fn = getattr(runtime, "get_agent_url_for_run", None)
+                agent_url = await _get_url_fn(run_id) if _get_url_fn is not None and _inspect.iscoroutinefunction(_get_url_fn) else None
+            if not agent_url:
+                raise RuntimeError(f"[step '{step_id}'] cannot resume: agent_url not found for run {run_id}")
             logger.info("[step '%s'] resuming run '%s' (container already running)", step_id, run_id)
 
-        # --- 5c. Suspend: interrupt() pauses the LangGraph node ---
-        # On first execution: suspends until POST /agent/output resumes the graph.
-        # On resume (LangGraph reruns node): returns immediately with stored output.
-        resume_value: dict = interrupt({"type": "waiting_agent", "agent_url": agent_url})
-        raw_output = resume_value.get("output", {})
+        # --- 5c. Pull-based polling: poll agent every N seconds until finished/failed/idle ---
+        _poll_interval = get_settings().agent_poll_interval_seconds
+        _max_loops = get_settings().agent_max_loops
+        _loop_count = 0
+        raw_output: dict = {}
+
+        while True:
+            await asyncio.sleep(_poll_interval)
+            try:
+                async with httpx.AsyncClient() as _hc:
+                    _poll_resp = await _hc.get(f"{agent_url}/poll", timeout=10.0)
+                    _poll_resp.raise_for_status()
+                    _poll_data = _poll_resp.json()
+            except Exception as _poll_exc:
+                logger.warning("[step '%s'] poll failed: %s", step_id, _poll_exc)
+                _loop_count += 1
+                if _loop_count >= _max_loops and agent_task_repository is not None:
+                    await agent_task_repository.update_task(f"{run_id}_{step_id}", {"status": "failed"})
+                if _loop_count >= _max_loops:
+                    raise RuntimeError(f"[step '{step_id}'] agent unreachable after {_max_loops} poll attempts") from _poll_exc
+                continue
+
+            _poll_status = _poll_data.get("status", "idle")
+            _poll_outputs = _poll_data.get("outputs", [])
+
+            if agent_task_repository is not None and _poll_outputs:
+                try:
+                    await agent_task_repository.append_outputs(f"{run_id}_{step_id}", _poll_outputs)
+                except Exception:
+                    pass
+
+            if _poll_status == "finished":
+                # Extract final output from outputs list
+                for _out in reversed(_poll_outputs):
+                    if _out.get("type") == "final":
+                        raw_output = _out.get("content", {})
+                        break
+                if not raw_output:
+                    logger.warning("[step '%s'] finished status but no 'final' output found — outputs may have been consumed by sweeper", step_id)
+                if agent_task_repository is not None:
+                    await agent_task_repository.update_task(f"{run_id}_{step_id}", {"status": "finished"})
+                break
+
+            if _poll_status == "failed":
+                if agent_task_repository is not None:
+                    await agent_task_repository.update_task(f"{run_id}_{step_id}", {"status": "failed"})
+                raise RuntimeError(f"[step '{step_id}'] agent reported failure")
+
+            if _poll_status == "idle":
+                # Agent lost the task — meta LLM recovery
+                from app.services.agent_poller import _meta_llm_recovery
+                _task_for_recovery = {"input": input_data, "outputs": _poll_outputs}
+                if agent_task_repository is not None:
+                    _stored_task = await agent_task_repository.get_task(f"{run_id}_{step_id}")
+                    if _stored_task:
+                        _task_for_recovery = _stored_task
+                _is_complete = await _meta_llm_recovery(_task_for_recovery, get_settings().anthropic_api_key)
+                if _is_complete:
+                    for _out in reversed(_task_for_recovery.get("outputs", [])):
+                        if isinstance(_out, dict) and _out.get("type") == "final":
+                            raw_output = _out.get("content", {})
+                            break
+                    if agent_task_repository is not None:
+                        await agent_task_repository.update_task(f"{run_id}_{step_id}", {"status": "finished"})
+                    break
+                _loop_count += 1
+                if _loop_count >= _max_loops:
+                    if agent_task_repository is not None:
+                        await agent_task_repository.update_task(f"{run_id}_{step_id}", {"status": "failed"})
+                    raise RuntimeError(f"[step '{step_id}'] agent idle after {_max_loops} recovery attempts")
+                # Resend task
+                logger.info("[step '%s'] resending task to agent (loop %d/%d)", step_id, _loop_count, _max_loops)
+                if agent_task_repository is not None:
+                    await agent_task_repository.update_task(f"{run_id}_{step_id}", {"loop_count": _loop_count})
+                try:
+                    async with httpx.AsyncClient() as _hc2:
+                        _restart_resp = await _hc2.post(
+                            f"{agent_url}/start",
+                            json={"run_id": run_id, "input": input_data, "callback_url": container_callback_url, "agent_config": agent_config_payload},
+                            timeout=10.0,
+                        )
+                        _restart_resp.raise_for_status()
+                except Exception as _restart_exc:
+                    logger.warning("[step '%s'] resend failed: %s", step_id, _restart_exc)
+                continue
+            # status == "working" or unknown — keep polling
 
         # Terminate using run_id label — works whether _containers is populated or not.
         if hasattr(runtime, "terminate_by_run_id"):

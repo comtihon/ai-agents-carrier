@@ -140,6 +140,42 @@ class MongoPvcLeaseRepository:
         return docs
 
 
+_AGENT_TASK_COLLECTION = "agent_tasks"
+
+
+class MongoAgentTaskRepository:
+    def __init__(self, collection: AsyncIOMotorCollection) -> None:
+        self._col = collection
+
+    async def save_task(self, task: dict[str, Any]) -> None:
+        await self._col.update_one({"_id": task["_id"]}, {"$setOnInsert": task}, upsert=True)
+
+    async def get_task(self, task_id: str) -> dict[str, Any] | None:
+        return await self._col.find_one({"_id": task_id})
+
+    async def update_task(self, task_id: str, fields: dict[str, Any]) -> None:
+        fields["updated_at"] = datetime.now(timezone.utc)
+        await self._col.update_one({"_id": task_id}, {"$set": fields})
+
+    async def append_outputs(self, task_id: str, outputs: list[dict]) -> None:
+        if outputs:
+            await self._col.update_one(
+                {"_id": task_id},
+                {"$push": {"outputs": {"$each": outputs}}, "$set": {"updated_at": datetime.now(timezone.utc)}},
+            )
+
+    async def list_running_tasks(self) -> list[dict[str, Any]]:
+        cursor = self._col.find({"status": {"$in": ["pending", "running"]}})
+        return await cursor.to_list(length=None)
+
+    async def list_stale_tasks(self, cutoff: datetime) -> list[dict[str, Any]]:
+        cursor = self._col.find({
+            "status": {"$in": ["pending", "running"]},
+            "updated_at": {"$lt": cutoff},
+        })
+        return await cursor.to_list(length=None)
+
+
 class MongoClientProvider:
     _COLLECTION = "graph_runs"
 
@@ -158,6 +194,12 @@ class MongoClientProvider:
             self._client = AsyncIOMotorClient(self._settings.mongodb_uri)
         db = self._client[self._settings.mongodb_database]
         return MongoPvcLeaseRepository(db[_PVC_COLLECTION])
+
+    def get_agent_task_repository(self) -> MongoAgentTaskRepository:
+        if self._client is None:
+            self._client = AsyncIOMotorClient(self._settings.mongodb_uri)
+        db = self._client[self._settings.mongodb_database]
+        return MongoAgentTaskRepository(db[_AGENT_TASK_COLLECTION])
 
     async def close(self) -> None:
         if self._client is not None:

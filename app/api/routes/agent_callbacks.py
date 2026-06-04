@@ -86,6 +86,8 @@ async def agent_output(
     background_tasks: BackgroundTasks,
     container: ApplicationContainer = Depends(get_container),
 ):
+    # DEPRECATED: primary output delivery now via GET /poll on the agent.
+    # Kept for backward compatibility.
     """Called by the agent when it has finished and has an output to report.
 
     Resumes the paused LangGraph run with the agent's output.
@@ -93,10 +95,10 @@ async def agent_output(
     run = await container.run_repository.get(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
-    if run.status != "waiting_agent":
+    if run.status not in ("waiting_agent", "running"):
         raise HTTPException(
             status_code=409,
-            detail=f"Run is not waiting for agent output (status: {run.status})",
+            detail=f"Run is not in a state to receive agent output (status={run.status})",
         )
 
     runner = container.live_runners.get(run_id)
