@@ -91,6 +91,9 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
         # human_approval with a custom output_key writes the bool result there
         if step.get("type") == "human_approval" and "output_key" in step:
             fields[step["output_key"]] = Any  # type: ignore[assignment]
+        # mcp steps always store their tool output text for display in the UI
+        if step.get("type") == "mcp":
+            fields[f"_mcp_output_{step['id']}"] = Any  # type: ignore[assignment]
         # execute steps persist their OpenHands conversation ID for restart resumption
         if step.get("type") == "execute":
             fields[f"_openhands_conv_{step['id']}"] = Any  # type: ignore[assignment]
@@ -1162,9 +1165,11 @@ class YamlGraphRunner:
                 }
                 result = await tool.ainvoke(tool_input)
                 logger.info("[%s] step '%s' finished", graph_id, step_id)
+                output_text = self._extract_mcp_text(result)
+                out = {f"_mcp_output_{step_id}": output_text}
                 if "output_key" in step:
-                    return {step["output_key"]: self._extract_mcp_text(result)}
-                return {}
+                    out[step["output_key"]] = output_text
+                return out
             except Exception as exc:
                 logger.exception("[%s] step '%s' MCP tool '%s'%s failed", graph_id, step_id, tool_name, server_tag)
                 err_msg = f"Error calling '{tool_name}': {exc}"
