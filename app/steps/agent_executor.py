@@ -162,6 +162,8 @@ def _build_agent_config(
             entry["command"] = cmd
         else:
             entry["url"] = intg.url
+            if intg.api_key:
+                entry["api_key"] = intg.api_key
         mcp_servers.append(entry)
 
     # --- Credentials (resolved API-key values) ---
