@@ -580,12 +580,46 @@ async def execute_agent_step(
                 except Exception:
                     pass
 
-            if _poll_status == "finished":
-                # Extract final output from outputs list
-                for _out in reversed(_poll_outputs):
+            # Cache final output from every poll cycle — the "final" output may arrive
+            # while status is still "working" (task_store marks it sent before the
+            # in-memory state["status"] flips to "done"), so we must capture it here
+            # rather than waiting until the "finished" poll cycle (which may see outputs=[]).
+            if not raw_output:
+                for _out in _poll_outputs:
                     if _out.get("type") == "final":
                         raw_output = _out.get("content", {})
                         break
+
+            # Forward progress messages to run state so the UI can see them.
+            if run_repository is not None and _poll_outputs:
+                _progress_msgs = [
+                    out["content"]["message"]
+                    for out in _poll_outputs
+                    if out.get("type") == "progress"
+                    and isinstance(out.get("content"), dict)
+                    and out["content"].get("message")
+                ]
+                if _progress_msgs:
+                    try:
+                        _run = await run_repository.get(run_id)
+                        if _run is not None:
+                            _progress_list = list((_run.state or {}).get("_agent_progress", []))
+                            _progress_list.extend(_progress_msgs)
+                            _run.state = {**(_run.state or {}), "_agent_progress": _progress_list}
+                            _run.touch()
+                            await run_repository.update(_run)
+                    except Exception:
+                        pass  # progress is best-effort
+
+            if _poll_status == "finished":
+                # raw_output may already be set from an earlier poll cycle (race condition
+                # where "final" output was consumed before status flipped to "finished").
+                # Fall back to scanning _poll_outputs only if not already captured.
+                if not raw_output:
+                    for _out in reversed(_poll_outputs):
+                        if _out.get("type") == "final":
+                            raw_output = _out.get("content", {})
+                            break
                 if not raw_output:
                     logger.warning("[step '%s'] finished status but no 'final' output found — outputs may have been consumed by sweeper", step_id)
                 if agent_task_repository is not None:
