@@ -728,7 +728,7 @@ async def execute_agent_step(
             # Try: yaml/json code fence, then raw text
             _parsed_out: dict | None = None
             _fence = _re.search(
-                r"```(?:yaml|json)?\s*\n?(.*?)\n?\s*```", _result_text, _re.DOTALL | _re.IGNORECASE
+                r"```(?:yaml|json)?\s*\n?(.*)\n?\s*```", _result_text, _re.DOTALL | _re.IGNORECASE
             )
             if _fence:
                 _parsed_out = _try_parse(_fence.group(1).strip())
