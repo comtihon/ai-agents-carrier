@@ -856,6 +856,18 @@ async def execute_agent_step(
                 f"Raw output (truncated): {_raw_snippet}"
             )
 
+    # Fail fast when the agent returned {"error": "...", "token_usage": {...}} with no
+    # "result" key — this is the framework's error format (max iterations, API error, etc.).
+    # Without this check, the error dict would be stored as the output_key value and the
+    # workflow would continue with garbage data.
+    if not _surfaced_pending and isinstance(raw_output, dict):
+        _agent_error_msg = raw_output.get("error")
+        if _agent_error_msg and not raw_output.get("result"):
+            raise RuntimeError(
+                f"[step '{step_id}'] Agent reported error: {_agent_error_msg}. "
+                f"Token usage: {raw_output.get('token_usage', {})}"
+            )
+
     # --- 6. Map output back to workflow state ---
     output_mapping: dict[str, str] | None = step.get("output_mapping")
     output_key: str | None = step.get("output_key")
