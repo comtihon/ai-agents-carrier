@@ -740,6 +740,30 @@ async def delete_run(
     await container.run_repository.delete(run_id)
 
 
+@router.post("/runs/{run_id}/terminate")
+async def terminate_run(
+    run_id: str,
+    container: ApplicationContainer = Depends(get_container),
+):
+    """Terminate a running agent and mark the run as failed."""
+    run = await container.run_repository.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run.status not in ("running", "waiting_agent"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Run is not active (status: {run.status})",
+        )
+    from app.services.agent_cleanup import cleanup_run_agents
+    await cleanup_run_agents(run_id, container.settings)
+    run.status = "failed"
+    run.state = {**(run.state or {}), "error": "Terminated by user"}
+    run.touch()
+    await container.run_repository.update(run)
+    container.live_runners.pop(run_id, None)
+    return await _run_response(run)
+
+
 @router.post("/runs/{run_id}/retry")
 async def retry_run(
     run_id: str,
