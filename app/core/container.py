@@ -90,14 +90,6 @@ class ApplicationContainer:
             id="waiting_agent_watcher",
             replace_existing=True,
         )
-        from app.services.agent_poller import sweep_stale_tasks
-        self.cron_scheduler._scheduler.add_job(
-            sweep_stale_tasks,
-            _IT(seconds=self.settings.agent_poll_interval_seconds),
-            args=[self],
-            id="agent_task_poller",
-            replace_existing=True,
-        )
 
     async def _load_registry(self) -> None:
         """Populate yaml_graph_registry from the configured backend."""
