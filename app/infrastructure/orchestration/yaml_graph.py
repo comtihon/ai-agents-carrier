@@ -114,6 +114,8 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
                     "agent output will not reach workflow state",
                     step.get("id"), step.get("type"),
                 )
+            if step.get("slack_input_key"):
+                fields[step["slack_input_key"]] = Any  # type: ignore[assignment]
             fields[f"_agent_token_usage_{step['id']}"] = Any  # type: ignore[assignment]
     # Internal field: agent_url stored while a run is in waiting_agent state
     fields["_agent_url"] = Any  # type: ignore[assignment]

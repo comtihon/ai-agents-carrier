@@ -137,10 +137,14 @@ def _build_agent_config(
             else compression_instruction
         )
 
-    # Inject Output Protocol when the step declares an output_mapping.
+    # Inject Output Protocol when the step declares an output_mapping or slack_input_key.
     output_mapping = (step or {}).get("output_mapping") or {}
-    if output_mapping:
-        field_list = "\n".join(f"- {k}" for k in output_mapping)
+    _slack_input_key_proto = (step or {}).get("slack_input_key")
+    _protocol_keys = list(output_mapping)
+    if _slack_input_key_proto and _slack_input_key_proto not in output_mapping:
+        _protocol_keys.append(_slack_input_key_proto)
+    if _protocol_keys:
+        field_list = "\n".join(f"- {k}" for k in _protocol_keys)
         protocol = (
             "\n\n## Output Protocol\n\n"
             "Your output MUST include these fields (YAML or JSON — the orchestrator "
@@ -690,20 +694,24 @@ async def execute_agent_step(
         # data.  When the step has output_mapping and the raw output is just {"result": "text"},
         # try to parse that text as JSON or YAML so the structured fields reach output_mapping.
         _pre_output_mapping = step.get("output_mapping") or {}
+        _slack_input_key_ext = step.get("slack_input_key")
+        _expected_keys = set(_pre_output_mapping.keys()) | (
+            {_slack_input_key_ext} if _slack_input_key_ext else set()
+        )
         if (
-            _pre_output_mapping
+            _expected_keys
             and isinstance(raw_output.get("result"), str)
-            and not any(k in raw_output for k in _pre_output_mapping)
+            and not any(k in raw_output for k in _expected_keys)
         ):
             import json as _json, re as _re
             _result_text = raw_output["result"].strip()
 
             def _try_parse(text: str) -> dict | None:
-                """Try JSON then YAML; return dict if any output_mapping key found."""
+                """Try JSON then YAML; return dict if any expected key found."""
                 # JSON attempt
                 try:
                     _p = _json.loads(text)
-                    if isinstance(_p, dict) and any(k in _p for k in _pre_output_mapping):
+                    if isinstance(_p, dict) and any(k in _p for k in _expected_keys):
                         return _p
                 except Exception:
                     pass
@@ -711,7 +719,7 @@ async def execute_agent_step(
                 try:
                     import yaml as _yaml
                     _p = _yaml.safe_load(text)
-                    if isinstance(_p, dict) and any(k in _p for k in _pre_output_mapping):
+                    if isinstance(_p, dict) and any(k in _p for k in _expected_keys):
                         return _p
                 except Exception:
                     pass
@@ -865,5 +873,16 @@ async def execute_agent_step(
     else:
         # No mapping configured — merge all agent output keys directly into state.
         result = raw_output
+
+    # Surface slack_input_key into state when routing would otherwise drop it
+    # (e.g. output_key branch only stores a single key; output_mapping may omit it).
+    _sik = step.get("slack_input_key")
+    if (
+        _sik
+        and isinstance(raw_output, dict)
+        and _sik in raw_output
+        and _sik not in result
+    ):
+        result[_sik] = raw_output[_sik]
 
     return result
