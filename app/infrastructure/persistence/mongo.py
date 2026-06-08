@@ -116,6 +116,10 @@ class MongoGraphRunRepository:
         return GraphRun.model_validate(data)
 
 
+    async def delete(self, run_id: str) -> None:
+        await self._collection.delete_one({"_id": run_id})
+
+
 _PVC_COLLECTION = "pvc_leases"
 
 

@@ -718,8 +718,26 @@ async def _resume_rejected(
         run.status = "cancelled"
         run.touch()
         await container.run_repository.update(run)
+    if run.status == "cancelled":
+        from app.services.agent_cleanup import cleanup_run_agents
+        await cleanup_run_agents(run.id, container.settings)
     if run.status in ("completed", "failed", "cancelled"):
         container.live_runners.pop(run.id, None)
+
+
+@router.delete("/runs/{run_id}", status_code=204)
+async def delete_run(
+    run_id: str,
+    container: ApplicationContainer = Depends(get_container),
+):
+    """Delete a run and terminate all its connected agents."""
+    run = await container.run_repository.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    from app.services.agent_cleanup import cleanup_run_agents
+    await cleanup_run_agents(run_id, container.settings)
+    container.live_runners.pop(run_id, None)
+    await container.run_repository.delete(run_id)
 
 
 @router.post("/runs/{run_id}/retry")

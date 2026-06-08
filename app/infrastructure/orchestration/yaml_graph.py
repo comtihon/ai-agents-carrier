@@ -288,6 +288,9 @@ async def stream_graph_to_pause(
             from app.core.config import get_settings as _get_settings
             _ns = _get_settings().agent_namespace
             await _cleanup_pvc(run, runner._pvc_lease_repository, _ns)
+        from app.services.agent_cleanup import cleanup_run_agents
+        from app.core.config import get_settings as _get_settings
+        await cleanup_run_agents(run.id, _get_settings())
         return
 
     snap = await runner.graph.aget_state(config)
@@ -369,6 +372,9 @@ async def stream_graph_to_pause(
             from app.core.config import get_settings as _get_settings
             _ns = _get_settings().agent_namespace
             await _cleanup_pvc(run, runner._pvc_lease_repository, _ns)
+        from app.services.agent_cleanup import cleanup_run_agents
+        from app.core.config import get_settings as _get_settings
+        await cleanup_run_agents(run.id, _get_settings())
 
     if run.status == "waiting_agent" and run.current_step:
         # Extract agent_url from the interrupt payload and persist it on the run
