@@ -625,7 +625,18 @@ async def execute_agent_step(
                             raw_output = _out.get("content", {})
                             break
                 if not raw_output:
-                    logger.warning("[step '%s'] finished status but no 'final' output found — outputs may have been consumed by sweeper", step_id)
+                    # Final output may have been consumed by a previous poll cycle or
+                    # missed due to a race — check the task repository as fallback.
+                    if agent_task_repository is not None:
+                        _stored = await agent_task_repository.get_task(f"{run_id}_{step_id}")
+                        if _stored:
+                            for _out in reversed(_stored.get("outputs", [])):
+                                if isinstance(_out, dict) and _out.get("type") == "final":
+                                    raw_output = _out.get("content", {})
+                                    logger.info("[step '%s'] recovered final output from task repository", step_id)
+                                    break
+                    if not raw_output:
+                        logger.warning("[step '%s'] finished status but no 'final' output found in poll outputs or task repository", step_id)
                 if agent_task_repository is not None:
                     await agent_task_repository.update_task(f"{run_id}_{step_id}", {"status": "finished"})
                 break
