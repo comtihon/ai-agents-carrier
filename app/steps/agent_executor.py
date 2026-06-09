@@ -199,6 +199,12 @@ def _build_agent_config(
             elif "value" in entry:
                 env_vars[name] = str(entry["value"])
 
+    # Forward meta-LLM settings to agent os.environ
+    if hasattr(settings, 'meta_llm_provider') and settings.meta_llm_provider:
+        env_vars["META_LLM_PROVIDER"] = settings.meta_llm_provider
+    if hasattr(settings, 'meta_llm_model') and settings.meta_llm_model:
+        env_vars["META_LLM_MODEL"] = settings.meta_llm_model
+
     return {
         "system_prompt": system_prompt,
         "model": model,
