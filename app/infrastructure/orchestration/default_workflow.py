@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from app.infrastructure.config.graph_loader import YamlGraphRegistry
+    from app.infrastructure.persistence.agent_backend import AgentDefinitionBackend
     from app.infrastructure.persistence.mongo import MongoGraphRunRepository
     from app.infrastructure.persistence.workflow_backend import WorkflowDefinitionBackend
 
@@ -65,6 +66,7 @@ def build_default_workflow(
     agent_config: dict | None = None,
     workflow_backend: "WorkflowDefinitionBackend | None" = None,
     refresh_runner: "Callable[[str], Awaitable[None]] | None" = None,
+    agent_backend: "AgentDefinitionBackend | None" = None,
 ):
     """Build and compile the default ReAct chat agent."""
 
@@ -299,8 +301,130 @@ def build_default_workflow(
         registry._runners.pop(workflow_id, None)
         return f"Workflow '{workflow_id}' deleted."
 
+    # --- Agent tools ---
+
+    async def _resolve_agent_id(query: str):
+        """Returns (resolved_id, None) or (None, error_str)."""
+        if agent_backend is None:
+            return None, "agent_backend not configured"
+        agents = await agent_backend.list()
+        # exact id match
+        for a in agents:
+            if a.id == query:
+                return a.id, None
+        # exact name match (case-insensitive)
+        for a in agents:
+            if a.name.lower() == query.lower():
+                return a.id, None
+        # substring match
+        matches = [a for a in agents if query.lower() in a.id.lower() or query.lower() in a.name.lower()]
+        if len(matches) == 1:
+            return matches[0].id, None
+        if matches:
+            cands = ", ".join(f"{a.id} ({a.name})" for a in matches)
+            return None, f"Ambiguous — multiple matches: {cands}"
+        return None, f"No agent found matching '{query}'. Available: {', '.join(f'{a.id} ({a.name})' for a in agents)}"
+
+    @tool
+    async def list_agents() -> str:
+        """List all available agent definitions."""
+        if agent_backend is None:
+            return "Agent backend not configured."
+        agents = await agent_backend.list()
+        if not agents:
+            return "No agents found."
+        lines = [f"- **{a.id}** ({a.name}): {a.description or '(no description)'}" for a in agents]
+        return "\n".join(lines)
+
+    @tool
+    async def get_agent(agent_id: str) -> str:
+        """Get full agent definition by id or name."""
+        if agent_backend is None:
+            return "Agent backend not configured."
+        resolved, err = await _resolve_agent_id(agent_id)
+        if err:
+            return err
+        agent = await agent_backend.get(resolved)
+        if agent is None:
+            return f"Agent '{resolved}' not found."
+        import json as _json
+        return _json.dumps(agent.model_dump(mode="json"), indent=2, default=str)
+
+    @tool
+    async def create_agent(agent_id: str, name: str, description: str = "", default_runtime: str = "local", agent_input_json: str = "{}") -> str:
+        """Create a new agent definition. agent_input_json is a JSON object of default input overrides."""
+        if agent_backend is None:
+            return "Agent backend not configured."
+        import json as _json
+        try:
+            agent_input = _json.loads(agent_input_json)
+            if not isinstance(agent_input, dict):
+                return "agent_input_json must be a JSON object."
+        except Exception as e:
+            return f"Invalid agent_input_json: {e}"
+        if default_runtime not in ("local", "docker", "k8s"):
+            return f"Invalid default_runtime '{default_runtime}'. Must be one of: local, docker, k8s."
+        existing = await agent_backend.get(agent_id)
+        if existing is not None:
+            return f"Agent '{agent_id}' already exists. Use update_agent to modify it."
+        from app.domain.models.agent_definition import AgentDefinition
+        new_agent = AgentDefinition(
+            id=agent_id,
+            name=name,
+            description=description,
+            default_runtime=default_runtime,
+            agent_input=agent_input,
+        )
+        await agent_backend.create(new_agent)
+        return f"Agent '{agent_id}' created."
+
+    @tool
+    async def update_agent(agent_id: str, name: str = None, description: str = None, default_runtime: str = None, agent_input_json: str = None) -> str:
+        """Update an existing agent definition. Only provided fields are changed; others preserved."""
+        if agent_backend is None:
+            return "Agent backend not configured."
+        resolved, err = await _resolve_agent_id(agent_id)
+        if err:
+            return err
+        existing = await agent_backend.get(resolved)
+        if existing is None:
+            return f"Agent '{resolved}' not found."
+        import json as _json
+        # Partial update — only mutate provided fields
+        updated = existing.model_copy()
+        if name is not None:
+            updated.name = name
+        if description is not None:
+            updated.description = description
+        if default_runtime is not None:
+            if default_runtime not in ("local", "docker", "k8s"):
+                return f"Invalid default_runtime '{default_runtime}'. Must be one of: local, docker, k8s."
+            updated.default_runtime = default_runtime
+        if agent_input_json is not None:
+            try:
+                agent_input = _json.loads(agent_input_json)
+                if not isinstance(agent_input, dict):
+                    return "agent_input_json must be a JSON object."
+                updated.agent_input = agent_input
+            except Exception as e:
+                return f"Invalid agent_input_json: {e}"
+        await agent_backend.update(resolved, updated)
+        return f"Agent '{resolved}' updated."
+
+    @tool
+    async def delete_agent(agent_id: str) -> str:
+        """Delete an agent definition by exact id."""
+        if agent_backend is None:
+            return "Agent backend not configured."
+        existing = await agent_backend.get(agent_id)
+        if existing is None:
+            return f"Agent '{agent_id}' not found. Use list_agents to see available agents."
+        await agent_backend.delete(agent_id)
+        return f"Agent '{agent_id}' deleted."
+
     tools = [list_workflows, run_workflow, list_runs, get_run, ask_user,
-             create_workflow, update_workflow, delete_workflow]
+             create_workflow, update_workflow, delete_workflow,
+             list_agents, get_agent, create_agent, update_agent, delete_agent]
     llm_with_tools = llm.bind_tools(tools)
 
     # ── nodes ────────────────────────────────────────────────────────────────
