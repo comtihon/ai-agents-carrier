@@ -87,6 +87,24 @@ def build_default_workflow(
         ]
         return "\n".join(lines)
 
+    async def _resolve_workflow_id(query: str):
+        """Returns (resolved_id, None) or (None, error_str)."""
+        defs = registry.list_definitions()
+        for d in defs:
+            if d["id"] == query:
+                return d["id"], None
+        for d in defs:
+            if d.get("name", "").lower() == query.lower():
+                return d["id"], None
+        matches = [d for d in defs if query.lower() in d["id"].lower() or query.lower() in d.get("name", "").lower()]
+        if len(matches) == 1:
+            return matches[0]["id"], None
+        if matches:
+            cands = ", ".join(f"{d['id']} ({d.get('name', d['id'])})" for d in matches)
+            return None, f"Ambiguous — multiple matches: {cands}"
+        available = ", ".join(f"{d['id']} ({d.get('name', d['id'])})" for d in defs) or "none"
+        return None, f"Workflow '{query}' not found. Available: {available}"
+
     @tool
     async def run_workflow(workflow_id: str, request: str) -> str:
         """Start a workflow run.
@@ -98,10 +116,13 @@ def build_default_workflow(
         Returns:
             JSON with run_id, workflow_id, workflow_name, and __event__ = workflow_started.
         """
+        resolved, err = await _resolve_workflow_id(workflow_id)
+        if err:
+            return err
+        workflow_id = resolved
         runner = registry.get(workflow_id)
         if runner is None:
-            available = ", ".join(registry.list_ids()) or "none"
-            return f"Workflow '{workflow_id}' not found. Available: {available}"
+            return f"Workflow '{workflow_id}' not found."
 
         run_id = str(uuid4())
         child_run = GraphRun(
@@ -256,10 +277,13 @@ def build_default_workflow(
         if workflow_backend is None:
             return "Workflow updates unavailable: no persistent backend configured."
 
+        resolved, err = await _resolve_workflow_id(workflow_id)
+        if err:
+            return err
+        workflow_id = resolved
         defn = await workflow_backend.get(workflow_id)
         if defn is None:
-            available = ", ".join(registry.list_ids()) or "none"
-            return f"Workflow '{workflow_id}' not found. Available: {available}"
+            return f"Workflow '{workflow_id}' not found."
         if defn.readonly:
             return f"Workflow '{workflow_id}' is read-only and cannot be modified."
 
@@ -291,6 +315,10 @@ def build_default_workflow(
         if workflow_backend is None:
             return "Workflow deletion unavailable: no persistent backend configured."
 
+        resolved, err = await _resolve_workflow_id(workflow_id)
+        if err:
+            return err
+        workflow_id = resolved
         defn = await workflow_backend.get(workflow_id)
         if defn is None:
             return f"Workflow '{workflow_id}' not found."

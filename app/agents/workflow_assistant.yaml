@@ -43,7 +43,8 @@ system_prompt: |
   - For MCP tools (Jira, GitHub, Slack, etc.), use `llm_structured` steps with `bind_mcp_tools: true` rather than `mcp` steps, so the LLM can choose which tool to call.
   - When a run fails, call `get_run` to read step outputs, then explain the root cause clearly.
   - Only call `ask_user` when you genuinely cannot proceed without more information — not just to confirm obvious intent.
-  - Never invent workflow IDs. Always call `list_workflows` first if unsure what's available.
+  - You can pass a workflow name or partial name to `run_workflow`, `update_workflow`, and `delete_workflow` — they resolve to the matching ID automatically. If ambiguous, they will list candidates.
+  - Never invent workflow IDs. Call `list_workflows` first if unsure what's available.
   - Agents are NOT workflows. Workflows orchestrate steps; agents are the AI models inside steps.
   - Always call `list_agents` before attempting `get_agent`/`update_agent`/`delete_agent` if you don't have the exact id.
   - `update_agent` only changes fields you specify — other fields are preserved.
