@@ -257,16 +257,23 @@ class Settings(BaseSettings):
                 result[key] = val
         return result
 
-    def get_mcp_integrations(self) -> list[McpIntegrationConfig]:
-        candidates: list[dict[str, Any]] = [
+    def _build_mcp_candidates(self) -> list[dict[str, Any]]:
+        return [
             dict(name="figma",  enabled=self.mcp_figma_enabled,  transport=self.mcp_figma_transport,  url=self.mcp_figma_url,  api_key=self.mcp_figma_api_key),
             self._jira_integration(),
             dict(name="miro",   enabled=self.mcp_miro_enabled,   transport=self.mcp_miro_transport,   url=self.mcp_miro_url,   api_key=self.mcp_miro_api_key),
             dict(name="notion", enabled=self.mcp_notion_enabled, transport=self.mcp_notion_transport, url=self.mcp_notion_url, api_key=self.mcp_notion_api_key),
             dict(name="github", enabled=self.mcp_github_enabled, transport=self.mcp_github_transport, url=self.mcp_github_url, api_key=self.mcp_github_api_key),
         ]
+
+    def get_mcp_integrations(self) -> list[McpIntegrationConfig]:
+        candidates = self._build_mcp_candidates()
         return [McpIntegrationConfig(**c) for c in candidates
                 if c["enabled"] and (c.get("url") or c.get("transport") == "stdio")]
+
+    def list_mcp_candidates(self) -> list[dict[str, Any]]:
+        """Return name + enabled for ALL known MCP servers regardless of URL/enabled state."""
+        return [{"name": c["name"], "enabled": c["enabled"]} for c in self._build_mcp_candidates()]
 
 
 @lru_cache(maxsize=1)

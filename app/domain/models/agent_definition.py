@@ -5,6 +5,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from app.domain.models.agent_addon import AnyAgentAddon, MCPAddon
+
 
 class AgentDefinition(BaseModel):
     """Persistent definition of a registered agent.
@@ -48,9 +50,25 @@ class AgentDefinition(BaseModel):
     helm_chart: str | None = None
     helm_values: dict = Field(default_factory=dict)
 
+    # Addons
+    addons: list[AnyAgentAddon] = Field(default_factory=list)
+
     # Timestamps
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+    @property
+    def mcp_addon(self) -> MCPAddon | None:
+        for addon in self.addons:
+            if addon.type == "mcp":
+                return addon  # type: ignore[return-value]
+        return None
+
+    def get_addon(self, addon_type: str) -> AnyAgentAddon | None:
+        for addon in self.addons:
+            if addon.type == addon_type:
+                return addon
+        return None
 
     def touch(self) -> None:
         from datetime import timezone

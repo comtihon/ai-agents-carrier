@@ -155,12 +155,13 @@ def _build_agent_config(
 
     # --- MCP servers ---
     raw_integrations: list[McpIntegrationConfig] = settings.get_mcp_integrations()
-    allowed_tools: set[str] | None = (
-        set(tools) if tools is not None else None
-    )
+    if agent_def.mcp_addon is None:
+        enabled_mcp: set[str] | None = set()  # no addon → no MCPs
+    else:
+        enabled_mcp = agent_def.mcp_addon.enabled_servers()
     mcp_servers: list[dict[str, Any]] = []
     for intg in raw_integrations:
-        if allowed_tools is not None and intg.name not in allowed_tools:
+        if intg.name not in enabled_mcp:
             continue
         entry: dict[str, Any] = {"name": intg.name, "transport": intg.transport, "env": intg.env}
         if intg.transport == "stdio":
@@ -433,12 +434,14 @@ async def execute_agent_step(
         from app.agents.local_agent import run_local_agent
 
         logger.info("[step '%s'] running local inline agent", step_id)
+        allowed_mcp = agent_def.mcp_addon.enabled_servers() if agent_def.mcp_addon else set()
         raw_output = await run_local_agent(
             agent_input=agent_def.agent_input,
             input_data=input_data,
             settings=settings,
             progress_cb=progress_cb,
             compression_level=step.get("compression_level", "none"),
+            allowed_mcp=allowed_mcp,
         )
         logger.info("[step '%s'] local agent completed, output keys: %s", step_id, list(raw_output))
     else:

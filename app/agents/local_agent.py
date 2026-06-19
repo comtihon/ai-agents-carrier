@@ -96,6 +96,7 @@ async def run_local_agent(
     settings: "Settings",
     progress_cb: Callable[[str], Awaitable[None]] | None = None,
     compression_level: str = "none",
+    allowed_mcp: set[str] | None = None,
 ) -> dict[str, Any]:
     """Run a LangGraph ReAct agent inline and return its output dict.
 
@@ -136,10 +137,11 @@ async def run_local_agent(
     provider: str | None = agent_input.get("llm_provider") or agent_input.get("provider")
     model: str | None = agent_input.get("model") or _DEFAULT_MODEL
     max_tokens: int = int(agent_input.get("max_tokens") or _DEFAULT_MAX_TOKENS)
-    allowed_tools_list: list[str] | None = agent_input.get("tools")
-    allowed_tools: set[str] | None = (
-        set(allowed_tools_list) if allowed_tools_list is not None else None
-    )
+    if allowed_mcp is not None:
+        allowed_tools: set[str] | None = allowed_mcp
+    else:
+        allowed_tools_list: list[str] | None = agent_input.get("tools")
+        allowed_tools = set(allowed_tools_list) if allowed_tools_list is not None else None
 
     # --- Resolve the task / request ---
     request: str = (

@@ -14,7 +14,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from app.api.dependencies import get_container
+from app.core.config import get_settings
 from app.core.container import ApplicationContainer
+from app.domain.models.agent_addon import AnyAgentAddon
 from app.domain.models.agent_definition import AgentDefinition
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,7 @@ class AgentDefinitionRequest(BaseModel):
     # K8s-specific
     helm_chart: str | None = None
     helm_values: dict = Field(default_factory=dict)
+    addons: list[dict] = Field(default_factory=list)
 
 
 class AgentDefinitionUpdateRequest(BaseModel):
@@ -46,6 +49,7 @@ class AgentDefinitionUpdateRequest(BaseModel):
     image: str | None = None
     helm_chart: str | None = None
     helm_values: dict = Field(default_factory=dict)
+    addons: list[dict] = Field(default_factory=list)
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -63,6 +67,13 @@ async def list_agent_types():
     return {
         "runtimes": ["local", "docker", "k8s"],
     }
+
+
+@router.get("/mcp-integrations")
+async def list_mcp_integrations():
+    """Return all known MCP servers with their enabled state."""
+    settings = get_settings()
+    return settings.list_mcp_candidates()
 
 
 # ─── Collection routes ────────────────────────────────────────────────────────
@@ -91,6 +102,8 @@ async def create_agent(
     if existing is not None:
         raise HTTPException(status_code=409, detail=f"Agent '{body.id}' already exists")
 
+    from pydantic import TypeAdapter
+    _addon_adapter: TypeAdapter[list[AnyAgentAddon]] = TypeAdapter(list[AnyAgentAddon])
     defn = AgentDefinition(
         id=body.id,
         name=body.name,
@@ -100,6 +113,7 @@ async def create_agent(
         image=body.image,
         helm_chart=body.helm_chart,
         helm_values=body.helm_values,
+        addons=_addon_adapter.validate_python(body.addons),
     )
     saved = await container.agent_backend.create(defn)
     return saved.model_dump(mode="json")
@@ -136,6 +150,8 @@ async def update_agent(
     if existing is None:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
 
+    from pydantic import TypeAdapter
+    _addon_adapter: TypeAdapter[list[AnyAgentAddon]] = TypeAdapter(list[AnyAgentAddon])
     defn = AgentDefinition(
         id=agent_id,
         name=body.name,
@@ -146,6 +162,7 @@ async def update_agent(
         helm_chart=body.helm_chart,
         helm_values=body.helm_values,
         created_at=existing.created_at,
+        addons=_addon_adapter.validate_python(body.addons),
     )
     saved = await container.agent_backend.update(agent_id, defn)
     return saved.model_dump(mode="json")
@@ -165,3 +182,43 @@ async def delete_agent(
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
 
     await container.agent_backend.delete(agent_id)
+
+
+@router.get("/{agent_id}/addons")
+async def get_agent_addons(
+    agent_id: str,
+    container: ApplicationContainer = Depends(get_container),
+):
+    """Return the addons list for an agent."""
+    _require_backend(container)
+    assert container.agent_backend is not None
+
+    defn = await container.agent_backend.get(agent_id)
+    if defn is None:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
+    return {"addons": [addon.model_dump(mode="json") for addon in defn.addons]}
+
+
+class AddonsUpdateRequest(BaseModel):
+    addons: list[dict] = Field(default_factory=list)
+
+
+@router.put("/{agent_id}/addons")
+async def update_agent_addons(
+    agent_id: str,
+    body: AddonsUpdateRequest,
+    container: ApplicationContainer = Depends(get_container),
+):
+    """Replace the addons list for an agent."""
+    _require_backend(container)
+    assert container.agent_backend is not None
+
+    existing = await container.agent_backend.get(agent_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
+
+    from pydantic import TypeAdapter
+    _addon_adapter: TypeAdapter[list[AnyAgentAddon]] = TypeAdapter(list[AnyAgentAddon])
+    existing.addons = _addon_adapter.validate_python(body.addons)
+    saved = await container.agent_backend.update(agent_id, existing)
+    return saved.model_dump(mode="json")
