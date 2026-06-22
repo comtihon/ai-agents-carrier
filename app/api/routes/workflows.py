@@ -83,6 +83,14 @@ def _config(thread_id: str) -> dict:
 def _langgraph_status(snap, runner: "YamlGraphRunner | None" = None) -> str:
     if not snap.next:
         return "completed"
+    # ask_context interrupts always require user input regardless of step type
+    for task in getattr(snap, "tasks", ()):
+        for intr in getattr(task, "interrupts", ()):
+            if isinstance(intr.value, dict) and intr.value.get("type") == "ask_context":
+                return "waiting_approval"
+    for intr in getattr(snap, "interrupts", ()):
+        if isinstance(intr.value, dict) and intr.value.get("type") == "ask_context":
+            return "waiting_approval"
     if runner is not None:
         current_step_id = snap.next[0]
         step_def = next((s for s in runner.steps if s["id"] == current_step_id), None)
@@ -161,7 +169,7 @@ def _get_runner_for_run(run: GraphRun, container: ApplicationContainer) -> YamlG
 
 async def _get_interrupt_payload(runner: YamlGraphRunner | None, run: GraphRun) -> dict:
     """Extract the rendered interrupt payload from the paused LangGraph snapshot."""
-    if run.status != "waiting_approval":
+    if run.status not in ("waiting_approval", "waiting_agent"):
         return {}
     # Primary: use the __interrupt__ chunk persisted to step_outputs during streaming
     raw = (run.step_outputs or {}).get("__interrupt__")
