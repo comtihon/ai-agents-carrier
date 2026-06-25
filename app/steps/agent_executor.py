@@ -84,6 +84,7 @@ def _build_agent_config(
     settings: "Settings",
     step: dict[str, Any] | None = None,
     run_id: str | None = None,
+    state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the ``agent_config`` payload to forward in ``POST /start``.
 
@@ -132,11 +133,12 @@ def _build_agent_config(
     if agent_def.s3_addon is not None:
         s3_addon = agent_def.s3_addon
         s3_path = s3_addon.path.replace("{workflow_id}", run_id or "")
+        s3_path = s3_path.replace("{project_id}", (state or {}).get("project_id", ""))
         extra["s3_bucket"] = s3_addon.bucket
         extra["s3_path"] = s3_path
 
-    # Apply compression level from step config (prepend instruction to system prompt)
-    compression_level = (step or {}).get("compression_level", "none")
+    # Apply compression level: step config takes priority, then agent_input, then none.
+    compression_level = (step or {}).get("compression_level") or agent_input.get("compression_level", "none")
     compression_instruction = _COMPRESSION_INSTRUCTIONS.get(compression_level or "none", "")
     if compression_instruction:
         system_prompt = (
@@ -463,7 +465,7 @@ async def execute_agent_step(
             agent_namespace=settings.agent_namespace,
             callback_override_url=settings.agent_callback_url,
         )
-        agent_config_payload = _build_agent_config(agent_def, settings, step=step, run_id=run_id)
+        agent_config_payload = _build_agent_config(agent_def, settings, step=step, run_id=run_id, state=state)
         resolved_env_vars: dict[str, str] = agent_config_payload.get("env_vars") or {}
 
         # LangGraph reruns the node from scratch on resume. Detect this by checking
