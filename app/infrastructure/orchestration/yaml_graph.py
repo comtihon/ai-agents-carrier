@@ -977,13 +977,17 @@ class YamlGraphRunner:
             from app.core.config import get_settings
             from app.steps.agent_executor import execute_agent_step
             logger.info("[%s] step '%s' running (%s)", graph_id, step_id, step["type"])
-            return await execute_agent_step(
-                step, state, agent_backend, run_id, callback_base_url,
-                settings=get_settings(),
-                run_repository=self._current_run_repository,
-                pvc_lease_repository=self._pvc_lease_repository,
-                agent_task_repository=self._agent_task_repository,
-            )
+            try:
+                return await execute_agent_step(
+                    step, state, agent_backend, run_id, callback_base_url,
+                    settings=get_settings(),
+                    run_repository=self._current_run_repository,
+                    pvc_lease_repository=self._pvc_lease_repository,
+                    agent_task_repository=self._agent_task_repository,
+                )
+            except Exception as _step_exc:
+                logger.error("[%s] step '%s' raised: %s", graph_id, step_id, _step_exc)
+                return {"__failed_step__": step_id, "error": str(_step_exc)}
 
         return node
 
