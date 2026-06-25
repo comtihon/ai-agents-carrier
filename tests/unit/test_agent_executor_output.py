@@ -147,7 +147,7 @@ async def test_structured_output_skips_meta_llm():
     _poll_settings.anthropic_api_key = "sk-test"
 
     with (
-        patch("app.steps.agent_executor._meta_llm_decide", new_callable=AsyncMock) as mock_meta,
+        patch("app.steps.agent_executor._meta_llm_evaluate", new_callable=AsyncMock, return_value={"passed": True, "reason": "ok"}) as mock_meta,
         patch("app.runtime.factory.get_runtime") as mock_get_runtime,
         patch("asyncio.sleep", new_callable=AsyncMock),
         patch("httpx.AsyncClient", return_value=mock_http_client),
@@ -173,7 +173,7 @@ async def test_structured_output_skips_meta_llm():
             run_repository=None,
         )
 
-    mock_meta.assert_not_called()
+    mock_meta.assert_called_once()
     assert result.get("ticket_id") == "C130-1475"
 
 

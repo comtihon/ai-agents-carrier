@@ -184,8 +184,8 @@ class Settings(BaseSettings):
     agent_max_loops: int = Field(default=3, alias="AGENT_MAX_LOOPS")
 
     # --- Meta-LLM (lightweight analysis after agent steps complete) ---
-    meta_llm_provider: str | None = Field(default="anthropic", alias="META_LLM_PROVIDER")
-    meta_llm_model: str = Field(default="claude-haiku-4-5-20251001", alias="META_LLM_MODEL")
+    meta_llm_provider: str | None = Field(default="openrouter", alias="META_LLM_PROVIDER")
+    meta_llm_model: str = Field(default="moonshotai/kimi-k2.6", alias="META_LLM_MODEL")
 
     model_config = SettingsConfigDict(
         env_file=".env",

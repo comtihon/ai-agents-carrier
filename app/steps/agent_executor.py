@@ -251,21 +251,22 @@ def _apply_mapping(
     }
 
 
-async def _meta_llm_decide(
-    raw_output: dict,
-    input_data: dict,
+async def _meta_llm_evaluate(
+    raw_output: Any,
+    input_data: Any,
     step_id: str,
     settings: "Settings",
+    success_criteria: str | None = None,
+    fail_criteria: str | None = None,
 ) -> dict:
-    """Call a lightweight LLM to decide how to proceed after an agent step.
+    """Evaluate step output against optional criteria using a lightweight LLM.
 
-    Returns: {"decision": "proceed"|"ask_clarification"|"ask_approval",
-              "questions": list[str], "reason": str}
-    Always returns proceed on any failure (non-blocking).
+    Returns: {"passed": bool, "reason": str}
+    Always returns passed=True on any failure (non-blocking).
     """
-    import json as _json
     try:
         from app.core.container import build_llm_native
+        from langchain_core.messages import HumanMessage
         provider = settings.meta_llm_provider or settings.llm_provider
         model = settings.meta_llm_model
         llm = build_llm_native(provider, model, settings, max_tokens=512)
@@ -275,82 +276,60 @@ async def _meta_llm_decide(
             or input_data.get("task")
             or input_data.get("prompt")
             or str(input_data)
-        )
+        ) if isinstance(input_data, dict) else str(input_data)
         output_text = (
             raw_output.get("result") or raw_output.get("answer") or str(raw_output)
             if isinstance(raw_output, dict) else str(raw_output)
         )
 
-        prompt = (
-            "You are an orchestrator analyzing an AI agent's response.\n\n"
-            f"Original request: {request_text}\n\n"
-            f"Agent output:\n{output_text}\n\n"
-            "Decide the next action:\n"
-            "1. Agent successfully answered → PROCEED\n"
-            "2. Agent needs more context that the user can provide → ASK_CLARIFICATION (extract the questions)\n"
-            "3. Output needs human review before continuing → ASK_APPROVAL\n"
-            "4. Agent cannot proceed due to missing tools/credentials/system access → FAIL\n\n"
-            "Use FAIL when the blocker is a hard configuration issue: "
-            "gcloud not authenticated, missing API key/token, tool not installed, "
-            "no access to required system. These cannot be resolved by answering questions.\n"
-            "Use ASK_CLARIFICATION when the user could unblock the agent by providing "
-            "information (e.g. which project, which environment, what format).\n\n"
-            "Respond with ONLY (no preamble):\n"
-            "DECISION: <PROCEED|ASK_CLARIFICATION|ASK_APPROVAL|FAIL>\n"
-            "QUESTIONS: [\"q1\", \"q2\"]  (only when ASK_CLARIFICATION)\n"
-            "REASON: <one sentence>"
-        )
+        has_criteria = bool(success_criteria or fail_criteria)
+        if has_criteria:
+            criteria_lines = []
+            if success_criteria:
+                criteria_lines.append(f"Success criteria: {success_criteria}")
+            if fail_criteria:
+                criteria_lines.append(f"Fail criteria: {fail_criteria}")
+            criteria_text = "\n".join(criteria_lines)
+            prompt = (
+                "You are evaluating whether an AI agent step produced acceptable output.\n\n"
+                f"Original request: {request_text}\n\n"
+                f"Agent output:\n{output_text}\n\n"
+                f"{criteria_text}\n\n"
+                "Based on the criteria above, did the agent output PASS or FAIL?\n"
+                "Respond with ONLY:\n"
+                "DECISION: PASS or DECISION: FAIL\n"
+                "REASON: <one line>"
+            )
+        else:
+            prompt = (
+                "You are evaluating whether an AI agent step actually accomplished what was requested.\n\n"
+                f"Original request: {request_text}\n\n"
+                f"Agent output:\n{output_text}\n\n"
+                "Did the agent output accomplish the requested task or did it fail/produce garbage?\n"
+                "Respond with ONLY:\n"
+                "DECISION: PASS or DECISION: FAIL\n"
+                "REASON: <one line>"
+            )
 
-        from langchain_core.messages import HumanMessage
         response = await llm.ainvoke([HumanMessage(content=prompt)])
         text = response.content if isinstance(response.content, str) else str(response.content)
 
-        decision = "proceed"
-        questions: list[str] = []
+        passed = True
         reason = ""
-
         for line in text.strip().splitlines():
             line = line.strip()
             if line.startswith("DECISION:"):
                 raw_d = line[len("DECISION:"):].strip().upper()
-                if raw_d == "ASK_CLARIFICATION":
-                    decision = "ask_clarification"
-                elif raw_d == "ASK_APPROVAL":
-                    decision = "ask_approval"
-                elif raw_d == "FAIL":
-                    decision = "fail"
-                else:
-                    decision = "proceed"
-            elif line.startswith("QUESTIONS:"):
-                raw_q = line[len("QUESTIONS:"):].strip()
-                try:
-                    parsed = _json.loads(raw_q)
-                    if isinstance(parsed, list):
-                        questions = [str(q) for q in parsed]
-                except Exception:
-                    # LLM returned non-JSON (e.g. plain text). Treat the
-                    # whole raw value as a single question so it is never lost.
-                    if raw_q:
-                        questions = [raw_q]
+                passed = (raw_d != "FAIL")
             elif line.startswith("REASON:"):
                 reason = line[len("REASON:"):].strip()
 
-        if decision == "ask_clarification" and not questions:
-            # LLM decided clarification is needed but produced no parseable
-            # QUESTIONS line. Log the full response so we can diagnose the
-            # LLM output format; the caller will use reason as a fallback.
-            logger.warning(
-                "[step '%s'] meta-LLM ask_clarification with no parseable questions. "
-                "Full response: %r",
-                step_id, text,
-            )
-
-        logger.info("[step '%s'] meta-LLM decision: %s — %s", step_id, decision, reason)
-        return {"decision": decision, "questions": questions, "reason": reason}
+        logger.info("[step '%s'] meta-LLM evaluation: %s — %s", step_id, "PASS" if passed else "FAIL", reason)
+        return {"passed": passed, "reason": reason}
 
     except Exception as exc:
-        logger.warning("[step '%s'] meta-LLM analysis failed: %s — proceeding normally", step_id, exc)
-        return {"decision": "proceed", "questions": [], "reason": str(exc)}
+        logger.warning("[step '%s'] meta-LLM evaluation failed: %s — defaulting to pass", step_id, exc)
+        return {"passed": True, "reason": "evaluator error, defaulting to pass"}
 
 
 async def execute_agent_step(
@@ -731,7 +710,7 @@ async def execute_agent_step(
                     _stored_task = await agent_task_repository.get_task(f"{run_id}_{step_id}")
                     if _stored_task:
                         _task_for_recovery = _stored_task
-                _is_complete = await _meta_llm_recovery(_task_for_recovery, get_settings().anthropic_api_key)
+                _is_complete = await _meta_llm_recovery(_task_for_recovery, settings)
                 if _is_complete:
                     for _out in reversed(_task_for_recovery.get("outputs", [])):
                         if isinstance(_out, dict) and _out.get("type") == "final":
@@ -944,6 +923,13 @@ async def execute_agent_step(
                 f"[step '{step_id}'] Agent reported error: {_agent_error_msg}. "
                 f"Token usage: {raw_output.get('token_usage', {})}"
             )
+
+    # --- 5b. Meta-LLM step evaluation ---
+    _sc = step.get("success_criteria") if isinstance(step, dict) else None
+    _fc = step.get("fail_criteria") if isinstance(step, dict) else None
+    _eval = await _meta_llm_evaluate(raw_output, input_data, step_id, settings, _sc, _fc)
+    if not _eval["passed"]:
+        raise RuntimeError(f"[step '{step_id}'] meta-LLM rejected output: {_eval['reason']}")
 
     # --- 6. Map output back to workflow state ---
     output_mapping: dict[str, str] | None = step.get("output_mapping")
