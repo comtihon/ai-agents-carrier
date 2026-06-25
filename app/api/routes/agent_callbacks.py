@@ -332,6 +332,45 @@ async def agent_progress(
         else:
             return {"run_id": run_id, "status": "token_updated"}
 
+    if body.message.startswith("__mcp_start__:"):
+        try:
+            d = _json.loads(body.message[len("__mcp_start__:"):])
+            servers: list = list(run.state.get("_active_mcp_servers", []))
+            if d.get("server"):
+                servers.append(d["server"])
+            run.state = {**(run.state or {}), "_active_mcp_servers": servers}
+            run.touch()
+            await container.run_repository.update(run)
+        except Exception:
+            pass
+        else:
+            return {"run_id": run_id, "status": "mcp_started"}
+
+    if body.message.startswith("__mcp_end__:"):
+        try:
+            d = _json.loads(body.message[len("__mcp_end__:"):])
+            servers = list(run.state.get("_active_mcp_servers", []))
+            srv = d.get("server")
+            if srv in servers:
+                servers.remove(srv)
+            run.state = {**(run.state or {}), "_active_mcp_servers": servers}
+            run.touch()
+            await container.run_repository.update(run)
+        except Exception:
+            pass
+        else:
+            return {"run_id": run_id, "status": "mcp_ended"}
+
+    if body.message.startswith("__mcp_clear__:"):
+        try:
+            run.state = {**(run.state or {}), "_active_mcp_servers": []}
+            run.touch()
+            await container.run_repository.update(run)
+        except Exception:
+            pass
+        else:
+            return {"run_id": run_id, "status": "mcp_cleared"}
+
     # Append progress message to run state for frontend polling.
     progress_list: list = list(run.state.get("_agent_progress", []))
     progress_list.append(body.message)
