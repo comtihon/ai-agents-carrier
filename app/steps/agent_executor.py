@@ -224,6 +224,7 @@ def _build_agent_config(
         "credentials": credentials,
         "extra": extra,
         "env_vars": env_vars,
+        "expected_output_fields": list(_protocol_keys),
     }
 
 

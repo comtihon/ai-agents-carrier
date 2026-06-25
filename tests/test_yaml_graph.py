@@ -28,32 +28,6 @@ async def test_llm_node_writes_output_key():
     assert state["result"] == "test output"
 
 
-@pytest.mark.asyncio
-async def test_llm_node_when_skips_if_falsy():
-    runner = _make_runner([
-        {"id": "step1", "type": "llm", "output_key": "result", "when": "missing_key"},
-    ])
-    config = {"configurable": {"thread_id": "t2"}}
-    state = await runner.graph.ainvoke({"request": "hello"}, config)
-    # node skipped — output_key not set
-    assert "result" not in state
-
-
-@pytest.mark.asyncio
-async def test_llm_node_when_runs_if_truthy():
-    runner = _make_runner([
-        {"id": "step1", "type": "llm", "output_key": "result", "when": "flag"},
-    ])
-    config = {"configurable": {"thread_id": "t3"}}
-    # inject flag=True into initial state via a passthrough step
-    runner2 = _make_runner([
-        {"id": "set_flag", "type": "llm", "output_key": "flag"},
-        {"id": "step1", "type": "llm", "output_key": "result", "when": "flag"},
-    ], extra_responses=[AIMessage(content="true"), AIMessage(content="output")])
-    state = await runner2.graph.ainvoke({"request": "hello"}, {"configurable": {"thread_id": "t3b"}})
-    assert state["flag"] == "true"
-    assert state["result"] == "output"
-
 
 @pytest.mark.asyncio
 async def test_mcp_node_missing_tool_returns_message():

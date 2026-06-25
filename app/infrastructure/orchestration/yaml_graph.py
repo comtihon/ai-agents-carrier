@@ -692,14 +692,9 @@ class YamlGraphRunner:
                         for r in routes
                         if "next" in r
                     }
-                    step_when = step.get("when")
-                    if step_when:
-                        # When the step's own guard is false (step was skipped),
-                        # the router must still fire — add END as a reachable target.
-                        route_map[END] = END
                     sg.add_conditional_edges(
                         sid,
-                        self._make_router_fn(sid, routes, step_when=step_when),
+                        self._make_router_fn(sid, routes),
                         route_map,
                     )
             elif next_val:
@@ -818,7 +813,7 @@ class YamlGraphRunner:
     _MAX_ROUTE_WAIT_SECONDS: float = 3600.0
 
     def _make_router_fn(
-        self, source_id: str, routes: list[dict[str, Any]], step_when: str | None = None
+        self, source_id: str, routes: list[dict[str, Any]]
     ) -> Callable[[dict], Awaitable[str]]:
         """Return an async routing function for add_conditional_edges.
 
@@ -898,11 +893,6 @@ class YamlGraphRunner:
         runner = self
 
         async def router(state: dict) -> str:
-            # When the enclosing step's own guard is false (step body returned {})
-            # the conditional edge router still fires.  Short-circuit to END so
-            # downstream steps never run after a skipped conditional step.
-            if step_when and not _eval_condition(step_when, state):
-                return END
             chosen = _select(state)
             wait = chosen.get("wait_seconds")
             if wait:
@@ -960,10 +950,6 @@ class YamlGraphRunner:
 
         async def node(state: dict) -> dict:
             step_id = step["id"]
-            if not self._when(step, state):
-                logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
-                return {}
-
             agent_backend = getattr(self, "_agent_backend", None)
             if agent_backend is None:
                 logger.error(
@@ -1001,9 +987,6 @@ class YamlGraphRunner:
 
         async def node(state: dict) -> dict:
             step_id = step["id"]
-            if not self._when(step, state):
-                logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
-                return {}
             logger.info("[%s] step '%s' running (llm_structured)", graph_id, step_id)
 
             output_model = self._build_output_model(step["output"])
@@ -1133,9 +1116,6 @@ class YamlGraphRunner:
         async def node(state: dict) -> dict:
             step_id = step["id"]
             output_key = step.get("output_key") or step_id
-            if not self._when(step, state):
-                logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
-                return {}
             logger.info("[%s] step '%s' running (llm)", graph_id, step_id)
             try:
                 system_prompt = step.get("system_prompt", "")
@@ -1162,9 +1142,6 @@ class YamlGraphRunner:
 
         async def node(state: dict) -> dict:
             step_id = step["id"]
-            if not self._when(step, state):
-                logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
-                return {}
             tool_name = step["tool"]
             server = self._mcp.get_tool_server(tool_name)
             server_tag = f" (server: {server})" if server else ""
@@ -1215,9 +1192,6 @@ class YamlGraphRunner:
         static_questions: list[str] = step.get("questions") or []
 
         async def node(state: dict) -> dict:
-            if not self._when(step, state):
-                logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
-                return {}
             if questions_key:
                 raw = state.get(questions_key) or []
                 # llm_structured outputs str, not list — split on newlines if needed
@@ -1241,13 +1215,6 @@ class YamlGraphRunner:
 
         def node(state: dict) -> dict:
             step_id = step["id"]
-            # Honour `when:` so a downstream approval gated on an earlier
-            # rejection does not prompt the user. Mirrors llm_structured /
-            # execute / mcp / workflow node bodies, which all early-return
-            # when the predicate is False.
-            if not self._when(step, state):
-                logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
-                return {}
             logger.info("[%s] step '%s' waiting for approval", graph_id, step_id)
             payload = {
                 k: self._render(v, state)
@@ -1274,9 +1241,6 @@ class YamlGraphRunner:
         output_key = step.get("output_key", f"{step_id}_result")
 
         async def node(state: dict) -> dict:
-            if not self._when(step, state):
-                logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
-                return {}
             if self._openhands is None:
                 logger.warning("[%s] step '%s' OpenHands not configured", graph_id, step_id)
                 return {output_key: "OpenHands not configured"}
@@ -1347,10 +1311,6 @@ class YamlGraphRunner:
         output_key = step.get("output_key", f"{step_id}_result")
 
         async def node(state: dict) -> dict:
-            if not self._when(step, state):
-                logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
-                return {}
-
             if self._registry is None or self._run_repository is None:
                 logger.error(
                     "[%s] step '%s': registry/run_repository not injected — "
@@ -1453,10 +1413,6 @@ class YamlGraphRunner:
 
         async def node(state: dict) -> dict:
             step_id = step["id"]
-            if not self._when(step, state):
-                logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
-                return {}
-
             method = step.get("method", "GET").upper()
             output_key = step.get("output_key") or step_id
 
@@ -1505,10 +1461,6 @@ class YamlGraphRunner:
 
         async def node(state: dict) -> dict:
             step_id = step["id"]
-            if not self._when(step, state):
-                logger.info("[%s] step '%s' skipped (condition not met)", graph_id, step_id)
-                return {}
-
             code = step.get("code", "")
             output_key = step.get("output_key") or step_id
 
@@ -1550,6 +1502,7 @@ class YamlGraphRunner:
             float(step["max_timeout"]) if step.get("max_timeout") else None
         )
         step_id = step["id"]
+        failure_policy: str = step.get("failure_policy", "and")
 
         async def node(state: dict) -> dict:
             # Check if any parallel branches recorded a timeout sentinel.
@@ -1563,6 +1516,15 @@ class YamlGraphRunner:
                             f"Join '{step_id}' timed out after {elapsed:.1f}s "
                             f"(max_timeout={max_timeout}s)"
                         )
+            # Apply branch failure policy.
+            failed = state.get("__failed_step__")
+            if failed:
+                if failure_policy == "and":
+                    # AND (default): any branch failure fails the join.
+                    return {"__failed_step__": step_id, "error": f"branch failed (AND policy): {failed}"}
+                # OR: proceed if at least one branch succeeded.
+                # TODO: full OR tracking requires counting successful branches.
+                pass
             return {}
         return node
 
@@ -1632,11 +1594,6 @@ class YamlGraphRunner:
             kept = YamlGraphRunner._MAX_TOOL_RESULT_CHARS
             content = content[:kept] + f"\n[truncated — {len(content) - kept} chars omitted]"
         return content
-
-    @staticmethod
-    def _when(step: dict[str, Any], state: dict) -> bool:
-        key = step.get("when")
-        return bool(state.get(key, False)) if key else True  # type: ignore[arg-type]
 
     @staticmethod
     def _render(template: str, state: dict) -> str:

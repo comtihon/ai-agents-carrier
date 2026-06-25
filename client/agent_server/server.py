@@ -57,6 +57,7 @@ class AgentConfig(BaseModel):
     mcp_servers: list[MCPServerConfig] = [] # full MCP server configs
     credentials: dict[str, str] = {}        # API keys, tokens — passed as resolved values
     extra: dict = {}                        # AgentDefinition.config passthrough
+    expected_output_fields: list[str] = [] # keys the agent MUST include in its output dict
 
 
 class StartRequest(BaseModel):
