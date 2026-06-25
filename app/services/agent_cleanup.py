@@ -1,9 +1,10 @@
 import logging
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
-async def cleanup_run_agents(run_id: str, settings) -> None:
+async def cleanup_run_agents(run_id: str, settings, warm_pod_repository: Any = None) -> None:
     """Terminate all k8s helm releases and docker containers for a run.
 
     Idempotent and never raises — safe to call on already-cleaned runs.
@@ -23,3 +24,9 @@ async def cleanup_run_agents(run_id: str, settings) -> None:
         logger.info("run %s: docker agent cleanup done", run_id)
     except Exception:
         logger.debug("run %s: docker agent cleanup failed", run_id, exc_info=True)
+    if warm_pod_repository is not None:
+        try:
+            await warm_pod_repository.delete_by_run(run_id)
+            logger.info("run %s: warm pod records deleted", run_id)
+        except Exception:
+            logger.debug("run %s: warm pod records cleanup failed", run_id, exc_info=True)

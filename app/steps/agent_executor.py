@@ -343,6 +343,7 @@ async def execute_agent_step(
     run_repository: Any = None,
     pvc_lease_repository: Any = None,
     agent_task_repository: Any = None,
+    warm_pod_repository: Any = None,
 ) -> dict[str, Any]:
     """Execute a ``langgraph-agent`` or ``claude-agent`` step.
 
@@ -447,16 +448,85 @@ async def execute_agent_step(
         agent_config_payload = _build_agent_config(agent_def, settings, step=step, run_id=run_id, state=state)
         resolved_env_vars: dict[str, str] = agent_config_payload.get("env_vars") or {}
 
+        # --- Warm pod reuse: check if a warm pod is available for this agent ---
+        _is_warm_reuse = False
+        _warm_agent_url: str | None = None
+        if warm_pod_repository is not None and runtime_type == "k8s":
+            _warm_record = await warm_pod_repository.get(run_id, agent_id)
+            if _warm_record is not None:
+                try:
+                    async with httpx.AsyncClient() as _hc:
+                        _hr = await _hc.get(f"{_warm_record.agent_url}/health", timeout=5.0)
+                        if _hr.status_code == 200:
+                            _is_warm_reuse = True
+                            _warm_agent_url = _warm_record.agent_url
+                        else:
+                            # Unhealthy pod — delete stale record, fall through to spawn
+                            try:
+                                await warm_pod_repository.delete(run_id, agent_id)
+                            except Exception:
+                                pass
+                except Exception:
+                    # Pod gone — delete the stale record for this specific agent
+                    try:
+                        await warm_pod_repository.delete(run_id, agent_id)
+                    except Exception:
+                        pass
+
         # LangGraph reruns the node from scratch on resume. Detect this by checking
         # whether a container already exists for this run (spawned in the first execution).
         # If so, skip spawn+start — interrupt() will return immediately with the stored output.
         _is_resume = (
-            hasattr(runtime, "has_container_for_run")
+            not _is_warm_reuse
+            and hasattr(runtime, "has_container_for_run")
             and await runtime.has_container_for_run(run_id)
         )
 
         container_callback_url = callback_base_url  # default; overridden below for docker/non-resume
-        if not _is_resume:
+        if _is_warm_reuse:
+            # Warm pod still alive — reuse it: send a fresh /start and enter poll loop.
+            agent_url = _warm_agent_url  # type: ignore[assignment]
+            container_callback_url = runtime.rewrite_callback_url(callback_base_url)
+            logger.info("[step '%s'] reusing warm pod at %s for run '%s'", step_id, agent_url, run_id)
+            try:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.post(
+                        f"{agent_url}/start",
+                        json={
+                            "run_id": run_id,
+                            "input": input_data,
+                            "callback_url": container_callback_url,
+                            "agent_config": agent_config_payload,
+                        },
+                        timeout=10.0,
+                    )
+                    resp.raise_for_status()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"[step '{step_id}'] Failed to start warm agent at {agent_url}: {exc}"
+                ) from exc
+            if agent_task_repository is not None:
+                from datetime import datetime, timezone
+                _task_doc = {
+                    "_id": f"{run_id}_{step_id}",
+                    "run_id": run_id,
+                    "step_id": step_id,
+                    "agent_id": agent_id,
+                    "agent_url": agent_url,
+                    "input": input_data,
+                    "agent_config": agent_config_payload if isinstance(agent_config_payload, dict) else {},
+                    "status": "pending",
+                    "loop_count": 0,
+                    "max_loops": get_settings().agent_max_loops,
+                    "outputs": [],
+                    "created_at": datetime.now(timezone.utc),
+                    "updated_at": datetime.now(timezone.utc),
+                }
+                try:
+                    await agent_task_repository.save_task(_task_doc)
+                except Exception as _e:
+                    logger.warning("[step '%s'] failed to save agent task (warm reuse): %s", step_id, _e)
+        elif not _is_resume:
             # --- 5a. Spawn the agent HTTP server ---
             agent_url = await runtime.spawn(agent_def, step, run_id, callback_base_url, extra_env=resolved_env_vars)
             logger.info("[step '%s'] agent server spawned at %s", step_id, agent_url)
@@ -741,14 +811,40 @@ async def execute_agent_step(
                 continue
             # status == "working" or unknown — keep polling
 
-        # Terminate using run_id label — works whether _containers is populated or not.
-        if hasattr(runtime, "terminate_by_run_id"):
-            await runtime.terminate_by_run_id(run_id)
-        else:
+        # After poll loop: either park as warm pod or terminate.
+        if warm_pod_repository is not None and runtime_type == "k8s":
+            from datetime import datetime, timezone, timedelta
+            from app.infrastructure.persistence.mongo import WarmPodRecord
+            _now = datetime.now(timezone.utc)
+            _release_name = runtime._release_name(agent_def, run_id) if hasattr(runtime, "_release_name") else ""
             try:
-                await runtime.terminate(agent_url)
-            except Exception as _exc:
-                logger.warning("[step '%s'] failed to terminate agent: %s", step_id, _exc)
+                await warm_pod_repository.upsert(WarmPodRecord(
+                    run_id=run_id,
+                    agent_id=agent_id,
+                    agent_url=agent_url,
+                    release_name=_release_name,
+                    created_at=_now,
+                    expires_at=_now + timedelta(hours=24),
+                ))
+                logger.info("[step '%s'] parked warm pod at %s (release=%s)", step_id, agent_url, _release_name)
+            except Exception as _wp_exc:
+                logger.warning("[step '%s'] failed to upsert warm pod record: %s — terminating instead", step_id, _wp_exc)
+                if hasattr(runtime, "terminate_by_run_id"):
+                    await runtime.terminate_by_run_id(run_id)
+                else:
+                    try:
+                        await runtime.terminate(agent_url)
+                    except Exception as _exc:
+                        logger.warning("[step '%s'] failed to terminate agent: %s", step_id, _exc)
+        else:
+            # Terminate using run_id label — works whether _containers is populated or not.
+            if hasattr(runtime, "terminate_by_run_id"):
+                await runtime.terminate_by_run_id(run_id)
+            else:
+                try:
+                    await runtime.terminate(agent_url)
+                except Exception as _exc:
+                    logger.warning("[step '%s'] failed to terminate agent: %s", step_id, _exc)
 
         logger.info(
             "[step '%s'] agent run '%s' resumed, output keys: %s",

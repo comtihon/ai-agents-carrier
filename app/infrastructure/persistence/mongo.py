@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -180,6 +181,68 @@ class MongoAgentTaskRepository:
         return await cursor.to_list(length=None)
 
 
+_WARM_POD_COLLECTION = "warm_pods"
+
+
+@dataclass
+class WarmPodRecord:
+    run_id: str
+    agent_id: str
+    agent_url: str
+    release_name: str
+    created_at: datetime
+    expires_at: datetime
+
+    def to_doc(self) -> dict:
+        return {
+            "_id": f"{self.run_id}|{self.agent_id}",
+            "run_id": self.run_id,
+            "agent_id": self.agent_id,
+            "agent_url": self.agent_url,
+            "release_name": self.release_name,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+        }
+
+    @classmethod
+    def from_doc(cls, doc: dict) -> "WarmPodRecord":
+        return cls(
+            run_id=doc["run_id"],
+            agent_id=doc["agent_id"],
+            agent_url=doc["agent_url"],
+            release_name=doc["release_name"],
+            created_at=doc["created_at"],
+            expires_at=doc["expires_at"],
+        )
+
+
+class MongoWarmPodRepository:
+    def __init__(self, collection: AsyncIOMotorCollection) -> None:
+        self._col = collection
+
+    async def get(self, run_id: str, agent_id: str) -> WarmPodRecord | None:
+        doc = await self._col.find_one({"_id": f"{run_id}|{agent_id}"})
+        return WarmPodRecord.from_doc(doc) if doc else None
+
+    async def upsert(self, record: WarmPodRecord) -> None:
+        await self._col.replace_one(
+            {"_id": f"{record.run_id}|{record.agent_id}"},
+            record.to_doc(),
+            upsert=True,
+        )
+
+    async def delete(self, run_id: str, agent_id: str) -> None:
+        await self._col.delete_one({"_id": f"{run_id}|{agent_id}"})
+
+    async def delete_by_run(self, run_id: str) -> None:
+        await self._col.delete_many({"run_id": run_id})
+
+    async def list_expired(self, now: datetime) -> list[WarmPodRecord]:
+        cursor = self._col.find({"expires_at": {"$lte": now}})
+        docs = await cursor.to_list(length=None)
+        return [WarmPodRecord.from_doc(d) for d in docs]
+
+
 class MongoClientProvider:
     _COLLECTION = "graph_runs"
 
@@ -204,6 +267,12 @@ class MongoClientProvider:
             self._client = AsyncIOMotorClient(self._settings.mongodb_uri)
         db = self._client[self._settings.mongodb_database]
         return MongoAgentTaskRepository(db[_AGENT_TASK_COLLECTION])
+
+    def get_warm_pod_repository(self) -> MongoWarmPodRepository:
+        if self._client is None:
+            self._client = AsyncIOMotorClient(self._settings.mongodb_uri)
+        db = self._client[self._settings.mongodb_database]
+        return MongoWarmPodRepository(db[_WARM_POD_COLLECTION])
 
     async def close(self) -> None:
         if self._client is not None:

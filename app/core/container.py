@@ -21,7 +21,7 @@ from app.infrastructure.config.graph_loader import (
 from app.infrastructure.integrations.openhands import OpenHandsAdapter
 from app.infrastructure.orchestration.checkpointer import MongoDBCheckpointSaver
 from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner, stream_graph_to_pause
-from app.infrastructure.persistence.mongo import MongoClientProvider, MongoGraphRunRepository, MongoPvcLeaseRepository, MongoAgentTaskRepository
+from app.infrastructure.persistence.mongo import MongoClientProvider, MongoGraphRunRepository, MongoPvcLeaseRepository, MongoAgentTaskRepository, MongoWarmPodRepository
 from app.infrastructure.persistence.agent_backend import (
     AgentDefinitionBackend,
     MongoAgentBackend,
@@ -61,6 +61,7 @@ class ApplicationContainer:
     cron_scheduler: CronScheduler = field(default_factory=CronScheduler)
     pvc_lease_repository: MongoPvcLeaseRepository | None = None
     agent_task_repository: MongoAgentTaskRepository | None = None
+    warm_pod_repository: MongoWarmPodRepository | None = None
 
     async def startup(self) -> None:
         await self.mcp_tools_provider.start()
@@ -80,6 +81,15 @@ class ApplicationContainer:
                 _pvc_cleanup_job,
                 IntervalTrigger(minutes=5),
                 id="pvc_lease_cleanup",
+                replace_existing=True,
+            )
+        # Register 10-minute warm pod TTL cleanup sweeper
+        if self.warm_pod_repository is not None:
+            from apscheduler.triggers.interval import IntervalTrigger as _WIT
+            self.cron_scheduler._scheduler.add_job(
+                self._cleanup_expired_warm_pods,
+                _WIT(minutes=10),
+                id="warm_pod_ttl_cleanup",
                 replace_existing=True,
             )
         # Register 60-second waiting_agent crash-detection sweeper
@@ -120,6 +130,8 @@ class ApplicationContainer:
                     runner._pvc_lease_repository = self.pvc_lease_repository
                 if self.agent_task_repository is not None:
                     runner._agent_task_repository = self.agent_task_repository
+                if self.warm_pod_repository is not None:
+                    runner._warm_pod_repository = self.warm_pod_repository
         logger.info("Loaded %d workflow definition(s) from backend", len(definitions))
         self._setup_all_cron_triggers()
 
@@ -177,6 +189,8 @@ class ApplicationContainer:
                         runner._pvc_lease_repository = self.pvc_lease_repository
                     if self.agent_task_repository is not None:
                         runner._agent_task_repository = self.agent_task_repository
+                    if self.warm_pod_repository is not None:
+                        runner._warm_pod_repository = self.warm_pod_repository
                     definition_snapshot: dict | None = defn.to_raw_dict()
                 else:
                     runner = self.yaml_graph_registry.get(workflow_id)
@@ -242,6 +256,8 @@ class ApplicationContainer:
                 runner._pvc_lease_repository = self.pvc_lease_repository
             if self.agent_task_repository is not None:
                 runner._agent_task_repository = self.agent_task_repository
+            if self.warm_pod_repository is not None:
+                runner._warm_pod_repository = self.warm_pod_repository
             self.yaml_graph_registry._runners[workflow_id] = runner
             self._register_cron_steps(runner)
             logger.info("Registry runner refreshed for workflow '%s'", workflow_id)
@@ -435,6 +451,8 @@ class ApplicationContainer:
                     runner._pvc_lease_repository = self.pvc_lease_repository
                 if self.agent_task_repository is not None:
                     runner._agent_task_repository = self.agent_task_repository
+                if self.warm_pod_repository is not None:
+                    runner._warm_pod_repository = self.warm_pod_repository
                 return runner
             except Exception:
                 logger.exception("run %s: failed to build runner from definition snapshot", run.id)
@@ -464,6 +482,27 @@ class ApplicationContainer:
             ).terminate_by_run_id(run.id)
         except Exception:
             logger.debug("run %s: docker cleanup in watcher failed", run.id, exc_info=True)
+
+    async def _cleanup_expired_warm_pods(self) -> None:
+        """Periodic sweep: helm-uninstall warm pods whose TTL has expired."""
+        if self.warm_pod_repository is None:
+            return
+        try:
+            now = datetime.datetime.now(datetime.timezone.utc)
+            expired = await self.warm_pod_repository.list_expired(now)
+            for record in expired:
+                try:
+                    from app.runtime.k8s import K8sRuntime
+                    rt = K8sRuntime(namespace=self.settings.agent_namespace)
+                    await rt.uninstall_release(record.release_name)
+                except Exception:
+                    logger.debug("warm pod cleanup: uninstall '%s' failed", record.release_name, exc_info=True)
+                try:
+                    await self.warm_pod_repository.delete(record.run_id, record.agent_id)
+                except Exception:
+                    logger.debug("warm pod cleanup: delete record failed for %s|%s", record.run_id, record.agent_id, exc_info=True)
+        except Exception:
+            logger.exception("_cleanup_expired_warm_pods sweep failed")
 
     async def _watch_waiting_agents(self) -> None:
         """Periodic sweep: detect crashed agent pods for waiting_agent runs."""
@@ -615,6 +654,7 @@ def build_container(settings: Settings) -> ApplicationContainer:
     run_repository = mongo_provider.get_repository()
     pvc_lease_repository = mongo_provider.get_pvc_lease_repository()
     agent_task_repository = mongo_provider.get_agent_task_repository()
+    warm_pod_repository = mongo_provider.get_warm_pod_repository()
     workflow_backend = _build_workflow_backend(settings)
     # Agent definitions are always stored in MongoDB (no local-files backend).
     agent_backend = MongoAgentBackend(settings.mongodb_uri, settings.mongodb_database)
@@ -637,4 +677,5 @@ def build_container(settings: Settings) -> ApplicationContainer:
         checkpointer=checkpointer,
         pvc_lease_repository=pvc_lease_repository,
         agent_task_repository=agent_task_repository,
+        warm_pod_repository=warm_pod_repository,
     )

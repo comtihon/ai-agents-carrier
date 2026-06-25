@@ -257,6 +257,22 @@ class K8sRuntime(AgentRuntime):
         except Exception:
             pass
 
+    async def uninstall_release(self, release_name: str) -> None:
+        """Helm-uninstall a single release by name (best-effort)."""
+        proc = await asyncio.create_subprocess_exec(
+            "helm", "uninstall", release_name, "-n", self._namespace,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.warning(
+                "K8sRuntime.uninstall_release: helm uninstall '%s' failed (exit %d): %s",
+                release_name, proc.returncode, stderr.decode(),
+            )
+        else:
+            logger.info("K8sRuntime.uninstall_release: release '%s' uninstalled", release_name)
+
     async def has_container_for_run(self, run_id: str) -> bool:
         """Return True if a Helm release for this run_id already exists in the cluster.
 

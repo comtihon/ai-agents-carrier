@@ -290,7 +290,7 @@ async def stream_graph_to_pause(
             await _cleanup_pvc(run, runner._pvc_lease_repository, _ns)
         from app.services.agent_cleanup import cleanup_run_agents
         from app.core.config import get_settings as _get_settings
-        await cleanup_run_agents(run.id, _get_settings())
+        await cleanup_run_agents(run.id, _get_settings(), warm_pod_repository=runner._warm_pod_repository)
         return
 
     snap = await runner.graph.aget_state(config)
@@ -374,7 +374,7 @@ async def stream_graph_to_pause(
             await _cleanup_pvc(run, runner._pvc_lease_repository, _ns)
         from app.services.agent_cleanup import cleanup_run_agents
         from app.core.config import get_settings as _get_settings
-        await cleanup_run_agents(run.id, _get_settings())
+        await cleanup_run_agents(run.id, _get_settings(), warm_pod_repository=runner._warm_pod_repository)
 
     if run.status == "waiting_agent" and run.current_step:
         # Extract agent_url from the interrupt payload and persist it on the run
@@ -622,6 +622,8 @@ class YamlGraphRunner:
         self._pvc_lease_repository: Any = None
         # Injected post-construction for agent task tracking (optional)
         self._agent_task_repository: Any = None
+        # Injected post-construction for warm pod reuse tracking (optional)
+        self._warm_pod_repository: Any = None
         # Set by stream_graph_to_pause to enable mid-run persistence from nodes
         self._current_run: Any = None
         self._current_run_repository: Any = None
@@ -984,6 +986,7 @@ class YamlGraphRunner:
                     run_repository=self._current_run_repository,
                     pvc_lease_repository=self._pvc_lease_repository,
                     agent_task_repository=self._agent_task_repository,
+                    warm_pod_repository=self._warm_pod_repository,
                 )
             except Exception as _step_exc:
                 logger.error("[%s] step '%s' raised: %s", graph_id, step_id, _step_exc)
