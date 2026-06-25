@@ -84,8 +84,12 @@ class K8sRuntime(AgentRuntime):
         release_name = self._release_name(agent_def, run_id)
 
         # Build --set arguments from helm_values plus runtime overrides.
+        # Skip dict values — they can't be serialised to --set and indicate a
+        # corrupted/nested helm_values document (e.g. from a bad $set path).
         set_args: list[str] = []
         for key, value in (agent_def.helm_values or {}).items():
+            if isinstance(value, dict):
+                continue
             set_args += ["--set", f"{key}={value}"]
         set_args += ["--set", f"env.AGENT_PORT={_AGENT_PORT}"]
         effective_url = self.rewrite_callback_url(callback_base_url)
