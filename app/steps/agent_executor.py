@@ -83,6 +83,7 @@ def _build_agent_config(
     agent_def: "AgentDefinition",
     settings: "Settings",
     step: dict[str, Any] | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     """Build the ``agent_config`` payload to forward in ``POST /start``.
 
@@ -126,6 +127,13 @@ def _build_agent_config(
         if intg:
             extra["llm_base_url"] = intg.base_url
             extra["llm_api_key_env"] = intg.resolved_api_key_env()
+
+    # Inject S3 workspace config when the agent has an s3 addon attached.
+    if agent_def.s3_addon is not None:
+        s3_addon = agent_def.s3_addon
+        s3_path = s3_addon.path.replace("{workflow_id}", run_id or "")
+        extra["s3_bucket"] = s3_addon.bucket
+        extra["s3_path"] = s3_path
 
     # Apply compression level from step config (prepend instruction to system prompt)
     compression_level = (step or {}).get("compression_level", "none")
@@ -455,7 +463,7 @@ async def execute_agent_step(
             agent_namespace=settings.agent_namespace,
             callback_override_url=settings.agent_callback_url,
         )
-        agent_config_payload = _build_agent_config(agent_def, settings, step=step)
+        agent_config_payload = _build_agent_config(agent_def, settings, step=step, run_id=run_id)
         resolved_env_vars: dict[str, str] = agent_config_payload.get("env_vars") or {}
 
         # LangGraph reruns the node from scratch on resume. Detect this by checking
@@ -559,8 +567,66 @@ async def execute_agent_step(
                 _get_url_fn = getattr(runtime, "get_agent_url_for_run", None)
                 agent_url = await _get_url_fn(run_id) if _get_url_fn is not None and _inspect.iscoroutinefunction(_get_url_fn) else None
             if not agent_url:
-                raise RuntimeError(f"[step '{step_id}'] cannot resume: agent_url not found for run {run_id}")
-            logger.info("[step '%s'] resuming run '%s' (container already running)", step_id, run_id)
+                # Stale pod from a failed spawn (e.g. helm timeout before task was saved).
+                # Terminate it and fall through to a fresh spawn below.
+                logger.warning(
+                    "[step '%s'] agent_url not found for run '%s' — stale pod detected, terminating and respawning",
+                    step_id, run_id,
+                )
+                _terminate_fn = getattr(runtime, "terminate_by_run_id", None)
+                if _terminate_fn is not None:
+                    try:
+                        await _terminate_fn(run_id)
+                    except Exception as _te:
+                        logger.warning("[step '%s'] terminate_by_run_id failed: %s", step_id, _te)
+                _is_resume = False
+                agent_url = await runtime.spawn(agent_def, step, run_id, callback_base_url, extra_env=resolved_env_vars)
+                logger.info("[step '%s'] agent server respawned at %s", step_id, agent_url)
+                container_callback_url = runtime.rewrite_callback_url(callback_base_url)
+                try:
+                    async with httpx.AsyncClient() as client:
+                        resp = await client.post(
+                            f"{agent_url}/start",
+                            json={
+                                "run_id": run_id,
+                                "input": input_data,
+                                "callback_url": container_callback_url,
+                                "agent_config": agent_config_payload,
+                            },
+                            timeout=10.0,
+                        )
+                        resp.raise_for_status()
+                except Exception as exc:
+                    try:
+                        await runtime.terminate(agent_url)
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"[step '{step_id}'] Failed to start respawned agent at {agent_url}: {exc}"
+                    ) from exc
+                if agent_task_repository is not None:
+                    from datetime import datetime, timezone
+                    _task_doc = {
+                        "_id": f"{run_id}_{step_id}",
+                        "run_id": run_id,
+                        "step_id": step_id,
+                        "agent_id": agent_id,
+                        "agent_url": agent_url,
+                        "input": input_data,
+                        "agent_config": agent_config_payload if isinstance(agent_config_payload, dict) else {},
+                        "status": "pending",
+                        "loop_count": 0,
+                        "max_loops": get_settings().agent_max_loops,
+                        "outputs": [],
+                        "created_at": datetime.now(timezone.utc),
+                        "updated_at": datetime.now(timezone.utc),
+                    }
+                    try:
+                        await agent_task_repository.save_task(_task_doc)
+                    except Exception as _e:
+                        logger.warning("[step '%s'] failed to save agent task on respawn: %s", step_id, _e)
+            else:
+                logger.info("[step '%s'] resuming run '%s' (container already running)", step_id, run_id)
 
         # --- 5c. Pull-based polling: poll agent every N seconds until finished/failed/idle ---
         _poll_interval = get_settings().agent_poll_interval_seconds

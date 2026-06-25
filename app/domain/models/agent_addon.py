@@ -19,4 +19,10 @@ class MCPAddon(AgentAddon):
         return {name for name, enabled in self.servers.items() if enabled}
 
 
-AnyAgentAddon = Annotated[Union[MCPAddon], Field(discriminator="type")]
+class S3Addon(AgentAddon):
+    type: Literal["s3"] = "s3"
+    bucket: str = ""
+    path: str = ""
+
+
+AnyAgentAddon = Annotated[Union[MCPAddon, S3Addon], Field(discriminator="type")]
