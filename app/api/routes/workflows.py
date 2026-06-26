@@ -116,7 +116,10 @@ def _build_steps(raw_steps: list, run: GraphRun) -> list[dict]:
         # Prefer the step-level error captured in step_outputs over the run-level
         # error — a step may fail mid-run before the overall run is marked failed,
         # so run_error would be None even though step_out["error"] has the message.
-        step_error = (step_out.get("error") or run_error) if is_failed else None
+        # Also use _meta_llm_rejection as error when present — it's a cleaner
+        # human-readable string without the [step '...'] prefix noise.
+        _raw_err = step_out.get("_meta_llm_rejection") or step_out.get("error") or run_error
+        step_error = _raw_err if is_failed else None
         # Strip internal sentinel keys from the output exposed to the UI.
         display_out = (
             {k: v for k, v in step_out.items() if not k.startswith("__")}

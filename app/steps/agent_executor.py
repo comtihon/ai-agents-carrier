@@ -1029,10 +1029,14 @@ async def execute_agent_step(
                     _mapped_for_rejection = {_rej_output_key: raw_output["result"]}
                 else:
                     _mapped_for_rejection = {}
+                # When structured extraction found nothing, still surface the raw
+                # result text so the UI can display what the agent actually produced.
+                if not _mapped_for_rejection and isinstance(raw_output.get("result"), str):
+                    _mapped_for_rejection["_agent_raw_output"] = raw_output["result"]
                 if "token_usage" in raw_output:
                     _mapped_for_rejection[f"_agent_token_usage_{step_id}"] = raw_output["token_usage"]
                 raise MetaLLMRejectionError(
-                    f"[step '{step_id}'] meta-LLM rejected output: {_rejection_reason}",
+                    _rejection_reason,  # clean reason — no step-id prefix noise
                     mapped_result=_mapped_for_rejection,
                     reason=_rejection_reason,
                 )
