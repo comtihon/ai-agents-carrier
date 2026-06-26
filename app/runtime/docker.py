@@ -169,8 +169,12 @@ class DockerRuntime(AgentRuntime):
         )
 
         # Poll GET /health until the server is ready (health_timeout seconds).
+        # Every 5 seconds also check the container state so we fail fast when
+        # the process crashed instead of waiting out the full timeout.
         loop = asyncio.get_event_loop()
         deadline = loop.time() + health_timeout
+        _last_state_check = loop.time()
+        _STATE_CHECK_INTERVAL = 5.0
         async with httpx.AsyncClient() as client:
             while loop.time() < deadline:
                 try:
@@ -182,14 +186,49 @@ class DockerRuntime(AgentRuntime):
                         return agent_url
                 except Exception:
                     pass
+
+                now = loop.time()
+                if now - _last_state_check >= _STATE_CHECK_INTERVAL:
+                    _last_state_check = now
+                    state, tail = await self._get_container_state(container.id)
+                    if state in ("exited", "dead"):
+                        logger.error(
+                            "DockerRuntime: container %s exited early (state=%r) logs:\n%s",
+                            container.id[:12], state, tail,
+                        )
+                        await self.terminate(agent_url)
+                        raise RuntimeError(
+                            f"DockerRuntime: container exited before becoming healthy "
+                            f"(state={state!r}, run_id={run_id}). "
+                            f"Last logs:\n{tail}"
+                        )
+                    logger.debug(
+                        "DockerRuntime: container %s still starting (state=%r)",
+                        container.id[:12], state,
+                    )
+
                 await asyncio.sleep(_HEALTH_POLL_INTERVAL)
 
-        # Agent did not become healthy — clean up and raise.
+        # Agent did not become healthy within timeout — collect logs and raise.
+        _, tail = await self._get_container_state(container.id)
         await self.terminate(agent_url)
         raise RuntimeError(
             f"DockerRuntime: agent at {agent_url} did not become healthy "
-            f"within {health_timeout}s (run_id={run_id})"
+            f"within {health_timeout}s (run_id={run_id}). "
+            f"Last logs:\n{tail}"
         )
+
+    async def _get_container_state(self, container_id: str) -> tuple[str, str]:
+        """Return (state, last_logs) for a container. Never raises."""
+        try:
+            container = await self._client.containers.get(container_id)
+            info = await container.show()
+            state = info.get("State", {}).get("Status", "unknown")
+            logs = await container.log(stdout=True, stderr=True, tail=30)
+            tail = "".join(logs).strip()
+            return state, tail
+        except Exception as exc:
+            return "unknown", f"(could not retrieve logs: {exc})"
 
     async def terminate(self, agent_url: str) -> None:
         """Call POST /terminate then docker stop + docker rm.

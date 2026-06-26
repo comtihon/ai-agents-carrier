@@ -131,6 +131,7 @@ class K8sRuntime(AgentRuntime):
 
         _helm_retries = 3
         _helm_retry_delay = 10.0
+        _extended_health_timeout = False  # set True when helm timed out but pod still initialising
         for _attempt in range(_helm_retries):
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -148,6 +149,34 @@ class K8sRuntime(AgentRuntime):
                 )
                 await asyncio.sleep(_helm_retry_delay)
                 continue
+            if "context deadline exceeded" in stderr_text:
+                # Helm timed out waiting for the rollout. Check whether the pod
+                # is still initialising (image pull, ContainerCreating) or is in
+                # a terminal bad state (CrashLoopBackOff, OOMKilled, not found).
+                pod_status = await self._get_pod_status(release_name)
+                logger.warning(
+                    "K8sRuntime: helm timeout for '%s' — pod_status=%r",
+                    release_name, pod_status,
+                )
+                _BAD_STATES = {
+                    "CrashLoopBackOff", "OOMKilled", "Error", "OOMKilling",
+                    "ImagePullBackOff", "ErrImagePull", "InvalidImageName",
+                    "Evicted", "not_found",
+                }
+                if pod_status in _BAD_STATES:
+                    raise RuntimeError(
+                        f"K8sRuntime: helm upgrade timed out for release '{release_name}' "
+                        f"and pod is in terminal state (pod_status={pod_status!r}). "
+                        f"Helm error: {stderr_text.strip()}"
+                    )
+                # Pod still starting — fall through to health polling with extended timeout.
+                logger.info(
+                    "K8sRuntime: helm timed out but pod still initialising (status=%r) — "
+                    "skipping helm wait, polling /health directly for '%s'",
+                    pod_status, release_name,
+                )
+                _extended_health_timeout = True
+                break
             raise RuntimeError(
                 f"K8sRuntime: helm upgrade failed for release '{release_name}':\n"
                 f"{stderr_text}"
@@ -161,8 +190,11 @@ class K8sRuntime(AgentRuntime):
         logger.info("K8sRuntime: release '%s' deployed at %s", release_name, agent_url)
 
         # Poll GET /health until the agent service is reachable.
-        # Inside the cluster the URL above is directly accessible.
+        # When helm timed out but the pod was still pulling/initialising, use a
+        # longer timeout so a slow image pull doesn't cause a false failure.
         health_timeout = float(agent_def.health_timeout or _HEALTH_TIMEOUT)
+        if _extended_health_timeout:
+            health_timeout = max(health_timeout, 300.0)
         loop = asyncio.get_event_loop()
         deadline = loop.time() + health_timeout
         async with httpx.AsyncClient() as client:
@@ -184,6 +216,47 @@ class K8sRuntime(AgentRuntime):
             f"K8sRuntime: agent at {agent_url} did not become healthy "
             f"within {health_timeout}s (run_id={run_id})"
         )
+
+    async def _get_pod_status(self, release_name: str) -> str:
+        """Return the pod phase or container waiting reason for a helm release.
+
+        Returns one of: a k8s phase ("Pending", "Running", "Succeeded",
+        "Failed", "Unknown"), a container waiting reason
+        ("ContainerCreating", "CrashLoopBackOff", "OOMKilled",
+        "ImagePullBackOff", …), or "not_found" when no pods exist.
+        """
+        try:
+            import json as _json
+            proc = await asyncio.create_subprocess_exec(
+                "kubectl", "get", "pods",
+                "-n", self._namespace,
+                "-l", f"app.kubernetes.io/instance={release_name}",
+                "-o", "json",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await proc.communicate()
+            data = _json.loads(stdout or "{}")
+            pods = data.get("items", [])
+            if not pods:
+                return "not_found"
+            pod = pods[-1]
+            # Check init + regular container waiting/terminated reasons first —
+            # these carry the actionable signal (CrashLoopBackOff, OOMKilled, …).
+            for cs in (
+                pod.get("status", {}).get("initContainerStatuses", [])
+                + pod.get("status", {}).get("containerStatuses", [])
+            ):
+                waiting = cs.get("state", {}).get("waiting", {})
+                if waiting.get("reason"):
+                    return waiting["reason"]
+                terminated = cs.get("state", {}).get("terminated", {})
+                if terminated.get("reason") and terminated["reason"] != "Completed":
+                    return terminated["reason"]
+            return pod.get("status", {}).get("phase", "Unknown")
+        except Exception as exc:
+            logger.warning("K8sRuntime._get_pod_status('%s') failed: %s", release_name, exc)
+            return "Unknown"
 
     async def terminate(self, agent_url: str) -> None:
         """Call POST /terminate then uninstall the Helm release."""
