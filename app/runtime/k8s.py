@@ -292,7 +292,10 @@ class K8sRuntime(AgentRuntime):
             )
             stdout, _ = await proc.communicate()
             releases = _json.loads(stdout or "[]")
-            return bool(releases)
+            # Only treat the run as "already running" when the release is in a
+            # healthy state.  A FAILED release (e.g. helm timed out on a cold
+            # image pull) must be re-spawned, not resumed.
+            return any(r.get("status") not in ("failed", "pending-install", "pending-upgrade") for r in releases)
         except Exception:
             return False
 
