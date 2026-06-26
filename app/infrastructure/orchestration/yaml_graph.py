@@ -846,7 +846,11 @@ class YamlGraphRunner:
 
         async def _guarded(state: dict) -> dict:
             failed = state.get("__failed_step__")
-            if failed:
+            if failed and failed != step_id:
+                # Only abort for a DIFFERENT upstream failure.  When failed == step_id
+                # the checkpoint carries this step's own previous failure sentinel —
+                # that happens on restart where the run resumes from the failed step
+                # itself.  Blocking self-restart would make every retry instant-fail.
                 logger.error(
                     "[%s] step '%s' aborted — upstream step '%s' already failed; "
                     "halting graph execution",
@@ -854,6 +858,11 @@ class YamlGraphRunner:
                 )
                 raise RuntimeError(
                     f"step '{step_id}' aborted — upstream step '{failed}' already failed"
+                )
+            if failed == step_id:
+                logger.info(
+                    "[%s] step '%s' restarting (own failure sentinel cleared)",
+                    graph_id, step_id,
                 )
             return (await fn(state)) if is_async else fn(state)
 
