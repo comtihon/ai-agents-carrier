@@ -49,6 +49,18 @@ import logging
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import httpx
+
+
+class MetaLLMRejectionError(RuntimeError):
+    """Raised when meta-LLM quality gate rejects a step's output.
+
+    Carries the already-mapped workflow state so callers can surface the
+    agent's actual output alongside the rejection reason instead of discarding it.
+    """
+    def __init__(self, message: str, mapped_result: dict[str, Any], reason: str) -> None:
+        super().__init__(message)
+        self.mapped_result = mapped_result
+        self.reason = reason
 from langgraph.types import interrupt
 
 from app.core.config import get_settings
@@ -1002,7 +1014,28 @@ async def execute_agent_step(
                 step_id, _eval["passed"], _eval.get("reason"),
             )
             if not _eval["passed"]:
-                raise RuntimeError(f"[step '{step_id}'] meta-LLM rejected output: {_eval['reason']}")
+                # Pre-compute the output mapping so the caller can surface the
+                # agent's actual extracted output in the UI alongside the rejection.
+                _rejection_reason = _eval["reason"]
+                _rej_output_mapping: dict[str, str] | None = step.get("output_mapping")
+                _rej_output_key: str | None = step.get("output_key")
+                if _rej_output_mapping:
+                    _mapped_for_rejection: dict[str, Any] = {
+                        wk: raw_output[ak]
+                        for ak, wk in _rej_output_mapping.items()
+                        if ak in raw_output
+                    }
+                elif _rej_output_key and "result" in raw_output:
+                    _mapped_for_rejection = {_rej_output_key: raw_output["result"]}
+                else:
+                    _mapped_for_rejection = {}
+                if "token_usage" in raw_output:
+                    _mapped_for_rejection[f"_agent_token_usage_{step_id}"] = raw_output["token_usage"]
+                raise MetaLLMRejectionError(
+                    f"[step '{step_id}'] meta-LLM rejected output: {_rejection_reason}",
+                    mapped_result=_mapped_for_rejection,
+                    reason=_rejection_reason,
+                )
 
         # Deterministic fail when output_mapping is set but nothing matched.
         # The agent returned unstructured output (e.g. {"result": "text"}) AND

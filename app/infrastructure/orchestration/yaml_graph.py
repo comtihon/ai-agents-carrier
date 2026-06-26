@@ -1070,6 +1070,21 @@ class YamlGraphRunner:
                     use_meta_llm=use_meta_llm,
                 )
             except Exception as _step_exc:
+                from app.steps.agent_executor import MetaLLMRejectionError
+                if isinstance(_step_exc, MetaLLMRejectionError):
+                    # Include the agent's actual extracted output alongside the
+                    # rejection so the UI can show what the agent produced and
+                    # why meta-LLM rejected it — not just a blank failed step.
+                    logger.error(
+                        "[%s] step '%s' meta-LLM rejected: %s",
+                        graph_id, step_id, _step_exc.reason,
+                    )
+                    return {
+                        "__failed_step__": step_id,
+                        "error": str(_step_exc),
+                        "_meta_llm_rejection": _step_exc.reason,
+                        **_step_exc.mapped_result,
+                    }
                 logger.error("[%s] step '%s' raised: %s", graph_id, step_id, _step_exc)
                 return {"__failed_step__": step_id, "error": str(_step_exc)}
 
