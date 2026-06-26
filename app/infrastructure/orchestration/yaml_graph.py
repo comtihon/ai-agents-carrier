@@ -74,6 +74,12 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
         # the default "finished" inferred from a non-empty output dict.
         "__failed_step__":            Annotated[Any, _last_wins],    # type: ignore[assignment]
         "_live_token_usage":          Annotated[Any, _last_wins],    # type: ignore[assignment]
+        # Quality-gate rejection fields — written by _agent_node when meta-LLM
+        # or output-mapping validation fails.  Must be in the schema or LangGraph
+        # silently drops them from the update stream before step_outputs is written.
+        "_meta_llm_rejection":        Annotated[Any, _last_wins],    # type: ignore[assignment]
+        "_agent_raw_output":          Annotated[Any, _last_wins],    # type: ignore[assignment]
+        "error":                      Annotated[Any, _last_wins],    # type: ignore[assignment]
     }
     for step in steps:
         # Regular output nodes store their result under output_key
