@@ -345,6 +345,7 @@ async def execute_agent_step(
     pvc_lease_repository: Any = None,
     agent_task_repository: Any = None,
     warm_pod_repository: Any = None,
+    use_meta_llm: bool = True,
 ) -> dict[str, Any]:
     """Execute a ``langgraph-agent`` or ``claude-agent`` step.
 
@@ -775,21 +776,22 @@ async def execute_agent_step(
 
             if _poll_status == "idle":
                 # Agent lost the task — meta LLM recovery
-                from app.services.agent_poller import _meta_llm_recovery
-                _task_for_recovery = {"input": input_data, "outputs": _poll_outputs}
-                if agent_task_repository is not None:
-                    _stored_task = await agent_task_repository.get_task(f"{run_id}_{step_id}")
-                    if _stored_task:
-                        _task_for_recovery = _stored_task
-                _is_complete = await _meta_llm_recovery(_task_for_recovery, settings)
-                if _is_complete:
-                    for _out in reversed(_task_for_recovery.get("outputs", [])):
-                        if isinstance(_out, dict) and _out.get("type") == "final":
-                            raw_output = _out.get("content", {})
-                            break
+                if use_meta_llm:
+                    from app.services.agent_poller import _meta_llm_recovery
+                    _task_for_recovery = {"input": input_data, "outputs": _poll_outputs}
                     if agent_task_repository is not None:
-                        await agent_task_repository.update_task(f"{run_id}_{step_id}", {"status": "finished"})
-                    break
+                        _stored_task = await agent_task_repository.get_task(f"{run_id}_{step_id}")
+                        if _stored_task:
+                            _task_for_recovery = _stored_task
+                    _is_complete = await _meta_llm_recovery(_task_for_recovery, settings)
+                    if _is_complete:
+                        for _out in reversed(_task_for_recovery.get("outputs", [])):
+                            if isinstance(_out, dict) and _out.get("type") == "final":
+                                raw_output = _out.get("content", {})
+                                break
+                        if agent_task_repository is not None:
+                            await agent_task_repository.update_task(f"{run_id}_{step_id}", {"status": "finished"})
+                        break
                 _loop_count += 1
                 if _loop_count >= _max_loops:
                     if agent_task_repository is not None:
@@ -1022,11 +1024,12 @@ async def execute_agent_step(
             )
 
     # --- 5b. Meta-LLM step evaluation ---
-    _sc = step.get("success_criteria") if isinstance(step, dict) else None
-    _fc = step.get("fail_criteria") if isinstance(step, dict) else None
-    _eval = await _meta_llm_evaluate(raw_output, input_data, step_id, settings, _sc, _fc)
-    if not _eval["passed"]:
-        raise RuntimeError(f"[step '{step_id}'] meta-LLM rejected output: {_eval['reason']}")
+    if use_meta_llm:
+        _sc = step.get("success_criteria") if isinstance(step, dict) else None
+        _fc = step.get("fail_criteria") if isinstance(step, dict) else None
+        _eval = await _meta_llm_evaluate(raw_output, input_data, step_id, settings, _sc, _fc)
+        if not _eval["passed"]:
+            raise RuntimeError(f"[step '{step_id}'] meta-LLM rejected output: {_eval['reason']}")
 
     # --- 6. Map output back to workflow state ---
     output_mapping: dict[str, str] | None = step.get("output_mapping")

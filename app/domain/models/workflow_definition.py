@@ -13,6 +13,7 @@ class WorkflowDefinition(BaseModel):
     steps: list[dict[str, Any]] = []
     ui: dict[str, Any] = Field(default_factory=dict)
     readonly: bool = False
+    use_meta_llm: bool = True
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -29,4 +30,5 @@ class WorkflowDefinition(BaseModel):
         }
         if self.ui:
             d["ui"] = self.ui
+        d["use_meta_llm"] = self.use_meta_llm
         return d

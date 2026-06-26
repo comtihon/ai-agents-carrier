@@ -61,6 +61,7 @@ class WorkflowDefinitionRequest(BaseModel):
     description: str = ""
     steps: list[dict[str, Any]] = []
     ui: dict[str, Any] = Field(default_factory=dict)
+    use_meta_llm: bool = True
 
 
 class WorkflowDefinitionUpdateRequest(BaseModel):
@@ -68,6 +69,7 @@ class WorkflowDefinitionUpdateRequest(BaseModel):
     description: str = ""
     steps: list[dict[str, Any]] = []
     ui: dict[str, Any] = Field(default_factory=dict)
+    use_meta_llm: bool = True
 
 
 class RestartFromStepRequest(BaseModel):
@@ -488,6 +490,7 @@ async def create_workflow(
         description=body.description,
         steps=body.steps,
         ui=body.ui,
+        use_meta_llm=body.use_meta_llm,
     )
     saved = await container.workflow_backend.create(defn)
     await container.refresh_runner(body.id)
@@ -982,6 +985,7 @@ async def update_workflow(
         description=body.description,
         steps=body.steps,
         ui=body.ui,
+        use_meta_llm=body.use_meta_llm,
         created_at=existing.created_at,
     )
     saved = await container.workflow_backend.update(workflow_id, defn)

@@ -8,9 +8,12 @@ Literal-segment routes (``/types``) are registered BEFORE parameterised routes
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from typing import Any
 
+import anyio
 from fastapi import APIRouter, Depends, HTTPException
+from google.cloud import storage
 from pydantic import BaseModel, Field
 
 from app.api.dependencies import get_container
@@ -222,3 +225,95 @@ async def update_agent_addons(
     existing.addons = _addon_adapter.validate_python(body.addons)
     saved = await container.agent_backend.update(agent_id, existing)
     return saved.model_dump(mode="json")
+
+
+# ─── S3 addon file browser helpers ───────────────────────────────────────────
+
+async def _resolve_s3_addon(
+    container: ApplicationContainer,
+    agent_id: str,
+    run_id: str,
+) -> tuple[str, str]:
+    """Load agent + run, resolve template placeholders in addon path.
+
+    Returns (bucket, resolved_path).
+    """
+    _require_backend(container)
+    assert container.agent_backend is not None
+
+    defn = await container.agent_backend.get(agent_id)
+    if defn is None:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
+
+    addon = defn.s3_addon
+    if addon is None:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' has no S3 addon")
+
+    run = await container.run_repository.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
+
+    path = addon.path.replace("{workflow_id}", run.id or "")
+    path = path.replace("{project_id}", (run.state or {}).get("project_id", ""))
+    return (addon.bucket, path)
+
+
+@router.get("/{agent_id}/s3/files")
+async def list_s3_addon_files(
+    agent_id: str,
+    run_id: str,
+    container: ApplicationContainer = Depends(get_container),
+):
+    """List files in the GCS bucket/path resolved from the agent's S3 addon."""
+    bucket_name, path = await _resolve_s3_addon(container, agent_id, run_id)
+
+    if not path or not path.strip():
+        return {"bucket": bucket_name, "path": path, "files": []}
+
+    def _list() -> list[dict]:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blobs = list(bucket.list_blobs(prefix=path))
+        return [
+            {
+                "name": blob.name.split("/")[-1],
+                "path": blob.name,
+                "size": blob.size,
+                "updated": blob.updated.isoformat() if blob.updated else None,
+            }
+            for blob in blobs
+        ]
+
+    files = await anyio.to_thread.run_sync(_list)
+    return {"bucket": bucket_name, "path": path, "files": files}
+
+
+@router.get("/{agent_id}/s3/download")
+async def get_s3_signed_url(
+    agent_id: str,
+    run_id: str,
+    file_path: str,
+    container: ApplicationContainer = Depends(get_container),
+):
+    """Generate a short-lived signed URL for a GCS file."""
+    bucket_name, resolved_path = await _resolve_s3_addon(container, agent_id, run_id)
+
+    if not resolved_path:
+        raise HTTPException(status_code=400, detail="resolved path is empty; cannot validate file_path")
+    if not file_path.startswith(resolved_path):
+        raise HTTPException(status_code=400, detail="file_path is outside the allowed prefix")
+
+    def _sign() -> str:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(file_path)
+        if not blob.exists():
+            raise HTTPException(status_code=404, detail=f"File '{file_path}' not found")
+        return blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(minutes=15),
+            method="GET",
+        )
+
+    signed_url = await anyio.to_thread.run_sync(_sign)
+    return {"url": signed_url, "expires_in": 900}

@@ -69,6 +69,7 @@ class LocalFilesWorkflowBackend(WorkflowDefinitionBackend):
                 steps=raw.get("steps", []),
                 ui=raw.get("ui", {}),
                 readonly=raw.get("readonly", self._readonly),
+                use_meta_llm=raw.get("use_meta_llm", True),
                 created_at=datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc),
                 updated_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
             )
@@ -118,6 +119,7 @@ class LocalFilesWorkflowBackend(WorkflowDefinitionBackend):
         }
         if definition.ui:
             data["ui"] = definition.ui
+        data["use_meta_llm"] = definition.use_meta_llm
         self._file_path(definition.id).write_text(
             yaml.dump(data, default_flow_style=False, allow_unicode=True, sort_keys=False)
         )
