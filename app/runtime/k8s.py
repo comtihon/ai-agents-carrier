@@ -144,9 +144,11 @@ class K8sRuntime(AgentRuntime):
             stderr_text = stderr.decode()
             if "another operation" in stderr_text and _attempt < _helm_retries - 1:
                 logger.warning(
-                    "K8sRuntime: helm upgrade for '%s' blocked by concurrent operation, retrying in %.0fs (attempt %d/%d)",
-                    release_name, _helm_retry_delay, _attempt + 1, _helm_retries,
+                    "K8sRuntime: helm upgrade for '%s' blocked by concurrent operation — "
+                    "unlocking stale lock then retrying (attempt %d/%d)",
+                    release_name, _attempt + 1, _helm_retries,
                 )
+                await self._unlock_helm_release(release_name)
                 await asyncio.sleep(_helm_retry_delay)
                 continue
             if "context deadline exceeded" in stderr_text:
@@ -216,6 +218,56 @@ class K8sRuntime(AgentRuntime):
             f"K8sRuntime: agent at {agent_url} did not become healthy "
             f"within {health_timeout}s (run_id={run_id})"
         )
+
+    async def _unlock_helm_release(self, release_name: str) -> None:
+        """Force-release a stuck helm pending-upgrade/pending-install lock.
+
+        When a backend pod is killed mid-install the helm subprocess dies but
+        the release stays locked in pending state (stored as a k8s secret).
+        Subsequent upgrades fail with "another operation in progress".
+
+        Strategy:
+        1. helm rollback — releases the lock and restores the previous revision.
+           Works when at least one deployed revision exists.
+        2. kubectl delete secret — removes the pending secret directly.
+           Used for first-install (revision 1, no deployed history to roll back to).
+        """
+        logger.info("K8sRuntime: attempting to unlock helm release '%s'", release_name)
+
+        # Try rollback first (non-blocking — we don't need it to wait for pods).
+        rollback = await asyncio.create_subprocess_exec(
+            "helm", "rollback", release_name,
+            "-n", self._namespace,
+            "--wait=false",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, rb_stderr = await rollback.communicate()
+        if rollback.returncode == 0:
+            logger.info("K8sRuntime: rolled back '%s' to release the pending lock", release_name)
+            return
+        logger.info(
+            "K8sRuntime: rollback not available for '%s' (%s) — deleting pending secret",
+            release_name, rb_stderr.decode().strip()[:120],
+        )
+
+        # Delete the pending-upgrade / pending-install k8s secret directly.
+        for status in ("pending-upgrade", "pending-install", "pending-rollback"):
+            proc = await asyncio.create_subprocess_exec(
+                "kubectl", "delete", "secret",
+                "-n", self._namespace,
+                "-l", f"name={release_name},status={status}",
+                "--ignore-not-found",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            deleted = stdout.decode().strip()
+            if deleted:
+                logger.info(
+                    "K8sRuntime: deleted helm lock secret for '%s' (status=%s): %s",
+                    release_name, status, deleted,
+                )
 
     async def _get_pod_status(self, release_name: str) -> str:
         """Return the pod phase or container waiting reason for a helm release.
