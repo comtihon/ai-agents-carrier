@@ -603,6 +603,7 @@ class YamlGraphRunner:
         )
         self.description: str = definition.get("description", "")
         self._max_iterations: int = definition.get("max_iterations", 10)
+        self._use_meta_llm: bool = definition.get("use_meta_llm", True)
         self.readonly: bool = False  # Set post-construction by build_registry_from_definitions
         self._steps: list[dict[str, Any]] = definition["steps"]
         self._llm = llm
@@ -817,6 +818,7 @@ class YamlGraphRunner:
     ) -> Callable[[dict], Awaitable[str]]:
         """Return an async routing function for add_conditional_edges.
 
+
         A route may declare ``wait_seconds: <number>`` to delay the transition
         to its destination. The wait runs after the route is selected and
         before the next node executes; it is capped at ``_MAX_ROUTE_WAIT_SECONDS``.
@@ -826,6 +828,8 @@ class YamlGraphRunner:
         """
         import ast as _ast
         import builtins as _builtins
+
+        graph_id = self.id
 
         # AST node types that are never safe to execute in a route condition.
         _UNSAFE_AST = (
@@ -861,18 +865,32 @@ class YamlGraphRunner:
                     if isinstance(node, _UNSAFE_AST):
                         raise ValueError(f"unsafe AST node: {type(node).__name__}")
                 code = compile(tree, "<route-condition>", "eval")
-                return bool(eval(code, vars(_builtins), dict(state)))  # noqa: S307
+                result = bool(eval(code, vars(_builtins), dict(state)))  # noqa: S307
+                logger.debug(
+                    "[%s] router '%s': condition %r → %s",
+                    graph_id, source_id, when, result,
+                )
+                return result
             except Exception:
                 # Fallback: simple state-key lookup with optional ! negation
                 negate = expr.strip().startswith("!")
                 key = expr.strip()[1:].strip() if negate else expr.strip()
                 val = bool(state.get(key))
-                return not val if negate else val
+                result = not val if negate else val
+                logger.debug(
+                    "[%s] router '%s': condition %r → %s (fallback key-lookup, key=%r, raw=%r)",
+                    graph_id, source_id, when, result, key, state.get(key),
+                )
+                return result
 
         def _select(state: dict) -> dict[str, Any]:
             for route in routes:
                 when = route.get("when")
                 if when is None:
+                    logger.debug(
+                        "[%s] router '%s': default route (when=null) → '%s'",
+                        graph_id, source_id, route.get("next"),
+                    )
                     return route
                 if _eval_condition(str(when), state):
                     return route
@@ -884,6 +902,20 @@ class YamlGraphRunner:
             # so the workflow author either adds an explicit default or
             # extends the conditions.
             checked = [r.get("when") for r in routes]
+            # Extract the relevant state values for each condition key so the
+            # error message explains exactly why nothing matched.
+            relevant: dict = {}
+            for cond in checked:
+                if cond is None:
+                    continue
+                key = str(cond).strip().lstrip("!").split()[0]
+                relevant[str(cond)] = state.get(key)
+            logger.error(
+                "[%s] router '%s': no route matched | checked=%s | state_values=%s | "
+                "non-null state keys=%s",
+                graph_id, source_id, checked, relevant,
+                [k for k, v in state.items() if v is not None and not k.startswith("_")],
+            )
             raise ValueError(
                 f"router: no route matched on state and no default "
                 f"(when=null) was declared; checked={checked}. "
@@ -894,6 +926,10 @@ class YamlGraphRunner:
 
         async def router(state: dict) -> str:
             chosen = _select(state)
+            logger.info(
+                "[%s] router '%s' → '%s' (condition: %r)",
+                graph_id, source_id, chosen.get("next"), chosen.get("when"),
+            )
             wait = chosen.get("wait_seconds")
             if wait:
                 try:
@@ -947,6 +983,7 @@ class YamlGraphRunner:
         path.
         """
         graph_id = self.id
+        use_meta_llm = self._use_meta_llm
 
         async def node(state: dict) -> dict:
             step_id = step["id"]
@@ -973,6 +1010,7 @@ class YamlGraphRunner:
                     pvc_lease_repository=self._pvc_lease_repository,
                     agent_task_repository=self._agent_task_repository,
                     warm_pod_repository=self._warm_pod_repository,
+                    use_meta_llm=use_meta_llm,
                 )
             except Exception as _step_exc:
                 logger.error("[%s] step '%s' raised: %s", graph_id, step_id, _step_exc)
@@ -1158,6 +1196,17 @@ class YamlGraphRunner:
                     k: self._render(v, state)
                     for k, v in step.get("tool_input", {}).items()
                 }
+                logger.info(
+                    "[%s] step '%s' MCP tool='%s' input=%r",
+                    graph_id, step_id, tool_name, tool_input,
+                )
+                empty_inputs = [k for k, v in tool_input.items() if v == "" or v is None]
+                if empty_inputs:
+                    logger.warning(
+                        "[%s] step '%s' MCP tool='%s': empty/null input fields: %s "
+                        "(template keys may be missing from state)",
+                        graph_id, step_id, tool_name, empty_inputs,
+                    )
                 result = await tool.ainvoke(tool_input)
                 logger.info("[%s] step '%s' finished", graph_id, step_id)
                 output_text = self._extract_mcp_text(result)
