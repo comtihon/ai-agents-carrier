@@ -753,9 +753,24 @@ class YamlGraphRunner:
             fn = self._switch_node(step)
         else:
             raise ValueError(f"Unknown step type '{t}' in graph '{self.id}'")
-        return self._wrap_with_status_running(self._wrap_with_loop_guard(step, fn), step)
+        wrapped = self._wrap_with_status_running(self._wrap_with_loop_guard(step, fn), step)
+        return self._wrap_with_when(step, wrapped)
 
     _NO_LOOP_GUARD_TYPES: frozenset = frozenset({"ask_context", "human_approval", "cron", "http", "parallel", "join", "switch", "langgraph-agent", "claude-agent"})
+
+    def _wrap_with_when(self, step: dict[str, Any], fn: Callable) -> Callable:
+        """Skip node if step has a `when` key and state[when] is falsy."""
+        when_key = step.get("when")
+        if not when_key:
+            return fn
+
+        async def _wrapped(state: dict) -> dict:
+            if not state.get(when_key):
+                logger.info("[%s] step '%s' skipped (when: %s is falsy)", self.id, step["id"], when_key)
+                return {}
+            return await fn(state)
+
+        return _wrapped
 
     def _wrap_with_status_running(self, fn: Callable, step: dict[str, Any]) -> Callable:
         """Persist step_status="running" + current_step before the node executes.
