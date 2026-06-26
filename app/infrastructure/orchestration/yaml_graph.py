@@ -78,6 +78,7 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
         # or output-mapping validation fails.  Must be in the schema or LangGraph
         # silently drops them from the update stream before step_outputs is written.
         "_meta_llm_rejection":        Annotated[Any, _last_wins],    # type: ignore[assignment]
+        "_meta_llm_result":           Annotated[Any, _last_wins],    # type: ignore[assignment]
         "_agent_raw_output":          Annotated[Any, _last_wins],    # type: ignore[assignment]
         "error":                      Annotated[Any, _last_wins],    # type: ignore[assignment]
     }

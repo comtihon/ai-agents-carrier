@@ -1001,6 +1001,7 @@ async def execute_agent_step(
         # a meaningful "meta-LLM rejected: <reason>" error rather than the opaque
         # "expected fields not found" message, and prevents downstream steps from
         # running on obviously bad output.
+        _meta_llm_verdict: dict[str, Any] | None = None
         if use_meta_llm and not _surfaced_pending:
             _sc = step.get("success_criteria") if isinstance(step, dict) else None
             _fc = step.get("fail_criteria") if isinstance(step, dict) else None
@@ -1013,9 +1014,13 @@ async def execute_agent_step(
                 "[step '%s'] meta-LLM result: passed=%s reason=%r",
                 step_id, _eval["passed"], _eval.get("reason"),
             )
+            # Store the meta-LLM verdict regardless of pass/fail so the UI can
+            # always show what the quality gate decided and why.
+            _meta_llm_verdict = {
+                "passed": _eval["passed"],
+                "reason": _eval.get("reason", ""),
+            }
             if not _eval["passed"]:
-                # Pre-compute the output mapping so the caller can surface the
-                # agent's actual extracted output in the UI alongside the rejection.
                 _rejection_reason = _eval["reason"]
                 _rej_output_mapping: dict[str, str] | None = step.get("output_mapping")
                 _rej_output_key: str | None = step.get("output_key")
@@ -1138,5 +1143,12 @@ async def execute_agent_step(
         and _sik not in result
     ):
         result[_sik] = raw_output[_sik]
+
+    # Always surface the agent's raw result text and meta-LLM verdict so the
+    # UI shows full transparency on every step — not just failed ones.
+    if isinstance(raw_output.get("result"), str):
+        result["_agent_raw_output"] = raw_output["result"]
+    if _meta_llm_verdict is not None:
+        result["_meta_llm_result"] = _meta_llm_verdict
 
     return result
