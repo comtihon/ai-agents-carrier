@@ -754,9 +754,13 @@ class YamlGraphRunner:
         else:
             raise ValueError(f"Unknown step type '{t}' in graph '{self.id}'")
         wrapped = self._wrap_with_status_running(self._wrap_with_loop_guard(step, fn), step)
-        return self._wrap_with_when(step, wrapped)
+        wrapped = self._wrap_with_when(step, wrapped)
+        return self._wrap_with_fail_guard(step, wrapped)
 
     _NO_LOOP_GUARD_TYPES: frozenset = frozenset({"ask_context", "human_approval", "cron", "http", "parallel", "join", "switch", "langgraph-agent", "claude-agent"})
+    # join handles __failed_step__ itself via failure_policy; all others must abort when
+    # a previous step has already written the sentinel into state.
+    _NO_FAIL_GUARD_TYPES: frozenset = frozenset({"join"})
 
     def _wrap_with_when(self, step: dict[str, Any], fn: Callable) -> Callable:
         """Skip node if step has a `when` key and state[when] is falsy."""
@@ -823,6 +827,35 @@ class YamlGraphRunner:
                     f"(ran {counts[step_id]} times)"
                 )
             return {**result, "_visit_counts": counts}
+
+        return _guarded
+
+    def _wrap_with_fail_guard(self, step: dict[str, Any], fn: Callable) -> Callable:
+        """Raise immediately when a previous step already set __failed_step__ in state.
+
+        This enforces fail-fast sequential execution: the moment any node writes the
+        failure sentinel, all downstream nodes abort and the graph fails.  Parallel
+        join nodes are exempt — they aggregate branch results including failures and
+        apply their own failure_policy.
+        """
+        if step.get("type") in self._NO_FAIL_GUARD_TYPES:
+            return fn
+        step_id = step["id"]
+        graph_id = self.id
+        is_async = asyncio.iscoroutinefunction(fn)
+
+        async def _guarded(state: dict) -> dict:
+            failed = state.get("__failed_step__")
+            if failed:
+                logger.error(
+                    "[%s] step '%s' aborted — upstream step '%s' already failed; "
+                    "halting graph execution",
+                    graph_id, step_id, failed,
+                )
+                raise RuntimeError(
+                    f"step '{step_id}' aborted — upstream step '{failed}' already failed"
+                )
+            return (await fn(state)) if is_async else fn(state)
 
         return _guarded
 

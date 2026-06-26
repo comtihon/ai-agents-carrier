@@ -108,19 +108,31 @@ def _require_backend(container: ApplicationContainer) -> None:
 
 def _build_steps(raw_steps: list, run: GraphRun) -> list[dict]:
     run_error = (run.state or {}).get("error") if run.status == "failed" else None
-    return [
-        {
-            "id": s["id"],
+    result = []
+    for s in raw_steps:
+        sid = s["id"]
+        step_out = run.step_outputs.get(sid) or {}
+        is_failed = run.step_statuses.get(sid) == "failed"
+        # Prefer the step-level error captured in step_outputs over the run-level
+        # error — a step may fail mid-run before the overall run is marked failed,
+        # so run_error would be None even though step_out["error"] has the message.
+        step_error = (step_out.get("error") or run_error) if is_failed else None
+        # Strip internal sentinel keys from the output exposed to the UI.
+        display_out = (
+            {k: v for k, v in step_out.items() if not k.startswith("__")}
+            if step_out else step_out
+        ) or None
+        result.append({
+            "id": sid,
             "type": _STEP_TYPE_MAP.get(s.get("type", "llm"), s.get("type", "llm")),
-            "name": s.get("name", s["id"]),
-            "status": run.step_statuses.get(s["id"], "pending"),
-            "input": run.step_inputs.get(s["id"]),
-            "output": run.step_outputs.get(s["id"]),
-            "summary": (run.step_outputs.get(s["id"]) or {}).get("summary"),
-            "error": run_error if run.step_statuses.get(s["id"]) == "failed" else None,
-        }
-        for s in raw_steps
-    ]
+            "name": s.get("name", sid),
+            "status": run.step_statuses.get(sid, "pending"),
+            "input": run.step_inputs.get(sid),
+            "output": display_out,
+            "summary": step_out.get("summary"),
+            "error": step_error,
+        })
+    return result
 
 
 async def _steps_from_definition(
