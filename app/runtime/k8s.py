@@ -252,22 +252,38 @@ class K8sRuntime(AgentRuntime):
         )
 
         # Delete the pending-upgrade / pending-install k8s secret directly.
-        for status in ("pending-upgrade", "pending-install", "pending-rollback"):
-            proc = await asyncio.create_subprocess_exec(
-                "kubectl", "delete", "secret",
-                "-n", self._namespace,
-                "-l", f"name={release_name},status={status}",
-                "--ignore-not-found",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await proc.communicate()
-            deleted = stdout.decode().strip()
-            if deleted:
-                logger.info(
-                    "K8sRuntime: deleted helm lock secret for '%s' (status=%s): %s",
-                    release_name, status, deleted,
+        try:
+            from kubernetes import client as _k8s_client, config as _k8s_config
+            try:
+                _k8s_config.load_incluster_config()
+            except Exception:
+                _k8s_config.load_kube_config()
+            v1 = _k8s_client.CoreV1Api()
+            loop = asyncio.get_event_loop()
+            for status in ("pending-upgrade", "pending-install", "pending-rollback"):
+                secret_list = await loop.run_in_executor(
+                    None,
+                    lambda s=status: v1.list_namespaced_secret(
+                        namespace=self._namespace,
+                        label_selector=f"name={release_name},status={s}",
+                    ),
                 )
+                for secret in secret_list.items:
+                    await loop.run_in_executor(
+                        None,
+                        lambda n=secret.metadata.name: v1.delete_namespaced_secret(
+                            name=n, namespace=self._namespace,
+                        ),
+                    )
+                    logger.info(
+                        "K8sRuntime: deleted helm lock secret '%s' for release '%s' (status=%s)",
+                        secret.metadata.name, release_name, status,
+                    )
+        except Exception as exc:
+            logger.warning(
+                "K8sRuntime: failed to delete helm lock secrets for '%s': %s",
+                release_name, exc,
+            )
 
     async def _get_pod_status(self, release_name: str) -> str:
         """Return the pod phase or container waiting reason for a helm release.
@@ -276,36 +292,37 @@ class K8sRuntime(AgentRuntime):
         "Failed", "Unknown"), a container waiting reason
         ("ContainerCreating", "CrashLoopBackOff", "OOMKilled",
         "ImagePullBackOff", …), or "not_found" when no pods exist.
+
+        Uses the kubernetes Python client (in-cluster service-account) so that
+        kubectl does not need to be present in the backend container.
         """
         try:
-            import json as _json
-            proc = await asyncio.create_subprocess_exec(
-                "kubectl", "get", "pods",
-                "-n", self._namespace,
-                "-l", f"app.kubernetes.io/instance={release_name}",
-                "-o", "json",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
+            from kubernetes import client as _k8s_client, config as _k8s_config
+            try:
+                _k8s_config.load_incluster_config()
+            except Exception:
+                _k8s_config.load_kube_config()
+            v1 = _k8s_client.CoreV1Api()
+            loop = asyncio.get_event_loop()
+            pod_list = await loop.run_in_executor(
+                None,
+                lambda: v1.list_namespaced_pod(
+                    namespace=self._namespace,
+                    label_selector=f"app.kubernetes.io/instance={release_name}",
+                ),
             )
-            stdout, _ = await proc.communicate()
-            data = _json.loads(stdout or "{}")
-            pods = data.get("items", [])
+            pods = pod_list.items
             if not pods:
                 return "not_found"
             pod = pods[-1]
-            # Check init + regular container waiting/terminated reasons first —
-            # these carry the actionable signal (CrashLoopBackOff, OOMKilled, …).
-            for cs in (
-                pod.get("status", {}).get("initContainerStatuses", [])
-                + pod.get("status", {}).get("containerStatuses", [])
-            ):
-                waiting = cs.get("state", {}).get("waiting", {})
-                if waiting.get("reason"):
-                    return waiting["reason"]
-                terminated = cs.get("state", {}).get("terminated", {})
-                if terminated.get("reason") and terminated["reason"] != "Completed":
-                    return terminated["reason"]
-            return pod.get("status", {}).get("phase", "Unknown")
+            # Check init + regular container waiting/terminated reasons — these
+            # carry the actionable signal (CrashLoopBackOff, OOMKilled, …).
+            for cs in (pod.status.init_container_statuses or []) + (pod.status.container_statuses or []):
+                if cs.state.waiting and cs.state.waiting.reason:
+                    return cs.state.waiting.reason
+                if cs.state.terminated and cs.state.terminated.reason and cs.state.terminated.reason != "Completed":
+                    return cs.state.terminated.reason
+            return pod.status.phase or "Unknown"
         except Exception as exc:
             logger.warning("K8sRuntime._get_pod_status('%s') failed: %s", release_name, exc)
             return "Unknown"
