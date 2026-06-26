@@ -974,6 +974,27 @@ async def execute_agent_step(
                     pass
                 _surfaced_pending = True
 
+        # --- 5b. Meta-LLM step evaluation ---
+        # Run BEFORE output_mapping validation so the quality gate fires even when
+        # the agent returned plain text instead of structured fields.  This produces
+        # a meaningful "meta-LLM rejected: <reason>" error rather than the opaque
+        # "expected fields not found" message, and prevents downstream steps from
+        # running on obviously bad output.
+        if use_meta_llm and not _surfaced_pending:
+            _sc = step.get("success_criteria") if isinstance(step, dict) else None
+            _fc = step.get("fail_criteria") if isinstance(step, dict) else None
+            logger.info(
+                "[step '%s'] running meta-LLM evaluation (success_criteria=%r, fail_criteria=%r)",
+                step_id, _sc, _fc,
+            )
+            _eval = await _meta_llm_evaluate(raw_output, input_data, step_id, settings, _sc, _fc)
+            logger.info(
+                "[step '%s'] meta-LLM result: passed=%s reason=%r",
+                step_id, _eval["passed"], _eval.get("reason"),
+            )
+            if not _eval["passed"]:
+                raise RuntimeError(f"[step '{step_id}'] meta-LLM rejected output: {_eval['reason']}")
+
         # Deterministic fail when output_mapping is set but nothing matched.
         # The agent returned unstructured output (e.g. {"result": "text"}) AND
         # YAML/JSON extraction above couldn't find any expected fields.
@@ -1022,14 +1043,6 @@ async def execute_agent_step(
                 f"[step '{step_id}'] Agent reported error: {_agent_error_msg}. "
                 f"Token usage: {raw_output.get('token_usage', {})}"
             )
-
-    # --- 5b. Meta-LLM step evaluation ---
-    if use_meta_llm:
-        _sc = step.get("success_criteria") if isinstance(step, dict) else None
-        _fc = step.get("fail_criteria") if isinstance(step, dict) else None
-        _eval = await _meta_llm_evaluate(raw_output, input_data, step_id, settings, _sc, _fc)
-        if not _eval["passed"]:
-            raise RuntimeError(f"[step '{step_id}'] meta-LLM rejected output: {_eval['reason']}")
 
     # --- 6. Map output back to workflow state ---
     output_mapping: dict[str, str] | None = step.get("output_mapping")
