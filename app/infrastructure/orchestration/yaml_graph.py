@@ -864,7 +864,18 @@ class YamlGraphRunner:
                     "[%s] step '%s' restarting (own failure sentinel cleared)",
                     graph_id, step_id,
                 )
-            return (await fn(state)) if is_async else fn(state)
+            result = (await fn(state)) if is_async else fn(state)
+            # If the step succeeded (didn't set __failed_step__ itself) and the
+            # checkpoint still carried a stale sentinel from a previous failure,
+            # explicitly clear it so downstream nodes aren't blocked by the ghost.
+            if (
+                failed
+                and isinstance(result, dict)
+                and result.get("__failed_step__") is None
+                and "__failed_step__" not in result
+            ):
+                result = {**result, "__failed_step__": None}
+            return result
 
         return _guarded
 
