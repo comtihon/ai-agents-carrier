@@ -292,10 +292,13 @@ class K8sRuntime(AgentRuntime):
             )
             stdout, _ = await proc.communicate()
             releases = _json.loads(stdout or "[]")
-            # Only treat the run as "already running" when the release is in a
-            # healthy state.  A FAILED release (e.g. helm timed out on a cold
-            # image pull) must be re-spawned, not resumed.
-            return any(r.get("status") not in ("failed", "pending-install", "pending-upgrade") for r in releases)
+            # Only exclude releases in terminal failure state.
+            # pending-install / pending-upgrade mean a helm operation is still
+            # in progress — treat those as "running" so the resume path polls
+            # the agent URL instead of launching a second concurrent helm
+            # upgrade (which would get "another operation in progress" when
+            # the backend restarts mid-install during a rolling deploy).
+            return any(r.get("status") != "failed" for r in releases)
         except Exception:
             return False
 
