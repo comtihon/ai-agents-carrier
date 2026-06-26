@@ -375,6 +375,43 @@ class K8sRuntime(AgentRuntime):
         except Exception:
             return False
 
+    async def get_agent_url_for_run(self, run_id: str) -> str | None:
+        """Return the in-cluster agent URL for an existing helm release, or None.
+
+        Called by agent_executor on resume when no task is stored in the DB
+        (e.g. the backend restarted while helm install was still in progress and
+        the task record was never written).  Discovering the URL from the
+        manifest avoids the stale-pod path that would try to start a second
+        concurrent helm operation.
+        """
+        try:
+            import json as _json
+            prefix = run_id[:8]
+            proc = await asyncio.create_subprocess_exec(
+                "helm", "list",
+                "-n", self._namespace,
+                "--filter", f"agent-.*-{prefix}",
+                "-o", "json",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await proc.communicate()
+            releases = _json.loads(stdout or "[]")
+            if not releases:
+                return None
+            release_name = releases[0].get("name", "")
+            if not release_name:
+                return None
+            url = await self._discover_service_url(release_name)
+            logger.info(
+                "K8sRuntime.get_agent_url_for_run: found existing release '%s' → %s",
+                release_name, url,
+            )
+            return url
+        except Exception as exc:
+            logger.warning("K8sRuntime.get_agent_url_for_run(%s) failed: %s", run_id, exc)
+            return None
+
     async def is_alive(self, agent_url: str) -> bool:
         """Return True if the agent's /health endpoint responds with 200."""
         try:
