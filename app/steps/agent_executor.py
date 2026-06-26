@@ -303,10 +303,19 @@ async def _meta_llm_evaluate(
             )
         else:
             prompt = (
-                "You are evaluating whether an AI agent step actually accomplished what was requested.\n\n"
-                f"Original request: {request_text}\n\n"
+                "You are evaluating whether an AI agent step produced useful output "
+                "as part of a multi-step automated workflow.\n\n"
+                f"Task context for this step: {request_text}\n\n"
                 f"Agent output:\n{output_text}\n\n"
-                "Did the agent output accomplish the requested task or did it fail/produce garbage?\n"
+                "IMPORTANT: this agent is ONE step in a larger pipeline. "
+                "It is NOT expected to complete the entire end-to-end task on its own. "
+                "A researcher step should produce research/analysis. "
+                "A planner step should produce a plan. "
+                "A coder step should produce code changes. Etc.\n\n"
+                "PASS if the output is relevant and contains substantive content for this step's role.\n"
+                "FAIL only if the output is clearly an error message, completely empty, "
+                "obviously hallucinated garbage, or entirely unrelated to the task.\n"
+                "Do NOT fail because the agent did not implement the full end-to-end solution.\n"
                 "Respond with ONLY:\n"
                 "DECISION: PASS or DECISION: FAIL\n"
                 "REASON: <one line>"
