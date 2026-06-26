@@ -1072,10 +1072,19 @@ async def execute_agent_step(
                     f"{_extra}"
                     f"Token usage: {_token_usage}"
                 )
-            raise RuntimeError(
-                f"[step '{step_id}'] Agent returned unstructured output — "
-                f"expected fields {list(_output_mapping_check)} not found. "
-                f"Raw output (truncated): {_raw_snippet}"
+            # Use MetaLLMRejectionError so the UI can display the raw output alongside
+            # the error — the agent may have returned a valid message (e.g. "Jira unavailable")
+            # that is useful to show even though it didn't match the structured schema.
+            _raw_mapped: dict[str, Any] = {}
+            if isinstance(raw_output.get("result"), str):
+                _raw_mapped["_agent_raw_output"] = raw_output["result"]
+            if "token_usage" in raw_output:
+                _raw_mapped[f"_agent_token_usage_{step_id}"] = raw_output["token_usage"]
+            raise MetaLLMRejectionError(
+                f"Agent returned unstructured output — expected fields {list(_output_mapping_check)} not found. "
+                f"Agent said: {_raw_snippet}",
+                mapped_result=_raw_mapped,
+                reason=f"Agent returned plain text instead of structured output. Agent said: {_raw_snippet}",
             )
 
     # Fail fast when the agent returned {"error": "...", "token_usage": {...}} with no
