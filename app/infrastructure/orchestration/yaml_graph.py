@@ -220,6 +220,27 @@ async def stream_graph_to_pause(
         except Exception:
             current_state = {}
 
+    # Restart resilience: if the checkpoint carries a stale __failed_step__
+    # sentinel, check the routing_log to see if the last routing decision
+    # targeted that very node (= router decided to loop back to retry it).
+    # In that case the sentinel is from a previous loop iteration and should
+    # be cleared so the fail-fast guard doesn't block legitimate execution.
+    _stale_failed = current_state.get("__failed_step__")
+    if _stale_failed and run.routing_log:
+        _last_route = next(
+            (e for e in reversed(run.routing_log) if e.event == "route"),
+            None,
+        )
+        if _last_route is not None and _last_route.target == _stale_failed:
+            logger.info(
+                "[%s] resume: clearing stale __failed_step__=%r — last route went TO that step (loop-back)",
+                run.id, _stale_failed,
+            )
+            current_state["__failed_step__"] = None
+            # Also patch the LangGraph checkpoint so astream sees the cleared value.
+            if not isinstance(input_value, dict):
+                input_value = {"__failed_step__": None}
+
     last_processed: str | None = None
     _stream_interrupt_output: list | None = None  # payload from __interrupt__ chunk if seen
     try:
@@ -794,6 +815,16 @@ class YamlGraphRunner:
             if run is not None and repo is not None:
                 run.step_statuses[step_id] = "running"
                 run.current_step = step_id
+                # Append node-start event to routing_log for restart resilience.
+                try:
+                    from app.domain.models.graph_run import RoutingEvent
+                    run.routing_log.append(RoutingEvent(
+                        event="node_start",
+                        node=step_id,
+                        iteration=int((state.get("_visit_counts") or {}).get(step_id, 0)),
+                    ))
+                except Exception:
+                    pass
                 run.touch()
                 try:
                     await repo.update(run)
@@ -1035,6 +1066,25 @@ class YamlGraphRunner:
                             run.touch()
                             if repo is not None:
                                 await repo.update(run)
+            # Persist routing decision so backend restarts can reconstruct graph
+            # position and clear stale __failed_step__ sentinels from prior loops.
+            _run = runner._current_run
+            _repo = runner._current_run_repository
+            if _run is not None and _repo is not None:
+                try:
+                    from app.domain.models.graph_run import RoutingEvent
+                    _event = RoutingEvent(
+                        event="route",
+                        node=source_id,
+                        target=chosen["next"],
+                        condition=str(chosen.get("when", "")) or "",
+                        iteration=int((state.get("_visit_counts") or {}).get(source_id, 0)),
+                    )
+                    _run.routing_log.append(_event)
+                    _run.touch()
+                    await _repo.update(_run)
+                except Exception as _re:
+                    logger.debug("routing_log update failed (non-critical): %s", _re)
             return chosen["next"]
         return router
 

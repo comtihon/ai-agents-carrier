@@ -6,6 +6,16 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
+class RoutingEvent(BaseModel):
+    """Single routing or node-start event persisted for restart resilience."""
+    ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    event: Literal["route", "node_start"]
+    node: str            # source node for "route", executing node for "node_start"
+    target: str = ""     # destination for "route" events
+    condition: str = ""  # matched when-condition (empty = default route)
+    iteration: int = 0   # _visit_counts for the source node at decision time
+
+
 class WaitingTransition(BaseModel):
     """Active inter-node `wait_seconds` delay (set while the router sleeps)."""
     source: str
@@ -31,6 +41,11 @@ class GraphRun(BaseModel):
     step_inputs: dict[str, Any] = {}    # step_id → state snapshot passed into the node
     step_outputs: dict[str, Any] = {}   # step_id → raw node output dict (captured during streaming)
     waiting_transition: WaitingTransition | None = None
+    # Routing + node-start journal — used to recover from backend restarts mid-run.
+    # Appended on every routing decision and every node execution start so that on
+    # resume we know the exact position in the graph and can clear stale sentinels
+    # (e.g. __failed_step__ left over from a previous loop iteration).
+    routing_log: list[RoutingEvent] = Field(default_factory=list)
     # LangSmith / local tracing
     langsmith_run_id: str | None = None
     trace_data: dict[str, Any] = Field(default_factory=dict)
