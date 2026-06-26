@@ -2,7 +2,7 @@ replicaCount: 1
 
 image:
   repository: ghcr.io/comtihon/langgraph-backend
-  tag: v1.2.85
+  tag: v1.2.86
   pullPolicy: IfNotPresent
 
 service:
