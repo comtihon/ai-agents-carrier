@@ -118,7 +118,7 @@ class K8sRuntime(AgentRuntime):
             agent_def.helm_chart,
             "--namespace", self._namespace,
             "--wait",          # wait for the rollout to complete
-            "--timeout", "120s",
+            "--timeout", "300s",  # 120s was too short for fresh image pulls (~554MB)
             *set_args,
         ]
 
