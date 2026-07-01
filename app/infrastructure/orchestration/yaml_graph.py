@@ -73,7 +73,6 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
         # handlers to mark step_statuses["that_step"] = "failed" rather than
         # the default "finished" inferred from a non-empty output dict.
         "__failed_step__":            Annotated[Any, _last_wins],    # type: ignore[assignment]
-        "_live_token_usage":          Annotated[Any, _last_wins],    # type: ignore[assignment]
         # Quality-gate rejection fields — written by _agent_node when meta-LLM
         # or output-mapping validation fails.  Must be in the schema or LangGraph
         # silently drops them from the update stream before step_outputs is written.
@@ -123,6 +122,14 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
             if step.get("slack_input_key"):
                 fields[step["slack_input_key"]] = Any  # type: ignore[assignment]
             fields[f"_agent_token_usage_{step['id']}"] = Any  # type: ignore[assignment]
+            # Live progress trail + in-flight token usage, written directly by
+            # POST /agent/progress (see agent_callbacks.py) and scoped per step
+            # via run.current_step. Must be declared here too, or LangGraph's
+            # state merge silently drops them on the next node transition —
+            # they'd flash briefly during live polling then vanish once the
+            # step finished, which is exactly what was observed in the UI.
+            fields[f"_agent_progress_{step['id']}"] = Any  # type: ignore[assignment]
+            fields[f"_live_token_usage_{step['id']}"] = Any  # type: ignore[assignment]
     # Internal field: agent_url stored while a run is in waiting_agent state
     fields["_agent_url"] = Any  # type: ignore[assignment]
     # Internal field: clarification answers from ask_context interrupt, forwarded to agent re-run
