@@ -1038,10 +1038,6 @@ async def execute_agent_step(
                     _mapped_for_rejection = {_rej_output_key: raw_output["result"]}
                 else:
                     _mapped_for_rejection = {}
-                # When structured extraction found nothing, still surface the raw
-                # result text so the UI can display what the agent actually produced.
-                if not _mapped_for_rejection and isinstance(raw_output.get("result"), str):
-                    _mapped_for_rejection["_agent_raw_output"] = raw_output["result"]
                 if "token_usage" in raw_output:
                     _mapped_for_rejection[f"_agent_token_usage_{step_id}"] = raw_output["token_usage"]
                 raise MetaLLMRejectionError(
@@ -1085,8 +1081,6 @@ async def execute_agent_step(
             # the error — the agent may have returned a valid message (e.g. "Jira unavailable")
             # that is useful to show even though it didn't match the structured schema.
             _raw_mapped: dict[str, Any] = {}
-            if isinstance(raw_output.get("result"), str):
-                _raw_mapped["_agent_raw_output"] = raw_output["result"]
             if "token_usage" in raw_output:
                 _raw_mapped[f"_agent_token_usage_{step_id}"] = raw_output["token_usage"]
             raise MetaLLMRejectionError(
@@ -1148,10 +1142,10 @@ async def execute_agent_step(
     ):
         result[_sik] = raw_output[_sik]
 
-    # Always surface the agent's raw result text and meta-LLM verdict so the
-    # UI shows full transparency on every step — not just failed ones.
-    if isinstance(raw_output.get("result"), str):
-        result["_agent_raw_output"] = raw_output["result"]
+    # Always surface the meta-LLM verdict so the UI shows full transparency on
+    # every step — not just failed ones. The agent's full raw output (including
+    # every tool invocation) is already tracked via _agent_progress; no need to
+    # duplicate the final result text here.
     if _meta_llm_verdict is not None:
         result["_meta_llm_result"] = _meta_llm_verdict
 
