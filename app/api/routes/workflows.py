@@ -634,6 +634,11 @@ async def get_run_trace(
         "run_id": run_id,
         "status": run.status,
         "trace_data": run.trace_data or {},
+        # Progress messages reported by spawned k8s agents (pi-agent) via
+        # POST /runs/{run_id}/agent/progress — e.g. each MCP tool call and
+        # result. These never go through RunTraceAccumulator (that only sees
+        # LLM/tool calls made in-process) so they're surfaced separately here.
+        "agent_progress": run.state.get("_agent_progress", []),
         "langsmith_run_id": run.langsmith_run_id,
         "langsmith_url": langsmith_url,
     }
