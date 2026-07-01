@@ -320,11 +320,19 @@ async def agent_progress(
 
     import json as _json
 
+    # Scope live progress/token fields to the step that's actually running —
+    # a single workflow run can have several langgraph-agent steps in sequence
+    # (researcher, planner, coder, ...) and they all report to this same
+    # run_id. Without scoping, opening a finished step's detail view would
+    # show whichever step is currently streaming instead of that step's own
+    # (now-static) history.
+    _step_key = run.current_step or "_unscoped"
+
     # Structured token-update message — store in _live_token_usage, skip progress list
     if body.message.startswith("__token__:"):
         try:
             usage = _json.loads(body.message[len("__token__:"):])
-            run.state = {**(run.state or {}), "_live_token_usage": usage}
+            run.state = {**(run.state or {}), f"_live_token_usage_{_step_key}": usage}
             run.touch()
             await container.run_repository.update(run)
         except Exception:
@@ -372,9 +380,10 @@ async def agent_progress(
             return {"run_id": run_id, "status": "mcp_cleared"}
 
     # Append progress message to run state for frontend polling.
-    progress_list: list = list(run.state.get("_agent_progress", []))
+    _progress_field = f"_agent_progress_{_step_key}"
+    progress_list: list = list(run.state.get(_progress_field, []))
     progress_list.append(body.message)
-    run.state = {**run.state, "_agent_progress": progress_list}
+    run.state = {**run.state, _progress_field: progress_list}
     run.touch()
     await container.run_repository.update(run)
 
