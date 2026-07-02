@@ -638,7 +638,7 @@ async def get_run_trace(
         # POST /runs/{run_id}/agent/progress — e.g. each MCP tool call and
         # result. These never go through RunTraceAccumulator (that only sees
         # LLM/tool calls made in-process) so they're surfaced separately here.
-        "agent_progress": run.state.get("_agent_progress", []),
+        "agent_progress": run.state.get(f"_agent_progress_{run.current_step or '_unscoped'}", []),
         "langsmith_run_id": run.langsmith_run_id,
         "langsmith_url": langsmith_url,
     }

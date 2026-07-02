@@ -760,9 +760,10 @@ async def execute_agent_step(
                     try:
                         _run = await run_repository.get(run_id)
                         if _run is not None:
-                            _progress_list = list((_run.state or {}).get("_agent_progress", []))
+                            _progress_key = f"_agent_progress_{step_id}"
+                            _progress_list = list((_run.state or {}).get(_progress_key, []))
                             _progress_list.extend(_progress_msgs)
-                            _run.state = {**(_run.state or {}), "_agent_progress": _progress_list}
+                            _run.state = {**(_run.state or {}), _progress_key: _progress_list}
                             _run.touch()
                             await run_repository.update(_run)
                     except Exception:
@@ -1059,7 +1060,7 @@ async def execute_agent_step(
             and "context_sufficient" not in raw_output
         ):
             _result_val = raw_output.get("result", "")
-            _raw_snippet = str(_result_val or raw_output)[:400]
+            _raw_snippet = str(_result_val or raw_output)[:5000]
             _token_usage = raw_output.get("token_usage", {})
             _output_tokens = _token_usage.get("output_tokens", 0) if isinstance(_token_usage, dict) else 0
             # "(no output)" is LangGraph's fallback when the ReAct loop ends
