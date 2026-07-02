@@ -346,7 +346,15 @@ async def _stream_graph(
         run.status = "failed"
         # Preserve accumulated step outputs so retry can recover OpenHands conv IDs
         # and other intermediate state without needing to re-run completed steps.
-        run.state = {**current_state, "error": str(exc)}
+        # Re-fetch first: a concurrent progress callback (e.g. agent_progress)
+        # may have written out-of-band Mongo-only keys (_agent_progress_*) to
+        # this run since we last read it — a wholesale overwrite here would
+        # silently wipe them.
+        _fresh = await container.run_repository.get(run.id)
+        _fresh_state = getattr(_fresh, "state", None)
+        if not isinstance(_fresh_state, dict):
+            _fresh_state = run.state if isinstance(run.state, dict) else {}
+        run.state = {**_fresh_state, **current_state, "error": str(exc)}
         run.current_step = None
         _persist_trace(extra_errors=[str(exc)])
         run.touch()
@@ -356,7 +364,14 @@ async def _stream_graph(
     snap = await runner.graph.aget_state(_config(run.id))
     run.status = _langgraph_status(snap, runner)
     run.current_step = snap.next[0] if snap.next else None
-    run.state = snap.values
+    # Re-fetch first: a concurrent progress callback may have written
+    # out-of-band Mongo-only keys (_agent_progress_*) to this run since we
+    # last read it — a wholesale overwrite here would silently wipe them.
+    _fresh = await container.run_repository.get(run.id)
+    _fresh_state = getattr(_fresh, "state", None)
+    if not isinstance(_fresh_state, dict):
+        _fresh_state = run.state if isinstance(run.state, dict) else {}
+    run.state = {**_fresh_state, **dict(snap.values)}
 
     active_interrupt_type: str | None = None
     for task in snap.tasks:

@@ -177,6 +177,95 @@ async def test_structured_output_skips_meta_llm():
     assert result.get("ticket_id") == "C130-1475"
 
 
+async def _run_unstructured_output_scenario(result_text: str) -> "MetaLLMRejectionError":
+    """Drive execute_agent_step through the unstructured-output rejection path
+    (output_mapping set, agent returned only 'result', no matching fields) and
+    return the raised MetaLLMRejectionError so callers can inspect its message.
+    """
+    from app.steps.agent_executor import MetaLLMRejectionError, execute_agent_step
+
+    output_mapping = {"ticket_id": "ticket_id", "summary": "summary"}
+    step = _make_step(output_mapping=output_mapping)
+    raw_output = {"result": result_text, "token_usage": {}}
+
+    fake_agent_def = MagicMock()
+    fake_agent_def.agent_input = {"system_prompt": "Research.", "model": "claude-sonnet-4-5"}
+    fake_agent_def.runtime = "k8s"
+    fake_agent_def.default_runtime = "k8s"
+
+    settings = _make_settings()
+
+    mock_poll_response = MagicMock()
+    mock_poll_response.raise_for_status = MagicMock()
+    mock_poll_response.json.return_value = {
+        "status": "finished",
+        "run_id": "test-run-id",
+        "outputs": [{"id": "x", "type": "final", "content": raw_output}],
+    }
+
+    mock_http_client = AsyncMock()
+    mock_http_client.__aenter__ = AsyncMock(return_value=mock_http_client)
+    mock_http_client.__aexit__ = AsyncMock(return_value=False)
+    mock_http_client.get = AsyncMock(return_value=mock_poll_response)
+    mock_http_client.post = AsyncMock(return_value=mock_poll_response)
+
+    _poll_settings3 = MagicMock()
+    _poll_settings3.agent_poll_interval_seconds = 1
+    _poll_settings3.agent_max_loops = 3
+    _poll_settings3.anthropic_api_key = "sk-test"
+
+    with (
+        patch("app.runtime.factory.get_runtime") as mock_get_runtime,
+        patch("asyncio.sleep", new_callable=AsyncMock),
+        patch("httpx.AsyncClient", return_value=mock_http_client),
+        patch("app.steps.agent_executor.get_settings", return_value=_poll_settings3),
+    ):
+        mock_runtime = MagicMock()
+        mock_runtime.has_container_for_run = AsyncMock(return_value=True)
+        mock_runtime.terminate_by_run_id = AsyncMock()
+        mock_runtime.rewrite_callback_url = MagicMock(return_value="http://localhost")
+        mock_runtime.get_agent_url_for_run = AsyncMock(return_value="http://agent-host:8080")
+        mock_get_runtime.return_value = mock_runtime
+
+        fake_backend = AsyncMock()
+        fake_backend.get = AsyncMock(return_value=fake_agent_def)
+
+        try:
+            await execute_agent_step(
+                step=step,
+                state={"request": "Implement C130-1475"},
+                agent_backend=fake_backend,
+                run_id="test-run-id",
+                callback_base_url="http://localhost",
+                settings=settings,
+                run_repository=None,
+            )
+        except MetaLLMRejectionError as exc:
+            return exc
+    raise AssertionError("expected MetaLLMRejectionError to be raised")
+
+
+@pytest.mark.asyncio
+async def test_unstructured_output_rejection_includes_full_text_under_5000_chars():
+    """Rejection snippet cap is 5000 chars, not 400 — text between 400 and
+    5000 chars must appear in full in the rejection reason/message."""
+    result_text = "x" * 4000
+    exc = await _run_unstructured_output_scenario(result_text)
+    assert result_text in exc.reason
+    assert result_text in str(exc)
+
+
+@pytest.mark.asyncio
+async def test_unstructured_output_rejection_truncates_at_5000_chars():
+    """A 6000-char result truncates to exactly the first 5000 chars (no
+    truncation marker is appended by the current implementation)."""
+    result_text = "y" * 6000
+    expected_snippet = result_text[:5000]
+    exc = await _run_unstructured_output_scenario(result_text)
+    assert expected_snippet in exc.reason
+    assert result_text not in exc.reason
+
+
 @pytest.mark.asyncio
 async def test_unstructured_output_raises_when_output_mapping_unmatched():
     """When agent returns only 'result' key and step has output_mapping, raises RuntimeError."""

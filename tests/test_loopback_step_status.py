@@ -279,6 +279,92 @@ def test_parse_questions_keeps_single_unnumbered_line():
 
 
 @pytest.mark.asyncio
+async def test_stream_graph_preserves_out_of_band_agent_progress_on_success():
+    """
+    `_stream_graph` (app.api.routes.workflows) must not wipe Mongo-only
+    `_agent_progress_*` keys that a concurrent progress callback wrote to
+    the run's state while the stream was in flight.
+
+    Before the fix, the success path did a wholesale `run.state = snap.values`,
+    silently dropping any key not present in the LangGraph snapshot values
+    (e.g. keys written directly to Mongo by a different request handler).
+    """
+    from app.api.routes.workflows import _stream_graph
+
+    runner = _make_runner()
+    run = _make_run()
+
+    concurrent_state = {
+        "_agent_progress_gather": ["m1", "m2"],
+        "_agent_progress_ask_context": ["x"],
+    }
+    fresh_run = GraphRun(
+        id=run.id,
+        graph_id=run.graph_id,
+        user_request=run.user_request,
+        status=run.status,
+        state=dict(concurrent_state),
+    )
+
+    container = MagicMock()
+    container.run_repository = AsyncMock()
+    container.run_repository.get = AsyncMock(return_value=fresh_run)
+    container.settings = MagicMock(base_url=None)
+
+    await _stream_graph(runner, run, container, {"request": "hello"}, base_url=None)
+
+    assert run.state["_agent_progress_gather"] == ["m1", "m2"]
+    assert run.state["_agent_progress_ask_context"] == ["x"]
+
+
+@pytest.mark.asyncio
+async def test_stream_graph_preserves_out_of_band_agent_progress_on_failure():
+    """
+    Same guarantee as above, but for the failure/except branch of
+    `_stream_graph`: `_agent_progress_*` keys must survive alongside the
+    newly-set `error` key.
+    """
+    from app.api.routes.workflows import _stream_graph
+
+    bad_response = AIMessage(content="thinking…")  # no tool_calls → nudge loop
+    llm = _FakeToolCallingChatModel(responses=[bad_response] * 5)
+    mcp = MagicMock(spec=McpToolsProvider)
+    mcp.get_tool = MagicMock(return_value=None)
+    mcp.get_tools = MagicMock(return_value=[])
+    mcp.get_tool_server = MagicMock(return_value=None)
+    steps = [
+        {**WORKFLOW_STEPS[0], "max_iterations": 3},
+        WORKFLOW_STEPS[1],
+        WORKFLOW_STEPS[2],
+    ]
+    runner = YamlGraphRunner(
+        {"id": "loopback-fail", "steps": steps}, llm=llm, mcp_tools_provider=mcp,
+    )
+    run = _make_run()
+    run.id = "loopback-fail-run"
+
+    concurrent_state = {"_agent_progress_gather": ["m1", "m2"]}
+    fresh_run = GraphRun(
+        id=run.id,
+        graph_id=run.graph_id,
+        user_request=run.user_request,
+        status=run.status,
+        state=dict(concurrent_state),
+    )
+
+    container = MagicMock()
+    container.run_repository = AsyncMock()
+    container.run_repository.get = AsyncMock(return_value=fresh_run)
+    container.settings = MagicMock(base_url=None)
+
+    await _stream_graph(runner, run, container, {"request": "hello"}, base_url=None)
+
+    assert run.status == "failed"
+    assert run.state["_agent_progress_gather"] == ["m1", "m2"]
+    assert "error" in run.state
+
+
+@pytest.mark.asyncio
 async def test_failure_during_loop_back_marks_running_step_not_next():
     """
     When gather fails on its second pass (e.g. max_iterations exceeded),
