@@ -240,6 +240,27 @@ def _build_agent_config(
     }
 
 
+def _merge_token_usage(
+    agent_usage: dict[str, Any] | None,
+    meta_llm_usage: dict[str, int] | None,
+) -> dict[str, Any] | None:
+    """Merge the agent pod's own ``token_usage`` with the meta-LLM evaluator's
+    captured usage by summing matching fields (``input_tokens``/``output_tokens``/
+    ``total_tokens``) — never clobbering one with the other.
+
+    Returns ``None`` only when both sides are missing. Falls back to whichever
+    side is present when the other is absent.
+    """
+    if not meta_llm_usage:
+        return agent_usage
+    if not agent_usage:
+        return meta_llm_usage
+    merged = dict(agent_usage)
+    for key in ("input_tokens", "output_tokens", "total_tokens"):
+        merged[key] = (agent_usage.get(key) or 0) + (meta_llm_usage.get(key) or 0)
+    return merged
+
+
 def _apply_mapping(
     source: dict[str, Any],
     mapping: dict[str, str] | None,
@@ -274,7 +295,11 @@ async def _meta_llm_evaluate(
 ) -> dict:
     """Evaluate step output against optional criteria using a lightweight LLM.
 
-    Returns: {"passed": bool, "reason": str}
+    Returns: {"passed": bool, "reason": str, "usage": dict | None}
+    ``usage``, when captured, has the shape
+    ``{"input_tokens": int, "output_tokens": int, "total_tokens": int}`` — it is
+    ``None`` when the underlying LLM client doesn't expose usage metadata or the
+    call errored (no real call succeeded).
     Always returns passed=True on any failure (non-blocking).
     """
     try:
@@ -340,6 +365,19 @@ async def _meta_llm_evaluate(
         response = await llm.ainvoke([HumanMessage(content=prompt)])
         text = response.content if isinstance(response.content, str) else str(response.content)
 
+        # Capture token usage off the AIMessage — modern LangChain chat models
+        # (ChatAnthropic/ChatOpenAI/ChatGoogleGenerativeAI, all used by
+        # build_llm_native) populate `usage_metadata` with
+        # input_tokens/output_tokens/total_tokens. None when unavailable.
+        usage: dict[str, int] | None = None
+        _usage_meta = getattr(response, "usage_metadata", None)
+        if _usage_meta:
+            usage = {
+                "input_tokens": _usage_meta.get("input_tokens", 0),
+                "output_tokens": _usage_meta.get("output_tokens", 0),
+                "total_tokens": _usage_meta.get("total_tokens", 0),
+            }
+
         passed = True
         reason = ""
         for line in text.strip().splitlines():
@@ -351,11 +389,11 @@ async def _meta_llm_evaluate(
                 reason = line[len("REASON:"):].strip()
 
         logger.info("[step '%s'] meta-LLM evaluation: %s — %s", step_id, "PASS" if passed else "FAIL", reason)
-        return {"passed": passed, "reason": reason}
+        return {"passed": passed, "reason": reason, "usage": usage}
 
     except Exception as exc:
         logger.warning("[step '%s'] meta-LLM evaluation failed: %s — defaulting to pass", step_id, exc)
-        return {"passed": True, "reason": "evaluator error, defaulting to pass"}
+        return {"passed": True, "reason": "evaluator error, defaulting to pass", "usage": None}
 
 
 async def execute_agent_step(
@@ -1007,6 +1045,7 @@ async def execute_agent_step(
         # "expected fields not found" message, and prevents downstream steps from
         # running on obviously bad output.
         _meta_llm_verdict: dict[str, Any] | None = None
+        _meta_llm_usage: dict[str, int] | None = None
         if use_meta_llm and not _surfaced_pending:
             _sc = step.get("success_criteria") if isinstance(step, dict) else None
             _fc = step.get("fail_criteria") if isinstance(step, dict) else None
@@ -1019,6 +1058,7 @@ async def execute_agent_step(
                 "[step '%s'] meta-LLM result: passed=%s reason=%r",
                 step_id, _eval["passed"], _eval.get("reason"),
             )
+            _meta_llm_usage = _eval.get("usage")
             # Store the meta-LLM verdict regardless of pass/fail so the UI can
             # always show what the quality gate decided and why.
             _meta_llm_verdict = {
@@ -1039,8 +1079,9 @@ async def execute_agent_step(
                     _mapped_for_rejection = {_rej_output_key: raw_output["result"]}
                 else:
                     _mapped_for_rejection = {}
-                if "token_usage" in raw_output:
-                    _mapped_for_rejection[f"_agent_token_usage_{step_id}"] = raw_output["token_usage"]
+                _merged_usage = _merge_token_usage(raw_output.get("token_usage"), _meta_llm_usage)
+                if _merged_usage is not None:
+                    _mapped_for_rejection[f"_agent_token_usage_{step_id}"] = _merged_usage
                 raise MetaLLMRejectionError(
                     _rejection_reason,  # clean reason — no step-id prefix noise
                     mapped_result=_mapped_for_rejection,
@@ -1082,8 +1123,9 @@ async def execute_agent_step(
             # the error — the agent may have returned a valid message (e.g. "Jira unavailable")
             # that is useful to show even though it didn't match the structured schema.
             _raw_mapped: dict[str, Any] = {}
-            if "token_usage" in raw_output:
-                _raw_mapped[f"_agent_token_usage_{step_id}"] = raw_output["token_usage"]
+            _merged_usage = _merge_token_usage(raw_output.get("token_usage"), _meta_llm_usage)
+            if _merged_usage is not None:
+                _raw_mapped[f"_agent_token_usage_{step_id}"] = _merged_usage
             raise MetaLLMRejectionError(
                 f"Agent returned unstructured output — expected fields {list(_output_mapping_check)} not found. "
                 f"Agent said: {_raw_snippet}",
@@ -1107,6 +1149,8 @@ async def execute_agent_step(
     output_mapping: dict[str, str] | None = step.get("output_mapping")
     output_key: str | None = step.get("output_key")
 
+    _final_meta_llm_usage = locals().get("_meta_llm_usage")
+
     if output_mapping:
         # Map individual agent output keys back to workflow state keys.
         # {agent_key: workflow_key}
@@ -1116,14 +1160,21 @@ async def execute_agent_step(
             if agent_key in raw_output
         }
         # Always preserve token usage regardless of output_mapping declaration.
-        if "token_usage" in raw_output:
-            result[f"_agent_token_usage_{step_id}"] = raw_output["token_usage"]
+        # Merge in the meta-LLM evaluator's own usage (if captured) rather than
+        # letting it clobber or be dropped.
+        _merged_usage = _merge_token_usage(
+            raw_output.get("token_usage") if isinstance(raw_output, dict) else None,
+            _final_meta_llm_usage,
+        )
+        if _merged_usage is not None:
+            result[f"_agent_token_usage_{step_id}"] = _merged_usage
     elif output_key:
         if isinstance(raw_output, dict) and "result" in raw_output:
             # Agent sent {"result": "...", "token_usage": {...}} — extract result key
             result = {output_key: raw_output["result"]}
-            if "token_usage" in raw_output:
-                result[f"_agent_token_usage_{step_id}"] = raw_output["token_usage"]
+            _merged_usage = _merge_token_usage(raw_output.get("token_usage"), _final_meta_llm_usage)
+            if _merged_usage is not None:
+                result[f"_agent_token_usage_{step_id}"] = _merged_usage
         elif isinstance(raw_output, dict) and len(raw_output) == 1:
             result = {output_key: next(iter(raw_output.values()))}
         else:

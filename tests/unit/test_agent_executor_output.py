@@ -177,6 +177,121 @@ async def test_structured_output_skips_meta_llm():
     assert result.get("ticket_id") == "C130-1475"
 
 
+# ---------------------------------------------------------------------------
+# _meta_llm_evaluate usage-capture and merge tests
+# ---------------------------------------------------------------------------
+
+def test_merge_token_usage_sums_matching_fields():
+    from app.steps.agent_executor import _merge_token_usage
+
+    agent_usage = {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150}
+    meta_usage = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+
+    merged = _merge_token_usage(agent_usage, meta_usage)
+
+    assert merged == {"input_tokens": 110, "output_tokens": 55, "total_tokens": 165}
+
+
+def test_merge_token_usage_falls_back_to_agent_only():
+    from app.steps.agent_executor import _merge_token_usage
+
+    agent_usage = {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150}
+
+    assert _merge_token_usage(agent_usage, None) == agent_usage
+
+
+def test_merge_token_usage_falls_back_to_meta_only():
+    from app.steps.agent_executor import _merge_token_usage
+
+    meta_usage = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+
+    assert _merge_token_usage(None, meta_usage) == meta_usage
+
+
+def test_merge_token_usage_both_missing_returns_none():
+    from app.steps.agent_executor import _merge_token_usage
+
+    assert _merge_token_usage(None, None) is None
+
+
+@pytest.mark.asyncio
+async def test_meta_llm_evaluate_captures_usage_metadata():
+    """_meta_llm_evaluate must read usage off response.usage_metadata and
+    return it under the 'usage' key with normalized field names."""
+    from app.steps.agent_executor import _meta_llm_evaluate
+
+    fake_response = MagicMock()
+    fake_response.content = "DECISION: PASS\nREASON: looks good"
+    fake_response.usage_metadata = {"input_tokens": 42, "output_tokens": 7, "total_tokens": 49}
+
+    fake_llm = AsyncMock()
+    fake_llm.ainvoke = AsyncMock(return_value=fake_response)
+
+    settings = _make_settings()
+    settings.meta_llm_provider = None
+    settings.meta_llm_model = None
+
+    with patch("app.core.container.build_llm_native", return_value=fake_llm):
+        result = await _meta_llm_evaluate(
+            raw_output={"result": "some output"},
+            input_data={"request": "do a thing"},
+            step_id="node_test",
+            settings=settings,
+        )
+
+    assert result["passed"] is True
+    assert result["usage"] == {"input_tokens": 42, "output_tokens": 7, "total_tokens": 49}
+
+
+@pytest.mark.asyncio
+async def test_meta_llm_evaluate_usage_none_when_not_exposed():
+    """When the LLM client doesn't expose usage_metadata, usage must be None
+    (not a zeroed dict)."""
+    from app.steps.agent_executor import _meta_llm_evaluate
+
+    fake_response = MagicMock(spec=["content"])  # no usage_metadata attribute
+    fake_response.content = "DECISION: PASS\nREASON: ok"
+
+    fake_llm = AsyncMock()
+    fake_llm.ainvoke = AsyncMock(return_value=fake_response)
+
+    settings = _make_settings()
+    settings.meta_llm_provider = None
+    settings.meta_llm_model = None
+
+    with patch("app.core.container.build_llm_native", return_value=fake_llm):
+        result = await _meta_llm_evaluate(
+            raw_output={"result": "some output"},
+            input_data={"request": "do a thing"},
+            step_id="node_test",
+            settings=settings,
+        )
+
+    assert result["usage"] is None
+
+
+@pytest.mark.asyncio
+async def test_meta_llm_evaluate_usage_none_on_error():
+    """The existing except-Exception fallback (evaluator error, defaulting to
+    pass) must report usage=None since no real call succeeded."""
+    from app.steps.agent_executor import _meta_llm_evaluate
+
+    settings = _make_settings()
+    settings.meta_llm_provider = None
+    settings.meta_llm_model = None
+
+    with patch("app.core.container.build_llm_native", side_effect=RuntimeError("boom")):
+        result = await _meta_llm_evaluate(
+            raw_output={"result": "some output"},
+            input_data={"request": "do a thing"},
+            step_id="node_test",
+            settings=settings,
+        )
+
+    assert result["passed"] is True
+    assert result["usage"] is None
+
+
 async def _run_unstructured_output_scenario(result_text: str) -> "MetaLLMRejectionError":
     """Drive execute_agent_step through the unstructured-output rejection path
     (output_mapping set, agent returned only 'result', no matching fields) and
