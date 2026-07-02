@@ -365,6 +365,81 @@ async def test_stream_graph_preserves_out_of_band_agent_progress_on_failure():
 
 
 @pytest.mark.asyncio
+async def test_stream_graph_preserves_out_of_band_agent_progress_per_chunk():
+    """
+    `_stream_graph` must not wipe out-of-band `_agent_progress_*` keys
+    written by a concurrent poll-forwarder DURING streaming (per-chunk),
+    not just at the terminal (success/failure) persistence sites.
+
+    Before the per-chunk fix, each per-chunk `update()` call did a plain
+    `run.touch(); await container.run_repository.update(run)` with no
+    re-fetch, so `run.state` (still holding the stale pre-stream snapshot)
+    would overwrite whatever `_agent_progress_*` keys a concurrent progress
+    callback had written to Mongo in between chunks.
+    """
+    from app.api.routes.workflows import _stream_graph
+
+    runner = _make_runner()
+    run = _make_run()
+
+    # Stateful fake for container.run_repository.get: first call simulates
+    # "no out-of-band write yet" (empty state), all subsequent calls
+    # simulate a concurrent poll-forwarder write having landed in Mongo.
+    _get_call_count = {"n": 0}
+
+    async def _fake_get(run_id):
+        _get_call_count["n"] += 1
+        if _get_call_count["n"] == 1:
+            return GraphRun(
+                id=run.id, graph_id=run.graph_id, user_request=run.user_request,
+                status=run.status, state={},
+            )
+        return GraphRun(
+            id=run.id, graph_id=run.graph_id, user_request=run.user_request,
+            status=run.status, state={"_agent_progress_gather": ["m1", "m2"]},
+        )
+
+    # Capture a snapshot of run.state at each update() call.
+    _snapshots: list[Any] = []
+
+    async def _capture_update(updated_run):
+        _snapshots.append(
+            dict(updated_run.state) if isinstance(updated_run.state, dict) else updated_run.state
+        )
+
+    container = MagicMock()
+    container.run_repository = AsyncMock()
+    container.run_repository.get = AsyncMock(side_effect=_fake_get)
+    container.run_repository.update = AsyncMock(side_effect=_capture_update)
+    container.settings = MagicMock(base_url=None)
+
+    await _stream_graph(runner, run, container, {"request": "hello"}, base_url=None)
+
+    if len(_snapshots) < 2:
+        # Not enough per-chunk writes from a single call — resume the
+        # interrupted run via Command(resume=...) as the other tests in
+        # this file do, to force more chunks through _stream_graph.
+        await _stream_graph(
+            runner, run, container,
+            Command(resume={"0": "a", "1": "b"}),
+            base_url=None,
+        )
+
+    assert len(_snapshots) >= 2, (
+        f"Expected at least 2 per-chunk persistence calls, got {len(_snapshots)}: {_snapshots!r}"
+    )
+
+    preserved = [
+        s for s in _snapshots[1:]
+        if isinstance(s, dict) and s.get("_agent_progress_gather") == ["m1", "m2"]
+    ]
+    assert preserved, (
+        "Expected at least one per-chunk update() snapshot (after the first) "
+        f"to preserve the out-of-band _agent_progress_gather key. Snapshots: {_snapshots!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_failure_during_loop_back_marks_running_step_not_next():
     """
     When gather fails on its second pass (e.g. max_iterations exceeded),

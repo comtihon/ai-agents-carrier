@@ -321,6 +321,11 @@ async def _stream_graph(
                 # Persist partial trace data after each step so polling clients
                 # see live data during execution.
                 _persist_trace()
+                _fresh = await container.run_repository.get(run.id)
+                _fresh_state = getattr(_fresh, "state", None)
+                if not isinstance(_fresh_state, dict):
+                    _fresh_state = run.state if isinstance(run.state, dict) else {}
+                run.state = _fresh_state
                 run.touch()
                 await container.run_repository.update(run)
     except Exception as exc:
