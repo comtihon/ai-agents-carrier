@@ -614,6 +614,7 @@ async def start_run(
 
     thread_id = str(uuid4())
     container.live_runners[thread_id] = runner
+    container._inject_runner_dependencies(runner)
 
     run = GraphRun(
         id=thread_id,

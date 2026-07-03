@@ -80,6 +80,106 @@ async def test_list_workflows(client):
     assert all("name" in w and "description" in w and "steps" in w for w in data)
 
 
+class _CapturingLiveRunners(dict):
+    """dict subclass that remembers the last inserted runner even after it
+    gets popped — needed because the graph in these tests runs to completion
+    synchronously within the request/response cycle (background tasks run
+    before Starlette returns the response), so `live_runners` is already
+    empty by the time `await client.post(...)` resolves."""
+
+    def __setitem__(self, key, value):
+        self.last_inserted = value
+        super().__setitem__(key, value)
+
+
+def _build_container_with_backend(registry: YamlGraphRegistry) -> ApplicationContainer:
+    """Container variant with workflow_backend + the 3 repos wired, so that
+    start_run() takes the `workflow_backend is not None` branch and we can
+    verify dependency injection onto the freshly built runner."""
+    settings = Settings()
+    repo = AsyncMock(spec=MongoGraphRunRepository)
+    repo.create = AsyncMock()
+    repo.update = AsyncMock()
+    repo.get = AsyncMock(
+        return_value=GraphRun(id="tid1", graph_id="simple", user_request="hello", status="running")
+    )
+    mcp = MagicMock(spec=McpToolsProvider)
+    mcp.start = AsyncMock()
+    mcp.stop = AsyncMock()
+    mcp.get_tool = MagicMock(return_value=None)
+    mongo_provider = MagicMock()
+    mongo_provider.close = AsyncMock()
+    openhands = MagicMock(spec=OpenHandsAdapter)
+
+    simple_defn = MagicMock()
+    simple_defn.id = "simple"
+    simple_defn.to_raw_dict = MagicMock(return_value={"id": "simple", "steps": [{"id": "step1", "type": "llm", "output_key": "answer"}]})
+    workflow_backend = MagicMock()
+    workflow_backend.get = AsyncMock(return_value=simple_defn)
+
+    warm_pod_repository = MagicMock()
+    pvc_lease_repository = MagicMock()
+    agent_task_repository = MagicMock()
+
+    return ApplicationContainer(
+        settings=settings,
+        llm=FakeMessagesListChatModel(responses=[AIMessage(content="x")]),
+        mcp_tools_provider=mcp,
+        yaml_graph_registry=registry,
+        mongo_provider=mongo_provider,
+        run_repository=repo,
+        openhands=openhands,
+        workflow_backend=workflow_backend,
+        warm_pod_repository=warm_pod_repository,
+        pvc_lease_repository=pvc_lease_repository,
+        agent_task_repository=agent_task_repository,
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_run_injects_runner_dependencies():
+    """start_run() must inject pvc_lease/agent_task/warm_pod repositories onto
+    the runner it builds — regression test for the missing
+    `_inject_runner_dependencies` call in the POST /workflows/runs handler."""
+    registry = _build_registry()
+    container = _build_container_with_backend(registry)
+    container.live_runners = _CapturingLiveRunners()
+    app = create_app()
+    app.state.container = container
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post(
+            "/api/v1/workflows/runs",
+            json={"workflow_id": "simple", "user_request": "hello"},
+        )
+        assert resp.status_code == 200, resp.text
+
+    runner = container.live_runners.last_inserted
+
+    assert runner._warm_pod_repository is container.warm_pod_repository
+    assert runner._pvc_lease_repository is container.pvc_lease_repository
+    assert runner._agent_task_repository is container.agent_task_repository
+
+
+@pytest.mark.asyncio
+async def test_start_run_does_not_force_inject_none_dependencies(client):
+    """When the container has no repos configured (legacy/test setups), the
+    runner's dependency attrs must remain None rather than being overwritten
+    with something truthy."""
+    c, container = client
+    container.live_runners = _CapturingLiveRunners()
+    resp = await c.post(
+        "/api/v1/workflows/runs",
+        json={"workflow_id": "simple", "user_request": "hello"},
+    )
+    assert resp.status_code == 200, resp.text
+    runner = container.live_runners.last_inserted
+
+    assert runner._warm_pod_repository is None
+    assert runner._pvc_lease_repository is None
+    assert runner._agent_task_repository is None
+
+
 @pytest.mark.asyncio
 async def test_start_run(client):
     c, container = client

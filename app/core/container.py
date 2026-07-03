@@ -101,6 +101,23 @@ class ApplicationContainer:
             replace_existing=True,
         )
 
+    def _inject_runner_dependencies(self, runner: YamlGraphRunner) -> None:
+        """Inject shared repositories onto a runner instance.
+
+        Deliberately excludes `_callback_base_url` — its value is NOT uniform
+        across call sites (some use `agent_callback_url or base_url`, one uses
+        plain `base_url`, one doesn't set it at all), so each call site keeps
+        setting that one itself to avoid silently changing existing behavior.
+        """
+        if self.agent_backend is not None:
+            runner._agent_backend = self.agent_backend
+        if self.pvc_lease_repository is not None:
+            runner._pvc_lease_repository = self.pvc_lease_repository
+        if self.agent_task_repository is not None:
+            runner._agent_task_repository = self.agent_task_repository
+        if self.warm_pod_repository is not None:
+            runner._warm_pod_repository = self.warm_pod_repository
+
     async def _load_registry(self) -> None:
         """Populate yaml_graph_registry from the configured backend."""
         assert self.workflow_backend is not None
@@ -123,15 +140,8 @@ class ApplicationContainer:
         for wf_id in self.yaml_graph_registry.list_ids():
             runner = self.yaml_graph_registry.get(wf_id)
             if runner is not None:
-                if self.agent_backend is not None:
-                    runner._agent_backend = self.agent_backend
+                self._inject_runner_dependencies(runner)
                 runner._callback_base_url = self.settings.agent_callback_url or self.settings.base_url
-                if self.pvc_lease_repository is not None:
-                    runner._pvc_lease_repository = self.pvc_lease_repository
-                if self.agent_task_repository is not None:
-                    runner._agent_task_repository = self.agent_task_repository
-                if self.warm_pod_repository is not None:
-                    runner._warm_pod_repository = self.warm_pod_repository
         logger.info("Loaded %d workflow definition(s) from backend", len(definitions))
         self._setup_all_cron_triggers()
 
@@ -183,14 +193,7 @@ class ApplicationContainer:
                         openhands=self.openhands,
                         checkpointer=self.checkpointer,
                     )
-                    if self.agent_backend is not None:
-                        runner._agent_backend = self.agent_backend
-                    if self.pvc_lease_repository is not None:
-                        runner._pvc_lease_repository = self.pvc_lease_repository
-                    if self.agent_task_repository is not None:
-                        runner._agent_task_repository = self.agent_task_repository
-                    if self.warm_pod_repository is not None:
-                        runner._warm_pod_repository = self.warm_pod_repository
+                    self._inject_runner_dependencies(runner)
                     definition_snapshot: dict | None = defn.to_raw_dict()
                 else:
                     runner = self.yaml_graph_registry.get(workflow_id)
@@ -249,15 +252,8 @@ class ApplicationContainer:
                 openhands=self.openhands,
                 checkpointer=self.checkpointer,
             )
-            if self.agent_backend is not None:
-                runner._agent_backend = self.agent_backend
+            self._inject_runner_dependencies(runner)
             runner._callback_base_url = self.settings.agent_callback_url or self.settings.base_url
-            if self.pvc_lease_repository is not None:
-                runner._pvc_lease_repository = self.pvc_lease_repository
-            if self.agent_task_repository is not None:
-                runner._agent_task_repository = self.agent_task_repository
-            if self.warm_pod_repository is not None:
-                runner._warm_pod_repository = self.warm_pod_repository
             self.yaml_graph_registry._runners[workflow_id] = runner
             self._register_cron_steps(runner)
             logger.info("Registry runner refreshed for workflow '%s'", workflow_id)
@@ -444,15 +440,8 @@ class ApplicationContainer:
                 )
                 runner._registry = self.yaml_graph_registry
                 runner._run_repository = self.run_repository
-                if self.agent_backend is not None:
-                    runner._agent_backend = self.agent_backend
+                self._inject_runner_dependencies(runner)
                 runner._callback_base_url = self.settings.agent_callback_url or self.settings.base_url
-                if self.pvc_lease_repository is not None:
-                    runner._pvc_lease_repository = self.pvc_lease_repository
-                if self.agent_task_repository is not None:
-                    runner._agent_task_repository = self.agent_task_repository
-                if self.warm_pod_repository is not None:
-                    runner._warm_pod_repository = self.warm_pod_repository
                 return runner
             except Exception:
                 logger.exception("run %s: failed to build runner from definition snapshot", run.id)
