@@ -11,7 +11,7 @@ async def cleanup_run_agents(run_id: str, settings, warm_pod_repository: Any = N
     """
     try:
         from app.runtime.k8s import K8sRuntime
-        await K8sRuntime(namespace=settings.agent_namespace).terminate_by_run_id(run_id)
+        await K8sRuntime(namespace=settings.agent_namespace).terminate_by_run_id(None, run_id)
         logger.info("run %s: k8s agent cleanup done", run_id)
     except Exception:
         logger.debug("run %s: k8s agent cleanup failed", run_id, exc_info=True)
@@ -20,7 +20,7 @@ async def cleanup_run_agents(run_id: str, settings, warm_pod_repository: Any = N
         await DockerRuntime(
             registry_username=settings.docker_registry_username,
             registry_password=settings.docker_registry_password,
-        ).terminate_by_run_id(run_id)
+        ).terminate_by_run_id(None, run_id)
         logger.info("run %s: docker agent cleanup done", run_id)
     except Exception:
         logger.debug("run %s: docker agent cleanup failed", run_id, exc_info=True)

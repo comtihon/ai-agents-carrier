@@ -263,8 +263,13 @@ class DockerRuntime(AgentRuntime):
                 "DockerRuntime.terminate: no container tracked for %s", agent_url
             )
 
-    async def has_container_for_run(self, run_id: str) -> bool:
-        """Return True if a running container labelled with this run_id exists."""
+    async def has_container_for_run(self, agent_def: "AgentDefinition", run_id: str) -> bool:
+        """Return True if a running container labelled with this run_id exists.
+
+        ``agent_def`` is accepted for signature parity with ``K8sRuntime`` (whose
+        equivalent method is now agent-scoped) but is currently unused — Docker's
+        run_id-only scoping is a documented follow-up, out of scope for this fix.
+        """
         try:
             containers = await self._client.containers.list(
                 filters={"label": [f"langgraph_run_id={run_id}"], "status": ["running"]}
@@ -273,8 +278,13 @@ class DockerRuntime(AgentRuntime):
         except Exception:
             return False
 
-    async def terminate_by_run_id(self, run_id: str) -> None:
-        """Find and terminate all containers labeled langgraph_run_id=<run_id>."""
+    async def terminate_by_run_id(self, agent_def: "AgentDefinition | None", run_id: str) -> None:
+        """Find and terminate all containers labeled langgraph_run_id=<run_id>.
+
+        ``agent_def`` is accepted for signature parity with ``K8sRuntime`` (whose
+        equivalent method is now agent-scoped) but is currently unused — Docker's
+        run_id-only scoping is a documented follow-up, out of scope for this fix.
+        """
         try:
             containers = await self._client.containers.list(
                 filters={"label": [f"langgraph_run_id={run_id}"]}

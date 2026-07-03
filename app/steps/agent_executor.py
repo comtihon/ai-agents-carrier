@@ -544,7 +544,7 @@ async def execute_agent_step(
         _is_resume = (
             not _is_warm_reuse
             and hasattr(runtime, "has_container_for_run")
-            and await runtime.has_container_for_run(run_id)
+            and await runtime.has_container_for_run(agent_def, run_id)
         )
 
         container_callback_url = callback_base_url  # default; overridden below for docker/non-resume
@@ -681,7 +681,7 @@ async def execute_agent_step(
                 # Fall back to runtime lookup (only if method is a coroutine function)
                 import inspect as _inspect
                 _get_url_fn = getattr(runtime, "get_agent_url_for_run", None)
-                agent_url = await _get_url_fn(run_id) if _get_url_fn is not None and _inspect.iscoroutinefunction(_get_url_fn) else None
+                agent_url = await _get_url_fn(agent_def, run_id) if _get_url_fn is not None and _inspect.iscoroutinefunction(_get_url_fn) else None
             if not agent_url:
                 # Stale pod from a failed spawn (e.g. helm timeout before task was saved).
                 # Terminate it and fall through to a fresh spawn below.
@@ -692,7 +692,7 @@ async def execute_agent_step(
                 _terminate_fn = getattr(runtime, "terminate_by_run_id", None)
                 if _terminate_fn is not None:
                     try:
-                        await _terminate_fn(run_id)
+                        await _terminate_fn(agent_def, run_id)
                     except Exception as _te:
                         logger.warning("[step '%s'] terminate_by_run_id failed: %s", step_id, _te)
                 _is_resume = False
@@ -897,7 +897,7 @@ async def execute_agent_step(
             except Exception as _wp_exc:
                 logger.warning("[step '%s'] failed to upsert warm pod record: %s — terminating instead", step_id, _wp_exc)
                 if hasattr(runtime, "terminate_by_run_id"):
-                    await runtime.terminate_by_run_id(run_id)
+                    await runtime.terminate_by_run_id(agent_def, run_id)
                 else:
                     try:
                         await runtime.terminate(agent_url)
@@ -906,7 +906,7 @@ async def execute_agent_step(
         else:
             # Terminate using run_id label — works whether _containers is populated or not.
             if hasattr(runtime, "terminate_by_run_id"):
-                await runtime.terminate_by_run_id(run_id)
+                await runtime.terminate_by_run_id(agent_def, run_id)
             else:
                 try:
                     await runtime.terminate(agent_url)

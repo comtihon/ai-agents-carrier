@@ -915,7 +915,7 @@ async def restart_from_step(
         await DockerRuntime(
             registry_username=container.settings.docker_registry_username,
             registry_password=container.settings.docker_registry_password,
-        ).terminate_by_run_id(run_id)
+        ).terminate_by_run_id(None, run_id)
     except Exception:
         logger.debug("run %s: docker cleanup on restart-from-step failed", run_id, exc_info=True)
     container.live_runners.pop(run_id, None)

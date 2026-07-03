@@ -363,8 +363,29 @@ class K8sRuntime(AgentRuntime):
         else:
             logger.info("K8sRuntime: release '%s' uninstalled", release_name)
 
-    async def terminate_by_run_id(self, run_id: str) -> None:
-        """Uninstall all Helm releases for the given run_id (best-effort, never raises)."""
+    async def terminate_by_run_id(self, agent_def: "AgentDefinition | None", run_id: str) -> None:
+        """Uninstall Helm release(s) for a run (best-effort, never raises).
+
+        When ``agent_def`` is given, uninstalls the exact release for that
+        agent+run_id via ``_release_name`` — scoped, does not touch other
+        agents' releases sharing the same run_id. This is the path used by
+        per-step resume/warm-pod logic in ``agent_executor.py``.
+
+        When ``agent_def`` is ``None`` (broad run-level cleanup — e.g. the run
+        was cancelled/failed and every agent pod for it must be torn down),
+        falls back to the previous behaviour of uninstalling every Helm
+        release whose name matches the run_id prefix, regardless of agent role.
+        """
+        if agent_def is not None:
+            try:
+                release_name = self._release_name(agent_def, run_id)
+                await self.uninstall_release(release_name)
+                # Clean up in-memory tracking for this release only.
+                self._releases = {k: v for k, v in self._releases.items() if v != release_name}
+            except Exception:
+                pass
+            return
+
         try:
             import json as _json
             prefix = run_id[:8]
@@ -381,18 +402,7 @@ class K8sRuntime(AgentRuntime):
                 if not release_name:
                     continue
                 try:
-                    cmd = [
-                        "helm", "uninstall", release_name,
-                        "--namespace", self._namespace,
-                    ]
-                    logger.info("K8sRuntime: helm uninstall '%s' (terminate_by_run_id)", release_name)
-                    proc = await asyncio.create_subprocess_exec(
-                        *cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                    await proc.communicate()
-                    # Clean up in-memory tracking
+                    await self.uninstall_release(release_name)
                     self._releases = {k: v for k, v in self._releases.items() if v != release_name}
                 except Exception:
                     pass
@@ -415,61 +425,68 @@ class K8sRuntime(AgentRuntime):
         else:
             logger.info("K8sRuntime.uninstall_release: release '%s' uninstalled", release_name)
 
-    async def has_container_for_run(self, run_id: str) -> bool:
-        """Return True if a Helm release for this run_id already exists in the cluster.
+    async def _release_status(self, release_name: str) -> str | None:
+        """Return the ``info.status`` field of ``helm status -o json`` for a release.
 
-        Used by agent_executor to detect whether a pod was already spawned (e.g. by
-        a previous backend instance) so it can resume instead of spawning a duplicate.
+        Returns ``None`` when the release doesn't exist or the command fails.
         """
         try:
             import json as _json
-            prefix = run_id[:8]
             proc = await asyncio.create_subprocess_exec(
-                "helm", "list",
+                "helm", "status", release_name,
                 "-n", self._namespace,
-                "--filter", f"agent-.*-{prefix}",
                 "-o", "json",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await proc.communicate()
-            releases = _json.loads(stdout or "[]")
+            if proc.returncode != 0 or not stdout:
+                return None
+            data = _json.loads(stdout)
+            return data.get("info", {}).get("status")
+        except Exception:
+            return None
+
+    async def has_container_for_run(self, agent_def: "AgentDefinition", run_id: str) -> bool:
+        """Return True if this exact agent+run_id's Helm release exists in the cluster.
+
+        Used by agent_executor to detect whether a pod was already spawned (e.g. by
+        a previous backend instance) so it can resume instead of spawning a duplicate.
+
+        Scoped to the release name computed via ``_release_name`` (agent + run_id) —
+        does NOT match other agents' releases that happen to share the same run_id.
+        """
+        try:
+            release_name = self._release_name(agent_def, run_id)
+            status = await self._release_status(release_name)
+            if status is None:
+                return False
             # Only exclude releases in terminal failure state.
             # pending-install / pending-upgrade mean a helm operation is still
             # in progress — treat those as "running" so the resume path polls
             # the agent URL instead of launching a second concurrent helm
             # upgrade (which would get "another operation in progress" when
             # the backend restarts mid-install during a rolling deploy).
-            return any(r.get("status") != "failed" for r in releases)
+            return status != "failed"
         except Exception:
             return False
 
-    async def get_agent_url_for_run(self, run_id: str) -> str | None:
-        """Return the in-cluster agent URL for an existing helm release, or None.
+    async def get_agent_url_for_run(self, agent_def: "AgentDefinition", run_id: str) -> str | None:
+        """Return the in-cluster agent URL for this exact agent+run_id's helm release, or None.
 
         Called by agent_executor on resume when no task is stored in the DB
         (e.g. the backend restarted while helm install was still in progress and
         the task record was never written).  Discovering the URL from the
         manifest avoids the stale-pod path that would try to start a second
         concurrent helm operation.
+
+        Scoped to the release name computed via ``_release_name`` (agent + run_id) —
+        does NOT resolve to another agent's release sharing the same run_id.
         """
         try:
-            import json as _json
-            prefix = run_id[:8]
-            proc = await asyncio.create_subprocess_exec(
-                "helm", "list",
-                "-n", self._namespace,
-                "--filter", f"agent-.*-{prefix}",
-                "-o", "json",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            stdout, _ = await proc.communicate()
-            releases = _json.loads(stdout or "[]")
-            if not releases:
-                return None
-            release_name = releases[0].get("name", "")
-            if not release_name:
+            release_name = self._release_name(agent_def, run_id)
+            status = await self._release_status(release_name)
+            if status is None:
                 return None
             url = await self._discover_service_url(release_name)
             logger.info(

@@ -341,7 +341,7 @@ class ApplicationContainer:
             # Agent is gone — clean up and mark failed.
             try:
                 from app.runtime.k8s import K8sRuntime
-                await K8sRuntime(namespace=self.settings.agent_namespace).terminate_by_run_id(run.id)
+                await K8sRuntime(namespace=self.settings.agent_namespace).terminate_by_run_id(None, run.id)
             except Exception:
                 logger.debug("run %s: k8s release cleanup on recovery failed", run.id, exc_info=True)
             try:
@@ -349,7 +349,7 @@ class ApplicationContainer:
                 await DockerRuntime(
                     registry_username=self.settings.docker_registry_username,
                     registry_password=self.settings.docker_registry_password,
-                ).terminate_by_run_id(run.id)
+                ).terminate_by_run_id(None, run.id)
             except Exception:
                 logger.debug("run %s: docker cleanup on recovery failed", run.id, exc_info=True)
             run.status = "failed"
@@ -460,7 +460,7 @@ class ApplicationContainer:
         await self.run_repository.update(run)
         try:
             from app.runtime.k8s import K8sRuntime
-            await K8sRuntime(namespace=self.settings.agent_namespace).terminate_by_run_id(run.id)
+            await K8sRuntime(namespace=self.settings.agent_namespace).terminate_by_run_id(None, run.id)
         except Exception:
             logger.debug("run %s: k8s cleanup in watcher failed", run.id, exc_info=True)
         try:
@@ -468,7 +468,7 @@ class ApplicationContainer:
             await DockerRuntime(
                 registry_username=self.settings.docker_registry_username,
                 registry_password=self.settings.docker_registry_password,
-            ).terminate_by_run_id(run.id)
+            ).terminate_by_run_id(None, run.id)
         except Exception:
             logger.debug("run %s: docker cleanup in watcher failed", run.id, exc_info=True)
 
