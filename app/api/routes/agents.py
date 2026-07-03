@@ -52,7 +52,9 @@ class AgentDefinitionUpdateRequest(BaseModel):
     image: str | None = None
     helm_chart: str | None = None
     helm_values: dict = Field(default_factory=dict)
-    addons: list[dict] = Field(default_factory=list)
+    # None = omitted by caller -> preserve existing addons on update.
+    # Explicit [] = caller intentionally clears addons.
+    addons: list[dict] | None = None
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -155,6 +157,15 @@ async def update_agent(
 
     from pydantic import TypeAdapter
     _addon_adapter: TypeAdapter[list[AnyAgentAddon]] = TypeAdapter(list[AnyAgentAddon])
+    # body.addons is None when the caller omits the field entirely (e.g. a UI
+    # form that only round-trips system_prompt/model) — preserve existing
+    # addons in that case instead of silently wiping them. An explicit []
+    # still clears addons, since that's a deliberate value, not an omission.
+    addons = (
+        existing.addons
+        if body.addons is None
+        else _addon_adapter.validate_python(body.addons)
+    )
     defn = AgentDefinition(
         id=agent_id,
         name=body.name,
@@ -165,7 +176,7 @@ async def update_agent(
         helm_chart=body.helm_chart,
         helm_values=body.helm_values,
         created_at=existing.created_at,
-        addons=_addon_adapter.validate_python(body.addons),
+        addons=addons,
     )
     saved = await container.agent_backend.update(agent_id, defn)
     return saved.model_dump(mode="json")
