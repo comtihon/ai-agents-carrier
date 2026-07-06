@@ -230,3 +230,243 @@ async def test_single_output_non_llm_structured_raises() -> None:
 
     with pytest.raises(ValueError, match="cannot have more than 1 route"):
         YamlGraphRunner(bad_graph, llm=llm, mcp_tools_provider=mcp)
+
+
+def _make_agent_route_runner(verdict: str) -> YamlGraphRunner:
+    """Build a runner with a langgraph-agent step that branches on `verdict`.
+
+    execute_agent_step is mocked to return {"verdict": verdict} directly
+    (as if output_mapping already merged the agent's output into state).
+    """
+    from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+    from langchain_core.messages import AIMessage
+    from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner
+    from app.infrastructure.tools.mcp_client import McpToolsProvider
+
+    definition = {
+        "id": "agent-route-graph",
+        "steps": [
+            {
+                "id": "agent_step",
+                "type": "langgraph-agent",
+                "agent_id": "test-agent",
+                "output_mapping": {"verdict": "verdict"},
+                "routes": [
+                    {"when": "verdict == 'approve'", "next": "route_a"},
+                    {"next": "route_b"},
+                ],
+            },
+            # Explicit terminal `next` (pointing outside the graph) so each branch
+            # ends the run instead of auto-chaining into the sibling branch.
+            {"id": "route_a", "type": "llm", "output_key": "a_out", "next": "__end__"},
+            {"id": "route_b", "type": "llm", "output_key": "b_out", "next": "__end__"},
+        ],
+    }
+    llm = FakeMessagesListChatModel(responses=[AIMessage(content="branch output")])
+    mcp = MagicMock(spec=McpToolsProvider)
+    mcp.get_tool = MagicMock(return_value=None)
+    runner = YamlGraphRunner(definition, llm=llm, mcp_tools_provider=mcp)
+    runner._agent_backend = MagicMock()
+    return runner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("verdict", "expected_key"),
+    [("approve", "a_out"), ("reject", "b_out")],
+)
+async def test_agent_step_multi_route_branches(verdict: str, expected_key: str) -> None:
+    """A langgraph-agent step with 2 routes builds without error and branches
+    on the merged output_mapping field, same as switch/llm_structured."""
+    runner = _make_agent_route_runner(verdict)
+
+    with patch(
+        "app.steps.agent_executor.execute_agent_step",
+        new=AsyncMock(return_value={"verdict": verdict}),
+    ):
+        config = {"configurable": {"thread_id": f"agent-route-{verdict}"}}
+        state = await runner.graph.ainvoke({"request": "go"}, config)
+
+    assert state.get(expected_key) == "branch output"
+    other_key = "b_out" if expected_key == "a_out" else "a_out"
+    assert other_key not in state
+
+
+@pytest.mark.asyncio
+async def test_agent_step_single_next_backward_compat() -> None:
+    """An agent step using plain `next` (no routes) still works unchanged."""
+    from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+    from langchain_core.messages import AIMessage
+    from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner
+    from app.infrastructure.tools.mcp_client import McpToolsProvider
+
+    definition = {
+        "id": "agent-next-graph",
+        "steps": [
+            {
+                "id": "agent_step",
+                "type": "langgraph-agent",
+                "agent_id": "test-agent",
+                "output_key": "agent_out",
+                "next": "after_agent",
+            },
+            {"id": "after_agent", "type": "llm", "output_key": "after_out"},
+        ],
+    }
+    llm = FakeMessagesListChatModel(responses=[AIMessage(content="done")])
+    mcp = MagicMock(spec=McpToolsProvider)
+    mcp.get_tool = MagicMock(return_value=None)
+    runner = YamlGraphRunner(definition, llm=llm, mcp_tools_provider=mcp)
+    runner._agent_backend = MagicMock()
+
+    with patch(
+        "app.steps.agent_executor.execute_agent_step",
+        new=AsyncMock(return_value={"agent_out": {"ok": True}}),
+    ):
+        config = {"configurable": {"thread_id": "agent-next"}}
+        state = await runner.graph.ainvoke({"request": "go"}, config)
+
+    assert state.get("agent_out") == {"ok": True}
+    assert state.get("after_out") == "done"
+
+
+@pytest.mark.asyncio
+async def test_agent_step_token_usage_sums_across_loopback_executions() -> None:
+    """Regression test for the ``_sum_usage`` reducer (yaml_graph.py).
+
+    A ``langgraph-agent`` step that loops back onto itself (via ``routes``)
+    must accumulate ``_agent_token_usage_<step>`` across re-executions
+    instead of the last write clobbering the first — this is the exact
+    scenario a plain ``LastValue`` field (or a hand-rolled
+    ``current_state.update(output)`` failure-path merge) would undercount:
+    150 (first execution) + 15 (second execution) must sum to 165, not
+    regress to 15.
+    """
+    from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+    from langchain_core.messages import AIMessage
+    from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner
+    from app.infrastructure.tools.mcp_client import McpToolsProvider
+
+    definition = {
+        "id": "agent-loop-usage-graph",
+        "steps": [
+            {
+                "id": "agent_step",
+                "type": "langgraph-agent",
+                "agent_id": "test-agent",
+                "routes": [
+                    {"when": "passed", "next": "__end__"},
+                    {"next": "agent_step"},
+                ],
+            },
+        ],
+    }
+    llm = FakeMessagesListChatModel(responses=[AIMessage(content="unused")])
+    mcp = MagicMock(spec=McpToolsProvider)
+    mcp.get_tool = MagicMock(return_value=None)
+    runner = YamlGraphRunner(definition, llm=llm, mcp_tools_provider=mcp)
+    runner._agent_backend = MagicMock()
+
+    # Each execution writes its own delta for the same field; the state
+    # schema's Annotated[Any, _sum_usage] reducer must sum them, not
+    # overwrite.
+    execute_agent_step_mock = AsyncMock(
+        side_effect=[
+            {
+                "passed": False,
+                "_agent_token_usage_agent_step": {
+                    "input_tokens": 100, "output_tokens": 50, "total_tokens": 150,
+                },
+            },
+            {
+                "passed": True,
+                "_agent_token_usage_agent_step": {
+                    "input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
+                },
+            },
+        ]
+    )
+    with patch(
+        "app.steps.agent_executor.execute_agent_step",
+        new=execute_agent_step_mock,
+    ):
+        config = {"configurable": {"thread_id": "agent-loop-usage"}}
+        state = await runner.graph.ainvoke({"request": "go"}, config)
+
+    assert execute_agent_step_mock.await_count == 2
+    assert state.get("_agent_token_usage_agent_step") == {
+        "input_tokens": 110, "output_tokens": 55, "total_tokens": 165,
+    }
+
+
+@pytest.mark.asyncio
+async def test_stream_graph_to_pause_failure_persists_checkpoint_usage_not_handrolled_overwrite() -> None:
+    """Regression test for the BLOCKER fix in ``stream_graph_to_pause``
+    (yaml_graph.py): on failure, ``run.state`` must be built from the
+    checkpointer's reducer-applied values (``runner.graph.aget_state``), not
+    the hand-rolled ``current_state.update(output)`` accumulation.
+
+    ``current_state.update()`` overwrites a repeated key with the LAST
+    chunk's value (15), losing the earlier chunk's contribution (150) that a
+    ``_sum_usage``-reducer field would have summed (165) — this mirrors the
+    validator's manual repro (165 via checkpointer vs 15 via failure path).
+
+    ``runner.graph.astream``/``aget_state`` are stubbed directly so this test
+    exercises exactly the failure-handler code path without depending on
+    incidental node-level exception-swallowing behavior elsewhere in the
+    runner.
+    """
+    from datetime import datetime, timezone
+    from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+    from langchain_core.messages import AIMessage
+    from app.domain.models.graph_run import GraphRun
+    from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner, stream_graph_to_pause
+    from app.infrastructure.tools.mcp_client import McpToolsProvider
+
+    llm = FakeMessagesListChatModel(responses=[AIMessage(content="unused")])
+    mcp = MagicMock(spec=McpToolsProvider)
+    mcp.get_tool = MagicMock(return_value=None)
+    runner = YamlGraphRunner(
+        {"id": "usage-fail-graph", "steps": [{"id": "step1", "type": "llm", "output_key": "out"}]},
+        llm=llm, mcp_tools_provider=mcp,
+    )
+
+    run = GraphRun(
+        id="usage-fail-run",
+        graph_id="usage-fail-graph",
+        user_request="hello",
+        status="running",
+        current_step=None,
+        state={},
+        step_inputs={},
+        step_outputs={},
+        step_statuses={"step1": "pending"},
+        created_at=datetime.now(tz=timezone.utc),
+        updated_at=datetime.now(tz=timezone.utc),
+    )
+    repo = AsyncMock()
+
+    async def fake_astream(*_args, **_kwargs):
+        # Two "successful" loop-back chunks writing partial deltas for the
+        # same _sum_usage-reducer field, then a stream failure.
+        yield {"step1": {"_judge_token_usage": {
+            "input_tokens": 100, "output_tokens": 50, "total_tokens": 150,
+        }}}
+        yield {"step1": {"_judge_token_usage": {
+            "input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
+        }}}
+        raise RuntimeError("simulated stream failure after loop-back")
+
+    checkpoint_snapshot = MagicMock()
+    checkpoint_snapshot.values = {
+        "_judge_token_usage": {"input_tokens": 110, "output_tokens": 55, "total_tokens": 165},
+    }
+    runner.graph.astream = fake_astream
+    runner.graph.aget_state = AsyncMock(return_value=checkpoint_snapshot)
+
+    await stream_graph_to_pause(runner, run, repo, {"request": "hello"})
+
+    assert run.status == "failed"
+    assert run.state["_judge_token_usage"] == {
+        "input_tokens": 110, "output_tokens": 55, "total_tokens": 165,
+    }

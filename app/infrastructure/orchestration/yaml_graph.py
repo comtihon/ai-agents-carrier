@@ -45,6 +45,41 @@ def _last_wins(a: Any, b: Any) -> Any:
     return b if b is not None else a
 
 
+def _coerce_usage_num(value: Any) -> int | float:
+    """Coerce a token-usage value to a number; non-numeric values become 0
+    instead of raising, so a single malformed field can't crash the reducer."""
+    if value is None:
+        return 0
+    if isinstance(value, int):
+        return value
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _sum_usage(a: Any, b: Any) -> Any:
+    """Reducer that sums numeric token-usage dicts across re-executions
+    (e.g. workflow-loop steps that run the same node multiple times), instead
+    of letting the last write clobber earlier usage.
+
+    Must never raise — a raising reducer would crash the graph superstep.
+    Non-dict inputs (e.g. a legacy string value written before this reducer
+    existed) and non-numeric field values are tolerated defensively."""
+    if not b:
+        return a
+    if not a:
+        return b
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        if isinstance(b, dict):
+            return b
+        if isinstance(a, dict):
+            return a
+        return {}
+    keys = set(a) | set(b)
+    return {key: _coerce_usage_num(a.get(key)) + _coerce_usage_num(b.get(key)) for key in keys}
+
+
 def _build_state_schema(steps: list[dict[str, Any]]) -> type:
     """
     Dynamically build a TypedDict (total=False) that includes all output keys
@@ -79,6 +114,9 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
         "_meta_llm_rejection":        Annotated[Any, _last_wins],    # type: ignore[assignment]
         "_meta_llm_result":           Annotated[Any, _last_wins],    # type: ignore[assignment]
         "error":                      Annotated[Any, _last_wins],    # type: ignore[assignment]
+        # Backend judge (meta-LLM) token usage, summed across the whole workflow
+        # run — a single global bucket, kept separate from per-step agent/meta usage.
+        "_judge_token_usage":         Annotated[Any, _sum_usage],    # type: ignore[assignment]
     }
     for step in steps:
         # Regular output nodes store their result under output_key
@@ -121,7 +159,11 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
                 )
             if step.get("slack_input_key"):
                 fields[step["slack_input_key"]] = Any  # type: ignore[assignment]
-            fields[f"_agent_token_usage_{step['id']}"] = Any  # type: ignore[assignment]
+            # Agent-LLM and post-compact meta-LLM token usage are tracked as two
+            # separate buckets, summed across workflow-loop re-executions of this
+            # step (never merged into one another).
+            fields[f"_agent_token_usage_{step['id']}"] = Annotated[Any, _sum_usage]  # type: ignore[assignment]
+            fields[f"_meta_token_usage_{step['id']}"] = Annotated[Any, _sum_usage]  # type: ignore[assignment]
             # Live progress trail + in-flight token usage, written directly by
             # POST /agent/progress (see agent_callbacks.py) and scoped per step
             # via run.current_step. Must be declared here too, or LangGraph's
@@ -313,7 +355,17 @@ async def stream_graph_to_pause(
         # Preserve accumulated step outputs AND any internal state keys written
         # mid-step by _save_conv_id (e.g. _openhands_conv_*, _conv_map).
         mid_run = {k: v for k, v in (run.state or {}).items() if k.startswith("_")}
-        run.state = {**current_state, **mid_run, "error": error_msg}
+        # Pull the checkpointer's reducer-applied values (e.g. _sum_usage) so a
+        # failure never regresses to the hand-rolled `current_state` overwrite,
+        # which would undercount token-usage fields accumulated across loop
+        # re-executions. aget_state must never raise here — a failure handler
+        # that raises would swallow the original error.
+        try:
+            _fail_snap = await runner.graph.aget_state(config)
+            _checkpoint_state = dict(_fail_snap.values) if _fail_snap and _fail_snap.values else {}
+        except Exception:
+            _checkpoint_state = {}
+        run.state = {**current_state, **mid_run, **_checkpoint_state, "error": error_msg}
         run.current_step = None
         run.touch()
         await run_repository.update(run)
@@ -573,11 +625,24 @@ class YamlGraphRunner:
               issue_key: "{ticket_id}"
             code: |                    # python only — executed with ``state`` dict in scope;
               output = state["x"] + 1  #   set ``output`` variable to store the result
-            routes:                    # llm_structured / switch — multiple branches
+            routes:                    # llm_structured / switch / langgraph-agent /
+                                       #   claude-agent — multiple branches
               - when: <state-key>      # route taken when state[key] is truthy
                 next: <node-id>
                 wait_seconds: 60       # optional — sleep before the next node runs
                                        #   (capped at 3600s; useful for retry back-edges)
+
+            ``routes`` is mutually exclusive with ``next``: an agent step (or
+            switch) declares one or the other, not both. For agent steps the
+            route conditions are evaluated against state *after* the agent's
+            ``output_mapping`` has been merged in, so a route can reference
+            any field the agent's output was mapped onto (e.g. a verdict
+            field). Exactly one route should omit ``when`` to act as the
+            default fallback; if no condition matches and there is no
+            default route, the run fails. This per-route ``when`` is
+            evaluated only to pick the next node and is distinct from the
+            step-level ``when`` field described above, which instead decides
+            whether the step runs at all (skip guard).
 
     ``human_approval`` steps additionally support an optional ``notify`` field
     that fires an HTTP request when the run reaches ``waiting_approval``:
@@ -687,7 +752,9 @@ class YamlGraphRunner:
 
         sg.add_edge(START, step_ids[0])
 
-        _MULTI_OUTPUT_TYPES = frozenset({"llm_structured", "switch"})
+        _MULTI_OUTPUT_TYPES = frozenset(
+            {"llm_structured", "switch", "langgraph-agent", "claude-agent"}
+        )
 
         for i, step in enumerate(self._steps):
             sid = step["id"]
@@ -713,7 +780,8 @@ class YamlGraphRunner:
                 if step_type not in _MULTI_OUTPUT_TYPES and len(routes) > 1:
                     raise ValueError(
                         f"Step '{sid}' (type={step_type}) cannot have more than "
-                        f"1 route; only llm_structured and switch support multiple routes."
+                        f"1 route; only llm_structured, switch, langgraph-agent, "
+                        f"and claude-agent support multiple routes."
                     )
                 # A direct edge skips the router, so any route carrying
                 # wait_seconds must go through add_conditional_edges to honor it.

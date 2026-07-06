@@ -359,7 +359,17 @@ async def _stream_graph(
         _fresh_state = getattr(_fresh, "state", None)
         if not isinstance(_fresh_state, dict):
             _fresh_state = run.state if isinstance(run.state, dict) else {}
-        run.state = {**_fresh_state, **current_state, "error": str(exc)}
+        # Pull the checkpointer's reducer-applied values (e.g. _sum_usage) so a
+        # failure never regresses to the hand-rolled `current_state` overwrite,
+        # which would undercount token-usage fields accumulated across loop
+        # re-executions. aget_state must never raise here — a failure handler
+        # that raises would swallow the original error.
+        try:
+            _fail_snap = await runner.graph.aget_state(_config(run.id))
+            _checkpoint_state = dict(_fail_snap.values) if _fail_snap and _fail_snap.values else {}
+        except Exception:
+            _checkpoint_state = {}
+        run.state = {**_fresh_state, **current_state, **_checkpoint_state, "error": str(exc)}
         run.current_step = None
         _persist_trace(extra_errors=[str(exc)])
         run.touch()

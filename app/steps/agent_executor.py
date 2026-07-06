@@ -240,25 +240,28 @@ def _build_agent_config(
     }
 
 
-def _merge_token_usage(
-    agent_usage: dict[str, Any] | None,
-    meta_llm_usage: dict[str, int] | None,
-) -> dict[str, Any] | None:
-    """Merge the agent pod's own ``token_usage`` with the meta-LLM evaluator's
-    captured usage by summing matching fields (``input_tokens``/``output_tokens``/
-    ``total_tokens``) — never clobbering one with the other.
-
-    Returns ``None`` only when both sides are missing. Falls back to whichever
-    side is present when the other is absent.
+def _apply_usage_keys(
+    target: dict[str, Any],
+    step_id: str,
+    raw_output: Any,
+    judge_usage: dict[str, int] | None,
+) -> None:
+    """Write the three token-usage buckets into *target* (in place): the
+    agent-LLM's own usage, the agent's post-compact meta-LLM usage (both keyed
+    per step), and the backend judge (meta-LLM evaluator) usage (a single
+    workflow-wide bucket). The buckets are never merged into one another; a
+    key is omitted entirely when its source has no data — state-level
+    ``_sum_usage`` reducers accumulate across workflow-loop re-executions.
     """
-    if not meta_llm_usage:
-        return agent_usage
-    if not agent_usage:
-        return meta_llm_usage
-    merged = dict(agent_usage)
-    for key in ("input_tokens", "output_tokens", "total_tokens"):
-        merged[key] = (agent_usage.get(key) or 0) + (meta_llm_usage.get(key) or 0)
-    return merged
+    if isinstance(raw_output, dict):
+        agent_usage = raw_output.get("token_usage")
+        if agent_usage:
+            target[f"_agent_token_usage_{step_id}"] = agent_usage
+        meta_usage = raw_output.get("meta_token_usage")
+        if meta_usage:
+            target[f"_meta_token_usage_{step_id}"] = meta_usage
+    if judge_usage:
+        target["_judge_token_usage"] = judge_usage
 
 
 def _apply_mapping(
@@ -456,6 +459,9 @@ async def execute_agent_step(
     step_id: str = step["id"]
     agent_id: str = step["agent_id"]
 
+    _visit_count = int((state.get("_visit_counts") or {}).get(step_id, 0))
+    task_key = f"{run_id}_{step_id}_{_visit_count}"
+
     # --- 1. Load agent definition ---
     agent_def: AgentDefinition | None = await agent_backend.get(agent_id)
     if agent_def is None:
@@ -559,6 +565,7 @@ async def execute_agent_step(
                         f"{agent_url}/start",
                         json={
                             "run_id": run_id,
+                            "task_id": task_key,
                             "input": input_data,
                             "callback_url": container_callback_url,
                             "agent_config": agent_config_payload,
@@ -573,7 +580,7 @@ async def execute_agent_step(
             if agent_task_repository is not None:
                 from datetime import datetime, timezone
                 _task_doc = {
-                    "_id": f"{run_id}_{step_id}",
+                    "_id": task_key,
                     "run_id": run_id,
                     "step_id": step_id,
                     "agent_id": agent_id,
@@ -606,6 +613,7 @@ async def execute_agent_step(
                         f"{agent_url}/start",
                         json={
                             "run_id": run_id,
+                            "task_id": task_key,
                             "input": input_data,
                             "callback_url": container_callback_url,
                             "agent_config": agent_config_payload,
@@ -631,7 +639,7 @@ async def execute_agent_step(
             if agent_task_repository is not None:
                 from datetime import datetime, timezone
                 _task_doc = {
-                    "_id": f"{run_id}_{step_id}",
+                    "_id": task_key,
                     "run_id": run_id,
                     "step_id": step_id,
                     "agent_id": agent_id,
@@ -674,7 +682,7 @@ async def execute_agent_step(
             # Retrieve real agent_url from task repository for resume path
             _stored_task = None
             if agent_task_repository is not None:
-                _stored_task = await agent_task_repository.get_task(f"{run_id}_{step_id}")
+                _stored_task = await agent_task_repository.get_task(task_key)
             if _stored_task and _stored_task.get("agent_url"):
                 agent_url = _stored_task["agent_url"]
             else:
@@ -705,6 +713,7 @@ async def execute_agent_step(
                             f"{agent_url}/start",
                             json={
                                 "run_id": run_id,
+                                "task_id": task_key,
                                 "input": input_data,
                                 "callback_url": container_callback_url,
                                 "agent_config": agent_config_payload,
@@ -723,7 +732,7 @@ async def execute_agent_step(
                 if agent_task_repository is not None:
                     from datetime import datetime, timezone
                     _task_doc = {
-                        "_id": f"{run_id}_{step_id}",
+                        "_id": task_key,
                         "run_id": run_id,
                         "step_id": step_id,
                         "agent_id": agent_id,
@@ -761,7 +770,7 @@ async def execute_agent_step(
                 logger.warning("[step '%s'] poll failed: %s", step_id, _poll_exc)
                 _loop_count += 1
                 if _loop_count >= _max_loops and agent_task_repository is not None:
-                    await agent_task_repository.update_task(f"{run_id}_{step_id}", {"status": "failed"})
+                    await agent_task_repository.update_task(task_key, {"status": "failed"})
                 if _loop_count >= _max_loops:
                     raise RuntimeError(f"[step '{step_id}'] agent unreachable after {_max_loops} poll attempts") from _poll_exc
                 continue
@@ -771,7 +780,7 @@ async def execute_agent_step(
 
             if agent_task_repository is not None and _poll_outputs:
                 try:
-                    await agent_task_repository.append_outputs(f"{run_id}_{step_id}", _poll_outputs)
+                    await agent_task_repository.append_outputs(task_key, _poll_outputs)
                 except Exception:
                     pass
 
@@ -820,7 +829,7 @@ async def execute_agent_step(
                     # Final output may have been consumed by a previous poll cycle or
                     # missed due to a race — check the task repository as fallback.
                     if agent_task_repository is not None:
-                        _stored = await agent_task_repository.get_task(f"{run_id}_{step_id}")
+                        _stored = await agent_task_repository.get_task(task_key)
                         if _stored:
                             for _out in reversed(_stored.get("outputs", [])):
                                 if isinstance(_out, dict) and _out.get("type") == "final":
@@ -830,12 +839,12 @@ async def execute_agent_step(
                     if not raw_output:
                         logger.warning("[step '%s'] finished status but no 'final' output found in poll outputs or task repository", step_id)
                 if agent_task_repository is not None:
-                    await agent_task_repository.update_task(f"{run_id}_{step_id}", {"status": "finished"})
+                    await agent_task_repository.update_task(task_key, {"status": "finished"})
                 break
 
             if _poll_status == "failed":
                 if agent_task_repository is not None:
-                    await agent_task_repository.update_task(f"{run_id}_{step_id}", {"status": "failed"})
+                    await agent_task_repository.update_task(task_key, {"status": "failed"})
                 raise RuntimeError(f"[step '{step_id}'] agent reported failure")
 
             if _poll_status == "idle":
@@ -844,7 +853,7 @@ async def execute_agent_step(
                     from app.services.agent_poller import _meta_llm_recovery
                     _task_for_recovery = {"input": input_data, "outputs": _poll_outputs}
                     if agent_task_repository is not None:
-                        _stored_task = await agent_task_repository.get_task(f"{run_id}_{step_id}")
+                        _stored_task = await agent_task_repository.get_task(task_key)
                         if _stored_task:
                             _task_for_recovery = _stored_task
                     _is_complete = await _meta_llm_recovery(_task_for_recovery, settings)
@@ -854,22 +863,22 @@ async def execute_agent_step(
                                 raw_output = _out.get("content", {})
                                 break
                         if agent_task_repository is not None:
-                            await agent_task_repository.update_task(f"{run_id}_{step_id}", {"status": "finished"})
+                            await agent_task_repository.update_task(task_key, {"status": "finished"})
                         break
                 _loop_count += 1
                 if _loop_count >= _max_loops:
                     if agent_task_repository is not None:
-                        await agent_task_repository.update_task(f"{run_id}_{step_id}", {"status": "failed"})
+                        await agent_task_repository.update_task(task_key, {"status": "failed"})
                     raise RuntimeError(f"[step '{step_id}'] agent idle after {_max_loops} recovery attempts")
                 # Resend task
                 logger.info("[step '%s'] resending task to agent (loop %d/%d)", step_id, _loop_count, _max_loops)
                 if agent_task_repository is not None:
-                    await agent_task_repository.update_task(f"{run_id}_{step_id}", {"loop_count": _loop_count})
+                    await agent_task_repository.update_task(task_key, {"loop_count": _loop_count})
                 try:
                     async with httpx.AsyncClient() as _hc2:
                         _restart_resp = await _hc2.post(
                             f"{agent_url}/start",
-                            json={"run_id": run_id, "input": input_data, "callback_url": container_callback_url, "agent_config": agent_config_payload},
+                            json={"run_id": run_id, "task_id": task_key, "input": input_data, "callback_url": container_callback_url, "agent_config": agent_config_payload},
                             timeout=10.0,
                         )
                         _restart_resp.raise_for_status()
@@ -1079,9 +1088,7 @@ async def execute_agent_step(
                     _mapped_for_rejection = {_rej_output_key: raw_output["result"]}
                 else:
                     _mapped_for_rejection = {}
-                _merged_usage = _merge_token_usage(raw_output.get("token_usage"), _meta_llm_usage)
-                if _merged_usage is not None:
-                    _mapped_for_rejection[f"_agent_token_usage_{step_id}"] = _merged_usage
+                _apply_usage_keys(_mapped_for_rejection, step_id, raw_output, _meta_llm_usage)
                 raise MetaLLMRejectionError(
                     _rejection_reason,  # clean reason — no step-id prefix noise
                     mapped_result=_mapped_for_rejection,
@@ -1123,9 +1130,7 @@ async def execute_agent_step(
             # the error — the agent may have returned a valid message (e.g. "Jira unavailable")
             # that is useful to show even though it didn't match the structured schema.
             _raw_mapped: dict[str, Any] = {}
-            _merged_usage = _merge_token_usage(raw_output.get("token_usage"), _meta_llm_usage)
-            if _merged_usage is not None:
-                _raw_mapped[f"_agent_token_usage_{step_id}"] = _merged_usage
+            _apply_usage_keys(_raw_mapped, step_id, raw_output, _meta_llm_usage)
             raise MetaLLMRejectionError(
                 f"Agent returned unstructured output — expected fields {list(_output_mapping_check)} not found. "
                 f"Agent said: {_raw_snippet}",
@@ -1160,23 +1165,17 @@ async def execute_agent_step(
             if agent_key in raw_output
         }
         # Always preserve token usage regardless of output_mapping declaration.
-        # Merge in the meta-LLM evaluator's own usage (if captured) rather than
-        # letting it clobber or be dropped.
-        _merged_usage = _merge_token_usage(
-            raw_output.get("token_usage") if isinstance(raw_output, dict) else None,
-            _final_meta_llm_usage,
-        )
-        if _merged_usage is not None:
-            result[f"_agent_token_usage_{step_id}"] = _merged_usage
+        # Agent-LLM, post-compact meta-LLM, and backend judge usage are kept as
+        # three separate buckets — never merged into one another.
+        _apply_usage_keys(result, step_id, raw_output, _final_meta_llm_usage)
     elif output_key:
         if isinstance(raw_output, dict) and "result" in raw_output:
             # Agent sent {"result": "...", "token_usage": {...}} — extract result key
             result = {output_key: raw_output["result"]}
-            _merged_usage = _merge_token_usage(raw_output.get("token_usage"), _final_meta_llm_usage)
-            if _merged_usage is not None:
-                result[f"_agent_token_usage_{step_id}"] = _merged_usage
+            _apply_usage_keys(result, step_id, raw_output, _final_meta_llm_usage)
         elif isinstance(raw_output, dict) and len(raw_output) == 1:
             result = {output_key: next(iter(raw_output.values()))}
+            _apply_usage_keys(result, step_id, raw_output, _final_meta_llm_usage)
         else:
             result = {output_key: raw_output}
     else:

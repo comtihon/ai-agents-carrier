@@ -153,7 +153,35 @@ class MongoAgentTaskRepository:
         self._col = collection
 
     async def save_task(self, task: dict[str, Any]) -> None:
-        await self._col.update_one({"_id": task["_id"]}, {"$setOnInsert": task}, upsert=True)
+        """Upsert a task doc.
+
+        Uses disjoint ``$setOnInsert``/``$set`` operators so a re-entrant call
+        with the same ``_id`` (e.g. the warm-reuse or idle-resend path) can
+        update mutable fields like ``input``/``status`` without clobbering
+        fields that must only be set once on creation (``outputs``,
+        ``loop_count``, ``created_at``, etc). Mongo raises
+        ConflictingUpdateOperators if the same field appears in both operators,
+        so each field present in *task* is routed to exactly one of them.
+        """
+        _insert_only_keys = {"run_id", "step_id", "agent_id", "created_at", "max_loops", "outputs", "loop_count"}
+        set_on_insert: dict[str, Any] = {}
+        set_fields: dict[str, Any] = {}
+        for key, value in task.items():
+            if key == "_id":
+                continue
+            if key in _insert_only_keys:
+                set_on_insert[key] = value
+            else:
+                set_fields[key] = value
+        set_on_insert.setdefault("outputs", [])
+        set_on_insert.setdefault("loop_count", 0)
+
+        update: dict[str, Any] = {}
+        if set_on_insert:
+            update["$setOnInsert"] = set_on_insert
+        if set_fields:
+            update["$set"] = set_fields
+        await self._col.update_one({"_id": task["_id"]}, update, upsert=True)
 
     async def get_task(self, task_id: str) -> dict[str, Any] | None:
         return await self._col.find_one({"_id": task_id})
