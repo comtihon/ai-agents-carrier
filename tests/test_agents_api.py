@@ -134,3 +134,29 @@ async def test_put_with_new_addons_replaces_existing(client):
     data = resp.json()
     assert len(data["addons"]) == 1
     assert data["addons"][0]["bucket"] == "other"
+
+
+@pytest.mark.asyncio
+async def test_put_addons_accepts_tools_addon(client):
+    c, backend = client
+    resp = await c.put(
+        "/api/v1/agents/researcher",
+        json={
+            "agent_input": {"system_prompt": "new prompt"},
+            "addons": [
+                {"type": "tools", "tools": {"github": True, "jira": False, "graphify": True}},
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["addons"]) == 1
+    assert data["addons"][0]["type"] == "tools"
+    assert data["addons"][0]["tools"] == {"github": True, "jira": False, "graphify": True}
+
+    # Round-trip: GET returns the persisted tools addon.
+    get_resp = await c.get("/api/v1/agents/researcher")
+    assert get_resp.status_code == 200
+    get_data = get_resp.json()
+    tools_addon = next(a for a in get_data["addons"] if a["type"] == "tools")
+    assert tools_addon["tools"] == {"github": True, "jira": False, "graphify": True}

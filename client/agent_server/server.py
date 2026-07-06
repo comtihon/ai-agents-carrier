@@ -56,6 +56,7 @@ class AgentConfig(BaseModel):
     tools: list[str] | None = None          # which tools / MCP servers are enabled
     mcp_servers: list[MCPServerConfig] = [] # full MCP server configs
     credentials: dict[str, str] = {}        # API keys, tokens — passed as resolved values
+    tool_access: dict[str, bool] | None = None  # bash-level tool gates; None/absent → all enabled
     extra: dict = {}                        # AgentDefinition.config passthrough
     expected_output_fields: list[str] = [] # keys the agent MUST include in its output dict
 

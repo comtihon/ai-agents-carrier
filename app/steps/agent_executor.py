@@ -75,6 +75,19 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# --- Tools addon: bash-level credential/binary gating ---
+# The "tools" addon toggles which bash-level integrations an agent may use.
+# Backend ALWAYS sends tool_access={"github":b,"jira":b,"graphify":b} (all
+# false when the addon is absent). Runtimes treat absent/null tool_access as
+# ALL ENABLED (rollout compat) and a present dict as exact (missing key =
+# disabled). When a tool is disabled backend-side we pop its credential keys
+# out of the resolved credentials dict so the agent never receives them.
+_KNOWN_TOOLS: tuple[str, ...] = ("github", "jira", "graphify")
+_TOOL_CREDENTIAL_KEYS: dict[str, set[str]] = {
+    "github": {"MCP_GITHUB_API_KEY", "GITHUB_TOKEN"},
+    "jira": {"MCP_JIRA_API_TOKEN", "JIRA_API_TOKEN"},
+}
+
 _COMPRESSION_INSTRUCTIONS: dict[str, str] = {
     "lite": (
         "Be concise. Drop filler words (just/really/basically/actually/simply). "
@@ -179,8 +192,16 @@ def _build_agent_config(
     - ``mcp_servers``: built from ``settings.get_mcp_integrations()``.
       Filtered to ``agent_input["tools"]`` when that key is provided.
     - ``credentials``: API keys from every active LLM integration.
+    - ``tool_access``: ``{tool: bool}`` for every known bash-level tool
+      (github/jira/graphify). Derived from the agent's ``tools`` addon —
+      no addon means strict: all disabled. Credential keys for disabled
+      tools are popped from ``credentials`` before it is returned.
     - ``extra``: the entire ``agent_input`` dict forwarded as-is.
     - ``description`` is NOT included.
+
+    Note: step-level ``env_vars`` with ``from_config`` are NOT gated here —
+    that path is an explicit operator override and deliberately bypasses the
+    tools-addon credential gating above.
     """
     from app.core.config import McpIntegrationConfig
 
@@ -267,6 +288,20 @@ def _build_agent_config(
         if key_name not in credentials:
             credentials[key_name] = val
 
+    # --- Tools addon gating ---
+    # Build tool_access for every known tool. No addon → strict: all disabled.
+    # Then pop credential keys for disabled tools so the agent never sees them.
+    # NEVER touch LLM / non-tool credentials (ANTHROPIC / OPENROUTER /
+    # GOOGLE_APPLICATION_CREDENTIALS_JSON / HUBSPOT_TOKEN / HF_TOKEN etc.) —
+    # only the keys enumerated in _TOOL_CREDENTIAL_KEYS are ever removed.
+    tools_addon = agent_def.tools_addon
+    enabled_tools: set[str] = tools_addon.enabled_tools() if tools_addon is not None else set()
+    tool_access: dict[str, bool] = {name: (name in enabled_tools) for name in _KNOWN_TOOLS}
+    for tool_name, cred_keys in _TOOL_CREDENTIAL_KEYS.items():
+        if not tool_access.get(tool_name, False):
+            for cred_key in cred_keys:
+                credentials.pop(cred_key, None)
+
     # Resolve env_vars from step config
     env_vars: dict[str, str] = {}
     if step:
@@ -294,6 +329,7 @@ def _build_agent_config(
         "tools": tools,
         "mcp_servers": mcp_servers,
         "credentials": credentials,
+        "tool_access": tool_access,
         "extra": extra,
         "env_vars": env_vars,
         "expected_output_fields": list(_protocol_keys),

@@ -179,6 +179,9 @@ class Settings(BaseSettings):
     mcp_github_url: str = Field(default="", alias="MCP_GITHUB_URL")
     mcp_github_api_key: str | None = Field(default=None, alias="MCP_GITHUB_API_KEY")
 
+    # --- Semble MCP (stdio; agent-side binary — never launched in backend container) ---
+    mcp_semble_enabled: bool = Field(default=True, alias="MCP_SEMBLE_ENABLED")
+
     # --- Agent polling ---
     agent_poll_interval_seconds: int = Field(default=10, alias="AGENT_POLL_INTERVAL_SECONDS")
     agent_max_loops: int = Field(default=3, alias="AGENT_MAX_LOOPS")
@@ -264,6 +267,7 @@ class Settings(BaseSettings):
             dict(name="miro",   enabled=self.mcp_miro_enabled,   transport=self.mcp_miro_transport,   url=self.mcp_miro_url,   api_key=self.mcp_miro_api_key),
             dict(name="notion", enabled=self.mcp_notion_enabled, transport=self.mcp_notion_transport, url=self.mcp_notion_url, api_key=self.mcp_notion_api_key),
             dict(name="github", enabled=self.mcp_github_enabled, transport=self.mcp_github_transport, url=self.mcp_github_url, api_key=self.mcp_github_api_key),
+            dict(name="semble", enabled=self.mcp_semble_enabled, transport="stdio", command="semble", args=["/workspace"]),
         ]
 
     def get_mcp_integrations(self) -> list[McpIntegrationConfig]:

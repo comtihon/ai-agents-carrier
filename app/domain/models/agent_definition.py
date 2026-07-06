@@ -5,7 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from app.domain.models.agent_addon import AnyAgentAddon, MCPAddon, S3Addon
+from app.domain.models.agent_addon import AnyAgentAddon, MCPAddon, S3Addon, ToolsAddon
 
 
 class AgentDefinition(BaseModel):
@@ -68,6 +68,13 @@ class AgentDefinition(BaseModel):
     def s3_addon(self) -> S3Addon | None:
         for addon in self.addons:
             if addon.type == "s3":
+                return addon  # type: ignore[return-value]
+        return None
+
+    @property
+    def tools_addon(self) -> ToolsAddon | None:
+        for addon in self.addons:
+            if addon.type == "tools":
                 return addon  # type: ignore[return-value]
         return None
 

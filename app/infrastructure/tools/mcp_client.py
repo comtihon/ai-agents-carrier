@@ -63,6 +63,10 @@ class McpToolsProvider:
     def _build_server_configs(self) -> dict[str, dict[str, Any]]:
         configs: dict[str, dict[str, Any]] = {}
         for integration in self._settings.get_mcp_integrations():
+            # semble is an agent-side stdio server; its binary is not present in
+            # the backend container, so launching it here would crash startup.
+            if integration.name in {"semble"}:
+                continue
             if integration.transport == "stdio":
                 cfg: dict[str, Any] = {
                     "transport": "stdio",

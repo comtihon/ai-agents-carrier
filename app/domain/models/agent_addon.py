@@ -25,4 +25,13 @@ class S3Addon(AgentAddon):
     path: str = ""
 
 
-AnyAgentAddon = Annotated[Union[MCPAddon, S3Addon], Field(discriminator="type")]
+class ToolsAddon(AgentAddon):
+    type: Literal["tools"] = "tools"
+    # tool-name → enabled toggle (github / jira / graphify)
+    tools: dict[str, bool] = Field(default_factory=dict)
+
+    def enabled_tools(self) -> set[str]:
+        return {name for name, enabled in self.tools.items() if enabled}
+
+
+AnyAgentAddon = Annotated[Union[MCPAddon, S3Addon, ToolsAddon], Field(discriminator="type")]
