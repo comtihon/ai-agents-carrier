@@ -43,6 +43,8 @@ That callback endpoint resumes the paused LangGraph run via
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import os
 
 import logging
@@ -89,6 +91,64 @@ _COMPRESSION_INSTRUCTIONS: dict[str, str] = {
         "No articles, no filler, no fluff. Abbreviate freely. Code blocks exact and unchanged."
     ),
 }
+
+_PREVIOUS_TASK_GUIDANCE = (
+    "You previously ran with this input and produced this output. Analyze the new "
+    "input against your previous output (e.g. answers received vs questions you "
+    "asked). If your previous open points are resolved, continue the original job "
+    "from where you left off using the previous output plus the new information. "
+    "If key questions remain unanswered or unclear, emit context_sufficient=false "
+    "with the unanswered questions."
+)
+
+
+def _truncate_for_prompt(value: Any, cap: int = 4000) -> Any:
+    """Walk ``value`` and truncate long string fields so they stay prompt-sized.
+
+    Handles bare strings and top-level dict values (one level of nesting is
+    enough for the ``input``/``final output`` blobs this is used for). Leaves
+    non-str values (numbers, bools, nested dicts/lists) untouched.
+    """
+    def _cap(s: str) -> str:
+        if len(s) <= cap:
+            return s
+        return s[:cap] + "…[truncated]"
+
+    if isinstance(value, str):
+        return _cap(value)
+    if isinstance(value, dict):
+        return {k: (_cap(v) if isinstance(v, str) else v) for k, v in value.items()}
+    return value
+
+
+async def _build_previous_task(
+    repo: Any, run_id: str, step_id: str, visit_count: int
+) -> dict[str, Any] | None:
+    """Build the ``previous_task`` context block from the prior visit's task doc.
+
+    NOTE: this looks up the prior visit using the plain (no clarification
+    discriminator) key ``f"{run_id}_{step_id}_{visit_count - 1}"``. If the
+    prior visit itself carried a clarification discriminator (i.e. it was
+    re-run after answers), this plain-key lookup will miss and we return
+    ``None`` — acceptable no-op for v1, documented here rather than solved.
+    """
+    if visit_count <= 0:
+        return None
+    prior = await repo.get_task(f"{run_id}_{step_id}_{visit_count - 1}")
+    if not prior or prior.get("status") != "finished":
+        return None
+    final = None
+    for o in reversed(prior.get("outputs", []) or []):
+        if isinstance(o, dict) and o.get("type") == "final":
+            final = o.get("content")
+            break
+    if final is None:
+        return None
+    return {
+        "guidance": _PREVIOUS_TASK_GUIDANCE,
+        "input": _truncate_for_prompt(prior.get("input")),
+        "output": _truncate_for_prompt(final),
+    }
 
 
 def _build_agent_config(
@@ -461,6 +521,9 @@ async def execute_agent_step(
 
     _visit_count = int((state.get("_visit_counts") or {}).get(step_id, 0))
     task_key = f"{run_id}_{step_id}_{_visit_count}"
+    if state.get("_clarification_answers"):
+        _ans_hash = hashlib.sha1(json.dumps(state["_clarification_answers"], sort_keys=True, default=str).encode()).hexdigest()[:8]
+        task_key += f"_c{_ans_hash}"
 
     # --- 1. Load agent definition ---
     agent_def: AgentDefinition | None = await agent_backend.get(agent_id)
@@ -488,6 +551,10 @@ async def execute_agent_step(
     # the input so the agent can use them as clarifying context.
     if state.get("_clarification_answers"):
         input_data = {**input_data, "clarification_context": state["_clarification_answers"]}
+    if _visit_count > 0 and agent_task_repository is not None:
+        _prev_task = await _build_previous_task(agent_task_repository, run_id, step_id, _visit_count)
+        if _prev_task:
+            input_data = {**input_data, "previous_task": _prev_task}
 
     # --- 5. Branch on runtime ---
     if runtime_type == "local":

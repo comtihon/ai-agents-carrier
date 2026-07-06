@@ -226,3 +226,127 @@ async def test_save_task_updates_input_preserves_outputs():
     second_update = fake_collection.update_one.call_args_list[1].args[1]
     assert first_update["$set"]["input"] == {"request": "first"}
     assert second_update["$set"]["input"] == {"request": "second"}
+
+
+async def _run_once(state: dict, task_repo) -> None:
+    """Shared helper: execute_agent_step once against a k8s agent, with the
+    standard finished-response HTTP mocks, for task_key discriminator tests."""
+    from app.steps.agent_executor import execute_agent_step
+
+    step = _make_step()
+    fake_agent_def = _make_agent_def()
+    settings = _make_settings()
+
+    mock_http_client = AsyncMock()
+    mock_http_client.__aenter__ = AsyncMock(return_value=mock_http_client)
+    mock_http_client.__aexit__ = AsyncMock(return_value=False)
+    mock_http_client.get = AsyncMock(return_value=_finished_response({"result": "ok"}))
+    mock_http_client.post = AsyncMock(return_value=_finished_response({"result": "ok"}))
+
+    fake_backend = AsyncMock()
+    fake_backend.get = AsyncMock(return_value=fake_agent_def)
+
+    with (
+        patch("app.runtime.factory.get_runtime") as mock_get_runtime,
+        patch("asyncio.sleep", new_callable=AsyncMock),
+        patch("httpx.AsyncClient", return_value=mock_http_client),
+        patch("app.steps.agent_executor.get_settings", return_value=_poll_settings()),
+    ):
+        mock_runtime = MagicMock()
+        mock_runtime.has_container_for_run = AsyncMock(return_value=False)
+        mock_runtime.terminate_by_run_id = AsyncMock()
+        mock_runtime.rewrite_callback_url = MagicMock(return_value="http://localhost")
+        mock_runtime.spawn = AsyncMock(return_value="http://agent-host:8080")
+        mock_get_runtime.return_value = mock_runtime
+
+        await execute_agent_step(
+            step=step,
+            state=state,
+            agent_backend=fake_backend,
+            run_id=state.get("_run_id_override", "run1"),
+            callback_base_url="http://localhost",
+            settings=settings,
+            run_repository=None,
+            agent_task_repository=task_repo,
+        )
+
+
+@pytest.mark.asyncio
+async def test_task_key_unchanged_without_clarification():
+    """No ``_clarification_answers`` in state → task_key keeps the plain
+    ``{run_id}_{step_id}_{visit}`` shape (no discriminator suffix)."""
+    task_repo = AsyncMock()
+    task_repo.save_task = AsyncMock()
+    task_repo.get_task = AsyncMock(return_value=None)
+    task_repo.update_task = AsyncMock()
+    task_repo.append_outputs = AsyncMock()
+
+    await _run_once({"request": "no clarification", "_visit_counts": {}}, task_repo)
+
+    saved_doc = task_repo.save_task.call_args_list[0].args[0]
+    assert saved_doc["_id"] == "run1_loop_step_0"
+
+
+@pytest.mark.asyncio
+async def test_task_key_discriminator_deterministic_same_answers():
+    """Same ``_clarification_answers`` content across two runs (different
+    run_id to force distinct task docs) must produce the SAME ``_c<hash>``
+    discriminator suffix — the hash is deterministic given the same answers."""
+    answers = {"q1": "yes", "q2": "no"}
+
+    task_repo_a = AsyncMock()
+    task_repo_a.save_task = AsyncMock()
+    task_repo_a.get_task = AsyncMock(return_value=None)
+    task_repo_a.update_task = AsyncMock()
+    task_repo_a.append_outputs = AsyncMock()
+    await _run_once(
+        {"request": "r", "_visit_counts": {}, "_clarification_answers": answers, "_run_id_override": "runA"},
+        task_repo_a,
+    )
+
+    task_repo_b = AsyncMock()
+    task_repo_b.save_task = AsyncMock()
+    task_repo_b.get_task = AsyncMock(return_value=None)
+    task_repo_b.update_task = AsyncMock()
+    task_repo_b.append_outputs = AsyncMock()
+    await _run_once(
+        {"request": "r", "_visit_counts": {}, "_clarification_answers": dict(answers), "_run_id_override": "runB"},
+        task_repo_b,
+    )
+
+    key_a = task_repo_a.save_task.call_args_list[0].args[0]["_id"]
+    key_b = task_repo_b.save_task.call_args_list[0].args[0]["_id"]
+    suffix_a = key_a.split("_loop_step_0")[1]
+    suffix_b = key_b.split("_loop_step_0")[1]
+    assert suffix_a.startswith("_c")
+    assert suffix_a == suffix_b
+
+
+@pytest.mark.asyncio
+async def test_task_key_changes_after_new_answers():
+    """Different ``_clarification_answers`` content must produce a different
+    ``_c<hash>`` discriminator suffix, so a re-run with new answers gets a
+    fresh task doc instead of colliding with the prior attempt."""
+    task_repo_a = AsyncMock()
+    task_repo_a.save_task = AsyncMock()
+    task_repo_a.get_task = AsyncMock(return_value=None)
+    task_repo_a.update_task = AsyncMock()
+    task_repo_a.append_outputs = AsyncMock()
+    await _run_once(
+        {"request": "r", "_visit_counts": {}, "_clarification_answers": {"q1": "yes"}},
+        task_repo_a,
+    )
+
+    task_repo_b = AsyncMock()
+    task_repo_b.save_task = AsyncMock()
+    task_repo_b.get_task = AsyncMock(return_value=None)
+    task_repo_b.update_task = AsyncMock()
+    task_repo_b.append_outputs = AsyncMock()
+    await _run_once(
+        {"request": "r", "_visit_counts": {}, "_clarification_answers": {"q1": "no"}},
+        task_repo_b,
+    )
+
+    key_a = task_repo_a.save_task.call_args_list[0].args[0]["_id"]
+    key_b = task_repo_b.save_task.call_args_list[0].args[0]["_id"]
+    assert key_a != key_b
