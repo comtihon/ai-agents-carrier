@@ -905,6 +905,7 @@ async def execute_agent_step(
                     if out.get("type") == "progress"
                     and isinstance(out.get("content"), dict)
                     and out["content"].get("message")
+                    and not out["content"]["message"].startswith("__")
                 ]
                 if _progress_msgs:
                     try:

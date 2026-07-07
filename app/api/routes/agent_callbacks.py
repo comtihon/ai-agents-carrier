@@ -369,15 +369,53 @@ async def agent_progress(
         else:
             return {"run_id": run_id, "status": "mcp_ended"}
 
+    if body.message.startswith("__tool_start__:"):
+        try:
+            d = _json.loads(body.message[len("__tool_start__:"):])
+            tools: list = list(run.state.get("_active_tools", []))
+            if d.get("tool"):
+                tools.append(d["tool"])
+            run.state = {**(run.state or {}), "_active_tools": tools}
+            run.touch()
+            await container.run_repository.update(run)
+        except Exception:
+            pass
+        else:
+            return {"run_id": run_id, "status": "tool_started"}
+
+    if body.message.startswith("__tool_end__:"):
+        try:
+            d = _json.loads(body.message[len("__tool_end__:"):])
+            tools = list(run.state.get("_active_tools", []))
+            tl = d.get("tool")
+            if tl in tools:
+                tools.remove(tl)
+            run.state = {**(run.state or {}), "_active_tools": tools}
+            run.touch()
+            await container.run_repository.update(run)
+        except Exception:
+            pass
+        else:
+            return {"run_id": run_id, "status": "tool_ended"}
+
     if body.message.startswith("__mcp_clear__:"):
         try:
-            run.state = {**(run.state or {}), "_active_mcp_servers": []}
+            run.state = {
+                **(run.state or {}),
+                "_active_mcp_servers": [],
+                "_active_tools": [],
+            }
             run.touch()
             await container.run_repository.update(run)
         except Exception:
             pass
         else:
             return {"run_id": run_id, "status": "mcp_cleared"}
+
+    # Unknown sentinel messages (prefixed with "__") are never appended to the
+    # progress list — they are control signals, not user-visible progress.
+    if body.message.startswith("__"):
+        return {"run_id": run_id, "status": "sentinel_ignored"}
 
     # Append progress message to run state for frontend polling.
     _progress_field = f"_agent_progress_{_step_key}"
