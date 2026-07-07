@@ -267,7 +267,9 @@ class Settings(BaseSettings):
             dict(name="miro",   enabled=self.mcp_miro_enabled,   transport=self.mcp_miro_transport,   url=self.mcp_miro_url,   api_key=self.mcp_miro_api_key),
             dict(name="notion", enabled=self.mcp_notion_enabled, transport=self.mcp_notion_transport, url=self.mcp_notion_url, api_key=self.mcp_notion_api_key),
             dict(name="github", enabled=self.mcp_github_enabled, transport=self.mcp_github_transport, url=self.mcp_github_url, api_key=self.mcp_github_api_key),
-            dict(name="semble", enabled=self.mcp_semble_enabled, transport="stdio", command="semble", args=["/workspace"]),
+            # Bare `semble` starts the MCP stdio server; the CLI takes no repo
+            # positional (repo is a per-call tool argument) and rejects one.
+            dict(name="semble", enabled=self.mcp_semble_enabled, transport="stdio", command="semble", args=[]),
         ]
 
     def get_mcp_integrations(self) -> list[McpIntegrationConfig]:

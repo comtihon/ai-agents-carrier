@@ -102,7 +102,7 @@ def test_mcp_addon_with_semble_included_in_mcp_servers():
     semble = next((s for s in cfg["mcp_servers"] if s["name"] == "semble"), None)
     assert semble is not None
     assert semble["transport"] == "stdio"
-    assert semble["command"] == ["semble", "/workspace"]
+    assert semble["command"] == ["semble"]
 
 
 def test_mcp_addon_without_semble_excluded():
