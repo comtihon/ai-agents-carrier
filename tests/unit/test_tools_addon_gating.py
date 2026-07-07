@@ -23,6 +23,8 @@ from app.steps.agent_executor import _build_agent_config
 def _tool_env(monkeypatch):
     monkeypatch.setenv("MCP_GITHUB_API_KEY", "gh-secret")
     monkeypatch.setenv("MCP_JIRA_API_TOKEN", "jira-secret")
+    monkeypatch.setenv("MCP_JIRA_JIRA_URL", "https://example.atlassian.net")
+    monkeypatch.setenv("MCP_JIRA_USERNAME", "bot@example.com")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-secret")
     monkeypatch.setenv("HF_TOKEN", "hf-secret")
 
@@ -58,6 +60,34 @@ def test_jira_only_enabled_keeps_jira_strips_github():
     cfg = _cfg([{"type": "tools", "tools": {"jira": True, "github": False}}])
     assert cfg["tool_access"] == {"github": False, "jira": True, "graphify": False}
     assert cfg["credentials"].get("MCP_JIRA_API_TOKEN") == "jira-secret"
+    assert "MCP_GITHUB_API_KEY" not in cfg["credentials"]
+
+
+def test_jira_enabled_injects_full_bash_credential_set():
+    cfg = _cfg([{"type": "tools", "tools": {"jira": True}}])
+    creds = cfg["credentials"]
+    assert creds.get("JIRA_URL") == "https://example.atlassian.net"
+    assert creds.get("JIRA_USERNAME") == "bot@example.com"
+    assert creds.get("JIRA_API_TOKEN") == "jira-secret"
+
+
+def test_jira_disabled_strips_url_and_username():
+    cfg = _cfg([{"type": "tools", "tools": {"jira": False, "github": True}}])
+    creds = cfg["credentials"]
+    assert "JIRA_URL" not in creds
+    assert "JIRA_USERNAME" not in creds
+    assert "JIRA_API_TOKEN" not in creds
+    assert "MCP_JIRA_API_TOKEN" not in creds
+
+
+def test_github_enabled_injects_github_token():
+    cfg = _cfg([{"type": "tools", "tools": {"github": True}}])
+    assert cfg["credentials"].get("GITHUB_TOKEN") == "gh-secret"
+
+
+def test_github_disabled_strips_github_token():
+    cfg = _cfg([{"type": "tools", "tools": {"jira": True}}])
+    assert "GITHUB_TOKEN" not in cfg["credentials"]
     assert "MCP_GITHUB_API_KEY" not in cfg["credentials"]
 
 

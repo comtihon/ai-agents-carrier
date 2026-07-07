@@ -85,7 +85,7 @@ logger = logging.getLogger(__name__)
 _KNOWN_TOOLS: tuple[str, ...] = ("github", "jira", "graphify")
 _TOOL_CREDENTIAL_KEYS: dict[str, set[str]] = {
     "github": {"MCP_GITHUB_API_KEY", "GITHUB_TOKEN"},
-    "jira": {"MCP_JIRA_API_TOKEN", "JIRA_API_TOKEN"},
+    "jira": {"MCP_JIRA_API_TOKEN", "JIRA_API_TOKEN", "JIRA_URL", "JIRA_USERNAME"},
 }
 
 _COMPRESSION_INSTRUCTIONS: dict[str, str] = {
@@ -301,6 +301,21 @@ def _build_agent_config(
         if not tool_access.get(tool_name, False):
             for cred_key in cred_keys:
                 credentials.pop(cred_key, None)
+
+    # An ENABLED tool needs its full bash-level credential set, not just the
+    # token: curl against $JIRA_URL requires the endpoint and identity vars,
+    # which get_forwardable_config() never picks up (no credential suffix).
+    if tool_access.get("jira"):
+        for cred_key, val in (
+            ("JIRA_URL", settings.mcp_jira_jira_url),
+            ("JIRA_USERNAME", settings.mcp_jira_username),
+            ("JIRA_API_TOKEN", settings.mcp_jira_api_token),
+        ):
+            if val and not credentials.get(cred_key):
+                credentials[cred_key] = val
+    if tool_access.get("github"):
+        if settings.mcp_github_api_key and not credentials.get("GITHUB_TOKEN"):
+            credentials["GITHUB_TOKEN"] = settings.mcp_github_api_key
 
     # Resolve env_vars from step config
     env_vars: dict[str, str] = {}
