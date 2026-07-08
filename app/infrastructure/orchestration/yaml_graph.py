@@ -183,6 +183,32 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
 # Shared graph streaming helper (used by workflow steps and default_workflow)
 # ---------------------------------------------------------------------------
 
+# State keys that are written to Mongo directly (POST /agent/progress and
+# poll-forwarding) and never flow through the LangGraph checkpoint. A run.state
+# rebuild from a graph snapshot would clobber them, so they are re-overlaid.
+_OUT_OF_BAND_STATE_PREFIXES: tuple[str, ...] = ("_agent_progress_",)
+
+
+async def merge_out_of_band_state(run_repository, run_id: str, merged: dict) -> dict:
+    """Re-overlay Mongo-only keys (written by POST /agent/progress and
+    poll-forwarding, never through LangGraph) so a run.state rebuild from
+    the graph snapshot can't clobber them. Non-empty fresh values win.
+    Best-effort: never raises (must not mask the original error in
+    failure-path callers)."""
+    if run_repository is None:
+        return merged
+    try:
+        fresh = await run_repository.get(run_id)
+        fresh_state = getattr(fresh, "state", None) if fresh is not None else None
+        if isinstance(fresh_state, dict):
+            for k, v in fresh_state.items():
+                if v and any(k.startswith(p) for p in _OUT_OF_BAND_STATE_PREFIXES):
+                    merged[k] = v
+    except Exception as _e:
+        logger.warning("merge_out_of_band_state: run %s: %s", run_id, _e)
+    return merged
+
+
 async def _cleanup_pvc(run, lease_repo, namespace: str) -> None:
     """Delete PVCs for the run immediately and remove their leases."""
     try:
@@ -365,7 +391,10 @@ async def stream_graph_to_pause(
             _checkpoint_state = dict(_fail_snap.values) if _fail_snap and _fail_snap.values else {}
         except Exception:
             _checkpoint_state = {}
-        run.state = {**current_state, **mid_run, **_checkpoint_state, "error": error_msg}
+        run.state = await merge_out_of_band_state(
+            run_repository, run.id,
+            {**current_state, **mid_run, **_checkpoint_state, "error": error_msg},
+        )
         run.current_step = None
         run.touch()
         await run_repository.update(run)
@@ -449,7 +478,7 @@ async def stream_graph_to_pause(
     else:
         run.status = "completed"
     run.current_step = _effective_next
-    run.state = snap.values
+    run.state = await merge_out_of_band_state(run_repository, run.id, dict(snap.values))
     run.touch()
     await run_repository.update(run)
     if run.status == "completed":

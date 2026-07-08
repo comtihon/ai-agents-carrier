@@ -66,8 +66,7 @@ async def receive_webhook(
             openhands=container.openhands,
             checkpointer=container.checkpointer,
         )
-        if container.agent_backend is not None:
-            runner._agent_backend = container.agent_backend
+        runner._callback_base_url = container.settings.agent_callback_url or container.settings.base_url
         definition_snapshot: dict | None = defn.to_raw_dict()
         steps = defn.steps
     else:
@@ -115,6 +114,7 @@ async def receive_webhook(
 
     thread_id = str(uuid4())
     container.live_runners[thread_id] = runner
+    container._inject_runner_dependencies(runner)
 
     run = GraphRun(
         id=thread_id,

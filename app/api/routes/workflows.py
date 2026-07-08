@@ -16,7 +16,7 @@ from app.core.container import ApplicationContainer
 from app.domain.models.graph_run import GraphRun
 from app.domain.models.workflow_definition import WorkflowDefinition
 from app.infrastructure.config.graph_loader import build_runner_from_definition
-from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner
+from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner, merge_out_of_band_state
 from app.infrastructure.tracing.callback_handler import RunTraceAccumulator
 
 logger = logging.getLogger(__name__)
@@ -369,7 +369,10 @@ async def _stream_graph(
             _checkpoint_state = dict(_fail_snap.values) if _fail_snap and _fail_snap.values else {}
         except Exception:
             _checkpoint_state = {}
-        run.state = {**_fresh_state, **current_state, **_checkpoint_state, "error": str(exc)}
+        run.state = await merge_out_of_band_state(
+            container.run_repository, run.id,
+            {**_fresh_state, **current_state, **_checkpoint_state, "error": str(exc)},
+        )
         run.current_step = None
         _persist_trace(extra_errors=[str(exc)])
         run.touch()
@@ -386,7 +389,9 @@ async def _stream_graph(
     _fresh_state = getattr(_fresh, "state", None)
     if not isinstance(_fresh_state, dict):
         _fresh_state = run.state if isinstance(run.state, dict) else {}
-    run.state = {**_fresh_state, **dict(snap.values)}
+    run.state = await merge_out_of_band_state(
+        container.run_repository, run.id, {**_fresh_state, **dict(snap.values)}
+    )
 
     active_interrupt_type: str | None = None
     for task in snap.tasks:

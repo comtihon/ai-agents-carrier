@@ -899,8 +899,8 @@ async def execute_agent_step(
             if agent_task_repository is not None and _poll_outputs:
                 try:
                     await agent_task_repository.append_outputs(task_key, _poll_outputs)
-                except Exception:
-                    pass
+                except Exception as _e:
+                    logger.warning("[step '%s'] failed to append agent task outputs: %s", step_id, _e)
 
             # Cache final output from every poll cycle — the "final" output may arrive
             # while status is still "working" (task_store marks it sent before the
