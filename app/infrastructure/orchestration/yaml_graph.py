@@ -529,10 +529,14 @@ async def stream_graph_to_pause(
     if run.status == "waiting_approval" and base_url and run.current_step:
         step = next((s for s in runner.steps if s["id"] == run.current_step), None)
         # Fire Slack notification for explicit ask_context steps AND for agent steps
-        # that raised an ask_context interrupt internally via meta-LLM.
+        # that raised an ask_context interrupt internally via meta-LLM — but only
+        # when a Slack addon (slack_notifications) is attached to the agent step.
+        # Without it, copilot_ui still surfaces the request for input; Slack is
+        # simply not involved.
         is_agent_ask_context = (
             step and step.get("type") in ("langgraph-agent", "claude-agent")
             and active_interrupt_type == "ask_context"
+            and step.get("slack_notifications")
         )
         if (step and (step.get("type") == "ask_context" or step.get("slack_notifications"))) or is_agent_ask_context:
             from app.core.config import get_settings
