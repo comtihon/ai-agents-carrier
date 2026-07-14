@@ -240,12 +240,9 @@ def _build_agent_config(
             else compression_instruction
         )
 
-    # Inject Output Protocol when the step declares an output_mapping or slack_input_key.
+    # Inject Output Protocol when the step declares an output_mapping.
     output_mapping = (step or {}).get("output_mapping") or {}
-    _slack_input_key_proto = (step or {}).get("slack_input_key")
     _protocol_keys = list(output_mapping)
-    if _slack_input_key_proto and _slack_input_key_proto not in output_mapping:
-        _protocol_keys.append(_slack_input_key_proto)
     if _protocol_keys:
         field_list = "\n".join(f"- {k}" for k in _protocol_keys)
         protocol = (
@@ -1052,10 +1049,7 @@ async def execute_agent_step(
         # data.  When the step has output_mapping and the raw output is just {"result": "text"},
         # try to parse that text as JSON or YAML so the structured fields reach output_mapping.
         _pre_output_mapping = step.get("output_mapping") or {}
-        _slack_input_key_ext = step.get("slack_input_key")
-        _expected_keys = set(_pre_output_mapping.keys()) | (
-            {_slack_input_key_ext} if _slack_input_key_ext else set()
-        )
+        _expected_keys = set(_pre_output_mapping.keys())
         if (
             _expected_keys
             and isinstance(raw_output.get("result"), str)
@@ -1300,17 +1294,6 @@ async def execute_agent_step(
     else:
         # No mapping configured — merge all agent output keys directly into state.
         result = raw_output
-
-    # Surface slack_input_key into state when routing would otherwise drop it
-    # (e.g. output_key branch only stores a single key; output_mapping may omit it).
-    _sik = step.get("slack_input_key")
-    if (
-        _sik
-        and isinstance(raw_output, dict)
-        and _sik in raw_output
-        and _sik not in result
-    ):
-        result[_sik] = raw_output[_sik]
 
     # Always surface the meta-LLM verdict so the UI shows full transparency on
     # every step — not just failed ones. The agent's full raw output (including
