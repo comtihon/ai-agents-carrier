@@ -39,15 +39,12 @@ _SUMMARY_TARGET_CHARS = 2600
 _SUMMARIZE_INPUT_CAP = 20000
 
 _SUMMARIZE_PROMPT = (
-    "The following text is too long to fit in a Slack message block "
-    "(limit {max_chars} characters).\n"
-    "Rewrite it as a concise summary of AT MOST {max_chars} characters.\n"
-    "Rules:\n"
-    "- Preserve the overall structure: if the text has sections or headers, "
-    "keep the headers and condense the content under each.\n"
-    "- Keep concrete identifiers (names, IDs, URLs, numbers) that matter.\n"
-    "- Keep Slack mrkdwn formatting (*bold*, bullets) where present.\n"
-    "- Output ONLY the summary text, no preamble, no code fences.\n\n"
+    "Cut text below to fit Slack block. HARD LIMIT: {max_chars} chars. Not a target — a wall.\n"
+    "Keep: headers, key names/IDs/files/numbers, bullets.\n"
+    "Drop: prose, repetition, detail.\n"
+    "Write caveman-style: drop articles/filler words, short fragments ok, keep technical terms exact.\n"
+    "Length beats completeness. Cut harder if unsure.\n"
+    "Output: summary only. No preamble, no fences.\n\n"
     "TEXT:\n{text}"
 )
 
