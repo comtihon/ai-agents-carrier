@@ -35,17 +35,73 @@ def _truncate(value: str, limit: int = _SLACK_BLOCK_TEXT_LIMIT) -> str:
     return value[:limit] + "\n…(truncated)"
 
 
-def _render_value(value: Any, ctx: dict, _in_block_text: bool = False) -> Any:
+_SUMMARY_TARGET_CHARS = 2600
+_SUMMARIZE_INPUT_CAP = 20000
+
+_SUMMARIZE_PROMPT = (
+    "The following text is too long to fit in a Slack message block "
+    "(limit {max_chars} characters).\n"
+    "Rewrite it as a concise summary of AT MOST {max_chars} characters.\n"
+    "Rules:\n"
+    "- Preserve the overall structure: if the text has sections or headers, "
+    "keep the headers and condense the content under each.\n"
+    "- Keep concrete identifiers (names, IDs, URLs, numbers) that matter.\n"
+    "- Keep Slack mrkdwn formatting (*bold*, bullets) where present.\n"
+    "- Output ONLY the summary text, no preamble, no code fences.\n\n"
+    "TEXT:\n{text}"
+)
+
+
+async def _summarize_for_slack(text: str, settings: Any) -> str:
+    """Summarize an oversized Slack block-text field via the meta-LLM.
+
+    Falls back to the existing hard _truncate() if the LLM call fails for any
+    reason, or if its output is itself still over the Slack block limit —
+    Slack must never receive an over-limit block regardless of LLM behavior.
+    """
+    try:
+        from app.core.container import build_llm_native
+        from langchain_core.messages import HumanMessage
+
+        provider = settings.meta_llm_provider or settings.llm_provider
+        model = settings.meta_llm_model
+        llm = build_llm_native(provider, model, settings, max_tokens=1024)
+
+        prompt = _SUMMARIZE_PROMPT.format(
+            max_chars=_SUMMARY_TARGET_CHARS, text=text[:_SUMMARIZE_INPUT_CAP]
+        )
+        response = await llm.ainvoke([HumanMessage(content=prompt)])
+        summary = response.content if isinstance(response.content, str) else str(response.content)
+        summary = summary.strip()
+
+        if not summary:
+            return _truncate(text)
+        if len(summary) <= _SLACK_BLOCK_TEXT_LIMIT:
+            return summary
+        return _truncate(summary)
+    except Exception as exc:
+        logger.warning("Slack block-text summarization failed, falling back to truncate: %s", exc)
+        return _truncate(text)
+
+
+async def _render_value(value: Any, ctx: dict, settings: Any = None,
+                         _in_block_text: bool = False) -> Any:
     if isinstance(value, str):
         rendered = _render(value, ctx)
-        return _truncate(rendered) if _in_block_text else rendered
+        if not _in_block_text:
+            return rendered
+        if len(rendered) <= _SLACK_BLOCK_TEXT_LIMIT:
+            return rendered
+        if settings is None:
+            return _truncate(rendered)
+        return await _summarize_for_slack(rendered, settings)
     if isinstance(value, dict):
         # Detect a Slack block text object: {"type": "mrkdwn"|"plain_text", "text": "..."}
         is_block_text = value.get("type") in ("mrkdwn", "plain_text") and "text" in value
-        return {k: _render_value(v, ctx, _in_block_text=is_block_text and k == "text")
+        return {k: await _render_value(v, ctx, settings, _in_block_text=is_block_text and k == "text")
                 for k, v in value.items()}
     if isinstance(value, list):
-        return [_render_value(v, ctx) for v in value]
+        return [await _render_value(v, ctx, settings) for v in value]
     return value
 
 
@@ -110,7 +166,7 @@ async def send_approval_notification(
         password = _render(auth_config.get("password", ""), ctx)
         httpx_auth = (username, password)
 
-    payload = _render_value(notify.get("payload", {}), ctx)
+    payload = await _render_value(notify.get("payload", {}), ctx, settings)
 
     # For Slack chat.postMessage: if a previous approval already created a thread,
     # reply in that thread and tag whoever approved it.
@@ -283,7 +339,7 @@ async def post_slack_addon_notification(
         logger.warning("run %s: slack addon payload JSON parse failed: %s", run_id, exc)
         return
 
-    payload = _render_value(payload, ctx)
+    payload = await _render_value(payload, ctx, settings)
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
