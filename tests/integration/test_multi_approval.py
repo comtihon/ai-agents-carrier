@@ -250,7 +250,7 @@ async def test_rejecting_first_approval_skips_when_gated_second_approval() -> No
         # remaining when-guarded steps).
         final = await client.get(f"/api/v1/workflows/runs/{run_id}")
         body = final.json()
-        assert body["status"] in ("completed", "cancelled"), (
+        assert body["status"] in ("completed", "cancelled", "rejected"), (
             f"second approval prompted again — current_step={body['current_step']}, "
             f"status={body['status']}"
         )

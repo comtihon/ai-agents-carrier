@@ -30,7 +30,7 @@ async def _execute_webhook_run(
     run.step_statuses = {s["id"]: "pending" for s in runner.steps}
     initial_state = {"request": run.user_request, "trigger_payload": trigger_payload}
     await stream_graph_to_pause(runner, run, container.run_repository, initial_state, base_url=container.settings.base_url)
-    if run.status in ("completed", "failed", "cancelled"):
+    if run.status in ("completed", "failed", "cancelled", "rejected"):
         container.live_runners.pop(run.id, None)
 
 

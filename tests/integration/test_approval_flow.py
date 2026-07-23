@@ -308,12 +308,12 @@ async def test_callback_reject_unblocks_workflow() -> None:
         assert reject.status_code == 200, reject.text
         body = reject.json()
 
-        assert body["status"] == "cancelled"
+        assert body["status"] == "rejected"
         assert body["run_id"] == run_id
 
         get_resp = await client.get(f"/api/v1/workflows/runs/{run_id}")
         result = get_resp.json()
-        assert result["status"] == "cancelled"
+        assert result["status"] == "rejected"
         assert result["intermediate_outputs"]["approved"] is False
         assert result["intermediate_outputs"]["reject_reason"] == "not ready"
         assert "implementation" not in result["intermediate_outputs"]
@@ -346,7 +346,7 @@ async def test_reject_skips_implement_step() -> None:
         get_resp = await client.get(f"/api/v1/workflows/runs/{run_id}")
         body = get_resp.json()
 
-        assert body["status"] == "cancelled"
+        assert body["status"] == "rejected"
         assert body["intermediate_outputs"]["approved"] is False
         assert body["intermediate_outputs"]["reject_reason"] == "plan looks wrong"
         # implement step skipped — key not set

@@ -28,7 +28,7 @@ class GraphRun(BaseModel):
     id: str                          # == LangGraph thread_id
     graph_id: str
     user_request: str = ""
-    status: Literal["running", "waiting_approval", "waiting_agent", "completed", "failed", "cancelled"]
+    status: Literal["running", "waiting_approval", "waiting_agent", "completed", "failed", "cancelled", "rejected"]
     parent_run_id: str | None = None  # set when this run was spawned by a workflow step
     agent_url: str | None = None  # URL of the running agent HTTP server (set while waiting_agent)
     # Snapshot of the workflow definition at the time the run was started.

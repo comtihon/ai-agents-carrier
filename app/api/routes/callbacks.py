@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
@@ -73,7 +74,14 @@ def _html(title: str, emoji: str, body: str) -> HTMLResponse:
     return HTMLResponse(content=content)
 
 
-async def _do_approve(run_id: str, container: ApplicationContainer, approver_slack_id: str = "") -> str:
+async def _do_approve(
+    run_id: str,
+    container: ApplicationContainer,
+    approver_slack_id: str = "",
+    approver_name: str = "",
+    approver_id: str = "",
+    approver_source: str = "",
+) -> str:
     run = await container.run_repository.claim_for_resume(run_id)
     if run is None:
         existing = await container.run_repository.get(run_id)
@@ -97,14 +105,30 @@ async def _do_approve(run_id: str, container: ApplicationContainer, approver_sla
         run.step_statuses[run.current_step] = "finished"
         run.touch()
         await container.run_repository.update(run)
-    await stream_graph_to_pause(runner, run, container.run_repository, Command(resume={"approved": True}))
-    if run.status in ("completed", "failed", "cancelled"):
+    await stream_graph_to_pause(
+        runner, run, container.run_repository,
+        Command(resume={
+            "approved": True,
+            "approver_name": approver_name or None,
+            "approver_id": approver_id or None,
+            "approver_source": approver_source or None,
+            "decided_at": datetime.now(timezone.utc).isoformat(),
+        }),
+    )
+    if run.status in ("completed", "failed", "cancelled", "rejected"):
         container.live_runners.pop(run_id, None)
     logger.info("run %s: approved via callback (approver=%s)", run_id, approver_slack_id or "unknown")
     return run.status
 
 
-async def _do_reject(run_id: str, reason: str | None, container: ApplicationContainer) -> str:
+async def _do_reject(
+    run_id: str,
+    reason: str | None,
+    container: ApplicationContainer,
+    approver_name: str = "",
+    approver_id: str = "",
+    approver_source: str = "",
+) -> str:
     run = await container.run_repository.claim_for_resume(run_id)
     if run is None:
         existing = await container.run_repository.get(run_id)
@@ -122,13 +146,20 @@ async def _do_reject(run_id: str, reason: str | None, container: ApplicationCont
         await container.run_repository.update(run)
     await stream_graph_to_pause(
         runner, run, container.run_repository,
-        Command(resume={"approved": False, "reason": reason}),
+        Command(resume={
+            "approved": False,
+            "reason": reason,
+            "approver_name": approver_name or None,
+            "approver_id": approver_id or None,
+            "approver_source": approver_source or None,
+            "decided_at": datetime.now(timezone.utc).isoformat(),
+        }),
     )
     if run.status == "completed":
-        run.status = "cancelled"
+        run.status = "rejected"
         run.touch()
         await container.run_repository.update(run)
-    if run.status in ("completed", "failed", "cancelled"):
+    if run.status in ("completed", "failed", "cancelled", "rejected"):
         container.live_runners.pop(run_id, None)
     logger.info("run %s: rejected via callback (reason=%s)", run_id, reason)
     return run.status
@@ -142,7 +173,7 @@ async def callback_approve(
     container: ApplicationContainer = Depends(get_container),
 ):
     """Approve a paused run. The run_id in the path acts as the auth token."""
-    status = await _do_approve(run_id, container)
+    status = await _do_approve(run_id, container, approver_source="slack")
     return {"run_id": run_id, "status": status}
 
 
@@ -154,7 +185,7 @@ async def callback_reject(
 ):
     """Reject a paused run. The run_id in the path acts as the auth token."""
     reason = body.reason if body else None
-    status = await _do_reject(run_id, reason, container)
+    status = await _do_reject(run_id, reason, container, approver_source="slack")
     return {"run_id": run_id, "status": status}
 
 
@@ -167,7 +198,7 @@ async def callback_approve_get(
 ):
     """Approve via browser link (e.g. Slack button URL). Returns a confirmation page."""
     try:
-        await _do_approve(run_id, container)
+        await _do_approve(run_id, container, approver_source="slack")
     except HTTPException as exc:
         if exc.status_code == 409:
             return _html(
@@ -185,7 +216,7 @@ async def callback_reject_get(
 ):
     """Reject via browser link (e.g. Slack button URL). Returns a confirmation page."""
     try:
-        await _do_reject(run_id, reason=None, container=container)
+        await _do_reject(run_id, reason=None, container=container, approver_source="slack")
     except HTTPException as exc:
         if exc.status_code == 409:
             return _html(
@@ -268,9 +299,20 @@ async def slack_interactive(
         )
 
     if action_id == "approve":
-        background_tasks.add_task(_do_approve, run_id, container, approver_slack_id=user_id)
+        background_tasks.add_task(
+            _do_approve, run_id, container,
+            approver_slack_id=user_id,
+            approver_name=user_name,
+            approver_id=user_id,
+            approver_source="slack",
+        )
     else:
-        background_tasks.add_task(_do_reject, run_id, None, container)
+        background_tasks.add_task(
+            _do_reject, run_id, None, container,
+            approver_name=user_name,
+            approver_id=user_id,
+            approver_source="slack",
+        )
 
     return JSONResponse(content={
         "replace_original": True,

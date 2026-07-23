@@ -221,7 +221,7 @@ async def test_rejection_survives_restart() -> None:
             get_resp = await client.get(f"/api/v1/workflows/runs/{run_id}")
             body = get_resp.json()
 
-            assert body["status"] == "cancelled"
+            assert body["status"] == "rejected"
             assert body["intermediate_outputs"]["approved"] is False
             assert body["intermediate_outputs"]["reject_reason"] == "not ready"
             assert "implementation" not in body["intermediate_outputs"]

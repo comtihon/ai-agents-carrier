@@ -222,7 +222,7 @@ class ApplicationContainer:
                 initial_state = {"request": request, "trigger_info": trigger_info}
                 await stream_graph_to_pause(runner, run, self.run_repository, initial_state, base_url=self.settings.base_url)
 
-                if run.status in ("completed", "failed", "cancelled"):
+                if run.status in ("completed", "failed", "cancelled", "rejected"):
                     self.live_runners.pop(thread_id, None)
 
             except Exception:
@@ -423,7 +423,7 @@ class ApplicationContainer:
         except Exception:
             logger.exception("run %s: resumed execution failed", run.id)
         finally:
-            if run.status in ("completed", "failed", "cancelled"):
+            if run.status in ("completed", "failed", "cancelled", "rejected"):
                 self.live_runners.pop(run.id, None)
 
     def _build_runner_for_recovery(self, run: GraphRun) -> YamlGraphRunner | None:

@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
@@ -496,7 +496,7 @@ async def _execute_graph(
     await _stream_graph(runner, run, container, {"request": run.user_request}, base_url=container.settings.base_url)
     # Remove from live_runners when run reaches a terminal or waiting state.
     # waiting_approval is kept — resume needs the runner with its MemorySaver state.
-    if run.status in ("completed", "failed", "cancelled"):
+    if run.status in ("completed", "failed", "cancelled", "rejected"):
         container.live_runners.pop(run.id, None)
 
 
@@ -695,6 +695,7 @@ async def get_run(
 @router.post("/runs/{run_id}/approve")
 async def approve_run(
     run_id: str,
+    request: Request,
     background_tasks: BackgroundTasks,
     body: ApproveRequest | None = None,
     container: ApplicationContainer = Depends(get_container),
@@ -723,7 +724,15 @@ async def approve_run(
         await container.run_repository.update(run)
 
     corrections = body.corrections if body else None
-    background_tasks.add_task(_resume_approved, runner, run, container, corrections)
+    claims = getattr(request.state, "jwt_claims", None) or {}
+    approver_id = claims.get("sub")
+    approver_name = (
+        claims.get("name") or claims.get("preferred_username") or claims.get("email")
+    )
+    background_tasks.add_task(
+        _resume_approved, runner, run, container, corrections,
+        approver_name, approver_id,
+    )
 
     return await _run_response(run, runner)
 
@@ -733,19 +742,29 @@ async def _resume_approved(
     run: GraphRun,
     container: ApplicationContainer,
     corrections: dict | None,
+    approver_name: str | None = None,
+    approver_id: str | None = None,
 ) -> None:
     await _stream_graph(
         runner, run, container,
-        Command(resume={"approved": True, "corrections": corrections}),
+        Command(resume={
+            "approved": True,
+            "corrections": corrections,
+            "approver_name": approver_name,
+            "approver_id": approver_id,
+            "approver_source": "ui",
+            "decided_at": datetime.now(timezone.utc).isoformat(),
+        }),
         base_url=container.settings.base_url,
     )
-    if run.status in ("completed", "failed", "cancelled"):
+    if run.status in ("completed", "failed", "cancelled", "rejected"):
         container.live_runners.pop(run.id, None)
 
 
 @router.post("/runs/{run_id}/reject")
 async def reject_run(
     run_id: str,
+    request: Request,
     background_tasks: BackgroundTasks,
     body: RejectRequest | None = None,
     container: ApplicationContainer = Depends(get_container),
@@ -766,7 +785,16 @@ async def reject_run(
         run.touch()
         await container.run_repository.update(run)
 
-    background_tasks.add_task(_resume_rejected, runner, run, container, body.reason if body else None)
+    claims = getattr(request.state, "jwt_claims", None) or {}
+    approver_id = claims.get("sub")
+    approver_name = (
+        claims.get("name") or claims.get("preferred_username") or claims.get("email")
+    )
+    background_tasks.add_task(
+        _resume_rejected, runner, run, container,
+        body.reason if body else None,
+        approver_name, approver_id,
+    )
 
     return await _run_response(run, runner)
 
@@ -776,19 +804,28 @@ async def _resume_rejected(
     run: GraphRun,
     container: ApplicationContainer,
     reason: str | None,
+    approver_name: str | None = None,
+    approver_id: str | None = None,
 ) -> None:
     await _stream_graph(
         runner, run, container,
-        Command(resume={"approved": False, "reason": reason}),
+        Command(resume={
+            "approved": False,
+            "reason": reason,
+            "approver_name": approver_name,
+            "approver_id": approver_id,
+            "approver_source": "ui",
+            "decided_at": datetime.now(timezone.utc).isoformat(),
+        }),
     )
     if run.status == "completed":
-        run.status = "cancelled"
+        run.status = "rejected"
         run.touch()
         await container.run_repository.update(run)
-    if run.status == "cancelled":
+    if run.status in ("cancelled", "rejected"):
         from app.services.agent_cleanup import cleanup_run_agents
         await cleanup_run_agents(run.id, container.settings)
-    if run.status in ("completed", "failed", "cancelled"):
+    if run.status in ("completed", "failed", "cancelled", "rejected"):
         container.live_runners.pop(run.id, None)
 
 
@@ -909,8 +946,8 @@ async def restart_from_step(
     run = await container.run_repository.get(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
-    if run.status == "cancelled":
-        raise HTTPException(status_code=409, detail="Cannot restart a cancelled run")
+    if run.status in ("cancelled", "rejected"):
+        raise HTTPException(status_code=409, detail=f"Cannot restart a {run.status} run")
     if run.status == "running":
         raise HTTPException(status_code=409, detail="Cannot restart a currently running workflow")
 
@@ -992,7 +1029,7 @@ async def _retry_graph(
     resume_input: Any,
 ) -> None:
     await _stream_graph(runner, run, container, resume_input, base_url=container.settings.base_url)
-    if run.status in ("completed", "failed", "cancelled"):
+    if run.status in ("completed", "failed", "cancelled", "rejected"):
         container.live_runners.pop(run.id, None)
 
 

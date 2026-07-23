@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
+from langgraph.types import Command
 from unittest.mock import AsyncMock, MagicMock
 
 from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner
@@ -67,6 +68,93 @@ async def test_human_approval_interrupts():
     await runner.graph.ainvoke({"request": "do something"}, config)
     snap = runner.graph.get_state(config)
     assert snap.next  # interrupted, waiting for approval
+
+
+# ── human_approval as a conditional goalkeeper (routes + END) ─────────────────
+
+def _approval_gate_steps() -> list[dict]:
+    """A minimal plan -> approval-gate -> downstream graph where the gate uses the
+    new approve->next / reject->END conditional routes shape."""
+    return [
+        {"id": "plan", "type": "llm", "output_key": "plan"},
+        {"id": "gate", "type": "human_approval", "output_key": "approved",
+         "routes": [{"when": "approved", "next": "after"}, {"next": "END"}]},
+        {"id": "after", "type": "llm", "output_key": "done"},
+    ]
+
+
+def test_human_approval_routes_compile():
+    # Two routes on a human_approval step must compile (proves human_approval is
+    # now in _MULTI_OUTPUT_TYPES).
+    runner = _make_runner(_approval_gate_steps())
+    assert runner.graph is not None
+
+
+def test_plain_step_two_routes_still_raises():
+    # Regression: a step type NOT in _MULTI_OUTPUT_TYPES still cannot carry >1 route.
+    with pytest.raises(ValueError, match="cannot have more than"):
+        _make_runner([
+            {"id": "s", "type": "llm", "output_key": "r",
+             "routes": [{"when": "r", "next": "a"}, {"next": "END"}]},
+            {"id": "a", "type": "llm", "output_key": "x"},
+        ])
+
+
+@pytest.mark.asyncio
+async def test_approval_approve_runs_downstream():
+    runner = _make_runner(
+        _approval_gate_steps(),
+        extra_responses=[AIMessage(content="the plan"), AIMessage(content="the result")],
+    )
+    config = {"configurable": {"thread_id": "appr-approve"}}
+    await runner.graph.ainvoke({"request": "do it"}, config)  # pauses at gate
+    decision = {
+        "approved": True,
+        "reason": None,
+        "approver_name": "Alice",
+        "approver_id": "u-1",
+        "approver_source": "ui",
+        "decided_at": "2026-07-23T00:00:00+00:00",
+    }
+    state = await runner.graph.ainvoke(Command(resume=decision), config)
+    # Downstream node executed.
+    assert state.get("done") == "the result"
+    # Audit record captured the decision identity.
+    history = state["approval_history"]
+    assert len(history) == 1
+    rec = history[0]
+    assert rec["step_id"] == "gate"
+    assert rec["approved"] is True
+    assert rec["approver_name"] == "Alice"
+    assert rec["approver_id"] == "u-1"
+    assert rec["approver_source"] == "ui"
+    assert rec["decided_at"] == "2026-07-23T00:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_approval_reject_ends_graph():
+    runner = _make_runner(
+        _approval_gate_steps(),
+        extra_responses=[AIMessage(content="the plan"), AIMessage(content="the result")],
+    )
+    config = {"configurable": {"thread_id": "appr-reject"}}
+    await runner.graph.ainvoke({"request": "do it"}, config)  # pauses at gate
+    decision = {
+        "approved": False,
+        "reason": "not good enough",
+        "approver_name": "Bob",
+        "approver_id": "u-2",
+        "approver_source": "ui",
+        "decided_at": "2026-07-23T00:00:00+00:00",
+    }
+    state = await runner.graph.ainvoke(Command(resume=decision), config)
+    # Downstream node did NOT execute — graph ended at the gate.
+    assert "done" not in state
+    assert state["approved"] is False
+    rec = state["approval_history"][0]
+    assert rec["approved"] is False
+    assert rec["reason"] == "not good enough"
+    assert rec["approver_source"] == "ui"
 
 
 @pytest.mark.asyncio

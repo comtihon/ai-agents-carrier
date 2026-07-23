@@ -166,7 +166,7 @@ async def _resume_with_output(runner, run, container: ApplicationContainer, outp
     except Exception:
         logger.exception("run %s: failed to resume after agent output", run.id)
     finally:
-        if run.status in ("completed", "failed", "cancelled"):
+        if run.status in ("completed", "failed", "cancelled", "rejected"):
             container.live_runners.pop(run.id, None)
 
 

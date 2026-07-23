@@ -94,6 +94,10 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
         "request": str,
         "approved": bool,
         "reject_reason": str,
+        # Append-only audit trail of every human_approval decision. Each approval
+        # node reads the current list, appends its record, and returns the full
+        # list, so a plain last-wins field is correct (nodes run sequentially).
+        "approval_history": list,
         # Dict fields updated by every node (loop guard, conversation tracking) —
         # multiple parallel branches may write simultaneously, so use _merge_dicts.
         "_conv_map":                  Annotated[Any, _merge_dicts],  # type: ignore[assignment]
@@ -786,7 +790,7 @@ class YamlGraphRunner:
         sg.add_edge(START, step_ids[0])
 
         _MULTI_OUTPUT_TYPES = frozenset(
-            {"llm_structured", "switch", "langgraph-agent", "claude-agent"}
+            {"llm_structured", "switch", "langgraph-agent", "claude-agent", "human_approval"}
         )
 
         for i, step in enumerate(self._steps):
@@ -1523,9 +1527,22 @@ class YamlGraphRunner:
                 "[%s] step '%s' decision: approved=%s corrections=%s",
                 graph_id, step_id, approved, list(corrections.keys()),
             )
+            record = {
+                "step_id": step_id,
+                "approved": approved,
+                "reason": decision.get("reason"),
+                "corrections": corrections or None,
+                "approver_name": decision.get("approver_name"),
+                "approver_id": decision.get("approver_id"),
+                "approver_source": decision.get("approver_source"),
+                "decided_at": decision.get("decided_at"),
+            }
+            history = list(state.get("approval_history") or [])
+            history.append(record)
             result: dict = {
                 approved_key: approved,
                 "reject_reason": decision.get("reason"),
+                "approval_history": history,
             }
             result.update(corrections)
             return result
