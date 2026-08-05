@@ -526,8 +526,10 @@ def build_default_workflow(
                 {params.x} and {other_operation.field.path}.
             description: What this data source provides.
             kind: "http" or "graphql".
-            auth_json: Optional JSON auth block referencing env var NAMES only,
-                e.g. {"type": "bearer", "token_env": "GITHUB_TOKEN"}.
+            auth_json: Optional JSON auth block carrying the secret value itself,
+                e.g. {"type": "bearer", "token": "<token>"},
+                {"type": "basic", "username": "...", "password": "..."} or
+                {"type": "header", "header_name": "X-Api-Key", "value": "..."}.
         """
         if data_source_backend is None:
             return "Data source creation unavailable: no persistent backend configured."

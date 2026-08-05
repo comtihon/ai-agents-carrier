@@ -382,9 +382,9 @@ id: github
 name: GitHub
 kind: http                       # http | graphql
 base_url: https://api.github.com
-auth:                            # env var NAMES only — secrets are never stored
+auth:                            # secret values stored in the definition; API responses redact them
   type: bearer                   # bearer | basic | header | none
-  token_env: GITHUB_TOKEN
+  token: <token value>           # basic: username/password; header: header_name/value
 default_headers:
   Accept: application/vnd.github+json
 timeout_seconds: 30
