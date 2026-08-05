@@ -35,6 +35,7 @@ system_prompt: |
   - `human_approval` — pause for user approval
   - `langgraph-agent` / `claude-agent` — run an external agent container
   - `http_call` — outbound HTTP request
+  - `data_source` — invoke one operation of a registered data source (add `source`, `operation`, `params` fields)
 
   Guidelines:
   - Be concise and action-oriented. Prefer doing over explaining.

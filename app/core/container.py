@@ -26,11 +26,16 @@ from app.infrastructure.persistence.agent_backend import (
     AgentDefinitionBackend,
     MongoAgentBackend,
 )
+from app.infrastructure.persistence.data_source_backend import (
+    DataSourceDefinitionBackend,
+    MongoDataSourceBackend,
+)
 from app.infrastructure.persistence.workflow_backend import (
     LocalFilesWorkflowBackend,
     MongoWorkflowBackend,
     WorkflowDefinitionBackend,
 )
+from app.infrastructure.datasources.executor import DataSourceExecutor
 from app.infrastructure.tools.mcp_client import McpToolsProvider
 from app.infrastructure.triggers.cron_scheduler import CronScheduler
 
@@ -53,6 +58,11 @@ class ApplicationContainer:
     # Agent definition backend — None when MongoDB is not configured or in
     # legacy test setups.  Required for langgraph-agent / claude-agent steps.
     agent_backend: AgentDefinitionBackend | None = None
+    # Data source definition backend + its DAG executor — None when MongoDB is
+    # not configured or in legacy test setups.  Required for `data_source`
+    # steps and for the /mcp/datasources tools.
+    data_source_backend: DataSourceDefinitionBackend | None = None
+    data_source_executor: DataSourceExecutor | None = None
     # Factory for per-step LLM overrides; None in legacy test setups.
     llm_factory: Callable[[str | None, str | None], BaseChatModel] | None = None
     # Runners keyed by run_id — alive for the duration of the run so that
@@ -62,13 +72,22 @@ class ApplicationContainer:
     pvc_lease_repository: MongoPvcLeaseRepository | None = None
     agent_task_repository: MongoAgentTaskRepository | None = None
     warm_pod_repository: MongoWarmPodRepository | None = None
+    # References to background tasks created in startup() — held so they
+    # can't be garbage-collected mid-flight, and cancelled on shutdown().
+    _recover_task: asyncio.Task | None = field(default=None, init=False, repr=False, compare=False)
+    _datasources_mcp_task: asyncio.Task | None = field(default=None, init=False, repr=False, compare=False)
 
     async def startup(self) -> None:
         await self.mcp_tools_provider.start()
         self.cron_scheduler.start()
         if self.workflow_backend is not None:
             await self._load_registry()
-        asyncio.create_task(self._recover_incomplete_runs())
+        self._recover_task = asyncio.create_task(self._recover_incomplete_runs())
+        # Data source MCP tools are loaded detached: the /mcp/datasources
+        # endpoint only answers once uvicorn is serving, so this must never be
+        # awaited inline during startup.
+        if self.settings.mcp_datasources_enabled and self.data_source_backend is not None:
+            self._datasources_mcp_task = asyncio.create_task(self._load_datasources_mcp())
         # Register 5-minute PVC lease cleanup sweeper
         if self.pvc_lease_repository is not None:
             from apscheduler.triggers.interval import IntervalTrigger
@@ -117,6 +136,40 @@ class ApplicationContainer:
             runner._agent_task_repository = self.agent_task_repository
         if self.warm_pod_repository is not None:
             runner._warm_pod_repository = self.warm_pod_repository
+        if self.data_source_backend is not None:
+            runner._data_source_backend = self.data_source_backend
+        if self.data_source_executor is not None:
+            runner._data_source_executor = self.data_source_executor
+
+    async def _load_datasources_mcp(self) -> None:
+        """Publish data source MCP tools, then connect the local MCP server.
+
+        Retried with backoff because the mounted /mcp/datasources endpoint is
+        only reachable after the HTTP server has started accepting requests.
+        """
+        if self.data_source_backend is None:
+            return
+        from app.api.mcp.datasources_server import (
+            get_datasources_mcp,
+            rebuild_datasource_tools,
+        )
+        delay = 2.0
+        for attempt in range(1, 7):
+            await asyncio.sleep(delay)
+            try:
+                await rebuild_datasource_tools(
+                    get_datasources_mcp(), self.data_source_backend, lambda: self
+                )
+                await self.mcp_tools_provider.refresh_server("datasources")
+                logger.info("datasources MCP tools loaded")
+                return
+            except Exception:
+                logger.debug(
+                    "datasources MCP load attempt %d failed — retrying", attempt,
+                    exc_info=True,
+                )
+                delay = min(delay * 2, 30.0)
+        logger.warning("datasources MCP tools unavailable after 6 attempts")
 
     async def _load_registry(self) -> None:
         """Populate yaml_graph_registry from the configured backend."""
@@ -524,6 +577,9 @@ class ApplicationContainer:
 
     async def shutdown(self) -> None:
         self.cron_scheduler.stop()
+        for task in (self._recover_task, self._datasources_mcp_task):
+            if task is not None and not task.done():
+                task.cancel()
         await self.mcp_tools_provider.stop()
         await self.mongo_provider.close()
         if self.checkpointer is not None:
@@ -532,6 +588,8 @@ class ApplicationContainer:
             await self.workflow_backend.close()
         if isinstance(self.agent_backend, MongoAgentBackend):
             await self.agent_backend.close()
+        if isinstance(self.data_source_backend, MongoDataSourceBackend):
+            await self.data_source_backend.close()
 
 
 def _fake_llm(reason: str) -> BaseChatModel:
@@ -647,6 +705,9 @@ def build_container(settings: Settings) -> ApplicationContainer:
     workflow_backend = _build_workflow_backend(settings)
     # Agent definitions are always stored in MongoDB (no local-files backend).
     agent_backend = MongoAgentBackend(settings.mongodb_uri, settings.mongodb_database)
+    # Data source definitions are likewise MongoDB-only.
+    data_source_backend = MongoDataSourceBackend(settings.mongodb_uri, settings.mongodb_database)
+    data_source_executor = DataSourceExecutor()
     checkpointer = MongoDBCheckpointSaver(
         MongoClient(settings.mongodb_uri),
         db_name=settings.mongodb_database,
@@ -663,6 +724,8 @@ def build_container(settings: Settings) -> ApplicationContainer:
         openhands=openhands,
         workflow_backend=workflow_backend,
         agent_backend=agent_backend,
+        data_source_backend=data_source_backend,
+        data_source_executor=data_source_executor,
         checkpointer=checkpointer,
         pvc_lease_repository=pvc_lease_repository,
         agent_task_repository=agent_task_repository,

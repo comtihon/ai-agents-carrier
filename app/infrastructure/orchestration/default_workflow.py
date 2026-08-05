@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 
     from app.infrastructure.config.graph_loader import YamlGraphRegistry
     from app.infrastructure.persistence.agent_backend import AgentDefinitionBackend
+    from app.infrastructure.persistence.data_source_backend import DataSourceDefinitionBackend
     from app.infrastructure.persistence.mongo import MongoGraphRunRepository
     from app.infrastructure.persistence.workflow_backend import WorkflowDefinitionBackend
 
@@ -67,6 +68,8 @@ def build_default_workflow(
     workflow_backend: "WorkflowDefinitionBackend | None" = None,
     refresh_runner: "Callable[[str], Awaitable[None]] | None" = None,
     agent_backend: "AgentDefinitionBackend | None" = None,
+    data_source_backend: "DataSourceDefinitionBackend | None" = None,
+    refresh_datasources: "Callable[[], Awaitable[None]] | None" = None,
 ):
     """Build and compile the default ReAct chat agent."""
 
@@ -236,7 +239,8 @@ def build_default_workflow(
                 llm_structured (LLM with structured output), llm (free-form LLM),
                 mcp (single MCP tool call), human_approval (pause for approval),
                 execute (OpenHands code execution), workflow (child workflow),
-                http_call (outbound HTTP), langgraph-agent, claude-agent.
+                http_call (outbound HTTP), langgraph-agent, claude-agent,
+                data_source (invoke a DataSourceDefinition operation).
                 Example: [{"id": "trigger", "type": "http"}, {"id": "research", "type": "llm_structured", "system_prompt": "...", "output": [{"name": "summary", "type": "str", "description": "..."}]}]
         """
         if workflow_backend is None:
@@ -450,9 +454,208 @@ def build_default_workflow(
         await agent_backend.delete(agent_id)
         return f"Agent '{agent_id}' deleted."
 
+    # --- Data source tools ---
+
+    async def _resolve_datasource_id(query: str):
+        """Returns (resolved_id, None) or (None, error_str)."""
+        if data_source_backend is None:
+            return None, "data_source_backend not configured"
+        sources = await data_source_backend.list()
+        for s in sources:
+            if s.id == query:
+                return s.id, None
+        for s in sources:
+            if (s.name or "").lower() == query.lower():
+                return s.id, None
+        matches = [
+            s for s in sources
+            if query.lower() in s.id.lower() or query.lower() in (s.name or "").lower()
+        ]
+        if len(matches) == 1:
+            return matches[0].id, None
+        if matches:
+            cands = ", ".join(f"{s.id} ({s.name})" for s in matches)
+            return None, f"Ambiguous — multiple matches: {cands}"
+        available = ", ".join(f"{s.id} ({s.name})" for s in sources) or "none"
+        return None, f"Data source '{query}' not found. Available: {available}"
+
+    async def _publish_datasources() -> None:
+        if refresh_datasources is not None:
+            try:
+                await refresh_datasources()
+            except Exception:
+                logger.exception("chat_agent: datasource tool refresh failed")
+
+    @tool
+    async def list_datasources() -> str:
+        """List all registered data sources with their operations."""
+        if data_source_backend is None:
+            return "Data source backend not configured."
+        sources = await data_source_backend.list()
+        if not sources:
+            return "No data sources found."
+        lines = []
+        for s in sources:
+            ops = ", ".join(op.name for op in s.operations) or "(no operations)"
+            lines.append(
+                f"- **{s.id}** ({s.name or s.id}, {s.kind}): "
+                f"{s.description or '(no description)'} — operations: {ops}"
+            )
+        return "\n".join(lines)
+
+    @tool
+    async def create_datasource(
+        source_id: str,
+        name: str,
+        base_url: str,
+        operations_json: str,
+        description: str = "",
+        kind: str = "http",
+        auth_json: str = "",
+    ) -> str:
+        """Create a data source definition and publish its MCP tools.
+
+        Args:
+            source_id: Unique kebab-case identifier (e.g. "github-api").
+            name: Human-readable display name.
+            base_url: Base URL of the API (GraphQL sources POST to it directly).
+            operations_json: JSON array of operation objects. Each needs "name" plus
+                "path" (http) or "query" (graphql), and optionally "method",
+                "params" ([{name, type, required, description}]), "mapping"
+                (JMESPath), "paginate", "response_schema". Templates may use
+                {params.x} and {other_operation.field.path}.
+            description: What this data source provides.
+            kind: "http" or "graphql".
+            auth_json: Optional JSON auth block referencing env var NAMES only,
+                e.g. {"type": "bearer", "token_env": "GITHUB_TOKEN"}.
+        """
+        if data_source_backend is None:
+            return "Data source creation unavailable: no persistent backend configured."
+        try:
+            operations = json.loads(operations_json)
+        except json.JSONDecodeError as exc:
+            return f"Invalid operations_json: {exc}"
+        if not isinstance(operations, list):
+            return "operations_json must be a JSON array."
+        auth: dict = {"type": "none"}
+        if auth_json:
+            try:
+                auth = json.loads(auth_json)
+            except json.JSONDecodeError as exc:
+                return f"Invalid auth_json: {exc}"
+
+        existing = await data_source_backend.get(source_id)
+        if existing is not None:
+            return f"Data source '{source_id}' already exists. Use update_datasource to modify it."
+
+        from app.domain.models.data_source_definition import (
+            DataSourceDefinition,
+            validate_operations,
+        )
+        try:
+            defn = DataSourceDefinition.model_validate({
+                "id": source_id,
+                "name": name,
+                "description": description,
+                "kind": kind,
+                "base_url": base_url,
+                "auth": auth,
+                "operations": operations,
+            })
+            validate_operations(defn)
+        except Exception as exc:
+            return f"Invalid data source definition: {exc}"
+
+        await data_source_backend.create(defn)
+        await _publish_datasources()
+        return f"Data source '{source_id}' created with {len(defn.operations)} operation(s)."
+
+    @tool
+    async def update_datasource(
+        source_id: str,
+        name: str | None = None,
+        description: str | None = None,
+        base_url: str | None = None,
+        operations_json: str | None = None,
+        auth_json: str | None = None,
+    ) -> str:
+        """Update a data source definition. Only provided fields change.
+
+        Args:
+            source_id: The data source id or name.
+            name: New display name (omit to keep current).
+            description: New description (omit to keep current).
+            base_url: New base URL (omit to keep current).
+            operations_json: JSON array replacing ALL operations (omit to keep current).
+            auth_json: JSON auth block replacing the current one (omit to keep current).
+        """
+        if data_source_backend is None:
+            return "Data source updates unavailable: no persistent backend configured."
+        resolved, err = await _resolve_datasource_id(source_id)
+        if err:
+            return err
+        existing = await data_source_backend.get(resolved)
+        if existing is None:
+            return f"Data source '{resolved}' not found."
+
+        payload = existing.model_dump(mode="json")
+        if name is not None:
+            payload["name"] = name
+        if description is not None:
+            payload["description"] = description
+        if base_url is not None:
+            payload["base_url"] = base_url
+        if operations_json is not None:
+            try:
+                operations = json.loads(operations_json)
+            except json.JSONDecodeError as exc:
+                return f"Invalid operations_json: {exc}"
+            if not isinstance(operations, list):
+                return "operations_json must be a JSON array."
+            payload["operations"] = operations
+        if auth_json is not None:
+            try:
+                payload["auth"] = json.loads(auth_json)
+            except json.JSONDecodeError as exc:
+                return f"Invalid auth_json: {exc}"
+
+        from app.domain.models.data_source_definition import (
+            DataSourceDefinition,
+            validate_operations,
+        )
+        try:
+            defn = DataSourceDefinition.model_validate(payload)
+            validate_operations(defn)
+        except Exception as exc:
+            return f"Invalid data source definition: {exc}"
+
+        await data_source_backend.update(resolved, defn)
+        await _publish_datasources()
+        return f"Data source '{resolved}' updated."
+
+    @tool
+    async def delete_datasource(source_id: str) -> str:
+        """Permanently delete a data source definition and unpublish its tools.
+
+        Args:
+            source_id: The data source id or name.
+        """
+        if data_source_backend is None:
+            return "Data source deletion unavailable: no persistent backend configured."
+        resolved, err = await _resolve_datasource_id(source_id)
+        if err:
+            return err
+        existing = await data_source_backend.get(resolved)
+        if existing is None:
+            return f"Data source '{resolved}' not found."
+        await data_source_backend.delete(resolved)
+        await _publish_datasources()
+        return f"Data source '{resolved}' deleted."
+
     tools = [list_workflows, run_workflow, list_runs, get_run, ask_user,
              create_workflow, update_workflow, delete_workflow,
-             list_agents, get_agent, create_agent, update_agent, delete_agent]
+             list_agents, get_agent, create_agent, update_agent, delete_agent,
+             list_datasources, create_datasource, update_datasource, delete_datasource]
     llm_with_tools = llm.bind_tools(tools)
 
     # ── nodes ────────────────────────────────────────────────────────────────
