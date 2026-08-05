@@ -27,6 +27,11 @@ _UNPROTECTED_PREFIXES = (
     # have no user credentials.  The run_id UUID in the path acts as the shared
     # secret; secure at the network level (cluster-internal traffic only).
     "/api/v1/runs/",
+    # Data sources MCP — this backend must be able to reach its own mounted
+    # endpoint at startup/refresh time without a user JWT (there is no user
+    # in that flow). The mount is guarded instead by a dedicated bearer-token
+    # wrapper around the mounted app (see app.api.app._DatasourcesAuthWrapper).
+    "/mcp/datasources",
 )
 
 

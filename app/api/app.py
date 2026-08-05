@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import app.compat  # noqa: F401 — must be first, patches langgraph.graph.graph
 
-from contextlib import asynccontextmanager
+import logging
+from contextlib import AsyncExitStack, asynccontextmanager
 from uuid import uuid4
 
 from copilotkit import Action, CopilotKitRemoteEndpoint, LangGraphAGUIAgent
@@ -12,11 +13,13 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from langgraph.types import Command
 
+from app.api.mcp.datasources_server import get_datasources_mcp, rebuild_datasource_tools
 from app.api.middleware.auth import OAuthMiddleware
 from app.api.routes.agent_callbacks import router as agent_callbacks_router
 from app.api.routes.agents import router as agents_router
 from app.api.routes.callbacks import router as callbacks_router
 from app.api.routes.chat import router as chat_router
+from app.api.routes.datasources import router as datasources_router
 from app.api.routes.health import router as health_router
 from app.api.routes.llm import router as llm_router
 from app.api.routes.webhooks import router as webhooks_router
@@ -28,6 +31,63 @@ from app.infrastructure.auth.auth_service import AuthService
 from app.infrastructure.orchestration.chat_agent_loader import load_chat_agent_config
 from app.infrastructure.orchestration.default_workflow import build_default_workflow
 from app.infrastructure.orchestration.router_agent import build_router_graph
+
+
+logger = logging.getLogger(__name__)
+
+
+class _DatasourcesAuthWrapper:
+    """Pure-ASGI bearer-auth gate for the mounted ``/mcp/datasources`` app.
+
+    ``OAuthMiddleware`` exempts ``/mcp/datasources`` (see
+    ``app.api.middleware.auth._UNPROTECTED_PREFIXES``) so this backend can
+    reach its own mounted MCP endpoint without a user JWT — there is no user
+    in that flow, only the container's own MCP client. This wrapper is the
+    actual gate for that endpoint:
+
+    - ``api_key`` set: every request must carry an exact
+      ``Authorization: Bearer <api_key>`` header, or it gets 401.
+    - ``api_key`` unset and ``oauth_enabled``: fail closed (401 on every
+      request) — without a key the endpoint would otherwise be reachable
+      with zero credentials, which is strictly worse than the OAuth posture
+      of the rest of the API.
+    - ``api_key`` unset and OAuth disabled: pass through, matching the
+      unauthenticated posture of the rest of the API.
+    """
+
+    def __init__(self, app, api_key: str | None, oauth_enabled: bool) -> None:
+        self._app = app
+        self._api_key = api_key
+        self._fail_closed = api_key is None and oauth_enabled
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+
+        if self._api_key is not None:
+            headers = dict(scope.get("headers") or ())
+            auth_header = headers.get(b"authorization", b"").decode("latin-1")
+            if auth_header != f"Bearer {self._api_key}":
+                await _send_401(send)
+                return
+        elif self._fail_closed:
+            await _send_401(send)
+            return
+
+        await self._app(scope, receive, send)
+
+
+async def _send_401(send) -> None:
+    await send({
+        "type": "http.response.start",
+        "status": 401,
+        "headers": [(b"content-type", b"application/json")],
+    })
+    await send({
+        "type": "http.response.body",
+        "body": b'{"detail":"Missing or invalid Authorization header"}',
+    })
 
 
 def _langgraph_status(snap) -> str:
@@ -159,11 +219,29 @@ def _build_actions(container: ApplicationContainer) -> list[Action]:
     ]
 
 
+def _make_datasources_refresher(container: ApplicationContainer):
+    """Return a coroutine that republishes data source MCP tools."""
+    async def refresh() -> None:
+        from app.api.routes.datasources import _refresh_datasource_tools
+        await _refresh_datasource_tools(container)
+    return refresh
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     container = build_container(get_settings())
     await container.startup()
     app.state.container = container
+
+    # Data sources MCP server: publish the current tool list, then keep its
+    # streamable-http session manager running for the app's lifetime.
+    datasources_mcp = get_datasources_mcp()
+    try:
+        await rebuild_datasource_tools(
+            datasources_mcp, container.data_source_backend, lambda: app.state.container
+        )
+    except Exception:
+        logger.exception("failed to build initial datasources MCP tools")
 
     router_graph = build_router_graph(container.llm)
 
@@ -189,6 +267,8 @@ async def lifespan(app: FastAPI):
         workflow_backend=container.workflow_backend,
         refresh_runner=container.refresh_runner,
         agent_backend=container.agent_backend,
+        data_source_backend=container.data_source_backend,
+        refresh_datasources=_make_datasources_refresher(container),
     )
     sdk = CopilotKitRemoteEndpoint(
         agents=[
@@ -228,7 +308,10 @@ async def lifespan(app: FastAPI):
         include_in_schema=False,
     )
 
-    yield
+    async with AsyncExitStack() as stack:
+        # FastMCP's streamable-http app requires an active session manager.
+        await stack.enter_async_context(datasources_mcp.session_manager.run())
+        yield
     await container.shutdown()
 
 
@@ -254,6 +337,7 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(workflows_router, prefix=settings.api_prefix)
     app.include_router(agents_router, prefix=settings.api_prefix)
+    app.include_router(datasources_router, prefix=settings.api_prefix)
     app.include_router(llm_router, prefix=settings.api_prefix)
     app.include_router(chat_router, prefix=settings.api_prefix)
     app.include_router(webhooks_router, prefix=settings.api_prefix)
@@ -261,4 +345,22 @@ def create_app() -> FastAPI:
     # Agent callback routes — registered after callbacks but the /runs prefix
     # means they don't conflict with the /{run_id} routes in workflows.
     app.include_router(agent_callbacks_router, prefix=settings.api_prefix)
+    # Data sources MCP server — the streamable-http endpoint lands exactly on
+    # /mcp/datasources (streamable_http_path="/datasources" inside the mount).
+    # OAuthMiddleware exempts this prefix (see _UNPROTECTED_PREFIXES); the
+    # actual gate is _DatasourcesAuthWrapper below.
+    if settings.mcp_datasources_api_key is None and settings.oauth_enabled:
+        logger.warning(
+            "OAUTH_ENABLED is true but MCP_DATASOURCES_API_KEY is not set — "
+            "/mcp/datasources will reject every request (fail closed). Set "
+            "MCP_DATASOURCES_API_KEY so the backend's own agents can reach it."
+        )
+    app.mount(
+        "/mcp",
+        _DatasourcesAuthWrapper(
+            get_datasources_mcp().streamable_http_app(),
+            api_key=settings.mcp_datasources_api_key,
+            oauth_enabled=settings.oauth_enabled,
+        ),
+    )
     return app

@@ -627,7 +627,7 @@ class YamlGraphRunner:
         description: "..."
         steps:
           - id: <node-id>
-            type: llm_structured | llm | mcp | human_approval | execute | workflow | cron | http | http_call | python
+            type: llm_structured | llm | mcp | human_approval | execute | workflow | cron | http | http_call | python | data_source
             when: <state-key>          # skip node if state[key] is falsy
             system_prompt: "..."       # llm / llm_structured
             user_template: "..."       # {key} placeholders resolved from state
@@ -662,6 +662,10 @@ class YamlGraphRunner:
               issue_key: "{ticket_id}"
             code: |                    # python only — executed with ``state`` dict in scope;
               output = state["x"] + 1  #   set ``output`` variable to store the result
+            source: github             # data_source only — DataSourceDefinition id
+            operation: list_repos      # data_source only — operation to invoke
+            params:                    # data_source only — operation inputs;
+              owner: "{repo_owner}"    #   values support {key} templates
             routes:                    # llm_structured / switch / langgraph-agent /
                                        #   claude-agent — multiple branches
               - when: <state-key>      # route taken when state[key] is truthy
@@ -714,6 +718,13 @@ class YamlGraphRunner:
     the ``trigger_info`` state key.  When the node executes it simply returns
     that metadata under ``output_key``.
 
+    ``data_source`` steps invoke one operation of a registered
+    ``DataSourceDefinition``.  Upstream operations of the source's DAG are
+    resolved by the executor, so the step only supplies the operation's own
+    ``params``.  The result is stored under ``output_key`` (defaults to the
+    step id); failures are captured as ``{"error": "..."}`` so the next node
+    can decide how to react.
+
     ``http`` steps are entry-point triggers: the ``POST /api/v1/webhooks/{id}``
     endpoint validates an HMAC-SHA256 signature, then starts a run with the
     webhook body stored in the ``trigger_payload`` state key.  When the node
@@ -761,6 +772,9 @@ class YamlGraphRunner:
         self._agent_task_repository: Any = None
         # Injected post-construction for warm pod reuse tracking (optional)
         self._warm_pod_repository: Any = None
+        # Injected post-construction for `data_source` steps (optional)
+        self._data_source_backend: Any = None
+        self._data_source_executor: Any = None
         # Set by stream_graph_to_pause to enable mid-run persistence from nodes
         self._current_run: Any = None
         self._current_run_repository: Any = None
@@ -882,6 +896,8 @@ class YamlGraphRunner:
             fn = self._http_trigger_node(step)
         elif t == "http_call":
             fn = self._http_call_node(step)
+        elif t == "data_source":
+            fn = self._data_source_node(step)
         elif t == "python":
             fn = self._python_node(step)
         elif t == "parallel":
@@ -1754,6 +1770,43 @@ class YamlGraphRunner:
                 raise
             except Exception as exc:
                 logger.exception("[%s] step '%s' http_call failed", graph_id, step_id)
+                return {output_key: {"error": str(exc)}}
+
+        return node
+
+    def _data_source_node(self, step: dict[str, Any]):
+        """Invoke one operation of a registered data source.
+
+        Config: ``source`` (data source id), ``operation`` (operation name),
+        ``params`` (dict of {key}-templated operation inputs) and the usual
+        ``output_key``.  The executor resolves any upstream operations the
+        operation depends on, so ``params`` only carries the operation's own
+        declared inputs.
+        """
+        graph_id = self.id
+
+        async def node(state: dict) -> dict:
+            step_id = step["id"]
+            source_id = step.get("source", "")
+            operation = step.get("operation", "")
+            output_key = step.get("output_key") or step_id
+
+            logger.info(
+                "[%s] step '%s' running (data_source %s.%s)",
+                graph_id, step_id, source_id, operation,
+            )
+            try:
+                if self._data_source_backend is None or self._data_source_executor is None:
+                    raise ValueError("data source backend/executor not configured")
+                params = self._render_deep(step.get("params") or {}, state)
+                source = await self._data_source_backend.get(source_id)
+                if source is None:
+                    raise ValueError(f"Data source '{source_id}' not found")
+                result = await self._data_source_executor.execute(source, operation, params)
+                logger.info("[%s] step '%s' finished", graph_id, step_id)
+                return {output_key: result}
+            except Exception as exc:
+                logger.exception("[%s] step '%s' data_source failed", graph_id, step_id)
                 return {output_key: {"error": str(exc)}}
 
         return node

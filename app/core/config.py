@@ -182,6 +182,13 @@ class Settings(BaseSettings):
     # --- Semble MCP (stdio; agent-side binary — never launched in backend container) ---
     mcp_semble_enabled: bool = Field(default=True, alias="MCP_SEMBLE_ENABLED")
 
+    # --- Data sources MCP (served in-process at /mcp/datasources) ---
+    # Connected lazily in the background, never during startup: the mounted
+    # endpoint only answers once the HTTP server is accepting requests.
+    mcp_datasources_enabled: bool = Field(default=True, alias="MCP_DATASOURCES_ENABLED")
+    mcp_datasources_url: str | None = Field(default=None, alias="MCP_DATASOURCES_URL")
+    mcp_datasources_api_key: str | None = Field(default=None, alias="MCP_DATASOURCES_API_KEY")
+
     # --- Agent polling ---
     agent_poll_interval_seconds: int = Field(default=10, alias="AGENT_POLL_INTERVAL_SECONDS")
     agent_max_loops: int = Field(default=3, alias="AGENT_MAX_LOOPS")
@@ -208,6 +215,18 @@ class Settings(BaseSettings):
                         command="uvx", args=["mcp-atlassian"], env=env)
         return dict(name="jira", enabled=self.mcp_jira_enabled, transport=self.mcp_jira_transport,
                     url=self.mcp_jira_url, api_key=self.mcp_jira_api_key)
+
+    def resolved_mcp_datasources_url(self) -> str:
+        """URL of the in-process data sources MCP server.
+
+        Defaults to loopback so the backend talks to its own mounted endpoint
+        without depending on the externally reachable base_url (which may be
+        OAuth-protected).
+        """
+        if self.mcp_datasources_url:
+            return self.mcp_datasources_url
+        port = os.environ.get("PORT", "8000")
+        return f"http://127.0.0.1:{port}/mcp/datasources"
 
     def get_llm_integrations(self) -> list[LLMIntegrationConfig]:
         """Parse the LLM_INTEGRATIONS JSON env var into a typed list."""
@@ -270,6 +289,9 @@ class Settings(BaseSettings):
             # Bare `semble` starts the MCP stdio server; the CLI takes no repo
             # positional (repo is a per-call tool argument) and rejects one.
             dict(name="semble", enabled=self.mcp_semble_enabled, transport="stdio", command="semble", args=[]),
+            # Served by this process at /mcp/datasources — connected lazily.
+            dict(name="datasources", enabled=self.mcp_datasources_enabled, transport="streamable_http",
+                 url=self.resolved_mcp_datasources_url(), api_key=self.mcp_datasources_api_key),
         ]
 
     def get_mcp_integrations(self) -> list[McpIntegrationConfig]:

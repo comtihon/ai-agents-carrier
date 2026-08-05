@@ -373,6 +373,70 @@ Progress messages starting with `__token__:` carry live token counts: `__token__
 
 ---
 
+## Data Sources
+
+A data source is a declarative definition of a remote HTTP or GraphQL API plus the named operations that can be invoked on it. Definitions live in MongoDB (`data_source_definitions`) and are managed through `/api/v1/datasources`, the chat assistant, or copilot_ui.
+
+```yaml
+id: github
+name: GitHub
+kind: http                       # http | graphql
+base_url: https://api.github.com
+auth:                            # env var NAMES only — secrets are never stored
+  type: bearer                   # bearer | basic | header | none
+  token_env: GITHUB_TOKEN
+default_headers:
+  Accept: application/vnd.github+json
+timeout_seconds: 30
+retries:
+  attempts: 3
+  backoff: 0.5
+cache:
+  ttl_seconds: 60                # 0 disables caching
+operations:
+  - name: list_repos
+    method: GET
+    path: /users/{params.owner}/repos
+    params:
+      - name: owner
+        type: string
+        required: true
+    mapping: "[].{name: name, full_name: full_name}"   # JMESPath
+    paginate:
+      type: page                 # cursor | page | offset
+      param: page
+      max_pages: 5
+  - name: repo_languages
+    method: GET
+    path: /repos/{list_repos.full_name}/languages      # DAG reference → fan-out
+```
+
+**DAG references.** Templates resolve `{params.<name>}` from the caller's inputs and `{<operation>.<field.path>}` from another operation of the same source. Field paths are JMESPath. The referenced operations form the dependency closure of the call: they run level by level with `asyncio.gather` and are memoised per request, so a diamond DAG calls each upstream exactly once. Unknown references, self-references and cycles are rejected at save time with HTTP 422.
+
+**Fan-out.** When a referenced upstream result is an array, the dependent operation runs once per element (bounded by an `asyncio.Semaphore`) and returns `[{"<field>": <element value>, "result": <call result>}, ...]`. An operation may bind at most one array upstream; a second one raises at runtime.
+
+**Pagination** runs before dependents see a result: `cursor` follows `cursor_path` (JMESPath) and sends it back as `param`; `page` sends a 1-based page number; `offset` sends the number of items already fetched. Looping stops on an empty page, a missing cursor, or `max_pages`. List pages are concatenated. When an operation has no `mapping`, set `items_path` (JMESPath to the items array in the raw page response) so pagination can detect an empty page and concatenate results — without it, a dict-shaped response never looks "empty" and looping silently runs to `max_pages`.
+
+**Cache** is in-memory and keyed by `(source id, operation, resolved params, resolved upstream/fan-out refs)` — so an operation whose template binds an upstream operation's result gets a distinct cache entry per upstream value — with a monotonic-clock TTL. Expired entries are dropped on access and swept opportunistically once the cache grows past a size threshold. **Auth** env vars are read at execution time and merged over `default_headers`.
+
+**MCP endpoint.** Every `<source> x <operation>` pair is exposed as an MCP tool `ds_<source_id>_<operation>` on a streamable-http server mounted at `/mcp/datasources`. The tool's input schema contains the operation's declared `params` only — upstream dependencies stay invisible. The backend registers this as the `datasources` MCP integration, so agents pick the tools up automatically; the server is connected lazily in the background after startup and re-published on every CRUD change (`MCP_DATASOURCES_ENABLED`, `MCP_DATASOURCES_URL`, `MCP_DATASOURCES_API_KEY`).
+
+**Workflow step.** The same executor is reachable from a workflow:
+
+```yaml
+- id: fetch_repos
+  type: data_source
+  source: github
+  operation: list_repos
+  params:
+    owner: "{repo_owner}"
+  output_key: repos
+```
+
+Errors are captured as `{"error": "..."}` under `output_key` so the next step can react.
+
+---
+
 ## API
 
 ```
@@ -396,6 +460,14 @@ POST   /api/v1/agents                         register an agent
 GET    /api/v1/agents/{id}                    get agent definition
 PUT    /api/v1/agents/{id}                    update agent definition
 DELETE /api/v1/agents/{id}                    delete agent definition
+
+# Data sources
+GET    /api/v1/datasources                    list data sources
+POST   /api/v1/datasources                    create data source
+GET    /api/v1/datasources/{id}               get data source definition
+PUT    /api/v1/datasources/{id}               update data source definition
+DELETE /api/v1/datasources/{id}               delete data source definition
+ALL    /mcp/datasources                       MCP (streamable-http) tools for all operations
 
 # Agent callbacks (called by running agent containers)
 POST   /api/v1/runs/{id}/agent/output         deliver result, resume run

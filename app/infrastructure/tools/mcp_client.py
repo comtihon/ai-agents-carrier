@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any
 
@@ -20,11 +21,17 @@ class McpToolsProvider:
     When no MCP servers are enabled, start() is a no-op and get_tools() returns [].
     """
 
+    # Servers excluded from eager start(); reachable only via refresh_server().
+    _EAGER_START_SKIP: frozenset[str] = frozenset({"semble", "datasources"})
+
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._client: MultiServerMCPClient | None = None
         self._tools: list[BaseTool] = []
         self._tool_server: dict[str, str] = {}  # tool name → server name
+        # Per-server clients created by refresh_server(); kept alive so their
+        # tools stay callable.
+        self._refresh_clients: dict[str, MultiServerMCPClient] = {}
 
     async def start(self) -> None:
         server_configs = self._build_server_configs()
@@ -49,6 +56,7 @@ class McpToolsProvider:
         self._client = None
         self._tools = []
         self._tool_server = {}
+        self._refresh_clients = {}
 
     def get_tools(self) -> list[BaseTool]:
         return list(self._tools)
@@ -60,12 +68,53 @@ class McpToolsProvider:
         """Return the MCP server name that provides the given tool, or None if unknown."""
         return self._tool_server.get(name)
 
-    def _build_server_configs(self) -> dict[str, dict[str, Any]]:
-        configs: dict[str, dict[str, Any]] = {}
+    async def refresh_server(self, name: str) -> None:
+        """(Re)connect a single MCP server and swap in its tools atomically.
+
+        Used for servers that are not eager-started (see ``_EAGER_START_SKIP``)
+        and for hot-reloading a server whose tool list changed.  Raises on
+        connection failure so the caller can retry.
+        """
+        cfg = self._config_for(name)
+        if cfg is None:
+            logger.debug("MCP server '%s' is not configured — nothing to refresh", name)
+            return
+        client = MultiServerMCPClient({name: cfg})
+        server_tools = await client.get_tools(server_name=name)
+        # Atomic swap: build the new lists first, then rebind.
+        tools = [t for t in self._tools if self._tool_server.get(t.name) != name]
+        tool_server = {k: v for k, v in self._tool_server.items() if v != name}
+        for tool in server_tools:
+            tools.append(tool)
+            tool_server[tool.name] = name
+        self._tools = tools
+        self._tool_server = tool_server
+        old_client = self._refresh_clients.get(name)
+        self._refresh_clients[name] = client
+        if old_client is not None:
+            await self._maybe_close_client(old_client)
+        logger.info(
+            "MCP server '%s': refreshed with %d tool(s): %s",
+            name, len(server_tools), [t.name for t in server_tools],
+        )
+
+    @staticmethod
+    async def _maybe_close_client(client: MultiServerMCPClient) -> None:
+        """Best-effort close of a replaced MCP client, if it exposes one."""
+        closer = getattr(client, "aclose", None) or getattr(client, "close", None)
+        if closer is None:
+            return
+        try:
+            result = closer()
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.debug("failed to close replaced MCP client", exc_info=True)
+
+    def _config_for(self, name: str) -> dict[str, Any] | None:
+        """Build the client config for one configured MCP server, or None."""
         for integration in self._settings.get_mcp_integrations():
-            # semble is an agent-side stdio server; its binary is not present in
-            # the backend container, so launching it here would crash startup.
-            if integration.name in {"semble"}:
+            if integration.name != name:
                 continue
             if integration.transport == "stdio":
                 cfg: dict[str, Any] = {
@@ -82,5 +131,19 @@ class McpToolsProvider:
                 }
                 if integration.api_key:
                     cfg["headers"] = {"Authorization": f"Bearer {integration.api_key}"}
-            configs[integration.name] = cfg
+            return cfg
+        return None
+
+    def _build_server_configs(self) -> dict[str, dict[str, Any]]:
+        configs: dict[str, dict[str, Any]] = {}
+        for integration in self._settings.get_mcp_integrations():
+            # These servers are never eager-started: `semble` is an agent-side
+            # stdio binary that is absent from the backend container, and
+            # `datasources` is served by this very process, so it is only
+            # reachable after startup completes (see refresh_server).
+            if integration.name in self._EAGER_START_SKIP:
+                continue
+            cfg = self._config_for(integration.name)
+            if cfg is not None:
+                configs[integration.name] = cfg
         return configs
