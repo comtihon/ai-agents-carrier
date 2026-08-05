@@ -10,6 +10,13 @@ Every successful mutation triggers a rebuild of the ``/mcp/datasources`` tool
 list plus a refresh of the ``datasources`` MCP integration, so newly created
 operations become callable by agents without a restart.  Refresh failures are
 logged, never raised — the definition is already persisted.
+
+Secret handling
+---------------
+Auth blocks store secret values (token / password / header value) in the
+definition itself.  Responses never echo them back: every secret field is
+replaced with ``REDACTED_SECRET``.  On update, an incoming secret equal to
+that placeholder (or an omitted auth block) preserves the stored value.
 """
 from __future__ import annotations
 
@@ -17,14 +24,16 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from app.api.dependencies import get_container
 from app.core.container import ApplicationContainer
 from app.domain.models.data_source_definition import (
+    AnyDataSourceAuth,
     DataSourceDefinition,
     validate_operations,
 )
+from app.infrastructure.datasources.discovery import probe_and_discover
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +68,65 @@ class UpdateDataSourceRequest(BaseModel):
     cache: dict | None = None
     timeout_seconds: float | None = None
     retries: dict | None = None
+
+
+class ProbeDataSourceRequest(BaseModel):
+    base_url: str
+    kind: str = "http"
+    # Auth block in the stored (secret-bearing) shape, e.g.
+    # {"type": "bearer", "token": "..."}; omit or {"type": "none"} for none.
+    auth: dict | None = None
+
+
+# ─── Secret redaction ─────────────────────────────────────────────────────────
+
+REDACTED_SECRET = "********"
+
+# Secret field(s) per auth type; anything else in the block is not secret.
+_SECRET_FIELDS: dict[str, tuple[str, ...]] = {
+    "bearer": ("token",),
+    "basic": ("password",),
+    "header": ("value",),
+}
+
+_AUTH_ADAPTER: TypeAdapter = TypeAdapter(AnyDataSourceAuth)
+
+
+def _redact_secrets(payload: dict[str, Any]) -> dict[str, Any]:
+    """Replace secret auth values in a dumped definition with the placeholder."""
+    auth = payload.get("auth")
+    if isinstance(auth, dict):
+        for field in _SECRET_FIELDS.get(auth.get("type", ""), ()):
+            if field in auth:
+                auth[field] = REDACTED_SECRET
+    return payload
+
+
+def _merge_auth_secrets(incoming: dict[str, Any], existing: dict[str, Any]) -> dict[str, Any]:
+    """Fill redacted placeholders in an incoming auth block from the stored one.
+
+    Only applies when the auth type is unchanged — switching types requires
+    real secret values.
+    """
+    existing_auth = existing.get("auth")
+    if not isinstance(existing_auth, dict) or incoming.get("type") != existing_auth.get("type"):
+        return incoming
+    for field in _SECRET_FIELDS.get(incoming.get("type", ""), ()):
+        if incoming.get(field) == REDACTED_SECRET and field in existing_auth:
+            incoming[field] = existing_auth[field]
+    return incoming
+
+
+def _reject_placeholder_secrets(auth: Any) -> None:
+    """422 when a secret field carries the redaction placeholder (create/type switch)."""
+    if not isinstance(auth, dict):
+        return
+    for field in _SECRET_FIELDS.get(auth.get("type", ""), ()):
+        if auth.get(field) == REDACTED_SECRET:
+            raise HTTPException(
+                status_code=422,
+                detail=f"auth.{field} must be a real secret value, not '{REDACTED_SECRET}'",
+            )
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -106,11 +174,11 @@ async def _refresh_datasource_tools(container: ApplicationContainer) -> None:
 async def list_datasources(
     container: ApplicationContainer = Depends(get_container),
 ):
-    """List all registered data source definitions."""
+    """List all registered data source definitions (auth secrets redacted)."""
     _require_backend(container)
     assert container.data_source_backend is not None
     sources = await container.data_source_backend.list()
-    return [s.model_dump(mode="json") for s in sources]
+    return [_redact_secrets(s.model_dump(mode="json")) for s in sources]
 
 
 @router.post("", status_code=201)
@@ -118,7 +186,11 @@ async def create_datasource(
     body: CreateDataSourceRequest,
     container: ApplicationContainer = Depends(get_container),
 ):
-    """Register a new data source definition."""
+    """Register a new data source definition.
+
+    Auth secrets must be real values (the redaction placeholder is rejected);
+    the response echoes the definition with secrets redacted.
+    """
     _require_backend(container)
     assert container.data_source_backend is not None
 
@@ -127,10 +199,30 @@ async def create_datasource(
         raise HTTPException(status_code=409, detail=f"Data source '{body.id}' already exists")
 
     payload = body.model_dump(exclude_none=True)
+    _reject_placeholder_secrets(payload.get("auth"))
     defn = _build_definition(payload)
     saved = await container.data_source_backend.create(defn)
     await _refresh_datasource_tools(container)
-    return saved.model_dump(mode="json")
+    return _redact_secrets(saved.model_dump(mode="json"))
+
+
+@router.post("/probe")
+async def probe_datasource(body: ProbeDataSourceRequest):
+    """Probe a base URL and attempt schema discovery (OpenAPI / GraphQL).
+
+    The auth block uses the stored shape (secret values inline).  Target-server
+    failures never surface as a 5xx here — they are encoded in the response:
+    ``url_status`` ok|unauthorized|unreachable, ``auth_status`` ok|failed|skipped,
+    ``error`` human-readable detail or null, ``discovered`` schema or null.
+    """
+    auth_model = None
+    if body.auth is not None:
+        try:
+            auth_model = _AUTH_ADAPTER.validate_python(body.auth)
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=exc.errors(include_url=False)) from exc
+    kind = "graphql" if body.kind == "graphql" else "http"
+    return await probe_and_discover(body.base_url, kind=kind, auth=auth_model)
 
 
 # ─── Item routes (parameterised — must come AFTER literal-segment routes) ─────
@@ -147,7 +239,7 @@ async def get_datasource(
     defn = await container.data_source_backend.get(source_id)
     if defn is None:
         raise HTTPException(status_code=404, detail=f"Data source '{source_id}' not found")
-    return defn.model_dump(mode="json")
+    return _redact_secrets(defn.model_dump(mode="json"))
 
 
 @router.put("/{source_id}")
@@ -156,7 +248,12 @@ async def update_datasource(
     body: UpdateDataSourceRequest,
     container: ApplicationContainer = Depends(get_container),
 ):
-    """Update an existing data source definition (omitted fields are preserved)."""
+    """Update an existing data source definition (omitted fields are preserved).
+
+    Auth secret fields equal to the redaction placeholder keep the stored
+    value (same auth type only); an omitted auth block keeps the stored auth
+    entirely.  The response redacts secrets.
+    """
     _require_backend(container)
     assert container.data_source_backend is not None
 
@@ -164,14 +261,19 @@ async def update_datasource(
     if existing is None:
         raise HTTPException(status_code=404, detail=f"Data source '{source_id}' not found")
 
-    payload = existing.model_dump(mode="json")
-    payload.update(body.model_dump(exclude_none=True))
+    existing_payload = existing.model_dump(mode="json")
+    incoming = body.model_dump(exclude_none=True)
+    if isinstance(incoming.get("auth"), dict):
+        incoming["auth"] = _merge_auth_secrets(incoming["auth"], existing_payload)
+        _reject_placeholder_secrets(incoming["auth"])
+    payload = existing_payload
+    payload.update(incoming)
     payload["id"] = source_id
     payload["created_at"] = existing.created_at
     defn = _build_definition(payload)
     saved = await container.data_source_backend.update(source_id, defn)
     await _refresh_datasource_tools(container)
-    return saved.model_dump(mode="json")
+    return _redact_secrets(saved.model_dump(mode="json"))
 
 
 @router.delete("/{source_id}", status_code=204)

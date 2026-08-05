@@ -68,7 +68,7 @@ def _payload(**overrides) -> dict:
         "id": "github",
         "name": "GitHub",
         "base_url": "https://api.github.com",
-        "auth": {"type": "bearer", "token_env": "GITHUB_TOKEN"},
+        "auth": {"type": "bearer", "token": "gh-secret-token"},
         "operations": [
             {
                 "name": "list_repos",
@@ -103,7 +103,9 @@ async def test_create_get_list_update_delete_roundtrip(client):
 
     resp = await c.post("/api/v1/datasources", json=_payload())
     assert resp.status_code == 201
-    assert resp.json()["auth"]["token_env"] == "GITHUB_TOKEN"
+    # Secrets are stored but never echoed back.
+    assert resp.json()["auth"]["token"] == "********"
+    assert (await backend.get("github")).auth.token == "gh-secret-token"
 
     resp = await c.get("/api/v1/datasources")
     assert resp.status_code == 200
@@ -117,13 +119,70 @@ async def test_create_get_list_update_delete_roundtrip(client):
     assert resp.status_code == 200
     data = resp.json()
     assert data["description"] == "code host"
-    # Omitted fields are preserved.
+    # Omitted fields are preserved (auth secret intact in the store, redacted here).
     assert data["operations"][0]["name"] == "list_repos"
-    assert data["auth"]["token_env"] == "GITHUB_TOKEN"
+    assert data["auth"]["token"] == "********"
+    assert (await backend.get("github")).auth.token == "gh-secret-token"
 
     resp = await c.delete("/api/v1/datasources/github")
     assert resp.status_code == 204
     assert await backend.get("github") is None
+
+
+async def test_list_and_get_redact_auth_secrets(client):
+    c, _ = client
+    await c.post("/api/v1/datasources", json=_payload())
+
+    listed = (await c.get("/api/v1/datasources")).json()
+    assert listed[0]["auth"] == {"type": "bearer", "token": "********"}
+
+    fetched = (await c.get("/api/v1/datasources/github")).json()
+    assert fetched["auth"] == {"type": "bearer", "token": "********"}
+
+
+async def test_update_with_redacted_secret_preserves_stored_value(client):
+    c, backend = client
+    await c.post("/api/v1/datasources", json=_payload())
+
+    resp = await c.put(
+        "/api/v1/datasources/github",
+        json={"auth": {"type": "bearer", "token": "********"}, "name": "GH"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["auth"]["token"] == "********"
+    assert (await backend.get("github")).auth.token == "gh-secret-token"
+
+
+async def test_update_with_real_secret_overwrites(client):
+    c, backend = client
+    await c.post("/api/v1/datasources", json=_payload())
+
+    resp = await c.put(
+        "/api/v1/datasources/github",
+        json={"auth": {"type": "bearer", "token": "new-token"}},
+    )
+    assert resp.status_code == 200
+    assert (await backend.get("github")).auth.token == "new-token"
+
+
+async def test_update_auth_type_switch_requires_real_secret(client):
+    c, _ = client
+    await c.post("/api/v1/datasources", json=_payload())
+
+    resp = await c.put(
+        "/api/v1/datasources/github",
+        json={"auth": {"type": "header", "header_name": "X-Api-Key", "value": "********"}},
+    )
+    assert resp.status_code == 422
+
+
+async def test_create_rejects_redaction_placeholder_as_secret(client):
+    c, _ = client
+    resp = await c.post(
+        "/api/v1/datasources",
+        json=_payload(auth={"type": "bearer", "token": "********"}),
+    )
+    assert resp.status_code == 422
 
 
 async def test_create_duplicate_conflicts(client):
