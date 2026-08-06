@@ -16,7 +16,6 @@ import asyncio
 import base64
 import json
 import logging
-import os
 import time
 from typing import Any
 
@@ -310,7 +309,7 @@ class DataSourceExecutor:
         bound: dict[str, Any],
         extra: dict[str, Any],
     ) -> Any:
-        headers = {**source.default_headers, **_auth_headers(source.auth)}
+        headers = {**source.default_headers, **build_auth_headers(source.auth)}
 
         if source.kind == "graphql":
             query = self._render(op.query or "", params, memo, bound)
@@ -493,19 +492,20 @@ def _combine_pages(pages: list[Any]) -> Any:
     return pages
 
 
-def _auth_headers(auth: Any) -> dict[str, str]:
-    """Resolve the auth block into request headers, reading env vars now."""
+def build_auth_headers(auth: Any) -> dict[str, str]:
+    """Resolve the auth block into request headers using the stored secrets.
+
+    Shared by the executor and the probe/discovery endpoint
+    (``app.infrastructure.datasources.discovery``).
+    """
     kind = getattr(auth, "type", "none")
     if kind == "bearer":
-        token = os.environ.get(auth.token_env, "")
-        return {"Authorization": f"Bearer {token}"}
+        return {"Authorization": f"Bearer {auth.token}"}
     if kind == "basic":
-        username = os.environ.get(auth.username_env, "")
-        password = os.environ.get(auth.password_env, "")
-        encoded = base64.b64encode(f"{username}:{password}".encode()).decode()
+        encoded = base64.b64encode(f"{auth.username}:{auth.password}".encode()).decode()
         return {"Authorization": f"Basic {encoded}"}
     if kind == "header":
-        return {auth.header_name: os.environ.get(auth.value_env, "")}
+        return {auth.header_name: auth.value}
     return {}
 
 

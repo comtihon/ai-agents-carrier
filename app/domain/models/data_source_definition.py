@@ -7,8 +7,10 @@ operation template may reference the caller-supplied inputs via
 ``{<operation>.<field.path>}``.  The executor
 (``app.infrastructure.datasources.executor``) resolves that DAG at call time.
 
-Secrets are never stored: auth blocks only carry the *names* of environment
-variables, which are read at execution time.
+Auth blocks carry the secret values themselves (token / password / header
+value) as part of the stored definition; the executor uses them directly at
+request time.  API responses redact these fields (see
+``app.api.routes.datasources``).
 """
 from __future__ import annotations
 
@@ -23,21 +25,24 @@ from pydantic import BaseModel, Field
 # Auth (discriminated union — mirrors app/domain/models/agent_addon.py)
 # ---------------------------------------------------------------------------
 
+# NOTE: secret values (token / password / value) are stored unencrypted in
+# the persistence backend (Mongo). The REST API redacts them in responses.
+
 class BearerAuth(BaseModel):
     type: Literal["bearer"] = "bearer"
-    token_env: str
+    token: str
 
 
 class BasicAuth(BaseModel):
     type: Literal["basic"] = "basic"
-    username_env: str
-    password_env: str
+    username: str
+    password: str
 
 
 class HeaderAuth(BaseModel):
     type: Literal["header"] = "header"
     header_name: str
-    value_env: str
+    value: str
 
 
 class NoAuth(BaseModel):
