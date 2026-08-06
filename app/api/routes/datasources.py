@@ -34,6 +34,7 @@ from app.domain.models.data_source_definition import (
     validate_operations,
 )
 from app.infrastructure.datasources.discovery import probe_and_discover
+from app.infrastructure.datasources.try_run import try_operation
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,22 @@ class ProbeDataSourceRequest(BaseModel):
     # Auth block in the stored (secret-bearing) shape, e.g.
     # {"type": "bearer", "token": "..."}; omit or {"type": "none"} for none.
     auth: dict | None = None
+
+
+class TryOperationRequest(BaseModel):
+    base_url: str
+    kind: str = "http"
+    # Auth in the stored shape. Secret fields may carry the redaction
+    # placeholder (or the block may be omitted) when ``source_id`` points at a
+    # stored definition — the stored secrets are used then.
+    auth: dict | None = None
+    source_id: str | None = None
+    # Every operation of the draft definition (templates may reference
+    # sibling operations), plus the name of the one to execute.
+    operations: list[dict] = Field(default_factory=list)
+    operation: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    timeout_seconds: float = 30
 
 
 # ─── Secret redaction ─────────────────────────────────────────────────────────
@@ -223,6 +240,47 @@ async def probe_datasource(body: ProbeDataSourceRequest):
             raise HTTPException(status_code=422, detail=exc.errors(include_url=False)) from exc
     kind = "graphql" if body.kind == "graphql" else "http"
     return await probe_and_discover(body.base_url, kind=kind, auth=auth_model)
+
+
+@router.post("/try-operation")
+async def try_datasource_operation(
+    body: TryOperationRequest,
+    container: ApplicationContainer = Depends(get_container),
+):
+    """Execute one operation of a draft definition and sample its output.
+
+    The target operation runs without its mapping / response_schema /
+    pagination so the raw response shape is visible; the result carries a
+    size-capped ``api_output`` sample plus a meta-LLM ``suggested_mapping``
+    (JMESPath), or ``status: error`` with detail when the call fails.
+    """
+    auth = body.auth
+    if body.source_id and container.data_source_backend is not None:
+        stored = await container.data_source_backend.get(body.source_id)
+        if stored is not None:
+            stored_payload = stored.model_dump(mode="json")
+            if auth is None:
+                auth = stored_payload.get("auth")
+            elif isinstance(auth, dict):
+                auth = _merge_auth_secrets(auth, stored_payload)
+    _reject_placeholder_secrets(auth)
+
+    payload: dict[str, Any] = {
+        "id": body.source_id or "__try__",
+        "kind": "graphql" if body.kind == "graphql" else "http",
+        "base_url": body.base_url,
+        "operations": body.operations,
+        "timeout_seconds": body.timeout_seconds,
+    }
+    if auth is not None:
+        payload["auth"] = auth
+    defn = _build_definition(payload)
+    if defn.get_operation(body.operation) is None:
+        raise HTTPException(status_code=422, detail=f"Unknown operation '{body.operation}'")
+
+    return await try_operation(
+        defn, body.operation, body.params, container.settings, container.data_source_executor
+    )
 
 
 # ─── Item routes (parameterised — must come AFTER literal-segment routes) ─────
