@@ -381,10 +381,9 @@ async def test_retry_recovers_after_transient_failure(http, monkeypatch):
 # Auth
 # ---------------------------------------------------------------------------
 
-async def test_bearer_auth_reads_env_at_call_time(http, monkeypatch):
-    monkeypatch.setenv("MY_TOKEN", "sekret")
+async def test_bearer_auth_uses_stored_token(http):
     source = _source(
-        auth={"type": "bearer", "token_env": "MY_TOKEN"},
+        auth={"type": "bearer", "token": "sekret"},
         default_headers={"Accept": "application/json"},
         operations=[{"name": "op", "path": "/x"}],
     )
@@ -396,11 +395,9 @@ async def test_bearer_auth_reads_env_at_call_time(http, monkeypatch):
     }
 
 
-async def test_basic_auth_encodes_env_credentials(http, monkeypatch):
-    monkeypatch.setenv("U", "alice")
-    monkeypatch.setenv("P", "pw")
+async def test_basic_auth_encodes_stored_credentials(http):
     source = _source(
-        auth={"type": "basic", "username_env": "U", "password_env": "P"},
+        auth={"type": "basic", "username": "alice", "password": "pw"},
         operations=[{"name": "op", "path": "/x"}],
     )
     http.handler = lambda call: {}
@@ -409,10 +406,9 @@ async def test_basic_auth_encodes_env_credentials(http, monkeypatch):
     assert http.calls[0]["headers"]["Authorization"] == f"Basic {expected}"
 
 
-async def test_header_auth_uses_configured_header(http, monkeypatch):
-    monkeypatch.setenv("API_KEY_ENV", "k123")
+async def test_header_auth_uses_configured_header(http):
     source = _source(
-        auth={"type": "header", "header_name": "X-Api-Key", "value_env": "API_KEY_ENV"},
+        auth={"type": "header", "header_name": "X-Api-Key", "value": "k123"},
         operations=[{"name": "op", "path": "/x"}],
     )
     http.handler = lambda call: {}
