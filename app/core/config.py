@@ -86,6 +86,23 @@ class Settings(BaseSettings):
     oauth_audience: str | None = Field(default=None, alias="OAUTH_AUDIENCE")
     oauth_algorithms: list[str] = Field(default=["RS256"], alias="OAUTH_ALGORITHMS")
 
+    # --- Outbound service identity (OAuth2 JWT bearer grant, RFC 7523) ---
+    # When enabled, the backend mints its own access tokens from an OAuth2
+    # authorization server using a signed client assertion, and attaches them
+    # to outbound calls that opt in (`service_identity` auth).
+    service_auth_enabled: bool = Field(default=False, alias="SERVICE_AUTH_ENABLED")
+    # OAuth2 token endpoint of the authorization server.
+    service_auth_token_url: str | None = Field(default=None, alias="SERVICE_AUTH_TOKEN_URL")
+    service_auth_client_id: str | None = Field(default=None, alias="SERVICE_AUTH_CLIENT_ID")
+    # `kid` header of the signing key, as registered with the provider.
+    service_auth_key_id: str | None = Field(default=None, alias="SERVICE_AUTH_KEY_ID")
+    # PEM-encoded RSA private key; literal "\n" escapes are normalized.
+    service_auth_private_key: str | None = Field(default=None, alias="SERVICE_AUTH_PRIVATE_KEY")
+    # `aud` of the client assertion — usually the authorization server issuer.
+    service_auth_audience: str | None = Field(default=None, alias="SERVICE_AUTH_AUDIENCE")
+    # Space-separated scope string, forwarded verbatim (opaque to this code).
+    service_auth_scopes: str = Field(default="openid", alias="SERVICE_AUTH_SCOPES")
+
     # --- LLM ---
     # Name of the integration to use when a step has no explicit `llm_provider`.
     # Must match one of the entries in `LLM_INTEGRATIONS`.
@@ -227,6 +244,16 @@ class Settings(BaseSettings):
             return self.mcp_datasources_url
         port = os.environ.get("PORT", "8000")
         return f"http://127.0.0.1:{port}/mcp/datasources"
+
+    def resolved_service_auth_private_key(self) -> str | None:
+        """Private key with literal ``\\n`` escapes turned into real newlines.
+
+        Secret managers and env-var injection frequently deliver PEM blocks as
+        a single line with escaped newlines, which no PEM parser accepts.
+        """
+        if not self.service_auth_private_key:
+            return None
+        return self.service_auth_private_key.replace("\\n", "\n")
 
     def get_llm_integrations(self) -> list[LLMIntegrationConfig]:
         """Parse the LLM_INTEGRATIONS JSON env var into a typed list."""
