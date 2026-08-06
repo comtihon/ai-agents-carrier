@@ -49,8 +49,11 @@ class DataSourceExecutor:
     # accesses to any single (source, op, inputs) key.
     _CACHE_SWEEP_THRESHOLD = 500
 
-    def __init__(self, *, fanout_concurrency: int = 5) -> None:
+    def __init__(self, *, fanout_concurrency: int = 5, token_provider: Any = None) -> None:
         self._fanout_concurrency = fanout_concurrency
+        # Provides bearer tokens for `service_identity` auth; when None the
+        # process-wide provider is resolved lazily in build_auth_headers.
+        self._token_provider = token_provider
         # cache key → (expiry monotonic timestamp, value)
         self._cache: dict[str, tuple[float, Any]] = {}
 
@@ -309,7 +312,8 @@ class DataSourceExecutor:
         bound: dict[str, Any],
         extra: dict[str, Any],
     ) -> Any:
-        headers = {**source.default_headers, **build_auth_headers(source.auth)}
+        auth_headers = await build_auth_headers(source.auth, self._token_provider)
+        headers = {**source.default_headers, **auth_headers}
 
         if source.kind == "graphql":
             query = self._render(op.query or "", params, memo, bound)
@@ -492,13 +496,25 @@ def _combine_pages(pages: list[Any]) -> Any:
     return pages
 
 
-def build_auth_headers(auth: Any) -> dict[str, str]:
+async def build_auth_headers(auth: Any, token_provider: Any = None) -> dict[str, str]:
     """Resolve the auth block into request headers using the stored secrets.
 
     Shared by the executor and the probe/discovery endpoint
     (``app.infrastructure.datasources.discovery``).
+
+    ``service_identity`` carries no stored secret: the bearer token is minted
+    at request time by *token_provider* (the process-wide provider is used when
+    none is injected).
     """
     kind = getattr(auth, "type", "none")
+    if kind == "service_identity":
+        provider = token_provider
+        if provider is None:
+            from app.infrastructure.auth.service_token_provider import (
+                get_service_token_provider,
+            )
+            provider = get_service_token_provider()
+        return await provider.get_auth_header()
     if kind == "bearer":
         return {"Authorization": f"Bearer {auth.token}"}
     if kind == "basic":
