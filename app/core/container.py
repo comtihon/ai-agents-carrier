@@ -35,6 +35,7 @@ from app.infrastructure.persistence.workflow_backend import (
     MongoWorkflowBackend,
     WorkflowDefinitionBackend,
 )
+from app.infrastructure.auth.service_token_provider import ServiceTokenProvider
 from app.infrastructure.datasources.executor import DataSourceExecutor
 from app.infrastructure.tools.mcp_client import McpToolsProvider
 from app.infrastructure.triggers.cron_scheduler import CronScheduler
@@ -63,6 +64,9 @@ class ApplicationContainer:
     # steps and for the /mcp/datasources tools.
     data_source_backend: DataSourceDefinitionBackend | None = None
     data_source_executor: DataSourceExecutor | None = None
+    # Mints the service's own OAuth2 access token for outbound calls that use
+    # `service_identity` auth — None in legacy test setups.
+    service_token_provider: ServiceTokenProvider | None = None
     # Factory for per-step LLM overrides; None in legacy test setups.
     llm_factory: Callable[[str | None, str | None], BaseChatModel] | None = None
     # Runners keyed by run_id — alive for the duration of the run so that
@@ -78,6 +82,9 @@ class ApplicationContainer:
     _datasources_mcp_task: asyncio.Task | None = field(default=None, init=False, repr=False, compare=False)
 
     async def startup(self) -> None:
+        # Fail fast on an enabled-but-incomplete outbound auth configuration.
+        if self.service_token_provider is not None:
+            self.service_token_provider.validate_configuration()
         await self.mcp_tools_provider.start()
         self.cron_scheduler.start()
         if self.workflow_backend is not None:
@@ -140,6 +147,8 @@ class ApplicationContainer:
             runner._data_source_backend = self.data_source_backend
         if self.data_source_executor is not None:
             runner._data_source_executor = self.data_source_executor
+        if self.service_token_provider is not None:
+            runner._service_token_provider = self.service_token_provider
 
     async def _load_datasources_mcp(self) -> None:
         """Publish data source MCP tools, then connect the local MCP server.
@@ -707,7 +716,8 @@ def build_container(settings: Settings) -> ApplicationContainer:
     agent_backend = MongoAgentBackend(settings.mongodb_uri, settings.mongodb_database)
     # Data source definitions are likewise MongoDB-only.
     data_source_backend = MongoDataSourceBackend(settings.mongodb_uri, settings.mongodb_database)
-    data_source_executor = DataSourceExecutor()
+    service_token_provider = ServiceTokenProvider(settings)
+    data_source_executor = DataSourceExecutor(token_provider=service_token_provider)
     checkpointer = MongoDBCheckpointSaver(
         MongoClient(settings.mongodb_uri),
         db_name=settings.mongodb_database,
@@ -726,6 +736,7 @@ def build_container(settings: Settings) -> ApplicationContainer:
         agent_backend=agent_backend,
         data_source_backend=data_source_backend,
         data_source_executor=data_source_executor,
+        service_token_provider=service_token_provider,
         checkpointer=checkpointer,
         pvc_lease_repository=pvc_lease_repository,
         agent_task_repository=agent_task_repository,
