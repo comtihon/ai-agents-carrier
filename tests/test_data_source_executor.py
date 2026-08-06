@@ -416,6 +416,44 @@ async def test_header_auth_uses_configured_header(http):
     assert http.calls[0]["headers"]["X-Api-Key"] == "k123"
 
 
+class _FakeTokenProvider:
+    """Stand-in for the OAuth2 service token provider."""
+
+    def __init__(self, token: str = "svc-token") -> None:
+        self.token = token
+        self.calls = 0
+
+    async def get_auth_header(self) -> dict[str, str]:
+        self.calls += 1
+        return {"Authorization": f"Bearer {self.token}"}
+
+
+async def test_service_identity_auth_injects_provider_token(http):
+    provider = _FakeTokenProvider()
+    source = _source(
+        auth={"type": "service_identity"},
+        operations=[{"name": "op", "path": "/x"}],
+    )
+    http.handler = lambda call: {}
+    await DataSourceExecutor(token_provider=provider).execute(source, "op", {})
+    assert http.calls[0]["headers"]["Authorization"] == "Bearer svc-token"
+    assert provider.calls == 1
+
+
+async def test_service_identity_auth_error_propagates(http):
+    class FailingProvider:
+        async def get_auth_header(self):
+            raise RuntimeError("service auth not configured")
+
+    source = _source(
+        auth={"type": "service_identity"},
+        operations=[{"name": "op", "path": "/x"}],
+    )
+    http.handler = lambda call: {}
+    with pytest.raises(RuntimeError, match="service auth not configured"):
+        await DataSourceExecutor(token_provider=FailingProvider()).execute(source, "op", {})
+
+
 # ---------------------------------------------------------------------------
 # GraphQL / mapping / schema
 # ---------------------------------------------------------------------------

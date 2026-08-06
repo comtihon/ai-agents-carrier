@@ -49,8 +49,19 @@ class NoAuth(BaseModel):
     type: Literal["none"] = "none"
 
 
+class ServiceIdentityAuth(BaseModel):
+    """Bearer token minted by the service's own OAuth2 identity.
+
+    Carries no secret: the token is obtained at request time from the
+    configured OAuth2 authorization server (see ``SERVICE_AUTH_*`` settings).
+    """
+
+    type: Literal["service_identity"] = "service_identity"
+
+
 AnyDataSourceAuth = Annotated[
-    Union[BearerAuth, BasicAuth, HeaderAuth, NoAuth], Field(discriminator="type")
+    Union[BearerAuth, BasicAuth, HeaderAuth, NoAuth, ServiceIdentityAuth],
+    Field(discriminator="type"),
 ]
 
 

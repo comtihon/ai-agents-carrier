@@ -359,7 +359,7 @@ async def probe_and_discover(
         "discovered": None,
     }
     try:
-        headers = build_auth_headers(auth) if auth is not None else {}
+        headers = await build_auth_headers(auth) if auth is not None else {}
         async with httpx.AsyncClient(
             timeout=PROBE_TIMEOUT_SECONDS, follow_redirects=True
         ) as client:

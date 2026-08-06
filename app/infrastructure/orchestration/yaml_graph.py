@@ -658,6 +658,8 @@ class YamlGraphRunner:
             method: POST               # http_call only — GET | POST | PUT | PATCH | DELETE
             headers:                   # http_call only — request headers; values support {key}
               Authorization: "Bearer {token}"
+            auth: service_identity     # http_call only — attach the service's own
+                                       #   OAuth2 access token as a bearer header
             body:                      # http_call only — JSON body; values support {key}
               issue_key: "{ticket_id}"
             code: |                    # python only — executed with ``state`` dict in scope;
@@ -775,6 +777,10 @@ class YamlGraphRunner:
         # Injected post-construction for `data_source` steps (optional)
         self._data_source_backend: Any = None
         self._data_source_executor: Any = None
+        # Injected post-construction for `http_call` steps that use
+        # `auth: service_identity` (optional — falls back to the process-wide
+        # provider built from settings).
+        self._service_token_provider: Any = None
         # Set by stream_graph_to_pause to enable mid-run persistence from nodes
         self._current_run: Any = None
         self._current_run_repository: Any = None
@@ -1730,6 +1736,28 @@ class YamlGraphRunner:
 
         return node
 
+    async def _auth_headers(self, step: dict[str, Any]) -> dict[str, str]:
+        """Resolve a step's ``auth`` mode into outbound request headers.
+
+        Currently only ``service_identity`` is supported; any other value is
+        rejected rather than silently ignored so a typo can never downgrade a
+        step to an unauthenticated call.
+        """
+        mode = step.get("auth")
+        if not mode:
+            return {}
+        if isinstance(mode, str) and mode.strip().lower() == "service_identity":
+            provider = self._service_token_provider
+            if provider is None:
+                from app.infrastructure.auth.service_token_provider import (
+                    get_service_token_provider,
+                )
+                provider = get_service_token_provider()
+            return await provider.get_auth_header()
+        raise ValueError(
+            f"Unsupported auth mode '{mode}' — supported: 'service_identity'"
+        )
+
     def _http_call_node(self, step: dict[str, Any]):
         """Make an outbound HTTP request.
 
@@ -1737,6 +1765,11 @@ class YamlGraphRunner:
         ``output_key`` (defaults to the step id).  All string fields in
         ``url``, ``headers`` values, and ``body`` values are rendered with
         ``{key}`` placeholders resolved from state before the request is sent.
+
+        ``auth: service_identity`` adds an ``Authorization: Bearer <token>``
+        header carrying the service's own OAuth2 access token, so a step can
+        call another service protected by the same authorization server.
+        Explicit ``headers`` win over the injected one.
         """
         graph_id = self.id
 
@@ -1750,6 +1783,7 @@ class YamlGraphRunner:
                 url = self._render(step.get("url", ""), state)
                 raw_headers = step.get("headers", {})
                 headers = {k: self._render(str(v), state) for k, v in raw_headers.items()}
+                headers = {**await self._auth_headers(step), **headers}
                 raw_body = step.get("body")
                 body = self._render_deep(raw_body, state) if raw_body else None
                 logger.info("[%s] step '%s' url=%s", graph_id, step_id, url)
