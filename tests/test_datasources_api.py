@@ -229,3 +229,115 @@ async def test_routes_return_501_without_backend(client_without_backend):
     assert (await c.get("/api/v1/datasources")).status_code == 501
     assert (await c.post("/api/v1/datasources", json=_payload())).status_code == 501
     assert (await c.get("/api/v1/datasources/github")).status_code == 501
+
+
+# ─── /datasources/try-operation ───────────────────────────────────────────────
+
+def _try_payload(**overrides) -> dict:
+    body = {
+        "base_url": "https://api.example.com",
+        "auth": {"type": "bearer", "token": "real-token"},
+        "operations": [{"name": "list_items", "path": "/items"}],
+        "operation": "list_items",
+    }
+    body.update(overrides)
+    return body
+
+
+async def test_try_operation_returns_sample_and_mapping(client, monkeypatch):
+    c, _ = client
+
+    async def fake_execute(self, source, operation, params):
+        assert operation == "list_items"
+        # mapping/schema/pagination must be stripped from the target op
+        op = source.get_operation(operation)
+        assert op.mapping is None and op.response_schema is None and op.paginate is None
+        return {"content": [{"id": 1}, {"id": 2}]}
+
+    async def fake_suggest(sample, settings):
+        return "content[].{id: id}"
+
+    monkeypatch.setattr(DataSourceExecutor, "execute", fake_execute)
+    monkeypatch.setattr("app.infrastructure.datasources.try_run.suggest_mapping", fake_suggest)
+
+    resp = await c.post(
+        "/api/v1/datasources/try-operation",
+        json=_try_payload(operations=[{"name": "list_items", "path": "/items", "mapping": "content", "paginate": {"param": "page"}}]),
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["api_output"] == {"content": [{"id": 1}, {"id": 2}]}
+    assert data["suggested_mapping"] == "content[].{id: id}"
+
+
+async def test_try_operation_encodes_target_failure(client, monkeypatch):
+    c, _ = client
+
+    async def fake_execute(self, source, operation, params):
+        raise ValueError("boom")
+
+    monkeypatch.setattr(DataSourceExecutor, "execute", fake_execute)
+
+    resp = await c.post("/api/v1/datasources/try-operation", json=_try_payload())
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "error"
+    assert "boom" in data["error"]
+    assert data["api_output"] is None
+
+
+async def test_try_operation_unknown_operation_returns_422(client):
+    c, _ = client
+    resp = await c.post("/api/v1/datasources/try-operation", json=_try_payload(operation="ghost"))
+    assert resp.status_code == 422
+
+
+async def test_try_operation_merges_stored_secret_for_redacted_auth(client, monkeypatch):
+    c, backend = client
+    await c.post("/api/v1/datasources", json=_payload())  # stores github with real token
+
+    seen: dict = {}
+
+    async def fake_execute(self, source, operation, params):
+        seen["auth"] = source.auth
+        return {"ok": True}
+
+    async def fake_suggest(sample, settings):
+        return None
+
+    monkeypatch.setattr(DataSourceExecutor, "execute", fake_execute)
+    monkeypatch.setattr("app.infrastructure.datasources.try_run.suggest_mapping", fake_suggest)
+
+    resp = await c.post(
+        "/api/v1/datasources/try-operation",
+        json=_try_payload(
+            source_id="github",
+            auth={"type": "bearer", "token": "********"},
+            operations=[{"name": "list_repos", "path": "/repos"}],
+            operation="list_repos",
+        ),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+    assert seen["auth"].token == "gh-secret-token"
+
+
+async def test_try_operation_rejects_placeholder_without_source(client):
+    c, _ = client
+    resp = await c.post(
+        "/api/v1/datasources/try-operation",
+        json=_try_payload(auth={"type": "bearer", "token": "********"}),
+    )
+    assert resp.status_code == 422
+
+
+def test_shrink_sample_caps_lists_and_strings():
+    from app.infrastructure.datasources.try_run import shrink_sample
+
+    value = {"items": list(range(10)), "text": "x" * 1000, "nested": [{"a": list(range(5))}] * 4}
+    out = shrink_sample(value)
+    assert out["items"] == [0, 1, 2]
+    assert len(out["text"]) == 501
+    assert len(out["nested"]) == 3
+    assert out["nested"][0]["a"] == [0, 1, 2]
