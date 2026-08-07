@@ -17,6 +17,10 @@ Auth blocks store secret values (token / password / header value) in the
 definition itself.  Responses never echo them back: every secret field is
 replaced with ``REDACTED_SECRET``.  On update, an incoming secret equal to
 that placeholder (or an omitted auth block) preserves the stored value.
+
+Instead of the secret itself, an auth block may carry ``from_config`` naming a
+key of the backend's forwardable config; the value is resolved here at write
+time and stored like any other secret, so the caller never handles it.
 """
 from __future__ import annotations
 
@@ -27,6 +31,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from app.api.dependencies import get_container
+from app.core.config import Settings, get_settings
 from app.core.container import ApplicationContainer
 from app.domain.models.data_source_definition import (
     AnyDataSourceAuth,
@@ -75,16 +80,19 @@ class ProbeDataSourceRequest(BaseModel):
     base_url: str
     kind: str = "http"
     # Auth block in the stored (secret-bearing) shape, e.g.
-    # {"type": "bearer", "token": "..."}; omit or {"type": "none"} for none.
+    # {"type": "bearer", "token": "..."}, or with the secret named as
+    # {"type": "bearer", "from_config": "AFP_SERVICE_TOKEN"}; omit or
+    # {"type": "none"} for none.
     auth: dict | None = None
 
 
 class TryOperationRequest(BaseModel):
     base_url: str
     kind: str = "http"
-    # Auth in the stored shape. Secret fields may carry the redaction
-    # placeholder (or the block may be omitted) when ``source_id`` points at a
-    # stored definition — the stored secrets are used then.
+    # Auth in the stored shape, or with the secret named via ``from_config``.
+    # Secret fields may carry the redaction placeholder (or the block may be
+    # omitted) when ``source_id`` points at a stored definition — the stored
+    # secrets are used then.
     auth: dict | None = None
     source_id: str | None = None
     # Every operation of the draft definition (templates may reference
@@ -132,6 +140,41 @@ def _merge_auth_secrets(incoming: dict[str, Any], existing: dict[str, Any]) -> d
         if incoming.get(field) == REDACTED_SECRET and field in existing_auth:
             incoming[field] = existing_auth[field]
     return incoming
+
+
+FROM_CONFIG_FIELD = "from_config"
+
+
+def _resolve_auth_from_config(auth: Any, settings: Settings) -> Any:
+    """Turn a ``from_config`` reference into the named backend config value.
+
+    Callers that must not handle a secret themselves may send, in place of the
+    secret field, ``{"type": "bearer", "from_config": "AFP_SERVICE_TOKEN"}``.
+    The key names an entry of the backend's forwardable config (the same set
+    ``GET /llm/config/keys`` exposes by name); its value replaces the auth
+    type's single secret field and is stored like any pasted secret.
+
+    An unknown or blank key is a 422: storing an empty secret instead would
+    resurface later as an opaque 401 from the target API.
+    """
+    if not isinstance(auth, dict) or FROM_CONFIG_FIELD not in auth:
+        return auth
+    resolved = dict(auth)
+    key = (resolved.pop(FROM_CONFIG_FIELD) or "").strip()
+    auth_type = resolved.get("type", "")
+    fields = _SECRET_FIELDS.get(auth_type, ())
+    if not fields:
+        raise HTTPException(
+            status_code=422,
+            detail=f"auth type '{auth_type}' has no secret that can come from config",
+        )
+    if not key:
+        raise HTTPException(status_code=422, detail="auth.from_config must name a config key")
+    available = settings.get_forwardable_config()
+    if key not in available:
+        raise HTTPException(status_code=422, detail=f"config key '{key}' is not set on this backend")
+    resolved[fields[0]] = available[key]
+    return resolved
 
 
 def _reject_placeholder_secrets(auth: Any) -> None:
@@ -216,6 +259,8 @@ async def create_datasource(
         raise HTTPException(status_code=409, detail=f"Data source '{body.id}' already exists")
 
     payload = body.model_dump(exclude_none=True)
+    if payload.get("auth") is not None:
+        payload["auth"] = _resolve_auth_from_config(payload["auth"], container.settings)
     _reject_placeholder_secrets(payload.get("auth"))
     defn = _build_definition(payload)
     saved = await container.data_source_backend.create(defn)
@@ -224,18 +269,23 @@ async def create_datasource(
 
 
 @router.post("/probe")
-async def probe_datasource(body: ProbeDataSourceRequest):
+async def probe_datasource(
+    body: ProbeDataSourceRequest,
+    settings: Settings = Depends(get_settings),
+):
     """Probe a base URL and attempt schema discovery (OpenAPI / GraphQL).
 
-    The auth block uses the stored shape (secret values inline).  Target-server
-    failures never surface as a 5xx here — they are encoded in the response:
-    ``url_status`` ok|unauthorized|unreachable, ``auth_status`` ok|failed|skipped,
-    ``error`` human-readable detail or null, ``discovered`` schema or null.
+    The auth block uses the stored shape (secret values inline) or names a
+    config key via ``from_config``.  Target-server failures never surface as a
+    5xx here — they are encoded in the response: ``url_status``
+    ok|unauthorized|unreachable, ``auth_status`` ok|failed|skipped, ``error``
+    human-readable detail or null, ``discovered`` schema or null.
     """
     auth_model = None
     if body.auth is not None:
+        auth = _resolve_auth_from_config(body.auth, settings)
         try:
-            auth_model = _AUTH_ADAPTER.validate_python(body.auth)
+            auth_model = _AUTH_ADAPTER.validate_python(auth)
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=exc.errors(include_url=False)) from exc
     kind = "graphql" if body.kind == "graphql" else "http"
@@ -254,7 +304,7 @@ async def try_datasource_operation(
     size-capped ``api_output`` sample plus a meta-LLM ``suggested_mapping``
     (JMESPath), or ``status: error`` with detail when the call fails.
     """
-    auth = body.auth
+    auth = _resolve_auth_from_config(body.auth, container.settings)
     if body.source_id and container.data_source_backend is not None:
         stored = await container.data_source_backend.get(body.source_id)
         if stored is not None:
@@ -322,6 +372,7 @@ async def update_datasource(
     existing_payload = existing.model_dump(mode="json")
     incoming = body.model_dump(exclude_none=True)
     if isinstance(incoming.get("auth"), dict):
+        incoming["auth"] = _resolve_auth_from_config(incoming["auth"], container.settings)
         incoming["auth"] = _merge_auth_secrets(incoming["auth"], existing_payload)
         _reject_placeholder_secrets(incoming["auth"])
     payload = existing_payload

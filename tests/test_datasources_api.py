@@ -185,6 +185,80 @@ async def test_create_rejects_redaction_placeholder_as_secret(client):
     assert resp.status_code == 422
 
 
+async def test_create_resolves_bearer_token_from_config(client, monkeypatch):
+    c, backend = client
+    monkeypatch.setenv("AFP_SERVICE_TOKEN", "resolved-service-token")
+
+    resp = await c.post(
+        "/api/v1/datasources",
+        json=_payload(auth={"type": "bearer", "from_config": "AFP_SERVICE_TOKEN"}),
+    )
+    assert resp.status_code == 201
+    # The reference never reaches the stored definition, and the resolved value
+    # is redacted in the response like any other secret.
+    assert resp.json()["auth"] == {"type": "bearer", "token": "********"}
+    assert (await backend.get("github")).auth.token == "resolved-service-token"
+
+
+async def test_create_resolves_header_value_from_config(client, monkeypatch):
+    c, backend = client
+    monkeypatch.setenv("AFP_SERVICE_TOKEN", "resolved-service-token")
+
+    resp = await c.post(
+        "/api/v1/datasources",
+        json=_payload(auth={"type": "header", "header_name": "X-Api-Key", "from_config": "AFP_SERVICE_TOKEN"}),
+    )
+    assert resp.status_code == 201
+    stored = (await backend.get("github")).auth
+    assert stored.header_name == "X-Api-Key"
+    assert stored.value == "resolved-service-token"
+
+
+async def test_update_resolves_token_from_config(client, monkeypatch):
+    c, backend = client
+    await c.post("/api/v1/datasources", json=_payload())
+    monkeypatch.setenv("AFP_SERVICE_TOKEN", "rotated-service-token")
+
+    resp = await c.put(
+        "/api/v1/datasources/github",
+        json={"auth": {"type": "bearer", "from_config": "AFP_SERVICE_TOKEN"}},
+    )
+    assert resp.status_code == 200
+    assert (await backend.get("github")).auth.token == "rotated-service-token"
+
+
+async def test_create_with_unset_config_key_returns_422(client, monkeypatch):
+    c, _ = client
+    monkeypatch.delenv("AFP_SERVICE_TOKEN", raising=False)
+
+    resp = await c.post(
+        "/api/v1/datasources",
+        json=_payload(auth={"type": "bearer", "from_config": "AFP_SERVICE_TOKEN"}),
+    )
+    assert resp.status_code == 422
+    assert "AFP_SERVICE_TOKEN" in resp.text
+
+
+async def test_create_with_blank_config_key_returns_422(client):
+    c, _ = client
+    resp = await c.post(
+        "/api/v1/datasources",
+        json=_payload(auth={"type": "bearer", "from_config": "  "}),
+    )
+    assert resp.status_code == 422
+
+
+async def test_from_config_on_secretless_auth_type_returns_422(client, monkeypatch):
+    c, _ = client
+    monkeypatch.setenv("AFP_SERVICE_TOKEN", "resolved-service-token")
+
+    resp = await c.post(
+        "/api/v1/datasources",
+        json=_payload(auth={"type": "none", "from_config": "AFP_SERVICE_TOKEN"}),
+    )
+    assert resp.status_code == 422
+
+
 async def test_create_duplicate_conflicts(client):
     c, _ = client
     assert (await c.post("/api/v1/datasources", json=_payload())).status_code == 201

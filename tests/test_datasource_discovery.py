@@ -1,7 +1,10 @@
 """Unit tests for the pure conversion helpers of datasource schema discovery."""
 from __future__ import annotations
 
+from app.domain.models.data_source_definition import ServiceIdentityAuth
+from app.infrastructure.datasources import discovery as discovery_mod
 from app.infrastructure.datasources.discovery import (
+    probe_and_discover,
     MAX_DISCOVERED_OPERATIONS,
     gql_param_type,
     graphql_to_operations,
@@ -270,3 +273,91 @@ def test_graphql_operation_count_is_capped():
         for i in range(MAX_DISCOVERED_OPERATIONS + 5)
     ]
     assert len(graphql_to_operations(fields, [])) == MAX_DISCOVERED_OPERATIONS
+
+
+# ---------------------------------------------------------------------------
+# probe_and_discover — credential resolution vs target reachability
+# ---------------------------------------------------------------------------
+
+class _FakeResponse:
+    def __init__(self, status_code: int = 200) -> None:
+        self.status_code = status_code
+
+
+class _FakeClient:
+    """Minimal stand-in for httpx.AsyncClient recording the headers it saw."""
+
+    def __init__(self, response: _FakeResponse) -> None:
+        self._response = response
+        self.seen_headers: dict | None = None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, url, headers=None):
+        self.seen_headers = headers
+        return self._response
+
+
+def _patch_probe_http(monkeypatch, status_code: int = 200) -> _FakeClient:
+    client = _FakeClient(_FakeResponse(status_code))
+    monkeypatch.setattr(discovery_mod.httpx, "AsyncClient", lambda **kwargs: client)
+
+    async def _no_schema(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(discovery_mod, "_discover_schema", _no_schema)
+    return client
+
+
+def _patch_auth_headers(monkeypatch, *, raises: Exception | None = None, headers: dict | None = None):
+    async def _build(auth, token_provider=None):
+        if raises is not None:
+            raise raises
+        return headers or {}
+
+    monkeypatch.setattr(discovery_mod, "build_auth_headers", _build)
+
+
+async def test_probe_reports_unresolvable_credentials_separately_from_reachability(monkeypatch):
+    """A service identity that cannot mint a token is not an unreachable server."""
+    client = _patch_probe_http(monkeypatch, status_code=200)
+    _patch_auth_headers(
+        monkeypatch,
+        raises=RuntimeError("Service authentication is enabled but incomplete"),
+    )
+
+    result = await probe_and_discover("https://afp.test", auth=ServiceIdentityAuth())
+
+    assert result["url_status"] == "ok"
+    assert result["auth_status"] == "failed"
+    assert "Could not resolve credentials" in result["error"]
+    assert "incomplete" in result["error"]
+    # The probe went on unauthenticated rather than aborting.
+    assert client.seen_headers == {}
+
+
+async def test_probe_401_with_unresolvable_credentials_reports_the_real_cause(monkeypatch):
+    _patch_probe_http(monkeypatch, status_code=401)
+    _patch_auth_headers(monkeypatch, raises=RuntimeError("no signing key"))
+
+    result = await probe_and_discover("https://afp.test", auth=ServiceIdentityAuth())
+
+    assert result["url_status"] == "unauthorized"
+    # Not "Credentials rejected (401)" — we never sent any.
+    assert "Could not resolve credentials" in result["error"]
+
+
+async def test_probe_with_working_service_identity_forwards_the_bearer(monkeypatch):
+    client = _patch_probe_http(monkeypatch, status_code=200)
+    _patch_auth_headers(monkeypatch, headers={"Authorization": "Bearer minted-token"})
+
+    result = await probe_and_discover("https://afp.test", auth=ServiceIdentityAuth())
+
+    assert result["url_status"] == "ok"
+    assert result["auth_status"] == "ok"
+    assert result["error"] is None
+    assert client.seen_headers == {"Authorization": "Bearer minted-token"}
