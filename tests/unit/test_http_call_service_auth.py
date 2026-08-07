@@ -52,9 +52,11 @@ class _FakeTokenProvider:
     def __init__(self, token: str = "svc-token") -> None:
         self.token = token
         self.calls = 0
+        self.identities: list[str | None] = []
 
-    async def get_auth_header(self) -> dict[str, str]:
+    async def get_auth_header(self, identity: str | None = None) -> dict[str, str]:
         self.calls += 1
+        self.identities.append(identity)
         return {"Authorization": f"Bearer {self.token}"}
 
 
@@ -125,7 +127,7 @@ async def test_unsupported_auth_mode_is_reported(http):
 
 async def test_token_failure_is_captured_as_step_error(http):
     class FailingProvider:
-        async def get_auth_header(self):
+        async def get_auth_header(self, identity: str | None = None):
             raise RuntimeError("service auth misconfigured")
 
     runner = _runner()
@@ -138,3 +140,35 @@ async def test_token_failure_is_captured_as_step_error(http):
 
     assert "service auth misconfigured" in result["call"]["error"]
     assert http == []
+
+
+async def test_auth_identity_selects_the_named_identity(http):
+    provider = _FakeTokenProvider()
+    runner = _runner()
+    runner._service_token_provider = provider
+    node = runner._http_call_node({
+        "id": "call",
+        "url": "https://svc.test/x",
+        "auth": "service_identity",
+        "auth_identity": "afp",
+    })
+
+    await node({})
+
+    assert provider.identities == ["afp"]
+
+
+async def test_blank_auth_identity_falls_back_to_the_default(http):
+    provider = _FakeTokenProvider()
+    runner = _runner()
+    runner._service_token_provider = provider
+    node = runner._http_call_node({
+        "id": "call",
+        "url": "https://svc.test/x",
+        "auth": "service_identity",
+        "auth_identity": "   ",
+    })
+
+    await node({})
+
+    assert provider.identities == [None]

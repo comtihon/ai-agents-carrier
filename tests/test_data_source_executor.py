@@ -422,9 +422,11 @@ class _FakeTokenProvider:
     def __init__(self, token: str = "svc-token") -> None:
         self.token = token
         self.calls = 0
+        self.identities: list[str | None] = []
 
-    async def get_auth_header(self) -> dict[str, str]:
+    async def get_auth_header(self, identity: str | None = None) -> dict[str, str]:
         self.calls += 1
+        self.identities.append(identity)
         return {"Authorization": f"Bearer {self.token}"}
 
 
@@ -442,7 +444,7 @@ async def test_service_identity_auth_injects_provider_token(http):
 
 async def test_service_identity_auth_error_propagates(http):
     class FailingProvider:
-        async def get_auth_header(self):
+        async def get_auth_header(self, identity: str | None = None):
             raise RuntimeError("service auth not configured")
 
     source = _source(
@@ -555,3 +557,26 @@ def test_validate_operations_accepts_valid_dag():
         {"name": "c", "path": "/c/{a.id}/{b.id}"},
     ])
     validate_operations(source)  # does not raise
+
+
+async def test_service_identity_auth_forwards_the_named_identity(http):
+    """A source may target a specific identity when several are configured."""
+    provider = _FakeTokenProvider()
+    source = _source(
+        auth={"type": "service_identity", "identity": "afp"},
+        operations=[{"name": "op", "path": "/x"}],
+    )
+    http.handler = lambda call: {}
+    await DataSourceExecutor(token_provider=provider).execute(source, "op", {})
+    assert provider.identities == ["afp"]
+
+
+async def test_service_identity_auth_without_identity_defers_to_the_default(http):
+    provider = _FakeTokenProvider()
+    source = _source(
+        auth={"type": "service_identity"},
+        operations=[{"name": "op", "path": "/x"}],
+    )
+    http.handler = lambda call: {}
+    await DataSourceExecutor(token_provider=provider).execute(source, "op", {})
+    assert provider.identities == [None]

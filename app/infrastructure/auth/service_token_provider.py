@@ -20,7 +20,12 @@ from functools import lru_cache
 import httpx
 import jwt
 
-from app.core.config import Settings, get_settings
+from app.core.config import (
+    DEFAULT_SERVICE_IDENTITY,
+    ServiceIdentityConfig,
+    Settings,
+    get_settings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,19 +49,22 @@ class ServiceAuthError(Exception):
 
 
 class ServiceTokenProvider:
-    """Mints and caches the service's own OAuth2 access token.
+    """Mints and caches the service's own OAuth2 access tokens.
 
-    Thread-safety: a single :class:`asyncio.Lock` guards refreshes so that
-    concurrent callers trigger at most one token request.
+    A deployment may configure several identities (see
+    :meth:`app.core.config.Settings.get_service_identities`); tokens are cached
+    and refreshed per identity, never shared between them. Each identity gets
+    its own :class:`asyncio.Lock`, so concurrent callers trigger at most one
+    token request per identity and a slow authorization server for one does not
+    block calls using another.
     """
 
     def __init__(self, settings: Settings, *, timeout_seconds: float = 30.0) -> None:
         self._settings = settings
         self._timeout_seconds = timeout_seconds
-        self._token: str | None = None
-        # Monotonic deadline after which the cached token must be refreshed.
-        self._expires_at: float = 0.0
-        self._lock = asyncio.Lock()
+        # identity name → (token, monotonic deadline after which to refresh)
+        self._tokens: dict[str, tuple[str, float]] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -70,103 +78,173 @@ class ServiceTokenProvider:
         """Raise :class:`ServiceAuthError` when enabled but misconfigured.
 
         Called at startup so a broken deployment fails fast instead of at the
-        first outbound call. A no-op while the feature is disabled.
+        first outbound call — every configured identity is checked, not just the
+        default. A no-op while the feature is disabled.
         """
         if not self.enabled:
             return
-        self._require_config()
+        try:
+            identities = self._settings.get_service_identities()
+        except ValueError as exc:
+            raise ServiceAuthError(f"SERVICE_AUTH_IDENTITIES is not valid: {exc}") from exc
+        if not identities:
+            raise ServiceAuthError(
+                "Service authentication is enabled but no identity is configured — "
+                "set SERVICE_AUTH_IDENTITIES, or the SERVICE_AUTH_TOKEN_URL / "
+                "_CLIENT_ID / _PRIVATE_KEY / _AUDIENCE set."
+            )
+        for identity in identities:
+            self._require_complete(identity)
 
-    async def get_token(self) -> str:
-        """Return a valid access token, refreshing it when near expiry."""
-        cached = self._cached_token()
+    def describe(self, name: str | None = None) -> tuple[ServiceIdentityConfig | None, str | None]:
+        """Return ``(identity, error)`` for *name* without minting a token.
+
+        ``identity`` is None when no such identity is configured. ``error``
+        explains why it is unusable, or is None when it is ready to use.
+        """
+        if not self.enabled:
+            return None, "SERVICE_AUTH_ENABLED is not set on this backend"
+        try:
+            identity = self._settings.get_service_identity(name)
+        except ValueError as exc:
+            return None, f"SERVICE_AUTH_IDENTITIES is not valid: {exc}"
+        if identity is None:
+            return None, f"No service identity named '{name}' is configured"
+        try:
+            self._require_complete(identity)
+        except ServiceAuthError as exc:
+            return identity, exc.message
+        return identity, None
+
+    async def get_token(self, identity: str | None = None) -> str:
+        """Return a valid access token for *identity*, refreshing near expiry."""
+        config = self._resolve_identity(identity)
+        cached = self._cached_token(config.name)
         if cached is not None:
             return cached
-        async with self._lock:
+        lock = self._locks.setdefault(config.name, asyncio.Lock())
+        async with lock:
             # Another caller may have refreshed while we waited for the lock.
-            cached = self._cached_token()
+            cached = self._cached_token(config.name)
             if cached is not None:
                 return cached
-            token, ttl = await self._request_token()
-            self._token = token
-            self._expires_at = time.monotonic() + ttl
-            logger.info("obtained service access token (ttl=%.0fs)", ttl)
+            token, ttl = await self._request_token(config)
+            self._tokens[config.name] = (token, time.monotonic() + ttl)
+            logger.info(
+                "obtained service access token for identity '%s' (ttl=%.0fs)",
+                config.name,
+                ttl,
+            )
             return token
 
-    async def get_auth_header(self) -> dict[str, str]:
+    async def get_auth_header(self, identity: str | None = None) -> dict[str, str]:
         """Return the ``Authorization`` header carrying the service token."""
-        return {"Authorization": f"Bearer {await self.get_token()}"}
+        return {"Authorization": f"Bearer {await self.get_token(identity)}"}
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
-    def _cached_token(self) -> str | None:
-        if self._token is None:
+    def _cached_token(self, name: str) -> str | None:
+        entry = self._tokens.get(name)
+        if entry is None:
             return None
-        if self._expires_at - _REFRESH_BUFFER_SECONDS <= time.monotonic():
+        token, expires_at = entry
+        if expires_at - _REFRESH_BUFFER_SECONDS <= time.monotonic():
             return None
-        return self._token
+        return token
 
-    def _require_config(self) -> tuple[str, str, str, str]:
-        """Return (token_url, client_id, private_key, audience) or raise."""
-        settings = self._settings
-        if not settings.service_auth_enabled:
+    def _resolve_identity(self, name: str | None) -> ServiceIdentityConfig:
+        """Return the requested identity's config, or raise with the reason."""
+        if not self._settings.service_auth_enabled:
             raise ServiceAuthError(
                 "Service authentication is disabled — set SERVICE_AUTH_ENABLED=true "
                 "to use service identity for outbound calls."
             )
+        try:
+            identity = self._settings.get_service_identity(name)
+        except ValueError as exc:
+            raise ServiceAuthError(f"SERVICE_AUTH_IDENTITIES is not valid: {exc}") from exc
+        if identity is None:
+            configured = [i.name for i in self._settings.get_service_identities()]
+            if name:
+                raise ServiceAuthError(
+                    f"No service identity named '{name}' is configured"
+                    + (f" — available: {', '.join(configured)}" if configured else "")
+                )
+            if len(configured) > 1:
+                raise ServiceAuthError(
+                    "Several service identities are configured and none is the "
+                    f"default — name one of {', '.join(configured)} on the call, or "
+                    "set SERVICE_AUTH_DEFAULT_IDENTITY."
+                )
+            raise ServiceAuthError(
+                "Service authentication is enabled but no identity is configured"
+            )
+        self._require_complete(identity)
+        return identity
+
+    def _require_complete(self, identity: ServiceIdentityConfig) -> None:
+        """Raise when *identity* is missing a field needed to mint a token."""
         missing = [
-            name
+            self._field_label(identity, name)
             for name, value in (
-                ("SERVICE_AUTH_TOKEN_URL", settings.service_auth_token_url),
-                ("SERVICE_AUTH_CLIENT_ID", settings.service_auth_client_id),
-                ("SERVICE_AUTH_PRIVATE_KEY", settings.service_auth_private_key),
-                ("SERVICE_AUTH_AUDIENCE", settings.service_auth_audience),
+                ("token_url", identity.token_url),
+                ("client_id", identity.client_id),
+                ("audience", identity.audience),
+                ("private_key", identity.resolved_private_key()),
             )
             if not value
         ]
         if missing:
             raise ServiceAuthError(
-                "Service authentication is enabled but incomplete — missing: "
+                f"Service identity '{identity.name}' is incomplete — missing: "
                 + ", ".join(missing)
             )
-        private_key = settings.resolved_service_auth_private_key()
-        assert private_key is not None  # guaranteed by the missing-check above
-        return (
-            str(settings.service_auth_token_url),
-            str(settings.service_auth_client_id),
-            private_key,
-            str(settings.service_auth_audience),
-        )
 
-    def _build_assertion(self, client_id: str, private_key: str, audience: str) -> str:
+    @staticmethod
+    def _field_label(identity: ServiceIdentityConfig, field: str) -> str:
+        """Name a field the way the operator configured it.
+
+        The default identity may come from the flat ``SERVICE_AUTH_*`` env vars,
+        where the env var name is what someone needs in order to fix it; named
+        identities come from a JSON object, where the field name is.
+        """
+        if identity.name == DEFAULT_SERVICE_IDENTITY:
+            return f"{field} (SERVICE_AUTH_{field.upper()})"
+        return field
+
+    def _build_assertion(self, identity: ServiceIdentityConfig) -> str:
         now = int(time.time())
         payload = {
-            "iss": client_id,
-            "sub": client_id,
-            "aud": audience,
+            "iss": identity.client_id,
+            "sub": identity.client_id,
+            "aud": identity.audience,
             "iat": now,
             "exp": now + _ASSERTION_TTL_SECONDS,
         }
         headers = {"alg": "RS256"}
-        if self._settings.service_auth_key_id:
-            headers["kid"] = self._settings.service_auth_key_id
+        if identity.key_id:
+            headers["kid"] = identity.key_id
+        private_key = identity.resolved_private_key()
         return jwt.encode(payload, private_key, algorithm="RS256", headers=headers)
 
-    async def _request_token(self) -> tuple[str, float]:
-        token_url, client_id, private_key, audience = self._require_config()
+    async def _request_token(self, identity: ServiceIdentityConfig) -> tuple[str, float]:
+        token_url = identity.token_url
         try:
-            assertion = self._build_assertion(client_id, private_key, audience)
+            assertion = self._build_assertion(identity)
         except Exception as exc:  # invalid / unreadable key material
             raise ServiceAuthError(
-                "Failed to sign the client assertion — check that "
-                f"SERVICE_AUTH_PRIVATE_KEY holds a valid PEM RSA private key: {exc}"
+                f"Failed to sign the client assertion for identity "
+                f"'{identity.name}' — check that "
+                f"{self._field_label(identity, 'private_key')} holds a valid PEM "
+                f"RSA private key: {exc}"
             ) from exc
 
         data = {
             "grant_type": JWT_BEARER_GRANT_TYPE,
             "assertion": assertion,
-            "scope": self._settings.service_auth_scopes,
+            "scope": identity.scopes,
         }
         try:
             async with httpx.AsyncClient(timeout=self._timeout_seconds) as client:

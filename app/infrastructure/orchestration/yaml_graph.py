@@ -660,6 +660,8 @@ class YamlGraphRunner:
               Authorization: "Bearer {token}"
             auth: service_identity     # http_call only — attach the service's own
                                        #   OAuth2 access token as a bearer header
+            auth_identity: afp         # http_call only — which configured service
+                                       #   identity to use; omit for the default
             body:                      # http_call only — JSON body; values support {key}
               issue_key: "{ticket_id}"
             code: |                    # python only — executed with ``state`` dict in scope;
@@ -1741,7 +1743,8 @@ class YamlGraphRunner:
 
         Currently only ``service_identity`` is supported; any other value is
         rejected rather than silently ignored so a typo can never downgrade a
-        step to an unauthenticated call.
+        step to an unauthenticated call.  ``auth_identity`` picks which
+        configured identity to use when the deployment has several.
         """
         mode = step.get("auth")
         if not mode:
@@ -1753,7 +1756,10 @@ class YamlGraphRunner:
                     get_service_token_provider,
                 )
                 provider = get_service_token_provider()
-            return await provider.get_auth_header()
+            identity = step.get("auth_identity")
+            return await provider.get_auth_header(
+                identity.strip() if isinstance(identity, str) and identity.strip() else None
+            )
         raise ValueError(
             f"Unsupported auth mode '{mode}' — supported: 'service_identity'"
         )

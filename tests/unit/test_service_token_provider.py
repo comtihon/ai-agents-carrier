@@ -6,6 +6,7 @@ a payload/status and the recorder captures every posted form.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 import jwt
@@ -304,3 +305,132 @@ async def test_response_without_access_token_raises(keypair, token_endpoint):
 
     with pytest.raises(ServiceAuthError, match="no access_token"):
         await provider.get_token()
+
+
+# ---------------------------------------------------------------------------
+# Multiple named identities
+# ---------------------------------------------------------------------------
+
+def _identities_settings(private_key: str, *names: str, **overrides) -> Settings:
+    """Settings configuring several named identities via SERVICE_AUTH_IDENTITIES."""
+    data = {
+        "SERVICE_AUTH_ENABLED": True,
+        "SERVICE_AUTH_IDENTITIES": json.dumps([
+            {
+                "name": name,
+                "token_url": f"{TOKEN_URL}?i={name}",
+                "client_id": f"{name}-client",
+                "audience": f"https://{name}.auth.test",
+                "scopes": f"openid {name}:aud",
+                "key_id": f"{name}-key",
+                "private_key": private_key,
+            }
+            for name in names
+        ]),
+    }
+    data.update(overrides)
+    return Settings(**data)
+
+
+async def test_each_identity_signs_with_its_own_client_id_and_scopes(keypair, token_endpoint):
+    private_key, public_key = keypair
+    provider = ServiceTokenProvider(_identities_settings(private_key, "afp", "control_center"))
+
+    await provider.get_token("afp")
+    await provider.get_token("control_center")
+
+    assert len(token_endpoint.calls) == 2
+    by_scope = {call["data"]["scope"]: call for call in token_endpoint.calls}
+    assert set(by_scope) == {"openid afp:aud", "openid control_center:aud"}
+    afp = by_scope["openid afp:aud"]
+    assert afp["url"] == f"{TOKEN_URL}?i=afp"
+    claims = jwt.decode(
+        afp["data"]["assertion"],
+        public_key,
+        algorithms=["RS256"],
+        audience="https://afp.auth.test",
+    )
+    assert claims["iss"] == claims["sub"] == "afp-client"
+
+
+async def test_tokens_are_cached_per_identity_never_shared(keypair, token_endpoint):
+    private_key, _ = keypair
+    provider = ServiceTokenProvider(_identities_settings(private_key, "afp", "control_center"))
+
+    first_afp = await provider.get_token("afp")
+    other = await provider.get_token("control_center")
+    second_afp = await provider.get_token("afp")
+
+    # One request per identity; the repeat hits afp's own cache.
+    assert len(token_endpoint.calls) == 2
+    assert first_afp == second_afp
+    assert other != first_afp
+
+
+async def test_unknown_identity_names_the_available_ones(keypair, token_endpoint):
+    private_key, _ = keypair
+    provider = ServiceTokenProvider(_identities_settings(private_key, "afp", "control_center"))
+
+    with pytest.raises(ServiceAuthError) as excinfo:
+        await provider.get_token("typo")
+    message = str(excinfo.value)
+    assert "typo" in message
+    assert "afp" in message and "control_center" in message
+    assert token_endpoint.calls == []
+
+
+async def test_several_identities_without_a_default_refuses_to_guess(keypair, token_endpoint):
+    """Picking one silently would sign calls with another service's credentials."""
+    private_key, _ = keypair
+    provider = ServiceTokenProvider(_identities_settings(private_key, "afp", "control_center"))
+
+    with pytest.raises(ServiceAuthError, match="SERVICE_AUTH_DEFAULT_IDENTITY"):
+        await provider.get_token()
+    assert token_endpoint.calls == []
+
+
+async def test_explicit_default_identity_is_used_when_none_is_named(keypair, token_endpoint):
+    private_key, _ = keypair
+    provider = ServiceTokenProvider(
+        _identities_settings(
+            private_key, "afp", "control_center", SERVICE_AUTH_DEFAULT_IDENTITY="control_center"
+        )
+    )
+
+    await provider.get_token()
+
+    assert token_endpoint.calls[0]["data"]["scope"] == "openid control_center:aud"
+
+
+async def test_single_identity_is_the_default_without_extra_config(keypair, token_endpoint):
+    private_key, _ = keypair
+    provider = ServiceTokenProvider(_identities_settings(private_key, "afp"))
+
+    await provider.get_token()
+
+    assert token_endpoint.calls[0]["data"]["scope"] == "openid afp:aud"
+
+
+async def test_validate_configuration_checks_every_identity(keypair):
+    private_key, _ = keypair
+    settings = _identities_settings(private_key, "afp")
+    broken = json.loads(settings.service_auth_identities_json)
+    broken.append({"name": "broken", "token_url": "https://x.test", "client_id": "c", "audience": "a"})
+    provider = ServiceTokenProvider(
+        _identities_settings(private_key, "afp", SERVICE_AUTH_IDENTITIES=json.dumps(broken))
+    )
+
+    with pytest.raises(ServiceAuthError) as excinfo:
+        provider.validate_configuration()
+    assert "broken" in str(excinfo.value)
+    assert "private_key" in str(excinfo.value)
+
+
+async def test_malformed_identities_json_is_actionable(keypair, token_endpoint):
+    private_key, _ = keypair
+    provider = ServiceTokenProvider(
+        _identities_settings(private_key, "afp", SERVICE_AUTH_IDENTITIES='{"name": "afp"}')
+    )
+
+    with pytest.raises(ServiceAuthError, match="SERVICE_AUTH_IDENTITIES"):
+        await provider.get_token("afp")
