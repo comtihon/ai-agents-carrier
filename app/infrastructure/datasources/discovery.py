@@ -358,8 +358,18 @@ async def probe_and_discover(
         "error": None,
         "discovered": None,
     }
+    # Resolving our own credentials can fail independently of the target — a
+    # `service_identity` block needs a token minted from the backend's key.
+    # That is not the target being unreachable, so probe on unauthenticated and
+    # report the real cause instead of mislabelling it.
+    auth_error: str | None = None
     try:
         headers = await build_auth_headers(auth) if auth is not None else {}
+    except Exception as exc:
+        headers = {}
+        auth_error = f"Could not resolve credentials: {exc}"
+
+    try:
         async with httpx.AsyncClient(
             timeout=PROBE_TIMEOUT_SECONDS, follow_redirects=True
         ) as client:
@@ -371,7 +381,9 @@ async def probe_and_discover(
 
             if response.status_code in (401, 403):
                 result["url_status"] = "unauthorized"
-                if auth_type == "none":
+                if auth_error is not None:
+                    result["error"] = auth_error
+                elif auth_type == "none":
                     result["error"] = "Server requires authentication"
                 else:
                     result["error"] = (
@@ -380,7 +392,9 @@ async def probe_and_discover(
                 return result
 
             result["url_status"] = "ok"
-            if auth_type != "none":
+            if auth_error is not None:
+                result["error"] = auth_error  # auth_status stays "failed"
+            elif auth_type != "none":
                 result["auth_status"] = "ok"
 
             result["discovered"] = await _discover_schema(client, base_url, headers, kind)
