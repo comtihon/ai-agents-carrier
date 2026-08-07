@@ -50,13 +50,16 @@ class NoAuth(BaseModel):
 
 
 class ServiceIdentityAuth(BaseModel):
-    """Bearer token minted by the service's own OAuth2 identity.
+    """Bearer token minted by one of the service's own OAuth2 identities.
 
-    Carries no secret: the token is obtained at request time from the
-    configured OAuth2 authorization server (see ``SERVICE_AUTH_*`` settings).
+    Carries no secret: the token is obtained at request time from the configured
+    OAuth2 authorization server (see ``SERVICE_AUTH_*`` settings).  ``identity``
+    names which configured identity to use; omit it to use the deployment's
+    default one.
     """
 
     type: Literal["service_identity"] = "service_identity"
+    identity: str | None = None
 
 
 AnyDataSourceAuth = Annotated[

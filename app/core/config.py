@@ -31,6 +31,47 @@ class LLMIntegrationConfig(BaseModel):
         return os.environ.get(self.resolved_api_key_env())
 
 
+DEFAULT_SERVICE_IDENTITY = "default"
+
+
+class ServiceIdentityConfig(BaseModel):
+    """One outbound OAuth2 service identity (RFC 7523 JWT bearer grant).
+
+    Nothing here is provider-specific: ``scopes`` is forwarded verbatim, so a
+    deployment may use plain scopes or any provider's scope URNs. The private
+    key may be inlined (``private_key``) or, so a JSON blob in config need not
+    embed a PEM, named via ``private_key_env``.
+    """
+
+    name: str = DEFAULT_SERVICE_IDENTITY
+    # OAuth2 token endpoint of the authorization server.
+    token_url: str
+    client_id: str
+    # `aud` of the client assertion — usually the authorization server issuer.
+    audience: str
+    # Space-separated scope string, opaque to this code.
+    scopes: str = "openid"
+    # `kid` header of the signing key, as registered with the provider.
+    key_id: str | None = None
+    # PEM-encoded RSA private key; literal "\n" escapes are normalized.
+    private_key: str | None = None
+    # Name of an env var holding the PEM instead of inlining it here.
+    private_key_env: str | None = None
+
+    def resolved_private_key(self) -> str | None:
+        """The PEM with literal ``\\n`` escapes turned into real newlines.
+
+        Secret managers and env-var injection frequently deliver PEM blocks as
+        a single line with escaped newlines, which no PEM parser accepts.
+        """
+        raw = self.private_key
+        if not raw and self.private_key_env:
+            raw = os.environ.get(self.private_key_env)
+        if not raw:
+            return None
+        return raw.replace("\\n", "\n")
+
+
 class McpIntegrationConfig(BaseModel):
     """Resolved configuration for a single MCP server."""
 
@@ -90,6 +131,17 @@ class Settings(BaseSettings):
     # When enabled, the backend mints its own access tokens from an OAuth2
     # authorization server using a signed client assertion, and attaches them
     # to outbound calls that opt in (`service_identity` auth).
+    #
+    # Two ways to configure them, and both may be used at once:
+    #   SERVICE_AUTH_IDENTITIES — a JSON array of named identities, for
+    #     deployments that call several protected services with different
+    #     credentials. Mirrors LLM_INTEGRATIONS.
+    #   SERVICE_AUTH_* (below) — a single unnamed identity, registered under
+    #     DEFAULT_SERVICE_IDENTITY. Simpler for the common one-identity case.
+    service_auth_identities_json: str | None = Field(default=None, alias="SERVICE_AUTH_IDENTITIES")
+    # Name of the identity used when an auth block names none. Defaults to the
+    # sole configured identity when there is exactly one.
+    service_auth_default_identity: str | None = Field(default=None, alias="SERVICE_AUTH_DEFAULT_IDENTITY")
     service_auth_enabled: bool = Field(default=False, alias="SERVICE_AUTH_ENABLED")
     # OAuth2 token endpoint of the authorization server.
     service_auth_token_url: str | None = Field(default=None, alias="SERVICE_AUTH_TOKEN_URL")
@@ -246,14 +298,86 @@ class Settings(BaseSettings):
         return f"http://127.0.0.1:{port}/mcp/datasources"
 
     def resolved_service_auth_private_key(self) -> str | None:
-        """Private key with literal ``\\n`` escapes turned into real newlines.
-
-        Secret managers and env-var injection frequently deliver PEM blocks as
-        a single line with escaped newlines, which no PEM parser accepts.
-        """
+        """Private key of the flat ``SERVICE_AUTH_*`` identity, newlines fixed."""
         if not self.service_auth_private_key:
             return None
         return self.service_auth_private_key.replace("\\n", "\n")
+
+    def get_service_identities(self) -> list[ServiceIdentityConfig]:
+        """Every configured outbound identity, in declaration order.
+
+        The flat ``SERVICE_AUTH_*`` set, when present, is registered as
+        :data:`DEFAULT_SERVICE_IDENTITY` and listed first — so deployments that
+        predate ``SERVICE_AUTH_IDENTITIES`` keep working unchanged. A JSON entry
+        of the same name wins, which is how such a deployment migrates.
+
+        Raises ``ValueError`` when the JSON is not an array or an entry is
+        missing a required field; the caller surfaces that at startup.
+        """
+        identities: list[ServiceIdentityConfig] = []
+        # Any flat field at all means someone intended a single identity — so a
+        # half-filled set is reported field by field rather than as "no identity
+        # configured", which would hide what is actually missing.
+        if any(
+            (
+                self.service_auth_token_url,
+                self.service_auth_client_id,
+                self.service_auth_audience,
+                self.service_auth_private_key,
+                self.service_auth_key_id,
+            )
+        ):
+            identities.append(
+                ServiceIdentityConfig(
+                    name=DEFAULT_SERVICE_IDENTITY,
+                    # Empty strings keep validation here lenient: completeness is
+                    # reported per identity by the token provider, which can say
+                    # *which* field is missing.
+                    token_url=self.service_auth_token_url or "",
+                    client_id=self.service_auth_client_id or "",
+                    audience=self.service_auth_audience or "",
+                    scopes=self.service_auth_scopes,
+                    key_id=self.service_auth_key_id,
+                    private_key=self.service_auth_private_key,
+                )
+            )
+        if self.service_auth_identities_json:
+            raw = json.loads(self.service_auth_identities_json)
+            if not isinstance(raw, list):
+                raise ValueError(
+                    "SERVICE_AUTH_IDENTITIES must be a JSON array of identity objects"
+                )
+            for item in raw:
+                parsed = ServiceIdentityConfig.model_validate(item)
+                identities = [i for i in identities if i.name != parsed.name]
+                identities.append(parsed)
+        return identities
+
+    def get_service_identity(self, name: str | None = None) -> ServiceIdentityConfig | None:
+        """Look up an identity by name (case-insensitive); None → the default."""
+        identities = self.get_service_identities()
+        if not identities:
+            return None
+        target = (name or self.resolved_default_service_identity() or "").lower()
+        for identity in identities:
+            if identity.name.lower() == target:
+                return identity
+        return None
+
+    def resolved_default_service_identity(self) -> str | None:
+        """Identity used when an auth block names none.
+
+        The explicit setting wins; otherwise a single configured identity is
+        unambiguously the default. With several and no setting there is no
+        default — an auth block must name one rather than silently borrowing
+        another service's credentials.
+        """
+        if self.service_auth_default_identity:
+            return self.service_auth_default_identity
+        identities = self.get_service_identities()
+        if len(identities) == 1:
+            return identities[0].name
+        return None
 
     def get_llm_integrations(self) -> list[LLMIntegrationConfig]:
         """Parse the LLM_INTEGRATIONS JSON env var into a typed list."""

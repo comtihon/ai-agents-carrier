@@ -504,7 +504,8 @@ async def build_auth_headers(auth: Any, token_provider: Any = None) -> dict[str,
 
     ``service_identity`` carries no stored secret: the bearer token is minted
     at request time by *token_provider* (the process-wide provider is used when
-    none is injected).
+    none is injected), using the identity the auth block names — or the
+    deployment's default one when it names none.
     """
     kind = getattr(auth, "type", "none")
     if kind == "service_identity":
@@ -514,7 +515,7 @@ async def build_auth_headers(auth: Any, token_provider: Any = None) -> dict[str,
                 get_service_token_provider,
             )
             provider = get_service_token_provider()
-        return await provider.get_auth_header()
+        return await provider.get_auth_header(getattr(auth, "identity", None))
     if kind == "bearer":
         return {"Authorization": f"Bearer {auth.token}"}
     if kind == "basic":

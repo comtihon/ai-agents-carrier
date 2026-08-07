@@ -38,12 +38,12 @@ def get_config_keys(settings: Settings = Depends(get_settings)) -> dict:
 
 
 class ServiceIdentityInfo(BaseModel):
-    """Non-secret description of the backend's own outbound service identity."""
+    """Non-secret description of one outbound service identity."""
 
-    enabled: bool
-    # Usable right now: enabled and every required setting present.
+    name: str
+    # Usable right now: every field needed to mint a token is present.
     configured: bool
-    # Zitadel machine-user id the assertion is signed as (a subject id, not a secret).
+    # Client id the assertion is signed as (a subject id, not a secret).
     client_id: str | None = None
     token_url: str | None = None
     audience: str | None = None
@@ -52,36 +52,63 @@ class ServiceIdentityInfo(BaseModel):
     error: str | None = None
 
 
-@router.get("/service-identity", response_model=ServiceIdentityInfo)
-def get_service_identity(settings: Settings = Depends(get_settings)) -> ServiceIdentityInfo:
-    """Describe the outbound service identity used by ``service_identity`` auth.
+class ServiceIdentitiesResponse(BaseModel):
+    """Every configured outbound identity, plus which one is the default."""
 
-    There is exactly one per deployment, and the secret behind it is a signing
-    key that never leaves the backend — so this reports only what a caller needs
-    in order to decide whether selecting ``service_identity`` will work: whether
-    it is configured, which machine user it authenticates as, and against which
-    authorization server.
-    """
-    from app.infrastructure.auth.service_token_provider import (
-        ServiceAuthError,
-        ServiceTokenProvider,
-    )
-
+    enabled: bool
+    identities: list[ServiceIdentityInfo] = []
+    # Used when an auth block names no identity; null when the deployment has
+    # several and has not designated one.
+    default_identity: str | None = None
+    # Set when the identities cannot be read at all (e.g. malformed JSON).
     error: str | None = None
-    if not settings.service_auth_enabled:
-        error = "SERVICE_AUTH_ENABLED is not set on this backend"
-    else:
-        try:
-            ServiceTokenProvider(settings).validate_configuration()
-        except ServiceAuthError as exc:
-            error = exc.message
 
-    return ServiceIdentityInfo(
-        enabled=bool(settings.service_auth_enabled),
-        configured=error is None,
-        client_id=settings.service_auth_client_id,
-        token_url=settings.service_auth_token_url,
-        audience=settings.service_auth_audience,
-        scopes=settings.service_auth_scopes,
-        error=error,
+
+@router.get("/service-identities", response_model=ServiceIdentitiesResponse)
+def list_service_identities(
+    settings: Settings = Depends(get_settings),
+) -> ServiceIdentitiesResponse:
+    """List the outbound identities available to ``service_identity`` auth.
+
+    The secret behind each is a signing key that never leaves the backend, so
+    this reports only what a caller needs in order to pick one: its name,
+    whether it is usable, which subject it authenticates as, and against which
+    authorization server. Key material and key ids are deliberately omitted.
+    """
+    from app.infrastructure.auth.service_token_provider import ServiceTokenProvider
+
+    enabled = bool(settings.service_auth_enabled)
+    if not enabled:
+        return ServiceIdentitiesResponse(
+            enabled=False, error="SERVICE_AUTH_ENABLED is not set on this backend"
+        )
+
+    provider = ServiceTokenProvider(settings)
+    try:
+        configured = settings.get_service_identities()
+    except ValueError as exc:
+        return ServiceIdentitiesResponse(
+            enabled=True, error=f"SERVICE_AUTH_IDENTITIES is not valid: {exc}"
+        )
+
+    identities: list[ServiceIdentityInfo] = []
+    for identity in configured:
+        _, error = provider.describe(identity.name)
+        identities.append(
+            ServiceIdentityInfo(
+                name=identity.name,
+                configured=error is None,
+                client_id=identity.client_id or None,
+                token_url=identity.token_url or None,
+                audience=identity.audience or None,
+                scopes=identity.scopes,
+                error=error,
+            )
+        )
+
+    return ServiceIdentitiesResponse(
+        enabled=True,
+        identities=identities,
+        default_identity=settings.resolved_default_service_identity(),
+        error=None if identities else "No service identity is configured",
     )
