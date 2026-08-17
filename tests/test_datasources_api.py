@@ -415,3 +415,176 @@ def test_shrink_sample_caps_lists_and_strings():
     assert len(out["text"]) == 501
     assert len(out["nested"]) == 3
     assert out["nested"][0]["a"] == [0, 1, 2]
+
+
+# ─── Schema import ────────────────────────────────────────────────────────────
+
+_OPENAPI_DOC = {
+    "openapi": "3.0.0",
+    "servers": [{"url": "https://api.test/v1"}],
+    "paths": {
+        "/pets": {
+            "get": {"operationId": "listPets", "summary": "List pets"},
+            "post": {
+                "operationId": "createPet",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["name"],
+                                "properties": {"name": {"type": "string"}},
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+}
+
+
+async def test_schema_fetch_returns_the_operation_pick_list(client, monkeypatch):
+    c, backend = client
+    seen: dict = {}
+
+    async def fake_fetch(schema_url, kind="http", auth=None, max_operations=0):
+        seen.update(url=schema_url, kind=kind, auth=auth)
+        from app.infrastructure.datasources.spec import openapi_to_operations
+        return {
+            "kind": "openapi",
+            "source": schema_url,
+            "base_url": "https://api.test/v1",
+            "operations": openapi_to_operations(_OPENAPI_DOC, max_operations=max_operations),
+        }
+
+    monkeypatch.setattr("app.api.routes.datasources.fetch_and_parse_spec", fake_fetch)
+
+    resp = await c.post(
+        "/api/v1/datasources/schema/fetch",
+        json={
+            "schema_url": "https://api.test/openapi.json",
+            "kind": "http",
+            "auth": {"type": "bearer", "token": "spec-token"},
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["kind"] == "openapi"
+    assert body["base_url"] == "https://api.test/v1"
+    assert [op["name"] for op in body["operations"]] == ["listpets", "createpet"]
+    # Nothing is stored — the caller saves the subset it wants.
+    assert await backend.list() == []
+    assert seen["auth"].token == "spec-token"
+
+
+async def test_schema_fetch_maps_a_bad_url_onto_422(client, monkeypatch):
+    c, _ = client
+
+    async def fake_fetch(*args, **kwargs):
+        from app.infrastructure.datasources.discovery import SpecFetchError
+        raise SpecFetchError("Schema URL returned HTTP 404 (request failed)")
+
+    monkeypatch.setattr("app.api.routes.datasources.fetch_and_parse_spec", fake_fetch)
+
+    resp = await c.post(
+        "/api/v1/datasources/schema/fetch",
+        json={"schema_url": "https://api.test/nope.json"},
+    )
+    assert resp.status_code == 422
+    assert "404" in resp.json()["detail"]
+
+
+async def test_schema_fetch_resolves_the_secret_from_backend_config(client, monkeypatch):
+    c, _ = client
+    seen: dict = {}
+
+    monkeypatch.setattr(
+        Settings, "get_forwardable_config", lambda self: {"SPEC_TOKEN": "from-config"}
+    )
+
+    async def fake_fetch(schema_url, kind="http", auth=None, max_operations=0):
+        seen["auth"] = auth
+        return {"kind": "openapi", "source": schema_url, "base_url": None, "operations": []}
+
+    monkeypatch.setattr("app.api.routes.datasources.fetch_and_parse_spec", fake_fetch)
+
+    resp = await c.post(
+        "/api/v1/datasources/schema/fetch",
+        json={
+            "schema_url": "https://api.test/openapi.json",
+            "auth": {"type": "bearer", "from_config": "SPEC_TOKEN"},
+        },
+    )
+    assert resp.status_code == 200
+    assert seen["auth"].token == "from-config"
+
+
+async def test_schema_upload_parses_an_uploaded_document(client):
+    import json as _json
+
+    c, _ = client
+    resp = await c.post(
+        "/api/v1/datasources/schema/upload",
+        files={"file": ("petstore.json", _json.dumps(_OPENAPI_DOC), "application/json")},
+        data={"kind": "http"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source"] == "petstore.json"
+    assert body["base_url"] == "https://api.test/v1"
+    create = next(op for op in body["operations"] if op["name"] == "createpet")
+    assert create["params"] == [
+        {"name": "name", "type": "string", "required": True, "description": ""}
+    ]
+
+
+async def test_schema_upload_rejects_a_non_specification(client):
+    c, _ = client
+    resp = await c.post(
+        "/api/v1/datasources/schema/upload",
+        files={"file": ("notes.txt", "just some notes", "text/plain")},
+    )
+    assert resp.status_code == 422
+    assert "Unrecognised specification" in resp.json()["detail"]
+
+
+async def test_probe_no_longer_hunts_for_an_openapi_document(client, monkeypatch):
+    """The probe reports reachability; an HTTP source's schema is imported explicitly."""
+    c, _ = client
+    requested: list[str] = []
+
+    class _Resp:
+        status_code = 200
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, headers=None):
+            requested.append(url)
+            return _Resp()
+
+        async def request(self, method, url, headers=None, json=None):
+            requested.append(url)
+            return _Resp()
+
+    monkeypatch.setattr(
+        "app.infrastructure.datasources.discovery.httpx.AsyncClient",
+        lambda **kwargs: _Client(),
+    )
+
+    resp = await c.post(
+        "/api/v1/datasources/probe",
+        json={"base_url": "https://api.test", "kind": "http"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["url_status"] == "ok"
+    assert body["discovered"] is None
+    # Only the base URL was touched — no /openapi.json, /swagger.json, …
+    assert requested == ["https://api.test"]

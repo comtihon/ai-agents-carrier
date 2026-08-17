@@ -1,264 +1,96 @@
-"""Server-side connectivity probing and schema discovery for data sources.
+"""Server-side connectivity probing and schema fetching for data sources.
 
-Given a base URL (plus optional auth), this module:
+Two jobs, both server-side so CORS never applies and the stored secrets can
+authenticate the request:
 
-1. Probes the URL — any HTTP response means "reachable"; 401/403 means
-   "unauthorized"; a connection/timeout error means "unreachable".
-2. When reachable, tries to auto-discover an API schema: OpenAPI/Swagger JSON
-   at well-known paths, then GraphQL introspection (order reversed for
-   ``kind == "graphql"``), converting whatever is found into
-   ``OperationDefinition``-shaped dicts.
+1. :func:`probe_and_discover` probes a base URL — any HTTP response means
+   "reachable"; 401/403 means "unauthorized"; a connection/timeout error means
+   "unreachable".  For ``kind == "graphql"`` it *also* introspects the schema,
+   because a GraphQL endpoint URL **is** the way to fetch its schema.  For HTTP
+   sources it does not go looking for a schema: guessing at ``/openapi.json``
+   and friends produced wrong or partial documents often enough that the schema
+   location is now something the user states (see below).
+2. :func:`fetch_and_parse_spec` fetches a specification from an explicit URL
+   and maps it onto operations via :mod:`app.infrastructure.datasources.spec`.
+   Uploaded specification files go through ``spec.parse_spec`` directly.
 
-This is the backend counterpart of the browser-side prober the UI used to
-ship; running it server-side avoids CORS blind spots and lets the stored
-secrets authenticate the probe.  Nothing here raises for target-server
-failures — every outcome is encoded in the returned ``ProbeOutcome``.
+Neither raises for target-server failures: the probe encodes every outcome in
+its returned dict, and the fetch raises :class:`SpecFetchError`, which the API
+layer reports as a 422 with the detail.
 """
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any
 
 import httpx
 
 from app.infrastructure.datasources.executor import build_auth_headers
+from app.infrastructure.datasources.spec import (  # re-exported for callers/tests
+    INTROSPECTION_QUERY,
+    MAX_DISCOVERED_OPERATIONS,
+    MAX_IMPORTED_OPERATIONS,
+    SpecParseError,
+    gql_param_type,
+    graphql_schema_to_operations,
+    graphql_to_operations,
+    is_openapi_doc,
+    map_param_type,
+    openapi_to_operations,
+    parse_spec,
+    scalar_selection,
+    slugify,
+    type_ref_to_string,
+    unwrap_type,
+)
 
 logger = logging.getLogger(__name__)
 
 PROBE_TIMEOUT_SECONDS = 8.0
+SCHEMA_FETCH_TIMEOUT_SECONDS = 20.0
+# Specifications are text; anything larger is not one we should be parsing.
+MAX_SPEC_BYTES = 8 * 1024 * 1024
 
-OPENAPI_PATHS = [
-    "/openapi.json",
-    "/swagger.json",
-    "/api-docs",
-    "/v2/api-docs",
-    "/v3/api-docs",
-    "/swagger/v1/swagger.json",
+__all__ = [
+    "INTROSPECTION_QUERY",
+    "MAX_DISCOVERED_OPERATIONS",
+    "MAX_IMPORTED_OPERATIONS",
+    "MAX_SPEC_BYTES",
+    "PROBE_TIMEOUT_SECONDS",
+    "SCHEMA_FETCH_TIMEOUT_SECONDS",
+    "SpecFetchError",
+    "SpecParseError",
+    "fetch_and_parse_spec",
+    "gql_param_type",
+    "graphql_schema_to_operations",
+    "graphql_to_operations",
+    "is_openapi_doc",
+    "join_url",
+    "map_param_type",
+    "openapi_to_operations",
+    "parse_spec",
+    "probe_and_discover",
+    "scalar_selection",
+    "slugify",
+    "type_ref_to_string",
+    "unwrap_type",
 ]
 
-MAX_DISCOVERED_OPERATIONS = 40
 
-INTROSPECTION_QUERY = """
-query DatasourceIntrospection {
-  __schema {
-    queryType { name }
-    types {
-      name
-      kind
-      fields {
-        name
-        description
-        args {
-          name
-          description
-          type { kind name ofType { kind name ofType { kind name ofType { kind name } } } }
-        }
-        type { kind name ofType { kind name ofType { kind name ofType { kind name } } } }
-      }
-    }
-  }
-}"""
+class SpecFetchError(ValueError):
+    """A specification URL could not be fetched (or returned a non-spec body)."""
 
 
 # ---------------------------------------------------------------------------
-# Pure helpers (unit-tested)
+# Pure helpers
 # ---------------------------------------------------------------------------
 
 def join_url(base: str, path: str) -> str:
     return base.rstrip("/") + path
 
 
-def map_param_type(t: str | None) -> str:
-    if t in ("integer", "number"):
-        return "number"
-    if t in ("boolean", "array", "object"):
-        return t
-    return "string"
-
-
-def slugify(text: str) -> str:
-    text = re.sub(r"[{}]", "", text)
-    text = re.sub(r"[^A-Za-z0-9_]+", "_", text)
-    return text.strip("_").lower()
-
-
-def is_openapi_doc(doc: Any) -> bool:
-    return (
-        isinstance(doc, dict)
-        and ("openapi" in doc or "swagger" in doc)
-        and isinstance(doc.get("paths"), dict)
-    )
-
-
-def openapi_to_operations(doc: dict[str, Any]) -> list[dict[str, Any]]:
-    """Convert an OpenAPI/Swagger document into operation dicts."""
-    paths = doc.get("paths") or {}
-    ops: list[dict[str, Any]] = []
-    seen: set[str] = set()
-
-    for raw_path, methods in paths.items():
-        if not isinstance(methods, dict):
-            continue
-        shared = methods.get("parameters")
-        shared = shared if isinstance(shared, list) else []
-        for method in ("get", "post", "put", "patch", "delete"):
-            spec = methods.get(method)
-            if not isinstance(spec, dict):
-                continue
-
-            spec_params = spec.get("parameters")
-            spec_params = spec_params if isinstance(spec_params, list) else []
-            all_params = [
-                p
-                for p in [*shared, *spec_params]
-                if isinstance(p, dict)
-                and p.get("name")
-                and p.get("in") in ("path", "query")
-            ]
-
-            params = [
-                {
-                    "name": p["name"],
-                    # swagger 2.0 puts the type inline; OpenAPI 3 nests it.
-                    "type": map_param_type(
-                        (p.get("schema") or {}).get("type") or p.get("type")
-                    ),
-                    "required": True if p.get("in") == "path" else bool(p.get("required")),
-                    "description": p.get("description") or "",
-                }
-                for p in all_params
-            ]
-
-            # {petId} in the OpenAPI path becomes the template {params.petId}.
-            path = re.sub(r"\{([^{}]+)\}", r"{params.\1}", raw_path)
-            query_params = [p for p in all_params if p.get("in") == "query"]
-            if query_params:
-                path += "?" + "&".join(
-                    f"{p['name']}={{params.{p['name']}}}" for p in query_params
-                )
-
-            operation_id = spec.get("operationId")
-            if isinstance(operation_id, str) and operation_id:
-                name = slugify(operation_id)
-            else:
-                name = f"{method}_{slugify(raw_path) or 'root'}"
-            while name in seen:
-                name = f"{name}_"
-            seen.add(name)
-
-            responses = spec.get("responses") or {}
-            ok = responses.get("200") or responses.get("201") or {}
-            ok = ok if isinstance(ok, dict) else {}
-            content = ok.get("content") or {}
-            json_content = content.get("application/json") if isinstance(content, dict) else None
-            json_content = json_content if isinstance(json_content, dict) else {}
-            response_schema = json_content.get("schema") or ok.get("schema")
-
-            ops.append(
-                {
-                    "name": name,
-                    "method": method.upper(),
-                    "path": path,
-                    "params": params,
-                    "response_schema": response_schema if isinstance(response_schema, dict) else None,
-                    "mapping": None,
-                }
-            )
-            if len(ops) >= MAX_DISCOVERED_OPERATIONS:
-                return ops
-    return ops
-
-
-def unwrap_type(t: dict[str, Any]) -> dict[str, Any]:
-    """Strip NON_NULL / LIST wrappers from a GraphQL type ref."""
-    cur = t
-    while cur.get("ofType") and cur.get("kind") in ("NON_NULL", "LIST"):
-        cur = cur["ofType"]
-    return cur
-
-
-def type_ref_to_string(t: dict[str, Any]) -> str:
-    if t.get("kind") == "NON_NULL" and t.get("ofType"):
-        return f"{type_ref_to_string(t['ofType'])}!"
-    if t.get("kind") == "LIST" and t.get("ofType"):
-        return f"[{type_ref_to_string(t['ofType'])}]"
-    return t.get("name") or "String"
-
-
-def gql_param_type(t: dict[str, Any]) -> str:
-    inner = unwrap_type(t)
-    of_type = t.get("ofType") or {}
-    if t.get("kind") == "LIST" or (
-        t.get("kind") == "NON_NULL" and of_type.get("kind") == "LIST"
-    ):
-        return "array"
-    name = inner.get("name")
-    if name in ("Int", "Float"):
-        return "number"
-    if name == "Boolean":
-        return "boolean"
-    if name in ("String", "ID"):
-        return "string"
-    return "object" if inner.get("kind") == "INPUT_OBJECT" else "string"
-
-
-def scalar_selection(field: dict[str, Any], types: list[dict[str, Any]]) -> str:
-    """Selection set of up to 8 scalar sub-fields, or ``__typename`` fallback."""
-    inner = unwrap_type(field.get("type") or {})
-    if inner.get("kind") in ("SCALAR", "ENUM"):
-        return ""
-    target = next((t for t in types if t.get("name") == inner.get("name")), None)
-    scalars = [
-        f["name"]
-        for f in (target or {}).get("fields") or []
-        if unwrap_type(f.get("type") or {}).get("kind") in ("SCALAR", "ENUM")
-    ][:8]
-    return f" {{ {' '.join(scalars) if scalars else '__typename'} }}"
-
-
-def graphql_to_operations(
-    fields: list[dict[str, Any]], types: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """Convert introspected query-type fields into operation dicts."""
-    ops: list[dict[str, Any]] = []
-    for field in fields[:MAX_DISCOVERED_OPERATIONS]:
-        args = field.get("args") or []
-        var_defs = ", ".join(
-            f"${a['name']}: {type_ref_to_string(a.get('type') or {})}" for a in args
-        )
-        arg_use = ", ".join(f"{a['name']}: ${a['name']}" for a in args)
-        query = (
-            f"query {field['name']}{f'({var_defs})' if var_defs else ''} "
-            f"{{ {field['name']}{f'({arg_use})' if arg_use else ''}"
-            f"{scalar_selection(field, types)} }}"
-        )
-        ops.append(
-            {
-                "name": field["name"],
-                "method": "POST",
-                "query": query,
-                "variables": (
-                    {a["name"]: f"{{params.{a['name']}}}" for a in args} if args else None
-                ),
-                "params": [
-                    {
-                        "name": a["name"],
-                        "type": gql_param_type(a.get("type") or {}),
-                        "required": (a.get("type") or {}).get("kind") == "NON_NULL",
-                        "description": a.get("description") or "",
-                    }
-                    for a in args
-                ],
-                "response_schema": None,
-                "mapping": None,
-            }
-        )
-    return ops
-
-
 # ---------------------------------------------------------------------------
-# Network probing + discovery
+# Network probing + GraphQL introspection
 # ---------------------------------------------------------------------------
 
 async def _fetch_json(
@@ -278,50 +110,45 @@ async def _fetch_json(
         return None
 
 
-async def _try_openapi(
-    client: httpx.AsyncClient, base_url: str, headers: dict[str, str]
+async def _introspect(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    *,
+    include_mutations: bool = False,
+    max_operations: int = MAX_DISCOVERED_OPERATIONS,
 ) -> dict[str, Any] | None:
-    candidates = [base_url, *(join_url(base_url, p) for p in OPENAPI_PATHS)]
-    for url in candidates:
-        doc = await _fetch_json(client, url, headers)
-        if is_openapi_doc(doc):
-            return {
-                "kind": "openapi",
-                "source": url,
-                "operations": openapi_to_operations(doc),
-            }
-    return None
+    """Run the introspection query against *url*; None when it is not GraphQL."""
+    doc = await _fetch_json(
+        client,
+        url,
+        {"Content-Type": "application/json", **headers},
+        method="POST",
+        json_body={"query": INTROSPECTION_QUERY},
+    )
+    schema = (doc or {}).get("data", {}).get("__schema") if isinstance(doc, dict) else None
+    if not isinstance(schema, dict):
+        return None
+    operations = graphql_schema_to_operations(
+        schema, max_operations=max_operations, include_mutations=include_mutations
+    )
+    if not operations:
+        return None
+    return {
+        "kind": "graphql",
+        "source": f"graphql introspection @ {url}",
+        "base_url": url,
+        "operations": operations,
+    }
 
 
 async def _try_graphql(
     client: httpx.AsyncClient, base_url: str, headers: dict[str, str]
 ) -> dict[str, Any] | None:
     for url in (base_url, join_url(base_url, "/graphql")):
-        doc = await _fetch_json(
-            client,
-            url,
-            {"Content-Type": "application/json", **headers},
-            method="POST",
-            json_body={"query": INTROSPECTION_QUERY},
-        )
-        schema = (doc or {}).get("data", {}).get("__schema") if isinstance(doc, dict) else None
-        if not isinstance(schema, dict):
-            continue
-        query_type = schema.get("queryType") or {}
-        types = schema.get("types")
-        if not query_type.get("name") or not isinstance(types, list):
-            continue
-        target = next(
-            (t for t in types if isinstance(t, dict) and t.get("name") == query_type["name"]),
-            None,
-        )
-        if not target or not target.get("fields"):
-            continue
-        return {
-            "kind": "graphql",
-            "source": f"graphql introspection @ {url}",
-            "operations": graphql_to_operations(target["fields"], types),
-        }
+        found = await _introspect(client, url, headers)
+        if found:
+            return found
     return None
 
 
@@ -331,25 +158,25 @@ async def _discover_schema(
     headers: dict[str, str],
     kind: str,
 ) -> dict[str, Any] | None:
-    attempts = (
-        (_try_graphql, _try_openapi) if kind == "graphql" else (_try_openapi, _try_graphql)
-    )
-    for attempt in attempts:
-        found = await attempt(client, base_url, headers)
-        if found and found["operations"]:
-            return found
-    return None
+    """Schema discovered from the base URL alone — GraphQL introspection only.
+
+    HTTP/REST sources get no automatic discovery: their schema location is
+    supplied explicitly (schema URL or uploaded file).
+    """
+    if kind != "graphql":
+        return None
+    return await _try_graphql(client, base_url, headers)
 
 
 async def probe_and_discover(
     base_url: str, kind: str = "http", auth: Any = None
 ) -> dict[str, Any]:
-    """Probe *base_url* (with the given auth block) and try schema discovery.
+    """Probe *base_url* (with the given auth block); introspect GraphQL schemas.
 
     Never raises for target-server failures: the outcome is encoded in the
     returned dict — ``url_status`` (ok | unauthorized | unreachable),
     ``auth_status`` (ok | failed | skipped), ``error`` (detail or None) and
-    ``discovered`` (schema dict or None).
+    ``discovered`` (schema dict or None; always None for ``kind == "http"``).
     """
     auth_type = getattr(auth, "type", "none")
     result: dict[str, Any] = {
@@ -403,3 +230,62 @@ async def probe_and_discover(
         logger.exception("datasource probe failed unexpectedly")
         result["error"] = f"Probe failed: {exc}"
         return result
+
+
+# ---------------------------------------------------------------------------
+# Explicit schema fetching
+# ---------------------------------------------------------------------------
+
+async def fetch_and_parse_spec(
+    schema_url: str,
+    kind: str = "http",
+    auth: Any = None,
+    *,
+    max_operations: int = MAX_IMPORTED_OPERATIONS,
+) -> dict[str, Any]:
+    """Fetch the specification at *schema_url* and map it onto operations.
+
+    For ``kind == "graphql"`` the URL is treated as a GraphQL endpoint first
+    (introspection POST) and only then as a document to download, so both
+    "here is my /graphql" and "here is my schema.graphql" work.
+
+    Raises :class:`SpecFetchError` when the URL cannot be read and
+    :class:`SpecParseError` when the body is not a specification.
+    """
+    try:
+        headers = await build_auth_headers(auth) if auth is not None else {}
+    except Exception as exc:
+        raise SpecFetchError(f"Could not resolve credentials: {exc}") from exc
+
+    async with httpx.AsyncClient(
+        timeout=SCHEMA_FETCH_TIMEOUT_SECONDS, follow_redirects=True
+    ) as client:
+        if kind == "graphql":
+            found = await _introspect(
+                client,
+                schema_url,
+                headers,
+                include_mutations=True,
+                max_operations=max_operations,
+            )
+            if found:
+                return found
+
+        try:
+            response = await client.get(schema_url, headers=headers)
+        except Exception as exc:
+            raise SpecFetchError(
+                f"Could not fetch the schema: {exc.__class__.__name__}: {exc}"
+            ) from exc
+
+    if response.status_code >= 400:
+        detail = "authentication required" if response.status_code in (401, 403) else "request failed"
+        raise SpecFetchError(
+            f"Schema URL returned HTTP {response.status_code} ({detail})"
+        )
+    if len(response.content) > MAX_SPEC_BYTES:
+        raise SpecFetchError(
+            f"Schema document is larger than {MAX_SPEC_BYTES // (1024 * 1024)} MB"
+        )
+
+    return parse_spec(response.content, source=schema_url, max_operations=max_operations)

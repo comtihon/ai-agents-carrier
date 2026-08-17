@@ -351,6 +351,64 @@ async def test_probe_401_with_unresolvable_credentials_reports_the_real_cause(mo
     assert "Could not resolve credentials" in result["error"]
 
 
+async def test_http_sources_get_no_automatic_schema_discovery(monkeypatch):
+    """Guessing at /openapi.json is gone — an HTTP source's schema is stated, not hunted."""
+    requested: list[str] = []
+
+    async def _fetch_json(client, url, headers, method="GET", json_body=None):
+        requested.append(url)
+        return None
+
+    monkeypatch.setattr(discovery_mod, "_fetch_json", _fetch_json)
+
+    assert await discovery_mod._discover_schema(object(), "https://api.test", {}, "http") is None
+    assert requested == []
+
+
+async def test_graphql_sources_are_still_introspected_from_the_base_url(monkeypatch):
+    """A GraphQL endpoint URL *is* the way to fetch its schema, so this stays automatic."""
+    schema = {
+        "queryType": {"name": "Query"},
+        "types": [
+            {
+                "name": "Query",
+                "kind": "OBJECT",
+                "fields": [{"name": "ping", "args": [], "type": _scalar("String")}],
+            },
+        ],
+    }
+
+    async def _fetch_json(client, url, headers, method="GET", json_body=None):
+        return {"data": {"__schema": schema}} if method == "POST" else None
+
+    monkeypatch.setattr(discovery_mod, "_fetch_json", _fetch_json)
+
+    found = await discovery_mod._discover_schema(object(), "https://api.test", {}, "graphql")
+    assert found is not None
+    assert found["kind"] == "graphql"
+    assert [op["name"] for op in found["operations"]] == ["ping"]
+
+
+async def test_graphql_discovery_does_not_prefill_mutations(monkeypatch):
+    """Auto-fill is unattended, so a destructive mutation must not land in the editor."""
+    schema = {
+        "queryType": {"name": "Query"},
+        "mutationType": {"name": "Mutation"},
+        "types": [
+            {"name": "Query", "kind": "OBJECT", "fields": [{"name": "ping", "args": [], "type": _scalar("String")}]},
+            {"name": "Mutation", "kind": "OBJECT", "fields": [{"name": "deleteAll", "args": [], "type": _scalar("Boolean")}]},
+        ],
+    }
+
+    async def _fetch_json(client, url, headers, method="GET", json_body=None):
+        return {"data": {"__schema": schema}} if method == "POST" else None
+
+    monkeypatch.setattr(discovery_mod, "_fetch_json", _fetch_json)
+
+    found = await discovery_mod._discover_schema(object(), "https://api.test", {}, "graphql")
+    assert [op["name"] for op in found["operations"]] == ["ping"]
+
+
 async def test_probe_with_working_service_identity_forwards_the_bearer(monkeypatch):
     client = _patch_probe_http(monkeypatch, status_code=200)
     _patch_auth_headers(monkeypatch, headers={"Authorization": "Bearer minted-token"})
