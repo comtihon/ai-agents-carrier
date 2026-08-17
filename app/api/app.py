@@ -269,6 +269,9 @@ async def lifespan(app: FastAPI):
         agent_backend=container.agent_backend,
         data_source_backend=container.data_source_backend,
         refresh_datasources=_make_datasources_refresher(container),
+        # The chat agent is the platform's internal agent: it gets the same MCP
+        # tools the workflow steps do, resolved per invocation.
+        mcp_tools_provider=container.mcp_tools_provider,
     )
     sdk = CopilotKitRemoteEndpoint(
         agents=[

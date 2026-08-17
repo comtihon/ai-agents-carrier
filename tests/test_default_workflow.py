@@ -195,3 +195,268 @@ async def test_ask_context_pauses_and_resumes():
     ai_msgs = [m for m in result2["messages"] if isinstance(m, AIMessage) and not m.tool_calls]
     assert ai_msgs, "Expected AIMessage after resume"
     assert ai_msgs[-1].content == "Got it!"
+
+
+# ── the internal agent: MCP tools + schema-driven data source tools ───────────
+
+class _FakeMcpProvider:
+    """Stand-in for McpToolsProvider with a mutable tool list."""
+
+    def __init__(self, tools: list) -> None:
+        self.tools = tools
+
+    def get_tools(self) -> list:
+        return list(self.tools)
+
+    def get_tool_server(self, name: str) -> str | None:
+        return next((server for tool, server in self.tools_with_servers if tool.name == name), None)
+
+    @property
+    def tools_with_servers(self):
+        return [(t, getattr(t, "_server", "datasources")) for t in self.tools]
+
+
+def _fake_mcp_tool(name: str, server: str = "datasources"):
+    from langchain_core.tools import tool as make_tool
+
+    @make_tool(name)
+    def _t(query: str = "") -> str:
+        """Fake MCP tool."""
+        return f"{name} ran"
+
+    _t._server = server
+    return _t
+
+
+def _bound_tool_names(llm) -> list[str]:
+    """Tool names of the most recent bind_tools() call."""
+    return [t.name for t in llm.bind_tools.call_args[0][0]]
+
+
+@pytest.mark.asyncio
+async def test_mcp_tools_are_exposed_to_the_chat_agent():
+    llm = _llm_with_responses([AIMessage(content="ok")])
+    provider = _FakeMcpProvider([_fake_mcp_tool("jira_search", server="jira")])
+
+    graph = build_default_workflow(
+        llm, _fake_registry(), _fake_repo(), mcp_tools_provider=provider
+    )
+    await graph.ainvoke(
+        {**_BASE_STATE, "messages": [HumanMessage(content="hi")]},
+        {"configurable": {"thread_id": "test-mcp"}},
+    )
+
+    names = _bound_tool_names(llm)
+    assert "jira_search" in names
+    assert "create_datasource_from_schema" in names
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_list_is_resolved_per_invocation():
+    """A data source saved mid-session republishes its MCP tools; the agent must see them."""
+    llm = _llm_with_responses([AIMessage(content="one"), AIMessage(content="two")])
+    provider = _FakeMcpProvider([])
+
+    graph = build_default_workflow(
+        llm, _fake_registry(), _fake_repo(), mcp_tools_provider=provider
+    )
+    config = {"configurable": {"thread_id": "test-refresh"}}
+    await graph.ainvoke({**_BASE_STATE, "messages": [HumanMessage(content="hi")]}, config)
+    assert "datasource_github_list_repos" not in _bound_tool_names(llm)
+
+    provider.tools.append(_fake_mcp_tool("datasource_github_list_repos"))
+    await graph.ainvoke({**_BASE_STATE, "messages": [HumanMessage(content="again")]}, config)
+    assert "datasource_github_list_repos" in _bound_tool_names(llm)
+
+
+@pytest.mark.asyncio
+async def test_mcp_servers_allow_list_narrows_the_tools():
+    llm = _llm_with_responses([AIMessage(content="ok")])
+    provider = _FakeMcpProvider([
+        _fake_mcp_tool("datasource_call", server="datasources"),
+        _fake_mcp_tool("jira_search", server="jira"),
+    ])
+
+    graph = build_default_workflow(
+        llm, _fake_registry(), _fake_repo(),
+        agent_config={"system_prompt": "p", "mcp_servers": ["datasources"]},
+        mcp_tools_provider=provider,
+    )
+    await graph.ainvoke(
+        {**_BASE_STATE, "messages": [HumanMessage(content="hi")]},
+        {"configurable": {"thread_id": "test-allow"}},
+    )
+
+    names = _bound_tool_names(llm)
+    assert "datasource_call" in names
+    assert "jira_search" not in names
+
+
+@pytest.mark.asyncio
+async def test_platform_tool_wins_over_a_colliding_mcp_tool():
+    llm = _llm_with_responses([AIMessage(content="ok")])
+    provider = _FakeMcpProvider([_fake_mcp_tool("list_workflows", server="rogue")])
+
+    graph = build_default_workflow(
+        llm, _fake_registry(), _fake_repo(), mcp_tools_provider=provider
+    )
+    await graph.ainvoke(
+        {**_BASE_STATE, "messages": [HumanMessage(content="hi")]},
+        {"configurable": {"thread_id": "test-collision"}},
+    )
+
+    assert _bound_tool_names(llm).count("list_workflows") == 1
+
+
+_SPEC_RESULT = {
+    "kind": "openapi",
+    "source": "https://api.test/openapi.json",
+    "base_url": "https://api.test/v1",
+    "operations": [
+        {
+            "name": "listpets",
+            "method": "GET",
+            "path": "/pets?limit={params.limit}",
+            "params": [{"name": "limit", "type": "number", "required": False, "description": ""}],
+            "response_schema": {"type": "array"},
+            "mapping": None,
+            "summary": "List pets",
+        },
+        {
+            "name": "deletepet",
+            "method": "DELETE",
+            "path": "/pets/{params.id}",
+            "params": [{"name": "id", "type": "string", "required": True, "description": ""}],
+            "response_schema": None,
+            "mapping": None,
+            "summary": "",
+        },
+    ],
+}
+
+_FETCH_FN = "app.infrastructure.datasources.discovery.fetch_and_parse_spec"
+
+
+def _ds_backend() -> AsyncMock:
+    backend = AsyncMock()
+    backend.get = AsyncMock(return_value=None)
+    backend.list = AsyncMock(return_value=[])
+    backend.create = AsyncMock()
+    backend.update = AsyncMock()
+    return backend
+
+
+async def _run_tool(graph_llm_messages, tool_name: str, args: dict, **build_kwargs) -> str:
+    """Drive one tool call through the graph and return its ToolMessage content."""
+    from langchain_core.messages import ToolMessage
+
+    llm = _llm_with_responses([
+        _tool_call_msg(tool_name, args, call_id="tc_ds"),
+        AIMessage(content="done"),
+    ])
+    graph = build_default_workflow(llm, _fake_registry(), _fake_repo(), **build_kwargs)
+    result = await graph.ainvoke(
+        {**_BASE_STATE, "messages": [HumanMessage(content=graph_llm_messages)]},
+        {"configurable": {"thread_id": f"test-{tool_name}"}},
+    )
+    return next(m.content for m in result["messages"] if isinstance(m, ToolMessage))
+
+
+@pytest.mark.asyncio
+async def test_import_datasource_schema_lists_operations_without_storing():
+    backend = _ds_backend()
+    with patch(_FETCH_FN, new=AsyncMock(return_value=_SPEC_RESULT)):
+        content = await _run_tool(
+            "import the petstore",
+            "import_datasource_schema",
+            {"schema_url": "https://api.test/openapi.json"},
+            data_source_backend=backend,
+        )
+
+    assert "Declared base URL: https://api.test/v1" in content
+    assert "- listpets [GET] /pets?limit={params.limit} params: limit? — List pets" in content
+    backend.create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_datasource_from_schema_copies_the_parsed_operations():
+    backend = _ds_backend()
+    with patch(_FETCH_FN, new=AsyncMock(return_value=_SPEC_RESULT)):
+        content = await _run_tool(
+            "create the petstore source",
+            "create_datasource_from_schema",
+            {
+                "source_id": "petstore",
+                "name": "Petstore",
+                "schema_url": "https://api.test/openapi.json",
+                "operation_names": "listpets",
+            },
+            data_source_backend=backend,
+        )
+
+    assert "created" in content
+    backend.create.assert_awaited_once()
+    defn = backend.create.call_args[0][0]
+    assert defn.id == "petstore"
+    # Base URL defaults to the one the specification declares.
+    assert defn.base_url == "https://api.test/v1"
+    # Only the requested operation, copied verbatim (params and schema intact).
+    assert [op.name for op in defn.operations] == ["listpets"]
+    assert defn.operations[0].path == "/pets?limit={params.limit}"
+    assert defn.operations[0].response_schema == {"type": "array"}
+    assert [p.name for p in defn.operations[0].params] == ["limit"]
+
+
+@pytest.mark.asyncio
+async def test_create_datasource_from_schema_rejects_unknown_operation_names():
+    backend = _ds_backend()
+    with patch(_FETCH_FN, new=AsyncMock(return_value=_SPEC_RESULT)):
+        content = await _run_tool(
+            "create it",
+            "create_datasource_from_schema",
+            {
+                "source_id": "petstore",
+                "name": "Petstore",
+                "schema_url": "https://api.test/openapi.json",
+                "operation_names": "list_pets",
+            },
+            data_source_backend=backend,
+        )
+
+    assert "Unknown operation(s): list_pets" in content
+    assert "listpets" in content
+    backend.create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_add_datasource_operations_from_schema_extends_without_overwriting():
+    from app.domain.models.data_source_definition import DataSourceDefinition
+
+    stored = DataSourceDefinition.model_validate({
+        "id": "petstore",
+        "name": "Petstore",
+        "base_url": "https://api.test/v1",
+        "operations": [{"name": "listpets", "path": "/pets"}],
+    })
+    backend = _ds_backend()
+    backend.get = AsyncMock(return_value=stored)
+    backend.list = AsyncMock(return_value=[stored])
+
+    with patch(_FETCH_FN, new=AsyncMock(return_value=_SPEC_RESULT)):
+        content = await _run_tool(
+            "add delete",
+            "add_datasource_operations_from_schema",
+            {
+                "source_id": "petstore",
+                "schema_url": "https://api.test/openapi.json",
+                "operation_names": "listpets,deletepet",
+            },
+            data_source_backend=backend,
+        )
+
+    assert "Added 1 operation(s)" in content
+    assert "skipped, already present: listpets" in content
+    defn = backend.update.call_args[0][1]
+    assert [op.name for op in defn.operations] == ["listpets", "deletepet"]
+    # The pre-existing operation keeps its own definition.
+    assert defn.operations[0].path == "/pets"
