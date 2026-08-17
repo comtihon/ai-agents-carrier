@@ -1,9 +1,18 @@
 """Default chat agent — the entry point for all copilot chat interactions.
 
 A ReAct-style LangGraph agent backed by the bundled workflow_assistant.yaml
-config.  The agent has built-in tools for listing, running, and inspecting
-workflow runs, plus an ask_user tool that pauses execution via interrupt() to
-collect clarifying answers from the user.
+config.  This is the platform's *internal* agent: it runs in-process and builds
+the platform itself — workflows, agent definitions and data sources — rather
+than delegating that to an external service.  Alongside the platform CRUD tools
+it gets an ask_user tool that pauses execution via interrupt() to collect
+clarifying answers, and the tools of every configured MCP server (optionally
+narrowed by ``mcp_servers`` in the YAML config), which is what lets it act on
+Jira/GitHub/Slack and on the ``datasources`` server's published operations.
+
+The tool list is resolved per invocation, not frozen at build time: MCP servers
+are (re)connected while the process runs — notably ``datasources``, whose tool
+list changes whenever a data source is saved — and the agent must see the tools
+that exist *now*.
 
 The system prompt and LLM provider are loaded from the YAML config so the
 agent can be customised without code changes.
@@ -33,11 +42,14 @@ from app.infrastructure.orchestration.yaml_graph import stream_graph_to_pause
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+    from langchain_core.tools import BaseTool
+
     from app.infrastructure.config.graph_loader import YamlGraphRegistry
     from app.infrastructure.persistence.agent_backend import AgentDefinitionBackend
     from app.infrastructure.persistence.data_source_backend import DataSourceDefinitionBackend
     from app.infrastructure.persistence.mongo import MongoGraphRunRepository
     from app.infrastructure.persistence.workflow_backend import WorkflowDefinitionBackend
+    from app.infrastructure.tools.mcp_client import McpToolsProvider
 
 logger = logging.getLogger(__name__)
 
@@ -70,11 +82,18 @@ def build_default_workflow(
     agent_backend: "AgentDefinitionBackend | None" = None,
     data_source_backend: "DataSourceDefinitionBackend | None" = None,
     refresh_datasources: "Callable[[], Awaitable[None]] | None" = None,
+    mcp_tools_provider: "McpToolsProvider | None" = None,
 ):
     """Build and compile the default ReAct chat agent."""
 
     config = agent_config or {}
     system_prompt_template = config.get("system_prompt", _DEFAULT_SYSTEM_PROMPT).strip()
+    # Optional allow-list of MCP server names; None (the default) means every
+    # configured server. An empty list means "no MCP tools at all".
+    raw_servers = config.get("mcp_servers")
+    allowed_mcp_servers: set[str] | None = (
+        {str(s) for s in raw_servers} if isinstance(raw_servers, list) else None
+    )
 
     # ── tools ────────────────────────────────────────────────────────────────
 
@@ -635,6 +654,249 @@ def build_default_workflow(
         await _publish_datasources()
         return f"Data source '{resolved}' updated."
 
+    # --- Data source schema import ---
+    #
+    # Specifications are parsed by code, never re-typed by the model: the tools
+    # below hand back operation *names*, and the create/extend tools copy the
+    # parsed operation objects verbatim. That keeps a 500-endpoint OpenAPI
+    # document out of the context window and out of the failure modes of
+    # transcribing JSON.
+
+    def _parse_auth_block(auth_json: str):
+        """(auth_model, None) or (None, error_str) from a JSON auth block."""
+        if not auth_json:
+            return None, None
+        from pydantic import TypeAdapter
+
+        from app.domain.models.data_source_definition import AnyDataSourceAuth
+        try:
+            return TypeAdapter(AnyDataSourceAuth).validate_python(json.loads(auth_json)), None
+        except Exception as exc:
+            return None, f"Invalid auth_json: {exc}"
+
+    async def _load_spec(schema_url: str, kind: str, auth_json: str):
+        """(spec_dict, None) or (None, error_str)."""
+        from app.infrastructure.datasources.discovery import (
+            SpecFetchError,
+            SpecParseError,
+            fetch_and_parse_spec,
+        )
+        auth_model, err = _parse_auth_block(auth_json)
+        if err:
+            return None, err
+        try:
+            spec = await fetch_and_parse_spec(
+                schema_url,
+                kind="graphql" if kind == "graphql" else "http",
+                auth=auth_model,
+            )
+        except (SpecFetchError, SpecParseError) as exc:
+            return None, f"Could not import the schema: {exc}"
+        return spec, None
+
+    def _select_operations(spec: dict, names_csv: str):
+        """(operations, None) or (None, error_str) — the named subset of a spec."""
+        wanted = [n.strip() for n in names_csv.split(",") if n.strip()]
+        available = {op["name"]: op for op in spec["operations"]}
+        if not wanted:
+            return None, (
+                "operation_names is required — call import_datasource_schema first "
+                "and pass a comma-separated subset of the names it lists."
+            )
+        missing = [n for n in wanted if n not in available]
+        if missing:
+            return None, (
+                f"Unknown operation(s): {', '.join(missing)}. "
+                f"Available: {', '.join(list(available)[:40])}"
+                + (" …" if len(available) > 40 else "")
+            )
+        return [available[n] for n in wanted], None
+
+    @tool
+    async def import_datasource_schema(
+        schema_url: str, kind: str = "http", auth_json: str = ""
+    ) -> str:
+        """List the operations an API specification defines. Stores nothing.
+
+        Use this before creating a data source for an API that publishes a
+        specification — it is the only way to get exact paths, params and
+        response schemas without guessing.
+
+        Args:
+            schema_url: URL of an OpenAPI/Swagger document (JSON or YAML), a
+                GraphQL introspection result, GraphQL SDL — or, with
+                kind="graphql", the GraphQL endpoint itself (it is introspected).
+            kind: "http" or "graphql".
+            auth_json: Optional auth block if the schema URL needs credentials,
+                same shape as create_datasource's auth_json.
+
+        Returns:
+            The declared base URL plus one line per operation. Pass the names you
+            want to create_datasource_from_schema or
+            add_datasource_operations_from_schema — the parsed operations are
+            copied as-is, so never re-type them yourself.
+        """
+        spec, err = await _load_spec(schema_url, kind, auth_json)
+        if err:
+            return err
+        lines = [
+            f"Schema: {spec['source']} ({spec['kind']})",
+            f"Declared base URL: {spec['base_url'] or '(none declared)'}",
+            f"Operations: {len(spec['operations'])}",
+        ]
+        for op in spec["operations"]:
+            target = op.get("path") or (op.get("query") or "")[:90]
+            params = ", ".join(
+                f"{p['name']}{'' if p['required'] else '?'}" for p in op.get("params") or []
+            )
+            summary = (op.get("summary") or "").strip()
+            lines.append(
+                f"- {op['name']} [{op['method']}] {target}"
+                + (f" params: {params}" if params else "")
+                + (f" — {summary}" if summary else "")
+            )
+        return "\n".join(lines)
+
+    @tool
+    async def create_datasource_from_schema(
+        source_id: str,
+        name: str,
+        schema_url: str,
+        operation_names: str,
+        base_url: str = "",
+        description: str = "",
+        kind: str = "http",
+        auth_json: str = "",
+    ) -> str:
+        """Create a data source from a specification, keeping only the named operations.
+
+        Args:
+            source_id: Unique kebab-case identifier (e.g. "github-api").
+            name: Human-readable display name.
+            schema_url: Same as import_datasource_schema.
+            operation_names: Comma-separated operation names from
+                import_datasource_schema's output.
+            base_url: Base URL for the calls; defaults to the one the
+                specification declares.
+            description: What this data source provides.
+            kind: "http" or "graphql".
+            auth_json: Auth block for the API calls (also used to fetch the schema).
+        """
+        if data_source_backend is None:
+            return "Data source creation unavailable: no persistent backend configured."
+        existing = await data_source_backend.get(source_id)
+        if existing is not None:
+            return (
+                f"Data source '{source_id}' already exists. Use "
+                "add_datasource_operations_from_schema to extend it."
+            )
+        spec, err = await _load_spec(schema_url, kind, auth_json)
+        if err:
+            return err
+        operations, err = _select_operations(spec, operation_names)
+        if err:
+            return err
+
+        resolved_base = base_url.strip() or spec["base_url"] or ""
+        if not resolved_base:
+            return (
+                "No base URL: the specification declares none, so pass base_url "
+                "explicitly."
+            )
+        auth: dict = {"type": "none"}
+        if auth_json:
+            try:
+                auth = json.loads(auth_json)
+            except json.JSONDecodeError as exc:
+                return f"Invalid auth_json: {exc}"
+
+        from app.domain.models.data_source_definition import (
+            DataSourceDefinition,
+            validate_operations,
+        )
+        try:
+            defn = DataSourceDefinition.model_validate({
+                "id": source_id,
+                "name": name,
+                "description": description,
+                "kind": spec["kind"] if spec["kind"] == "graphql" else "http",
+                "base_url": resolved_base,
+                "auth": auth,
+                "operations": operations,
+            })
+            validate_operations(defn)
+        except Exception as exc:
+            return f"Invalid data source definition: {exc}"
+
+        await data_source_backend.create(defn)
+        await _publish_datasources()
+        return (
+            f"Data source '{source_id}' created from {spec['source']} with "
+            f"{len(defn.operations)} operation(s): "
+            f"{', '.join(op.name for op in defn.operations)}"
+        )
+
+    @tool
+    async def add_datasource_operations_from_schema(
+        source_id: str,
+        schema_url: str,
+        operation_names: str,
+        kind: str = "http",
+        auth_json: str = "",
+    ) -> str:
+        """Add operations from a specification to an existing data source.
+
+        Existing operations are kept; a name that already exists is skipped
+        rather than overwritten.
+
+        Args:
+            source_id: The data source id or name.
+            schema_url: Same as import_datasource_schema.
+            operation_names: Comma-separated operation names to add.
+            kind: "http" or "graphql".
+            auth_json: Optional auth block if the schema URL needs credentials.
+        """
+        if data_source_backend is None:
+            return "Data source updates unavailable: no persistent backend configured."
+        resolved, err = await _resolve_datasource_id(source_id)
+        if err:
+            return err
+        existing = await data_source_backend.get(resolved)
+        if existing is None:
+            return f"Data source '{resolved}' not found."
+        spec, err = await _load_spec(schema_url, kind, auth_json)
+        if err:
+            return err
+        operations, err = _select_operations(spec, operation_names)
+        if err:
+            return err
+
+        payload = existing.model_dump(mode="json")
+        present = {op["name"] for op in payload["operations"]}
+        added = [op for op in operations if op["name"] not in present]
+        skipped = [op["name"] for op in operations if op["name"] in present]
+        if not added:
+            return f"Nothing to add — already present: {', '.join(skipped)}"
+        payload["operations"] = [*payload["operations"], *added]
+
+        from app.domain.models.data_source_definition import (
+            DataSourceDefinition,
+            validate_operations,
+        )
+        try:
+            defn = DataSourceDefinition.model_validate(payload)
+            validate_operations(defn)
+        except Exception as exc:
+            return f"Invalid data source definition: {exc}"
+
+        await data_source_backend.update(resolved, defn)
+        await _publish_datasources()
+        return (
+            f"Added {len(added)} operation(s) to '{resolved}': "
+            f"{', '.join(op['name'] for op in added)}"
+            + (f" (skipped, already present: {', '.join(skipped)})" if skipped else "")
+        )
+
     @tool
     async def delete_datasource(source_id: str) -> str:
         """Permanently delete a data source definition and unpublish its tools.
@@ -654,11 +916,57 @@ def build_default_workflow(
         await _publish_datasources()
         return f"Data source '{resolved}' deleted."
 
-    tools = [list_workflows, run_workflow, list_runs, get_run, ask_user,
-             create_workflow, update_workflow, delete_workflow,
-             list_agents, get_agent, create_agent, update_agent, delete_agent,
-             list_datasources, create_datasource, update_datasource, delete_datasource]
-    llm_with_tools = llm.bind_tools(tools)
+    platform_tools = [list_workflows, run_workflow, list_runs, get_run, ask_user,
+                      create_workflow, update_workflow, delete_workflow,
+                      list_agents, get_agent, create_agent, update_agent, delete_agent,
+                      list_datasources, create_datasource, update_datasource,
+                      delete_datasource, import_datasource_schema,
+                      create_datasource_from_schema,
+                      add_datasource_operations_from_schema]
+    _platform_tool_names = {t.name for t in platform_tools}
+
+    # ── tool resolution ──────────────────────────────────────────────────────
+
+    def _mcp_tools() -> "list[BaseTool]":
+        """MCP tools available right now, narrowed by the config allow-list.
+
+        Resolved per invocation because servers are (re)connected while the
+        process runs: the ``datasources`` server republishes its tool list on
+        every data source save, and a frozen list would keep serving the old one.
+        """
+        if mcp_tools_provider is None or allowed_mcp_servers == set():
+            return []
+        try:
+            available = mcp_tools_provider.get_tools()
+        except Exception:
+            logger.warning("chat_agent: could not read MCP tools", exc_info=True)
+            return []
+        selected = []
+        for mcp_tool in available:
+            # A platform tool of the same name wins — the built-ins are the
+            # documented contract of this agent.
+            if mcp_tool.name in _platform_tool_names:
+                continue
+            if allowed_mcp_servers is not None:
+                server = mcp_tools_provider.get_tool_server(mcp_tool.name)
+                if server not in allowed_mcp_servers:
+                    continue
+            selected.append(mcp_tool)
+        return selected
+
+    def _all_tools() -> list:
+        return [*platform_tools, *_mcp_tools()]
+
+    # bind_tools() re-runs only when the tool set actually changed.
+    _bound_llms: dict[tuple[str, ...], Any] = {}
+
+    def _bound_llm(tools: list):
+        key = tuple(t.name for t in tools)
+        bound = _bound_llms.get(key)
+        if bound is None:
+            bound = llm.bind_tools(tools)
+            _bound_llms[key] = bound
+        return bound
 
     # ── nodes ────────────────────────────────────────────────────────────────
 
@@ -676,8 +984,12 @@ def build_default_workflow(
     async def agent(state: AssistantState, config: RunnableConfig) -> dict:
         from langchain_core.messages import SystemMessage
         messages = [SystemMessage(content=_build_system_prompt())] + list(state.get("messages", []))
-        response = await llm_with_tools.ainvoke(messages, config)
+        response = await _bound_llm(_all_tools()).ainvoke(messages, config)
         return {"messages": [response]}
+
+    async def tools_node(state: AssistantState, config: RunnableConfig) -> Any:
+        """ToolNode over the current tool set (see ``_mcp_tools``)."""
+        return await ToolNode(_all_tools()).ainvoke(state, config)
 
     def route(state: AssistantState) -> str:
         msgs = state.get("messages", [])
@@ -692,7 +1004,7 @@ def build_default_workflow(
 
     sg: StateGraph = StateGraph(AssistantState)
     sg.add_node("agent", agent)
-    sg.add_node("tools", ToolNode(tools))
+    sg.add_node("tools", tools_node)
 
     sg.add_edge(START, "agent")
     sg.add_conditional_edges("agent", route, {"tools": "tools", END: END})
