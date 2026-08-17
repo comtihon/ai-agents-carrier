@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from app.api.dependencies import get_container
@@ -38,7 +38,15 @@ from app.domain.models.data_source_definition import (
     DataSourceDefinition,
     validate_operations,
 )
-from app.infrastructure.datasources.discovery import probe_and_discover
+from app.infrastructure.datasources.discovery import (
+    MAX_IMPORTED_OPERATIONS,
+    MAX_SPEC_BYTES,
+    SpecFetchError,
+    SpecParseError,
+    fetch_and_parse_spec,
+    parse_spec,
+    probe_and_discover,
+)
 from app.infrastructure.datasources.try_run import try_operation
 
 logger = logging.getLogger(__name__)
@@ -83,6 +91,16 @@ class ProbeDataSourceRequest(BaseModel):
     # {"type": "bearer", "token": "..."}, or with the secret named as
     # {"type": "bearer", "from_config": "AFP_SERVICE_TOKEN"}; omit or
     # {"type": "none"} for none.
+    auth: dict | None = None
+
+
+class FetchSchemaRequest(BaseModel):
+    """Import a specification the caller points at explicitly."""
+
+    schema_url: str
+    kind: str = "http"
+    # Auth in the stored (secret-bearing) shape, or with the secret named via
+    # ``from_config``; omit for an unauthenticated fetch.
     auth: dict | None = None
 
 
@@ -273,7 +291,13 @@ async def probe_datasource(
     body: ProbeDataSourceRequest,
     settings: Settings = Depends(get_settings),
 ):
-    """Probe a base URL and attempt schema discovery (OpenAPI / GraphQL).
+    """Probe a base URL for reachability and credential acceptance.
+
+    Schema discovery happens here only for ``kind == "graphql"``, where the
+    endpoint URL is itself the way to fetch the schema (introspection).  HTTP
+    sources are never guessed at: point ``POST /datasources/schema/fetch`` at
+    the specification URL, or upload the file to
+    ``POST /datasources/schema/upload``.
 
     The auth block uses the stored shape (secret values inline) or names a
     config key via ``from_config``.  Target-server failures never surface as a
@@ -290,6 +314,67 @@ async def probe_datasource(
             raise HTTPException(status_code=422, detail=exc.errors(include_url=False)) from exc
     kind = "graphql" if body.kind == "graphql" else "http"
     return await probe_and_discover(body.base_url, kind=kind, auth=auth_model)
+
+
+@router.post("/schema/fetch")
+async def fetch_datasource_schema(
+    body: FetchSchemaRequest,
+    settings: Settings = Depends(get_settings),
+):
+    """Fetch an API specification from an explicit URL and map it to operations.
+
+    ``schema_url`` may point at an OpenAPI/Swagger document (JSON or YAML), a
+    GraphQL introspection result, GraphQL SDL, or — when ``kind`` is
+    ``graphql`` — at the GraphQL endpoint itself, which is introspected.
+
+    Returns ``{kind, source, base_url, operations}``.  The operations are a
+    pick-list: nothing is stored until the caller saves the data source with
+    the subset it wants.  A URL that cannot be read or a body that is not a
+    specification is a 422 with the detail, never a 5xx.
+    """
+    auth_model = None
+    if body.auth is not None:
+        auth = _resolve_auth_from_config(body.auth, settings)
+        try:
+            auth_model = _AUTH_ADAPTER.validate_python(auth)
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=exc.errors(include_url=False)) from exc
+    kind = "graphql" if body.kind == "graphql" else "http"
+    try:
+        return await fetch_and_parse_spec(
+            body.schema_url, kind=kind, auth=auth_model,
+            max_operations=MAX_IMPORTED_OPERATIONS,
+        )
+    except (SpecFetchError, SpecParseError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/schema/upload")
+async def upload_datasource_schema(
+    file: UploadFile = File(...),
+    kind: str = Form("http"),
+):
+    """Map an uploaded API specification file to operations.
+
+    Same result shape as ``POST /datasources/schema/fetch``; the document is
+    read from the upload instead of a URL.  ``kind`` is accepted for symmetry
+    but the document type is detected from the content, so an OpenAPI file
+    uploaded against ``kind=graphql`` still parses as OpenAPI.
+    """
+    raw = await file.read()
+    if len(raw) > MAX_SPEC_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Specification is larger than {MAX_SPEC_BYTES // (1024 * 1024)} MB",
+        )
+    try:
+        return parse_spec(
+            raw,
+            source=file.filename or "uploaded specification",
+            max_operations=MAX_IMPORTED_OPERATIONS,
+        )
+    except SpecParseError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.post("/try-operation")
