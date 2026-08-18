@@ -110,6 +110,16 @@ class AuthService:
     # ── Main entry point ──────────────────────────────────────────────────────
 
     async def validate_token(self, token: str) -> dict:
+        # An inbound Authorization header is latin-1 decoded, so any header byte
+        # >= 0x80 becomes a non-ASCII character.  Such a token can never be a
+        # valid credential, and putting it in the *outbound* userinfo
+        # Authorization header makes httpx raise UnicodeEncodeError while
+        # ascii-encoding it — an unauthenticated 500 (plus a logged traceback)
+        # instead of a 401.  Reject it here, before any outbound call, so every
+        # caller of validate_token keeps turning it into a clean 401.
+        if not token.isascii():
+            raise AuthError("Invalid token: non-ASCII characters in bearer token")
+
         # Fast path: try standard JWT validation
         try:
             header = jwt.get_unverified_header(token)

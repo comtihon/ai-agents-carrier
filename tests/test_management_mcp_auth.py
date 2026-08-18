@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 from starlette.applications import Starlette
@@ -460,3 +461,99 @@ async def test_non_ascii_authorization_header_is_401_not_500(monkeypatch):
 
     assert await probe("/mcp/datasources") == 401
     assert await probe("/mcp/management") == 401
+
+
+# ---------------------------------------------------------------------------
+# Non-ASCII bearer through the OAuth fallback → 401, never a 500
+# ---------------------------------------------------------------------------
+
+class _ExplodingTransport(httpx.AsyncBaseTransport):
+    """Transport-level stub: any outbound call at all fails the test."""
+
+    def __init__(self) -> None:
+        self.calls: list = []
+
+    async def handle_async_request(self, request):  # pragma: no cover - must not run
+        self.calls.append(request)
+        raise AssertionError(f"unexpected outbound request to {request.url}")
+
+
+async def test_non_ascii_bearer_through_oauth_fallback_is_401(monkeypatch):
+    """Raw byte header + real AuthService: the wrapper must still 401.
+
+    The auth service is deliberately NOT mocked here — the prod bug lived in the
+    real outbound httpx call, so it is stubbed at the transport level instead and
+    must never be reached.
+    """
+    transport = _ExplodingTransport()
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda *a, **kw: real_client(*a, **{**kw, "transport": transport}),
+    )
+    service = AuthService(
+        jwks_url="https://auth.example.com/keys", issuer="https://auth.example.com"
+    )
+    wrapper = _ManagementAuthWrapper(
+        _inner_app(), api_key="secret", oauth_enabled=True, auth_service=service
+    )
+
+    status = await _raw_asgi_post(wrapper, "/management", auth=b"Bearer \xff\xfe\xc3\xbf")
+
+    assert status == 401
+    assert transport.calls == []
+
+
+async def _raw_asgi_post(app, path: str, auth: bytes | None = None) -> int:
+    """Drive an ASGI app directly so the Authorization header keeps raw bytes."""
+    headers = [(b"host", b"t")]
+    if auth is not None:
+        headers.append((b"authorization", auth))
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.1"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": headers,
+        "client": ("127.0.0.1", 1234),
+        "server": ("t", 80),
+    }
+    status: dict = {}
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            status["code"] = message["status"]
+
+    await app(scope, receive, send)
+    return status["code"]
+
+
+# ---------------------------------------------------------------------------
+# API keys with surrounding whitespace (Secret Manager trailing newline)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("key", ["secret\n", "  secret  ", "\tsecret\r\n"])
+async def test_api_key_with_surrounding_whitespace_still_matches(key):
+    wrapper = _ManagementAuthWrapper(_inner_app(), api_key=key, oauth_enabled=False)
+    async with AsyncClient(transport=ASGITransport(app=wrapper), base_url="http://t") as c:
+        resp = await c.post("/management", headers={"Authorization": "Bearer secret"})
+    assert resp.status_code == 200
+
+
+@pytest.mark.parametrize("key", ["", "   ", "\n"])
+async def test_empty_api_key_counts_as_unset_and_fails_closed(key):
+    wrapper = _ManagementAuthWrapper(_inner_app(), api_key=key, oauth_enabled=False)
+    async with AsyncClient(transport=ASGITransport(app=wrapper), base_url="http://t") as c:
+        bare = await c.post("/management", headers={"Authorization": "Bearer "})
+        none = await c.post("/management")
+    assert bare.status_code == 401
+    assert none.status_code == 401
