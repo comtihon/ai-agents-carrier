@@ -3,6 +3,7 @@ from __future__ import annotations
 import app.compat  # noqa: F401 — must be first, patches langgraph.graph.graph
 
 import logging
+import secrets
 from contextlib import AsyncExitStack, asynccontextmanager
 from uuid import uuid4
 
@@ -12,8 +13,10 @@ from copilotkit.integrations.fastapi import handler as _ck_handler
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from langgraph.types import Command
+from starlette.routing import get_route_path
 
 from app.api.mcp.datasources_server import get_datasources_mcp, rebuild_datasource_tools
+from app.api.mcp.management_server import get_management_mcp, register_management_tools
 from app.api.middleware.auth import OAuthMiddleware
 from app.api.routes.agent_callbacks import router as agent_callbacks_router
 from app.api.routes.agents import router as agents_router
@@ -27,7 +30,7 @@ from app.api.routes.workflows import router as workflows_router
 from app.core.config import get_settings
 from app.core.container import ApplicationContainer, build_container
 from app.domain.models.graph_run import GraphRun
-from app.infrastructure.auth.auth_service import AuthService
+from app.infrastructure.auth.auth_service import AuthError, AuthService
 from app.infrastructure.orchestration.chat_agent_loader import load_chat_agent_config
 from app.infrastructure.orchestration.default_workflow import build_default_workflow
 from app.infrastructure.orchestration.router_agent import build_router_graph
@@ -67,8 +70,11 @@ class _DatasourcesAuthWrapper:
 
         if self._api_key is not None:
             headers = dict(scope.get("headers") or ())
-            auth_header = headers.get(b"authorization", b"").decode("latin-1")
-            if auth_header != f"Bearer {self._api_key}":
+            # Compare the raw header bytes: a decoded str can hold non-ASCII
+            # characters (any header byte >= 0x80), and secrets.compare_digest
+            # raises TypeError on those -> 500 instead of 401.
+            expected = b"Bearer " + self._api_key.encode()
+            if not secrets.compare_digest(headers.get(b"authorization", b""), expected):
                 await _send_401(send)
                 return
         elif self._fail_closed:
@@ -76,6 +82,99 @@ class _DatasourcesAuthWrapper:
             return
 
         await self._app(scope, receive, send)
+
+
+class _ManagementAuthWrapper:
+    """Pure-ASGI bearer-auth gate for the mounted ``/mcp/management`` app.
+
+    Stricter than ``_DatasourcesAuthWrapper``: it always fails closed, because
+    nothing inside this backend calls the management endpoint — it exists for
+    external MCP clients only, and it can delete workflows and control runs.
+
+    - ``api_key`` set and the request carries ``Authorization: Bearer <api_key>``
+      → pass.
+    - otherwise, ``oauth_enabled`` with a bearer token that ``auth_service``
+      validates → pass.
+    - everything else → 401.  In particular: no ``api_key`` and OAuth disabled
+      means every request is rejected.  An empty / whitespace-only ``api_key``
+      counts as *unset*, so ``MANAGEMENT_MCP_API_KEY=""`` cannot turn the bare
+      header ``"Bearer "`` into a valid credential.
+
+    Only ``http`` scopes can reach the inner app: anything else (websocket
+    included) is refused here rather than forwarded unauthenticated.
+    """
+
+    def __init__(
+        self,
+        app,
+        api_key: str | None,
+        oauth_enabled: bool,
+        auth_service: AuthService | None = None,
+    ) -> None:
+        self._app = app
+        self._api_key = api_key if (api_key or "").strip() else None
+        self._oauth_enabled = oauth_enabled and auth_service is not None
+        self._auth_service = auth_service
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.close", "code": 1008})
+            return
+
+        headers = dict(scope.get("headers") or ())
+        # Keep the raw bytes for the constant-time comparison: a latin-1 decode
+        # turns any byte >= 0x80 into a non-ASCII character and
+        # secrets.compare_digest raises TypeError on those (500 instead of 401).
+        auth_bytes = headers.get(b"authorization", b"")
+
+        if self._api_key is not None and secrets.compare_digest(
+            auth_bytes, b"Bearer " + self._api_key.encode()
+        ):
+            await self._app(scope, receive, send)
+            return
+
+        auth_header = auth_bytes.decode("latin-1")
+
+        if self._oauth_enabled and auth_header.startswith("Bearer "):
+            token = auth_header.split(" ", 1)[1]
+            try:
+                await self._auth_service.validate_token(token)
+            except AuthError as exc:
+                logger.warning("management MCP auth rejected: %s", exc.message)
+                await _send_401(send)
+                return
+            await self._app(scope, receive, send)
+            return
+
+        await _send_401(send)
+
+
+class _McpDispatcher:
+    """Route ``/mcp/<name>`` to the matching mounted MCP app.
+
+    Starlette matches mounts in registration order and ``Mount("/mcp")``
+    swallows every ``/mcp/*`` path, so a second ``app.mount("/mcp", ...)``
+    would be dead code.  This dispatcher sits behind the single ``/mcp`` mount
+    and picks the inner app by path prefix instead.  Each inner FastMCP keeps
+    its native ``streamable_http_path`` (``/datasources``, ``/management``), so
+    the inner apps see exactly the paths they already expect.
+    """
+
+    def __init__(self, routes: dict) -> None:
+        self._routes = routes
+
+    async def __call__(self, scope, receive, send) -> None:
+        # Starlette's Mount does not rewrite scope["path"] — it only sets
+        # root_path ("/mcp"). get_route_path strips root_path, which is what the
+        # inner-app prefixes ("/datasources", "/management") are relative to.
+        path = get_route_path(scope) if scope.get("type") in ("http", "websocket") else ""
+        for prefix, app in self._routes.items():
+            if path == prefix or path.startswith(f"{prefix}/"):
+                await app(scope, receive, send)
+                return
+        if scope["type"] == "http":
+            await _send_404(send)
 
 
 async def _send_401(send) -> None:
@@ -87,6 +186,18 @@ async def _send_401(send) -> None:
     await send({
         "type": "http.response.body",
         "body": b'{"detail":"Missing or invalid Authorization header"}',
+    })
+
+
+async def _send_404(send) -> None:
+    await send({
+        "type": "http.response.start",
+        "status": 404,
+        "headers": [(b"content-type", b"application/json")],
+    })
+    await send({
+        "type": "http.response.body",
+        "body": b'{"detail":"Not Found"}',
     })
 
 
@@ -229,7 +340,10 @@ def _make_datasources_refresher(container: ApplicationContainer):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    container = build_container(get_settings())
+    # create_app stashes the Settings it resolved; reuse it so the mount and the
+    # tool registration below cannot disagree with it.
+    settings = getattr(app.state, "settings", None) or get_settings()
+    container = build_container(settings)
     await container.startup()
     app.state.container = container
 
@@ -243,10 +357,16 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("failed to build initial datasources MCP tools")
 
+    # Management MCP server: static tool set, registered once. Disabled by flag
+    # means the server is never built and never mounted (404 at /mcp/management).
+    management_mcp = None
+    if settings.management_mcp_enabled:
+        management_mcp = get_management_mcp(settings.management_mcp_allowed_hosts)
+        register_management_tools(management_mcp, lambda: app.state.container)
+
     router_graph = build_router_graph(container.llm)
 
     # Load bundled chat agent config (always, regardless of workflow backend type)
-    settings = get_settings()
     agent_config = load_chat_agent_config(
         getattr(settings, "chat_agent_config_path", None)
     )
@@ -272,6 +392,8 @@ async def lifespan(app: FastAPI):
         # The chat agent is the platform's internal agent: it gets the same MCP
         # tools the workflow steps do, resolved per invocation.
         mcp_tools_provider=container.mcp_tools_provider,
+        # Needed by the run-control tools (terminate/retry/restart/approve/reject).
+        container=container,
     )
     sdk = CopilotKitRemoteEndpoint(
         agents=[
@@ -314,6 +436,8 @@ async def lifespan(app: FastAPI):
     async with AsyncExitStack() as stack:
         # FastMCP's streamable-http app requires an active session manager.
         await stack.enter_async_context(datasources_mcp.session_manager.run())
+        if management_mcp is not None:
+            await stack.enter_async_context(management_mcp.session_manager.run())
         yield
     await container.shutdown()
 
@@ -321,6 +445,9 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(title=settings.app_name, debug=settings.debug, lifespan=lifespan)
+    app.state.settings = settings
+    # Built once and shared by OAuthMiddleware and the management MCP gate.
+    auth_service: AuthService | None = None
     if settings.oauth_enabled:
         auth_service = AuthService(
             jwks_url=settings.oauth_jwks_url,
@@ -358,12 +485,29 @@ def create_app() -> FastAPI:
             "/mcp/datasources will reject every request (fail closed). Set "
             "MCP_DATASOURCES_API_KEY so the backend's own agents can reach it."
         )
-    app.mount(
-        "/mcp",
-        _DatasourcesAuthWrapper(
+    mcp_routes: dict = {
+        "/datasources": _DatasourcesAuthWrapper(
             get_datasources_mcp().streamable_http_app(),
             api_key=settings.mcp_datasources_api_key,
             oauth_enabled=settings.oauth_enabled,
         ),
-    )
+    }
+    # Management MCP — the platform's own CRUD + run control tools for external
+    # MCP clients. Flag off means it is not mounted at all (404).
+    if settings.management_mcp_enabled:
+        # Same normalization as _ManagementAuthWrapper: an empty / whitespace-only
+        # key counts as unset, so it must warn too instead of silently 401-ing.
+        if not (settings.management_mcp_api_key or "").strip() and not settings.oauth_enabled:
+            logger.warning(
+                "MANAGEMENT_MCP_ENABLED is true but MANAGEMENT_MCP_API_KEY is not "
+                "set and OAuth is disabled — /mcp/management will reject every "
+                "request (fail closed). Set MANAGEMENT_MCP_API_KEY to use it."
+            )
+        mcp_routes["/management"] = _ManagementAuthWrapper(
+            get_management_mcp(settings.management_mcp_allowed_hosts).streamable_http_app(),
+            api_key=settings.management_mcp_api_key,
+            oauth_enabled=settings.oauth_enabled,
+            auth_service=auth_service,
+        )
+    app.mount("/mcp", _McpDispatcher(mcp_routes))
     return app

@@ -19,11 +19,9 @@ agent can be customised without code changes.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from typing import TYPE_CHECKING, Annotated, Any
-from uuid import uuid4
 
 from copilotkit import CopilotKitState
 from langchain_core.language_models import BaseChatModel
@@ -36,7 +34,10 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from langgraph.types import RunnableConfig, interrupt
 
-from app.domain.models.graph_run import GraphRun
+from app.application import management_tools as core
+from app.application import run_control
+from app.application.management_tools import ManagementDeps, _spawn_background
+from app.application.run_control import RunControlError
 from app.infrastructure.orchestration.yaml_graph import stream_graph_to_pause
 
 if TYPE_CHECKING:
@@ -52,6 +53,7 @@ if TYPE_CHECKING:
     from app.infrastructure.tools.mcp_client import McpToolsProvider
 
 logger = logging.getLogger(__name__)
+
 
 _DEFAULT_SYSTEM_PROMPT = """\
 You are the Workflow Assistant for this workflow automation platform.
@@ -83,8 +85,15 @@ def build_default_workflow(
     data_source_backend: "DataSourceDefinitionBackend | None" = None,
     refresh_datasources: "Callable[[], Awaitable[None]] | None" = None,
     mcp_tools_provider: "McpToolsProvider | None" = None,
+    container: Any | None = None,
 ):
-    """Build and compile the default ReAct chat agent."""
+    """Build and compile the default ReAct chat agent.
+
+    ``container`` is the ApplicationContainer.  It is optional: the run-control
+    tools (terminate/retry/restart/approve/reject) need it and are only
+    registered when it is passed, so callers that build the agent without a
+    container (tests, embedded uses) keep the CRUD tool set unchanged.
+    """
 
     config = agent_config or {}
     system_prompt_template = config.get("system_prompt", _DEFAULT_SYSTEM_PROMPT).strip()
@@ -97,35 +106,25 @@ def build_default_workflow(
 
     # ── tools ────────────────────────────────────────────────────────────────
 
+    # Every platform tool below is a thin wrapper over the shared cores in
+    # app.application.management_tools — the same functions back the
+    # /mcp/management MCP surface, so the two can never drift apart.  Only the
+    # names, signatures and docstrings live here: those are the LLM-facing
+    # contract of this agent.
+    deps = ManagementDeps(
+        registry=registry,
+        run_repository=run_repository,
+        workflow_backend=workflow_backend,
+        agent_backend=agent_backend,
+        data_source_backend=data_source_backend,
+        refresh_runner=refresh_runner,
+        refresh_datasources=refresh_datasources,
+    )
+
     @tool
     def list_workflows() -> str:
         """List all available workflow IDs, names, and descriptions."""
-        defs = registry.list_definitions()
-        if not defs:
-            return "No workflows are currently configured."
-        lines = [
-            f"- **{d['id']}** ({d.get('name', d['id'])}): {(d.get('description') or '').strip()}"
-            for d in defs
-        ]
-        return "\n".join(lines)
-
-    async def _resolve_workflow_id(query: str):
-        """Returns (resolved_id, None) or (None, error_str)."""
-        defs = registry.list_definitions()
-        for d in defs:
-            if d["id"] == query:
-                return d["id"], None
-        for d in defs:
-            if d.get("name", "").lower() == query.lower():
-                return d["id"], None
-        matches = [d for d in defs if query.lower() in d["id"].lower() or query.lower() in d.get("name", "").lower()]
-        if len(matches) == 1:
-            return matches[0]["id"], None
-        if matches:
-            cands = ", ".join(f"{d['id']} ({d.get('name', d['id'])})" for d in matches)
-            return None, f"Ambiguous — multiple matches: {cands}"
-        available = ", ".join(f"{d['id']} ({d.get('name', d['id'])})" for d in defs) or "none"
-        return None, f"Workflow '{query}' not found. Available: {available}"
+        return core.list_workflows(deps)
 
     @tool
     async def run_workflow(workflow_id: str, request: str) -> str:
@@ -138,33 +137,11 @@ def build_default_workflow(
         Returns:
             JSON with run_id, workflow_id, workflow_name, and __event__ = workflow_started.
         """
-        resolved, err = await _resolve_workflow_id(workflow_id)
-        if err:
-            return err
-        workflow_id = resolved
-        runner = registry.get(workflow_id)
-        if runner is None:
-            return f"Workflow '{workflow_id}' not found."
-
-        run_id = str(uuid4())
-        child_run = GraphRun(
-            id=run_id,
-            graph_id=workflow_id,
-            user_request=request,
-            status="running",
-            step_statuses={s["id"]: "pending" for s in runner.steps},
+        # stream_graph_to_pause is passed explicitly so that this module's
+        # binding (the one tests patch) is the one the core calls.
+        return await core.run_workflow(
+            deps, workflow_id, request, stream_fn=stream_graph_to_pause
         )
-        await run_repository.create(child_run)
-        asyncio.create_task(
-            stream_graph_to_pause(runner, child_run, run_repository, {"request": request})
-        )
-        logger.info("chat_agent: spawned '%s' as run %s", workflow_id, run_id)
-        return json.dumps({
-            "__event__": "workflow_started",
-            "run_id": run_id,
-            "workflow_id": workflow_id,
-            "workflow_name": runner.name,
-        })
 
     @tool
     async def list_runs(workflow_id: str | None = None, limit: int = 10) -> str:
@@ -174,26 +151,7 @@ def build_default_workflow(
             workflow_id: Filter to a specific workflow (optional).
             limit: Maximum number of runs to return (default 10).
         """
-        try:
-            runs = await run_repository.list(
-                workflow_id=workflow_id,
-                limit=min(limit, 20),
-            )
-        except TypeError:
-            # fallback for backends that don't support keyword args
-            runs = await run_repository.list()
-            if workflow_id:
-                runs = [r for r in runs if r.graph_id == workflow_id]
-            runs = runs[:limit]
-
-        if not runs:
-            return "No runs found."
-        lines = [
-            f"- **{r.id}** ({r.graph_id}) — status: {r.status}"
-            + (f", started: {r.created_at}" if getattr(r, "created_at", None) else "")
-            for r in runs
-        ]
-        return "\n".join(lines)
+        return await core.list_runs(deps, workflow_id, limit)
 
     @tool
     async def get_run(run_id: str) -> str:
@@ -202,32 +160,7 @@ def build_default_workflow(
         Args:
             run_id: The run ID to inspect.
         """
-        run = await run_repository.get(run_id)
-        if run is None:
-            return f"Run '{run_id}' not found."
-        parts = [
-            f"Run: {run.id}",
-            f"Workflow: {run.graph_id}",
-            f"Status: {run.status}",
-        ]
-        if run.step_statuses:
-            parts.append("Steps:")
-            for step_id, status in run.step_statuses.items():
-                parts.append(f"  - {step_id}: {status}")
-        if run.state:
-            # Include output values for failed/finished steps — skip internal keys
-            output_keys = [k for k in run.state if not k.startswith("_")]
-            if output_keys:
-                parts.append("State keys: " + ", ".join(output_keys))
-                for k in output_keys[:8]:  # cap to avoid huge responses
-                    v = run.state[k]
-                    if isinstance(v, dict) and "error" in v:
-                        parts.append(f"  {k}.error: {v['error'][:300]}")
-                    elif isinstance(v, dict) and "status" in v:
-                        parts.append(f"  {k}.status: {v.get('status')} {str(v.get('body',''))[:200]}")
-        if run.error:
-            parts.append(f"Error: {run.error[:500]}")
-        return "\n".join(parts)
+        return await core.get_run(deps, run_id)
 
     @tool
     def ask_user(questions: list[str]) -> str:
@@ -262,25 +195,7 @@ def build_default_workflow(
                 data_source (invoke a DataSourceDefinition operation).
                 Example: [{"id": "trigger", "type": "http"}, {"id": "research", "type": "llm_structured", "system_prompt": "...", "output": [{"name": "summary", "type": "str", "description": "..."}]}]
         """
-        if workflow_backend is None:
-            return "Workflow creation unavailable: no persistent backend configured."
-        try:
-            steps = json.loads(steps_json)
-        except json.JSONDecodeError as exc:
-            return f"Invalid steps_json: {exc}"
-        if not isinstance(steps, list):
-            return "steps_json must be a JSON array."
-
-        existing = await workflow_backend.get(workflow_id)
-        if existing is not None:
-            return f"Workflow '{workflow_id}' already exists. Use update_workflow to modify it."
-
-        from app.domain.models.workflow_definition import WorkflowDefinition
-        defn = WorkflowDefinition(id=workflow_id, name=name, description=description, steps=steps)
-        await workflow_backend.create(defn)
-        if refresh_runner is not None:
-            await refresh_runner(workflow_id)
-        return f"Workflow '{workflow_id}' created with {len(steps)} step(s)."
+        return await core.create_workflow(deps, workflow_id, name, description, steps_json)
 
     @tool
     async def update_workflow(
@@ -297,36 +212,7 @@ def build_default_workflow(
             description: New description (omit to keep current).
             steps_json: JSON array replacing ALL steps (omit to keep current).
         """
-        if workflow_backend is None:
-            return "Workflow updates unavailable: no persistent backend configured."
-
-        resolved, err = await _resolve_workflow_id(workflow_id)
-        if err:
-            return err
-        workflow_id = resolved
-        defn = await workflow_backend.get(workflow_id)
-        if defn is None:
-            return f"Workflow '{workflow_id}' not found."
-        if defn.readonly:
-            return f"Workflow '{workflow_id}' is read-only and cannot be modified."
-
-        if name is not None:
-            defn.name = name
-        if description is not None:
-            defn.description = description
-        if steps_json is not None:
-            try:
-                steps = json.loads(steps_json)
-            except json.JSONDecodeError as exc:
-                return f"Invalid steps_json: {exc}"
-            if not isinstance(steps, list):
-                return "steps_json must be a JSON array."
-            defn.steps = steps
-
-        await workflow_backend.update(workflow_id, defn)
-        if refresh_runner is not None:
-            await refresh_runner(workflow_id)
-        return f"Workflow '{workflow_id}' updated."
+        return await core.update_workflow(deps, workflow_id, name, description, steps_json)
 
     @tool
     async def delete_workflow(workflow_id: str) -> str:
@@ -335,192 +221,45 @@ def build_default_workflow(
         Args:
             workflow_id: The workflow ID to delete.
         """
-        if workflow_backend is None:
-            return "Workflow deletion unavailable: no persistent backend configured."
-
-        resolved, err = await _resolve_workflow_id(workflow_id)
-        if err:
-            return err
-        workflow_id = resolved
-        defn = await workflow_backend.get(workflow_id)
-        if defn is None:
-            return f"Workflow '{workflow_id}' not found."
-        if defn.readonly:
-            return f"Workflow '{workflow_id}' is read-only and cannot be deleted."
-
-        await workflow_backend.delete(workflow_id)
-        registry._runners.pop(workflow_id, None)
-        return f"Workflow '{workflow_id}' deleted."
+        return await core.delete_workflow(deps, workflow_id)
 
     # --- Agent tools ---
-
-    async def _resolve_agent_id(query: str):
-        """Returns (resolved_id, None) or (None, error_str)."""
-        if agent_backend is None:
-            return None, "agent_backend not configured"
-        agents = await agent_backend.list()
-        # exact id match
-        for a in agents:
-            if a.id == query:
-                return a.id, None
-        # exact name match (case-insensitive)
-        for a in agents:
-            if a.name.lower() == query.lower():
-                return a.id, None
-        # substring match
-        matches = [a for a in agents if query.lower() in a.id.lower() or query.lower() in a.name.lower()]
-        if len(matches) == 1:
-            return matches[0].id, None
-        if matches:
-            cands = ", ".join(f"{a.id} ({a.name})" for a in matches)
-            return None, f"Ambiguous — multiple matches: {cands}"
-        return None, f"No agent found matching '{query}'. Available: {', '.join(f'{a.id} ({a.name})' for a in agents)}"
 
     @tool
     async def list_agents() -> str:
         """List all available agent definitions."""
-        if agent_backend is None:
-            return "Agent backend not configured."
-        agents = await agent_backend.list()
-        if not agents:
-            return "No agents found."
-        lines = [f"- **{a.id}** ({a.name}): {a.description or '(no description)'}" for a in agents]
-        return "\n".join(lines)
+        return await core.list_agents(deps)
 
     @tool
     async def get_agent(agent_id: str) -> str:
         """Get full agent definition by id or name."""
-        if agent_backend is None:
-            return "Agent backend not configured."
-        resolved, err = await _resolve_agent_id(agent_id)
-        if err:
-            return err
-        agent = await agent_backend.get(resolved)
-        if agent is None:
-            return f"Agent '{resolved}' not found."
-        import json as _json
-        return _json.dumps(agent.model_dump(mode="json"), indent=2, default=str)
+        return await core.get_agent(deps, agent_id)
 
     @tool
     async def create_agent(agent_id: str, name: str, description: str = "", default_runtime: str = "local", agent_input_json: str = "{}") -> str:
         """Create a new agent definition. agent_input_json is a JSON object of default input overrides."""
-        if agent_backend is None:
-            return "Agent backend not configured."
-        import json as _json
-        try:
-            agent_input = _json.loads(agent_input_json)
-            if not isinstance(agent_input, dict):
-                return "agent_input_json must be a JSON object."
-        except Exception as e:
-            return f"Invalid agent_input_json: {e}"
-        if default_runtime not in ("local", "docker", "k8s"):
-            return f"Invalid default_runtime '{default_runtime}'. Must be one of: local, docker, k8s."
-        existing = await agent_backend.get(agent_id)
-        if existing is not None:
-            return f"Agent '{agent_id}' already exists. Use update_agent to modify it."
-        from app.domain.models.agent_definition import AgentDefinition
-        new_agent = AgentDefinition(
-            id=agent_id,
-            name=name,
-            description=description,
-            default_runtime=default_runtime,
-            agent_input=agent_input,
+        return await core.create_agent(
+            deps, agent_id, name, description, default_runtime, agent_input_json
         )
-        await agent_backend.create(new_agent)
-        return f"Agent '{agent_id}' created."
 
     @tool
     async def update_agent(agent_id: str, name: str = None, description: str = None, default_runtime: str = None, agent_input_json: str = None) -> str:
         """Update an existing agent definition. Only provided fields are changed; others preserved."""
-        if agent_backend is None:
-            return "Agent backend not configured."
-        resolved, err = await _resolve_agent_id(agent_id)
-        if err:
-            return err
-        existing = await agent_backend.get(resolved)
-        if existing is None:
-            return f"Agent '{resolved}' not found."
-        import json as _json
-        # Partial update — only mutate provided fields
-        updated = existing.model_copy()
-        if name is not None:
-            updated.name = name
-        if description is not None:
-            updated.description = description
-        if default_runtime is not None:
-            if default_runtime not in ("local", "docker", "k8s"):
-                return f"Invalid default_runtime '{default_runtime}'. Must be one of: local, docker, k8s."
-            updated.default_runtime = default_runtime
-        if agent_input_json is not None:
-            try:
-                agent_input = _json.loads(agent_input_json)
-                if not isinstance(agent_input, dict):
-                    return "agent_input_json must be a JSON object."
-                updated.agent_input = agent_input
-            except Exception as e:
-                return f"Invalid agent_input_json: {e}"
-        await agent_backend.update(resolved, updated)
-        return f"Agent '{resolved}' updated."
+        return await core.update_agent(
+            deps, agent_id, name, description, default_runtime, agent_input_json
+        )
 
     @tool
     async def delete_agent(agent_id: str) -> str:
         """Delete an agent definition by exact id."""
-        if agent_backend is None:
-            return "Agent backend not configured."
-        existing = await agent_backend.get(agent_id)
-        if existing is None:
-            return f"Agent '{agent_id}' not found. Use list_agents to see available agents."
-        await agent_backend.delete(agent_id)
-        return f"Agent '{agent_id}' deleted."
+        return await core.delete_agent(deps, agent_id)
 
     # --- Data source tools ---
-
-    async def _resolve_datasource_id(query: str):
-        """Returns (resolved_id, None) or (None, error_str)."""
-        if data_source_backend is None:
-            return None, "data_source_backend not configured"
-        sources = await data_source_backend.list()
-        for s in sources:
-            if s.id == query:
-                return s.id, None
-        for s in sources:
-            if (s.name or "").lower() == query.lower():
-                return s.id, None
-        matches = [
-            s for s in sources
-            if query.lower() in s.id.lower() or query.lower() in (s.name or "").lower()
-        ]
-        if len(matches) == 1:
-            return matches[0].id, None
-        if matches:
-            cands = ", ".join(f"{s.id} ({s.name})" for s in matches)
-            return None, f"Ambiguous — multiple matches: {cands}"
-        available = ", ".join(f"{s.id} ({s.name})" for s in sources) or "none"
-        return None, f"Data source '{query}' not found. Available: {available}"
-
-    async def _publish_datasources() -> None:
-        if refresh_datasources is not None:
-            try:
-                await refresh_datasources()
-            except Exception:
-                logger.exception("chat_agent: datasource tool refresh failed")
 
     @tool
     async def list_datasources() -> str:
         """List all registered data sources with their operations."""
-        if data_source_backend is None:
-            return "Data source backend not configured."
-        sources = await data_source_backend.list()
-        if not sources:
-            return "No data sources found."
-        lines = []
-        for s in sources:
-            ops = ", ".join(op.name for op in s.operations) or "(no operations)"
-            lines.append(
-                f"- **{s.id}** ({s.name or s.id}, {s.kind}): "
-                f"{s.description or '(no description)'} — operations: {ops}"
-            )
-        return "\n".join(lines)
+        return await core.list_datasources(deps)
 
     @tool
     async def create_datasource(
@@ -550,46 +289,9 @@ def build_default_workflow(
                 {"type": "basic", "username": "...", "password": "..."} or
                 {"type": "header", "header_name": "X-Api-Key", "value": "..."}.
         """
-        if data_source_backend is None:
-            return "Data source creation unavailable: no persistent backend configured."
-        try:
-            operations = json.loads(operations_json)
-        except json.JSONDecodeError as exc:
-            return f"Invalid operations_json: {exc}"
-        if not isinstance(operations, list):
-            return "operations_json must be a JSON array."
-        auth: dict = {"type": "none"}
-        if auth_json:
-            try:
-                auth = json.loads(auth_json)
-            except json.JSONDecodeError as exc:
-                return f"Invalid auth_json: {exc}"
-
-        existing = await data_source_backend.get(source_id)
-        if existing is not None:
-            return f"Data source '{source_id}' already exists. Use update_datasource to modify it."
-
-        from app.domain.models.data_source_definition import (
-            DataSourceDefinition,
-            validate_operations,
+        return await core.create_datasource(
+            deps, source_id, name, base_url, operations_json, description, kind, auth_json
         )
-        try:
-            defn = DataSourceDefinition.model_validate({
-                "id": source_id,
-                "name": name,
-                "description": description,
-                "kind": kind,
-                "base_url": base_url,
-                "auth": auth,
-                "operations": operations,
-            })
-            validate_operations(defn)
-        except Exception as exc:
-            return f"Invalid data source definition: {exc}"
-
-        await data_source_backend.create(defn)
-        await _publish_datasources()
-        return f"Data source '{source_id}' created with {len(defn.operations)} operation(s)."
 
     @tool
     async def update_datasource(
@@ -610,49 +312,9 @@ def build_default_workflow(
             operations_json: JSON array replacing ALL operations (omit to keep current).
             auth_json: JSON auth block replacing the current one (omit to keep current).
         """
-        if data_source_backend is None:
-            return "Data source updates unavailable: no persistent backend configured."
-        resolved, err = await _resolve_datasource_id(source_id)
-        if err:
-            return err
-        existing = await data_source_backend.get(resolved)
-        if existing is None:
-            return f"Data source '{resolved}' not found."
-
-        payload = existing.model_dump(mode="json")
-        if name is not None:
-            payload["name"] = name
-        if description is not None:
-            payload["description"] = description
-        if base_url is not None:
-            payload["base_url"] = base_url
-        if operations_json is not None:
-            try:
-                operations = json.loads(operations_json)
-            except json.JSONDecodeError as exc:
-                return f"Invalid operations_json: {exc}"
-            if not isinstance(operations, list):
-                return "operations_json must be a JSON array."
-            payload["operations"] = operations
-        if auth_json is not None:
-            try:
-                payload["auth"] = json.loads(auth_json)
-            except json.JSONDecodeError as exc:
-                return f"Invalid auth_json: {exc}"
-
-        from app.domain.models.data_source_definition import (
-            DataSourceDefinition,
-            validate_operations,
+        return await core.update_datasource(
+            deps, source_id, name, description, base_url, operations_json, auth_json
         )
-        try:
-            defn = DataSourceDefinition.model_validate(payload)
-            validate_operations(defn)
-        except Exception as exc:
-            return f"Invalid data source definition: {exc}"
-
-        await data_source_backend.update(resolved, defn)
-        await _publish_datasources()
-        return f"Data source '{resolved}' updated."
 
     # --- Data source schema import ---
     #
@@ -661,56 +323,6 @@ def build_default_workflow(
     # parsed operation objects verbatim. That keeps a 500-endpoint OpenAPI
     # document out of the context window and out of the failure modes of
     # transcribing JSON.
-
-    def _parse_auth_block(auth_json: str):
-        """(auth_model, None) or (None, error_str) from a JSON auth block."""
-        if not auth_json:
-            return None, None
-        from pydantic import TypeAdapter
-
-        from app.domain.models.data_source_definition import AnyDataSourceAuth
-        try:
-            return TypeAdapter(AnyDataSourceAuth).validate_python(json.loads(auth_json)), None
-        except Exception as exc:
-            return None, f"Invalid auth_json: {exc}"
-
-    async def _load_spec(schema_url: str, kind: str, auth_json: str):
-        """(spec_dict, None) or (None, error_str)."""
-        from app.infrastructure.datasources.discovery import (
-            SpecFetchError,
-            SpecParseError,
-            fetch_and_parse_spec,
-        )
-        auth_model, err = _parse_auth_block(auth_json)
-        if err:
-            return None, err
-        try:
-            spec = await fetch_and_parse_spec(
-                schema_url,
-                kind="graphql" if kind == "graphql" else "http",
-                auth=auth_model,
-            )
-        except (SpecFetchError, SpecParseError) as exc:
-            return None, f"Could not import the schema: {exc}"
-        return spec, None
-
-    def _select_operations(spec: dict, names_csv: str):
-        """(operations, None) or (None, error_str) — the named subset of a spec."""
-        wanted = [n.strip() for n in names_csv.split(",") if n.strip()]
-        available = {op["name"]: op for op in spec["operations"]}
-        if not wanted:
-            return None, (
-                "operation_names is required — call import_datasource_schema first "
-                "and pass a comma-separated subset of the names it lists."
-            )
-        missing = [n for n in wanted if n not in available]
-        if missing:
-            return None, (
-                f"Unknown operation(s): {', '.join(missing)}. "
-                f"Available: {', '.join(list(available)[:40])}"
-                + (" …" if len(available) > 40 else "")
-            )
-        return [available[n] for n in wanted], None
 
     @tool
     async def import_datasource_schema(
@@ -736,26 +348,7 @@ def build_default_workflow(
             add_datasource_operations_from_schema — the parsed operations are
             copied as-is, so never re-type them yourself.
         """
-        spec, err = await _load_spec(schema_url, kind, auth_json)
-        if err:
-            return err
-        lines = [
-            f"Schema: {spec['source']} ({spec['kind']})",
-            f"Declared base URL: {spec['base_url'] or '(none declared)'}",
-            f"Operations: {len(spec['operations'])}",
-        ]
-        for op in spec["operations"]:
-            target = op.get("path") or (op.get("query") or "")[:90]
-            params = ", ".join(
-                f"{p['name']}{'' if p['required'] else '?'}" for p in op.get("params") or []
-            )
-            summary = (op.get("summary") or "").strip()
-            lines.append(
-                f"- {op['name']} [{op['method']}] {target}"
-                + (f" params: {params}" if params else "")
-                + (f" — {summary}" if summary else "")
-            )
-        return "\n".join(lines)
+        return await core.import_datasource_schema(deps, schema_url, kind, auth_json)
 
     @tool
     async def create_datasource_from_schema(
@@ -782,58 +375,9 @@ def build_default_workflow(
             kind: "http" or "graphql".
             auth_json: Auth block for the API calls (also used to fetch the schema).
         """
-        if data_source_backend is None:
-            return "Data source creation unavailable: no persistent backend configured."
-        existing = await data_source_backend.get(source_id)
-        if existing is not None:
-            return (
-                f"Data source '{source_id}' already exists. Use "
-                "add_datasource_operations_from_schema to extend it."
-            )
-        spec, err = await _load_spec(schema_url, kind, auth_json)
-        if err:
-            return err
-        operations, err = _select_operations(spec, operation_names)
-        if err:
-            return err
-
-        resolved_base = base_url.strip() or spec["base_url"] or ""
-        if not resolved_base:
-            return (
-                "No base URL: the specification declares none, so pass base_url "
-                "explicitly."
-            )
-        auth: dict = {"type": "none"}
-        if auth_json:
-            try:
-                auth = json.loads(auth_json)
-            except json.JSONDecodeError as exc:
-                return f"Invalid auth_json: {exc}"
-
-        from app.domain.models.data_source_definition import (
-            DataSourceDefinition,
-            validate_operations,
-        )
-        try:
-            defn = DataSourceDefinition.model_validate({
-                "id": source_id,
-                "name": name,
-                "description": description,
-                "kind": spec["kind"] if spec["kind"] == "graphql" else "http",
-                "base_url": resolved_base,
-                "auth": auth,
-                "operations": operations,
-            })
-            validate_operations(defn)
-        except Exception as exc:
-            return f"Invalid data source definition: {exc}"
-
-        await data_source_backend.create(defn)
-        await _publish_datasources()
-        return (
-            f"Data source '{source_id}' created from {spec['source']} with "
-            f"{len(defn.operations)} operation(s): "
-            f"{', '.join(op.name for op in defn.operations)}"
+        return await core.create_datasource_from_schema(
+            deps, source_id, name, schema_url, operation_names, base_url,
+            description, kind, auth_json,
         )
 
     @tool
@@ -856,45 +400,8 @@ def build_default_workflow(
             kind: "http" or "graphql".
             auth_json: Optional auth block if the schema URL needs credentials.
         """
-        if data_source_backend is None:
-            return "Data source updates unavailable: no persistent backend configured."
-        resolved, err = await _resolve_datasource_id(source_id)
-        if err:
-            return err
-        existing = await data_source_backend.get(resolved)
-        if existing is None:
-            return f"Data source '{resolved}' not found."
-        spec, err = await _load_spec(schema_url, kind, auth_json)
-        if err:
-            return err
-        operations, err = _select_operations(spec, operation_names)
-        if err:
-            return err
-
-        payload = existing.model_dump(mode="json")
-        present = {op["name"] for op in payload["operations"]}
-        added = [op for op in operations if op["name"] not in present]
-        skipped = [op["name"] for op in operations if op["name"] in present]
-        if not added:
-            return f"Nothing to add — already present: {', '.join(skipped)}"
-        payload["operations"] = [*payload["operations"], *added]
-
-        from app.domain.models.data_source_definition import (
-            DataSourceDefinition,
-            validate_operations,
-        )
-        try:
-            defn = DataSourceDefinition.model_validate(payload)
-            validate_operations(defn)
-        except Exception as exc:
-            return f"Invalid data source definition: {exc}"
-
-        await data_source_backend.update(resolved, defn)
-        await _publish_datasources()
-        return (
-            f"Added {len(added)} operation(s) to '{resolved}': "
-            f"{', '.join(op['name'] for op in added)}"
-            + (f" (skipped, already present: {', '.join(skipped)})" if skipped else "")
+        return await core.add_datasource_operations_from_schema(
+            deps, source_id, schema_url, operation_names, kind, auth_json
         )
 
     @tool
@@ -904,17 +411,7 @@ def build_default_workflow(
         Args:
             source_id: The data source id or name.
         """
-        if data_source_backend is None:
-            return "Data source deletion unavailable: no persistent backend configured."
-        resolved, err = await _resolve_datasource_id(source_id)
-        if err:
-            return err
-        existing = await data_source_backend.get(resolved)
-        if existing is None:
-            return f"Data source '{resolved}' not found."
-        await data_source_backend.delete(resolved)
-        await _publish_datasources()
-        return f"Data source '{resolved}' deleted."
+        return await core.delete_datasource(deps, source_id)
 
     platform_tools = [list_workflows, run_workflow, list_runs, get_run, ask_user,
                       create_workflow, update_workflow, delete_workflow,
@@ -923,6 +420,146 @@ def build_default_workflow(
                       delete_datasource, import_datasource_schema,
                       create_datasource_from_schema,
                       add_datasource_operations_from_schema]
+
+    # --- Run control tools ---
+    #
+    # These mutate live runs, so they need the ApplicationContainer (runners,
+    # checkpoints, agent cleanup).  Same shared cores as the REST routes and
+    # the /mcp/management surface; approvals made here are recorded with
+    # approver_source="agent".
+    if container is not None:
+
+        @tool
+        async def terminate_run(run_id: str) -> str:
+            """Stop a running run immediately and mark it as FAILED.
+
+            Irreversible: any agent container attached to the run is killed and
+            the run is recorded with error "Terminated by user". Only runs that
+            are currently running or waiting on an agent can be terminated; use
+            retry_run afterwards if the work should continue.
+
+            Args:
+                run_id: The run ID to terminate.
+            """
+            try:
+                run = await run_control.terminate_run(container, run_id)
+            except RunControlError as exc:
+                return f"Error ({exc.status_code}): {exc.detail}"
+            return f"Run {run.id} terminated and marked failed."
+
+        @tool
+        async def retry_run(run_id: str) -> str:
+            """Retry a FAILED run from its last completed step.
+
+            Already-finished steps are kept and skipped; the failed step and
+            every step after it are reset to pending and executed again. Returns
+            as soon as the retry is scheduled — poll get_run for progress.
+
+            Args:
+                run_id: The run ID to retry. The run must be in status failed.
+            """
+            try:
+                run, runner, resume_input = await run_control.retry_run(container, run_id)
+            except RunControlError as exc:
+                return f"Error ({exc.status_code}): {exc.detail}"
+            _spawn_background(
+                run_control._retry_graph(runner, run, container, resume_input),
+                f"retry of run {run.id}",
+            )
+            return f"Run {run.id} retrying from the last completed step."
+
+        @tool
+        async def restart_from_step(run_id: str, step_id: str) -> str:
+            """Re-run a run from a specific step, discarding that step's results.
+
+            Irreversible: the outputs and statuses of *step_id* and of every
+            later step are deleted before execution restarts. Steps before it are
+            preserved. Cannot be used on a currently running, cancelled or
+            rejected run. Returns as soon as the restart is scheduled.
+
+            Args:
+                run_id: The run ID to restart.
+                step_id: The step to restart from (see get_run for step IDs).
+            """
+            try:
+                run, runner, resume_input = await run_control.restart_from_step(
+                    container, run_id, step_id
+                )
+            except RunControlError as exc:
+                return f"Error ({exc.status_code}): {exc.detail}"
+            _spawn_background(
+                run_control._retry_graph(runner, run, container, resume_input),
+                f"restart of run {run.id} from step '{step_id}'",
+            )
+            return f"Run {run.id} restarting from step '{step_id}'."
+
+        @tool
+        async def approve_run(run_id: str, corrections_json: str = "") -> str:
+            """Approve a run that is paused at a human-approval step.
+
+            The decision is final and the run continues immediately; it is
+            recorded in the run's approval history as approver_source="agent".
+            Only approve when the user has actually asked for it.
+
+            Args:
+                run_id: The run ID. The run must be waiting for approval.
+                corrections_json: Optional JSON object of state corrections to
+                    apply along with the approval (omit for a plain approval).
+            """
+            corrections: dict | None = None
+            if corrections_json:
+                try:
+                    corrections = json.loads(corrections_json)
+                except json.JSONDecodeError as exc:
+                    return f"Invalid corrections_json: {exc}"
+                if not isinstance(corrections, dict):
+                    return "corrections_json must be a JSON object."
+            try:
+                run, runner = await run_control.approve_run(container, run_id)
+            except RunControlError as exc:
+                return f"Error ({exc.status_code}): {exc.detail}"
+            _spawn_background(
+                run_control._resume_approved(
+                    runner, run, container, corrections,
+                    approver_name="chat-agent",
+                    approver_id=None,
+                    approver_source="agent",
+                ),
+                f"approval resume of run {run.id}",
+            )
+            return f"Run {run.id} approved; resuming."
+
+        @tool
+        async def reject_run(run_id: str, reason: str = "") -> str:
+            """Reject a run that is paused at a human-approval step.
+
+            The decision is final: the run does not continue past the gate and
+            ends up rejected (or takes the gate's rejection route). Recorded in
+            the run's approval history as approver_source="agent".
+
+            Args:
+                run_id: The run ID. The run must be waiting for approval.
+                reason: Optional explanation stored with the rejection.
+            """
+            try:
+                run, runner = await run_control.reject_run(container, run_id)
+            except RunControlError as exc:
+                return f"Error ({exc.status_code}): {exc.detail}"
+            _spawn_background(
+                run_control._resume_rejected(
+                    runner, run, container, reason or None,
+                    approver_name="chat-agent",
+                    approver_id=None,
+                    approver_source="agent",
+                ),
+                f"rejection resume of run {run.id}",
+            )
+            return f"Run {run.id} rejected."
+
+        platform_tools.extend([
+            terminate_run, retry_run, restart_from_step, approve_run, reject_run,
+        ])
+
     _platform_tool_names = {t.name for t in platform_tools}
 
     # ── tool resolution ──────────────────────────────────────────────────────

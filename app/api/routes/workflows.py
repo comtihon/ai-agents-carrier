@@ -8,10 +8,13 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
-from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from app.api.dependencies import get_container
+from app.application import run_control
+# _config is defined in run_control (the shared run-control layer); imported here
+# rather than duplicated. The dependency direction is workflows -> run_control.
+from app.application.run_control import RunControlError, _config
 from app.core.container import ApplicationContainer
 from app.domain.models.graph_run import GraphRun
 from app.domain.models.workflow_definition import WorkflowDefinition
@@ -77,10 +80,6 @@ class RestartFromStepRequest(BaseModel):
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
-
-def _config(thread_id: str) -> dict:
-    return {"configurable": {"thread_id": thread_id}}
-
 
 def _langgraph_status(snap, runner: "YamlGraphRunner | None" = None) -> str:
     if not snap.next:
@@ -500,19 +499,6 @@ async def _execute_graph(
         container.live_runners.pop(run.id, None)
 
 
-async def _get_runner_or_404(
-    run: GraphRun, container: ApplicationContainer
-) -> YamlGraphRunner:
-    runner = _get_runner_for_run(run, container)
-    if runner is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Runner for workflow '{run.graph_id}' not found. "
-                   "The run may have been started before a server restart.",
-        )
-    return runner
-
-
 # ─── Workflow definition list + create (no path param — must come before run routes) ─────
 
 @router.get("")
@@ -700,28 +686,10 @@ async def approve_run(
     body: ApproveRequest | None = None,
     container: ApplicationContainer = Depends(get_container),
 ):
-    # Atomic claim. Two concurrent /approve requests must not both schedule
-    # a resume task on the same runner — see claim_for_resume's docstring
-    # for the failure mode that motivated this.
-    run = await container.run_repository.claim_for_resume(run_id)
-    if run is None:
-        existing = await container.run_repository.get(run_id)
-        if existing is None:
-            raise HTTPException(status_code=404, detail="Run not found")
-        raise HTTPException(
-            status_code=409,
-            detail=f"Run is not awaiting approval (status: {existing.status})",
-        )
-    runner = await _get_runner_or_404(run, container)
-
-    # Flip the approval step to finished synchronously so polling clients see
-    # the transition immediately, not after the resume task drains. The
-    # subsequent step's status will be set by the chunk handler in
-    # stream_graph_to_pause when the resumed graph reaches it.
-    if run.current_step:
-        run.step_statuses[run.current_step] = "finished"
-        run.touch()
-        await container.run_repository.update(run)
+    try:
+        run, runner = await run_control.approve_run(container, run_id)
+    except RunControlError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
     corrections = body.corrections if body else None
     claims = getattr(request.state, "jwt_claims", None) or {}
@@ -730,35 +698,11 @@ async def approve_run(
         claims.get("name") or claims.get("preferred_username") or claims.get("email")
     )
     background_tasks.add_task(
-        _resume_approved, runner, run, container, corrections,
+        run_control._resume_approved, runner, run, container, corrections,
         approver_name, approver_id,
     )
 
     return await _run_response(run, runner)
-
-
-async def _resume_approved(
-    runner: YamlGraphRunner,
-    run: GraphRun,
-    container: ApplicationContainer,
-    corrections: dict | None,
-    approver_name: str | None = None,
-    approver_id: str | None = None,
-) -> None:
-    await _stream_graph(
-        runner, run, container,
-        Command(resume={
-            "approved": True,
-            "corrections": corrections,
-            "approver_name": approver_name,
-            "approver_id": approver_id,
-            "approver_source": "ui",
-            "decided_at": datetime.now(timezone.utc).isoformat(),
-        }),
-        base_url=container.settings.base_url,
-    )
-    if run.status in ("completed", "failed", "cancelled", "rejected"):
-        container.live_runners.pop(run.id, None)
 
 
 @router.post("/runs/{run_id}/reject")
@@ -769,21 +713,10 @@ async def reject_run(
     body: RejectRequest | None = None,
     container: ApplicationContainer = Depends(get_container),
 ):
-    run = await container.run_repository.claim_for_resume(run_id)
-    if run is None:
-        existing = await container.run_repository.get(run_id)
-        if existing is None:
-            raise HTTPException(status_code=404, detail="Run not found")
-        raise HTTPException(
-            status_code=409,
-            detail=f"Run is not awaiting approval (status: {existing.status})",
-        )
-    runner = await _get_runner_or_404(run, container)
-
-    if run.current_step:
-        run.step_statuses[run.current_step] = "finished"
-        run.touch()
-        await container.run_repository.update(run)
+    try:
+        run, runner = await run_control.reject_run(container, run_id)
+    except RunControlError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
     claims = getattr(request.state, "jwt_claims", None) or {}
     approver_id = claims.get("sub")
@@ -791,42 +724,12 @@ async def reject_run(
         claims.get("name") or claims.get("preferred_username") or claims.get("email")
     )
     background_tasks.add_task(
-        _resume_rejected, runner, run, container,
+        run_control._resume_rejected, runner, run, container,
         body.reason if body else None,
         approver_name, approver_id,
     )
 
     return await _run_response(run, runner)
-
-
-async def _resume_rejected(
-    runner: YamlGraphRunner,
-    run: GraphRun,
-    container: ApplicationContainer,
-    reason: str | None,
-    approver_name: str | None = None,
-    approver_id: str | None = None,
-) -> None:
-    await _stream_graph(
-        runner, run, container,
-        Command(resume={
-            "approved": False,
-            "reason": reason,
-            "approver_name": approver_name,
-            "approver_id": approver_id,
-            "approver_source": "ui",
-            "decided_at": datetime.now(timezone.utc).isoformat(),
-        }),
-    )
-    if run.status == "completed":
-        run.status = "rejected"
-        run.touch()
-        await container.run_repository.update(run)
-    if run.status in ("cancelled", "rejected"):
-        from app.services.agent_cleanup import cleanup_run_agents
-        await cleanup_run_agents(run.id, container.settings)
-    if run.status in ("completed", "failed", "cancelled", "rejected"):
-        container.live_runners.pop(run.id, None)
 
 
 @router.delete("/runs/{run_id}", status_code=204)
@@ -850,21 +753,10 @@ async def terminate_run(
     container: ApplicationContainer = Depends(get_container),
 ):
     """Terminate a running agent and mark the run as failed."""
-    run = await container.run_repository.get(run_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail="Run not found")
-    if run.status not in ("running", "waiting_agent"):
-        raise HTTPException(
-            status_code=409,
-            detail=f"Run is not active (status: {run.status})",
-        )
-    from app.services.agent_cleanup import cleanup_run_agents
-    await cleanup_run_agents(run_id, container.settings)
-    run.status = "failed"
-    run.state = {**(run.state or {}), "error": "Terminated by user"}
-    run.touch()
-    await container.run_repository.update(run)
-    container.live_runners.pop(run_id, None)
+    try:
+        run = await run_control.terminate_run(container, run_id)
+    except RunControlError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     return await _run_response(run)
 
 
@@ -875,63 +767,12 @@ async def retry_run(
     container: ApplicationContainer = Depends(get_container),
 ):
     """Retry a failed run from the last completed step, skipping already-finished steps."""
-    run = await container.run_repository.get(run_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail="Run not found")
-    if run.status != "failed":
-        raise HTTPException(
-            status_code=409, detail=f"Run is not in failed state (status={run.status})"
-        )
+    try:
+        run, runner, resume_input = await run_control.retry_run(container, run_id)
+    except RunControlError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
-    runner = container._build_runner_for_recovery(run)
-    if runner is None:
-        raise HTTPException(
-            status_code=409, detail="Workflow definition not available for retry"
-        )
-
-    # Reconstruct accumulated state from already-completed steps (in step order)
-    accumulated: dict[str, Any] = {"request": run.user_request}
-    last_done: str | None = None
-    for step in runner.steps:
-        sid = step["id"]
-        if run.step_statuses.get(sid) in ("finished", "skipped"):
-            last_done = sid
-            output = run.step_outputs.get(sid)
-            if output and isinstance(output, dict):
-                accumulated.update(output)
-
-    # Seed mid-execution state keys persisted before step completion (but NOT _visit_counts
-    # so that retried runs start with a fresh loop counter).
-    if run.state and isinstance(run.state, dict):
-        for k, v in run.state.items():
-            if k.startswith("_") and k != "_visit_counts" and v is not None:
-                accumulated.setdefault(k, v)
-
-    # Reset failed step and all subsequent steps back to "pending"
-    found_failed = False
-    for step in runner.steps:
-        sid = step["id"]
-        if not found_failed and run.step_statuses.get(sid) == "failed":
-            found_failed = True
-        if found_failed:
-            run.step_statuses[sid] = "pending"
-
-    # Seed the LangGraph checkpoint at the last completed step
-    config = _config(run.id)
-    if last_done is not None:
-        await runner.graph.aupdate_state(config, accumulated, as_node=last_done)
-        resume_input: Any = None  # resume from checkpoint
-    else:
-        resume_input = accumulated  # no completed steps — start fresh
-
-    run.status = "running"
-    run.current_step = None
-    run.state = accumulated
-    run.touch()
-    await container.run_repository.update(run)
-
-    container.live_runners[run.id] = runner
-    background_tasks.add_task(_retry_graph, runner, run, container, resume_input)
+    background_tasks.add_task(run_control._retry_graph, runner, run, container, resume_input)
 
     return await _run_response(run, runner)
 
@@ -943,94 +784,15 @@ async def restart_from_step(
     background_tasks: BackgroundTasks,
     container: ApplicationContainer = Depends(get_container),
 ):
-    run = await container.run_repository.get(run_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail="Run not found")
-    if run.status in ("cancelled", "rejected"):
-        raise HTTPException(status_code=409, detail=f"Cannot restart a {run.status} run")
-    if run.status == "running":
-        raise HTTPException(status_code=409, detail="Cannot restart a currently running workflow")
-
-    runner = container._build_runner_for_recovery(run)
-    if runner is None:
-        raise HTTPException(status_code=409, detail="Workflow definition unavailable")
-
-    step_ids = [s["id"] for s in runner.steps]
-    if body.step_id not in step_ids:
-        raise HTTPException(status_code=409, detail=f"Unknown step_id: {body.step_id}")
-
-    restart_idx = step_ids.index(body.step_id)
-
-    # Terminate any live agent container via the runtime (best-effort).
     try:
-        from app.runtime.docker import DockerRuntime
-        await DockerRuntime(
-            registry_username=container.settings.docker_registry_username,
-            registry_password=container.settings.docker_registry_password,
-        ).terminate_by_run_id(None, run_id)
-    except Exception:
-        logger.debug("run %s: docker cleanup on restart-from-step failed", run_id, exc_info=True)
-    container.live_runners.pop(run_id, None)
+        run, runner, resume_input = await run_control.restart_from_step(
+            container, run_id, body.step_id
+        )
+    except RunControlError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
-    # Build accumulated state from steps BEFORE restart_idx
-    accumulated: dict = {"request": run.user_request}
-    # Seed underscore-prefixed internal state keys from run.state (e.g. conv IDs),
-    # excluding _visit_counts so the restarted run gets a fresh loop counter.
-    for k, v in (run.state or {}).items():
-        if k.startswith("_") and k != "_visit_counts":
-            accumulated.setdefault(k, v)
-    last_done: str | None = None
-    for step in runner.steps[:restart_idx]:
-        sid = step["id"]
-        if run.step_statuses.get(sid) in ("finished", "skipped"):
-            output = run.step_outputs.get(sid) or {}
-            for k, v in output.items():
-                if k == "_visit_counts":
-                    continue
-                accumulated.setdefault(k, v)
-            last_done = sid
-
-    # Reset step_statuses, step_inputs, step_outputs for restart_idx and beyond
-    for step in runner.steps[restart_idx:]:
-        sid = step["id"]
-        run.step_statuses[sid] = "pending"
-        run.step_inputs.pop(sid, None)
-        run.step_outputs.pop(sid, None)
-
-    # Clear per-attempt transient keys so they don't suppress new notifications
-    for _k in ("_slack_ask_context_ts", "_slack_ask_context_channel", "_pending_question"):
-        accumulated.pop(_k, None)
-
-    run.current_step = None
-    run.agent_url = None
-    run.status = "running"
-    run.state = accumulated
-
-    run.touch()
-    await container.run_repository.update(run)
-
-    # Re-seed LangGraph checkpoint
-    config = {"configurable": {"thread_id": run_id}}
-    if last_done is not None:
-        await runner.graph.aupdate_state(config, accumulated, as_node=last_done)
-        resume_input: Any = None
-    else:
-        resume_input = accumulated
-
-    container.live_runners[run_id] = runner
-    background_tasks.add_task(_retry_graph, runner, run, container, resume_input)
+    background_tasks.add_task(run_control._retry_graph, runner, run, container, resume_input)
     return await _run_response(run, runner)
-
-
-async def _retry_graph(
-    runner: YamlGraphRunner,
-    run: GraphRun,
-    container: ApplicationContainer,
-    resume_input: Any,
-) -> None:
-    await _stream_graph(runner, run, container, resume_input, base_url=container.settings.base_url)
-    if run.status in ("completed", "failed", "cancelled", "rejected"):
-        container.live_runners.pop(run.id, None)
 
 
 # ─── Workflow definition detail / update / delete ─────────────────────────────

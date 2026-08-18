@@ -40,6 +40,10 @@ class YamlGraphRegistry:
     def get(self, graph_id: str) -> YamlGraphRunner | None:
         return self._runners.get(graph_id)
 
+    def remove(self, graph_id: str) -> None:
+        """Drop a runner from the registry (no-op when it is not registered)."""
+        self._runners.pop(graph_id, None)
+
     def list_ids(self) -> list[str]:
         return list(self._runners.keys())
 
