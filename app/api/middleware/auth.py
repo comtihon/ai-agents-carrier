@@ -11,7 +11,9 @@ from app.infrastructure.auth.auth_service import AuthError, AuthService
 logger = logging.getLogger(__name__)
 
 # Exact paths that bypass authentication (health/readiness probes)
-_UNPROTECTED_PATHS = {"/health", "/ready"}
+# /mcp/management is the bare form of the "/mcp/management/" prefix below; it is
+# guarded by _ManagementAuthWrapper instead (see app.api.app).
+_UNPROTECTED_PATHS = {"/health", "/ready", "/mcp/management"}
 
 # Path prefixes that bypass authentication.
 # /copilotkit is the CopilotKit runtime endpoint — it has no user-specific data
@@ -32,6 +34,13 @@ _UNPROTECTED_PREFIXES = (
     # in that flow). The mount is guarded instead by a dedicated bearer-token
     # wrapper around the mounted app (see app.api.app._DatasourcesAuthWrapper).
     "/mcp/datasources",
+    # Management MCP — same reasoning as /mcp/datasources: BaseHTTPMiddleware in
+    # front of a FastMCP streamable-HTTP app is unverified, so the prefix is
+    # exempted here and guarded by a dedicated bearer-token wrapper around the
+    # mounted app instead (see app.api.app._ManagementAuthWrapper), which fails
+    # closed when no API key is configured.  Listed as a "/"-terminated prefix so
+    # it cannot also exempt a sibling path like /mcp/managementfoo.
+    "/mcp/management/",
 )
 
 
@@ -42,7 +51,10 @@ class OAuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
-        if path in _UNPROTECTED_PATHS or path.startswith(_UNPROTECTED_PREFIXES):
+        if (
+            path in _UNPROTECTED_PATHS
+            or path.startswith(_UNPROTECTED_PREFIXES)
+        ):
             return await call_next(request)
 
         auth_header = request.headers.get("Authorization", "")

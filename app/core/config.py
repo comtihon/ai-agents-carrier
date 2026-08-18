@@ -258,6 +258,20 @@ class Settings(BaseSettings):
     mcp_datasources_url: str | None = Field(default=None, alias="MCP_DATASOURCES_URL")
     mcp_datasources_api_key: str | None = Field(default=None, alias="MCP_DATASOURCES_API_KEY")
 
+    # --- Management MCP (served in-process at /mcp/management) ---
+    # Exposes the platform's own CRUD + run control tools to external MCP
+    # clients. Token-gated and fail-closed (see app.api.app._ManagementAuthWrapper).
+    management_mcp_enabled: bool = Field(default=True, alias="MANAGEMENT_MCP_ENABLED")
+    management_mcp_api_key: str | None = Field(default=None, alias="MANAGEMENT_MCP_API_KEY")
+    # Host header values FastMCP's DNS-rebinding guard accepts for this endpoint.
+    # Unset means the loopback defaults only (see
+    # app.api.mcp.management_server.DEFAULT_ALLOWED_HOSTS), so a deployment that
+    # is reached under a real hostname must list it here, e.g.
+    # MANAGEMENT_MCP_ALLOWED_HOSTS='["langgraph.airteam.cloud"]'.
+    management_mcp_allowed_hosts: list[str] | None = Field(
+        default=None, alias="MANAGEMENT_MCP_ALLOWED_HOSTS"
+    )
+
     # --- Agent polling ---
     agent_poll_interval_seconds: int = Field(default=10, alias="AGENT_POLL_INTERVAL_SECONDS")
     agent_max_loops: int = Field(default=3, alias="AGENT_MAX_LOOPS")
