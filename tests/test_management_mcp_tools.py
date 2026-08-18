@@ -16,6 +16,7 @@ from app.api.mcp.management_server import build_management_mcp, register_managem
 from app.application import run_control
 from app.domain.models.graph_run import GraphRun
 from app.infrastructure.orchestration.default_workflow import build_default_workflow
+from app.infrastructure.persistence.mongo import MongoGraphRunRepository
 from tests.test_datasources_api import InMemoryDataSourceBackend
 
 _EXPECTED_TOOLS = {
@@ -311,3 +312,34 @@ async def test_reject_run_records_mcp_approver(mcp, monkeypatch):
         "approver_id": None,
         "approver_source": "mcp",
     }
+
+
+async def test_list_runs_calls_the_real_repository_interface(mcp):
+    """``list_runs`` must call a method the concrete repository actually has.
+
+    Regression test: the core used to call ``run_repository.list()``, which has
+    never existed on ``MongoGraphRunRepository`` (the only implementation) — the
+    real method is ``list_recent``. Every other test fakes the repository with a
+    bare ``AsyncMock``, where any attribute name resolves, so the broken call
+    passed the suite and only failed against a live backend. Speccing the mock
+    to the real class is what makes a wrong name fail here.
+    """
+    repo = AsyncMock(spec=MongoGraphRunRepository)
+    repo.list_recent = AsyncMock(return_value=[_run("running")])
+    _register(mcp, _Container(run_repository=repo))
+
+    result = str(await mcp.call_tool("list_runs", {"limit": 5}))
+
+    repo.list_recent.assert_awaited_once_with(limit=5, workflow_id=None)
+    assert "run-1" in result
+
+
+async def test_list_runs_clamps_limit_and_passes_workflow_filter(mcp):
+    repo = AsyncMock(spec=MongoGraphRunRepository)
+    repo.list_recent = AsyncMock(return_value=[])
+    _register(mcp, _Container(run_repository=repo))
+
+    assert "No runs found." in str(
+        await mcp.call_tool("list_runs", {"workflow_id": "wf1", "limit": 999})
+    )
+    repo.list_recent.assert_awaited_once_with(limit=20, workflow_id="wf1")

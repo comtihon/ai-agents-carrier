@@ -232,17 +232,10 @@ async def run_workflow(
 async def list_runs(
     deps: ManagementDeps, workflow_id: str | None = None, limit: int = 10
 ) -> str:
-    try:
-        runs = await deps.run_repository.list(
-            workflow_id=workflow_id,
-            limit=min(limit, 20),
-        )
-    except TypeError:
-        # fallback for backends that don't support keyword args
-        runs = await deps.run_repository.list()
-        if workflow_id:
-            runs = [r for r in runs if r.graph_id == workflow_id]
-        runs = runs[:limit]
+    runs = await deps.run_repository.list_recent(
+        limit=min(limit, 20),
+        workflow_id=workflow_id,
+    )
 
     if not runs:
         return "No runs found."
