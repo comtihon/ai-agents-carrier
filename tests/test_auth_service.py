@@ -13,6 +13,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from app.infrastructure.auth.auth_service import AuthError, AuthService
@@ -191,3 +192,77 @@ async def test_jwt_decode_error_falls_back_to_userinfo():
             claims = await service.validate_token("not.a.valid.jwt")
 
     assert claims["sub"] == "from-userinfo"
+
+
+# ── Non-ASCII bearer token → AuthError, never an outbound call ────────────────
+
+class _ExplodingTransport(httpx.AsyncBaseTransport):
+    """Real httpx transport that fails the test if it is ever reached."""
+
+    def __init__(self) -> None:
+        self.calls: list[httpx.Request] = []
+
+    async def handle_async_request(self, request):  # pragma: no cover - must not run
+        self.calls.append(request)
+        raise AssertionError(f"unexpected outbound request to {request.url}")
+
+
+@pytest.mark.asyncio
+async def test_non_ascii_token_raises_auth_error_without_userinfo_call(monkeypatch):
+    """A latin-1 decoded header byte >= 0x80 must 401, not blow up in httpx.
+
+    The token is placed in an *outbound* Authorization header on the userinfo
+    path and httpx ascii-encodes header values, so a non-ASCII token used to
+    raise UnicodeEncodeError -> unauthenticated 500.  Patched at the transport
+    level (not the auth service) so the real httpx call would actually happen
+    if the guard regressed.
+    """
+    service = _make_service()
+    transport = _ExplodingTransport()
+    real_client = httpx.AsyncClient
+
+    def _client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client)
+
+    with pytest.raises(AuthError) as exc_info:
+        await service.validate_token("\xff\xfe\xc3junk")
+
+    assert "non-ascii" in exc_info.value.message.lower()
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_non_ascii_token_raises_auth_error_on_jwks_path(monkeypatch):
+    """Same guard on the JWKS branch: no JWKS fetch, no crash, just AuthError."""
+    service = _make_service()
+    transport = _ExplodingTransport()
+    real_client = httpx.AsyncClient
+
+    def _client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client)
+    # Force the JWT branch: without the guard this would reach _fetch_jwks.
+    monkeypatch.setattr("jwt.get_unverified_header", lambda token: {"kid": "k1"})
+
+    with pytest.raises(AuthError):
+        await service.validate_token("hdr.payl\xffoad.sig")
+
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_ascii_junk_token_still_reaches_userinfo():
+    """Guard must not swallow ordinary ASCII junk tokens (still a 401 path)."""
+    service = _make_service()
+    mock_client = _mock_http_client(status=401)
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        with pytest.raises(AuthError):
+            await service.validate_token("plain-junk")
+
+    mock_client.get.assert_called_once()

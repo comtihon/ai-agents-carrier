@@ -56,12 +56,24 @@ class _DatasourcesAuthWrapper:
       of the rest of the API.
     - ``api_key`` unset and OAuth disabled: pass through, matching the
       unauthenticated posture of the rest of the API.
+    - ``api_key`` configured but empty / whitespace-only: unusable as a
+      credential, so it fails closed regardless of ``oauth_enabled`` rather
+      than passing through.
     """
 
     def __init__(self, app, api_key: str | None, oauth_enabled: bool) -> None:
         self._app = app
-        self._api_key = api_key
-        self._fail_closed = api_key is None and oauth_enabled
+        # Surrounding whitespace is stripped (Secret Manager values often carry a
+        # trailing newline, which no HTTP header value can hold — such a key can
+        # never match anything).  A key that is *configured but empty* after
+        # stripping is not a usable credential either: keeping it would make the
+        # bare header "Bearer " valid.  It counts as unset for matching, but it
+        # fails closed instead of passing through unauthenticated — an empty
+        # secret must never open the endpoint.
+        stripped = (api_key or "").strip()
+        self._api_key = stripped or None
+        configured_empty = api_key is not None and not stripped
+        self._fail_closed = self._api_key is None and (oauth_enabled or configured_empty)
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] != "http":
@@ -112,7 +124,10 @@ class _ManagementAuthWrapper:
         auth_service: AuthService | None = None,
     ) -> None:
         self._app = app
-        self._api_key = api_key if (api_key or "").strip() else None
+        # Strip surrounding whitespace (a Secret Manager value often carries a
+        # trailing newline, which no HTTP header value can hold, so an unstripped
+        # key could never match); empty / whitespace-only counts as unset.
+        self._api_key = (api_key or "").strip() or None
         self._oauth_enabled = oauth_enabled and auth_service is not None
         self._auth_service = auth_service
 
@@ -479,7 +494,9 @@ def create_app() -> FastAPI:
     # /mcp/datasources (streamable_http_path="/datasources" inside the mount).
     # OAuthMiddleware exempts this prefix (see _UNPROTECTED_PREFIXES); the
     # actual gate is _DatasourcesAuthWrapper below.
-    if settings.mcp_datasources_api_key is None and settings.oauth_enabled:
+    # Same normalization as _DatasourcesAuthWrapper: an empty / whitespace-only
+    # key counts as unset (and fails closed), so it must warn too.
+    if not (settings.mcp_datasources_api_key or "").strip() and settings.oauth_enabled:
         logger.warning(
             "OAUTH_ENABLED is true but MCP_DATASOURCES_API_KEY is not set — "
             "/mcp/datasources will reject every request (fail closed). Set "

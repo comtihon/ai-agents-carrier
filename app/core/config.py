@@ -5,7 +5,7 @@ import os
 from functools import lru_cache
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -286,6 +286,20 @@ class Settings(BaseSettings):
         extra="ignore",
         populate_by_name=True,
     )
+
+    @field_validator("mcp_datasources_api_key", "management_mcp_api_key")
+    @classmethod
+    def _strip_api_key(cls, value: str | None) -> str | None:
+        """Trim surrounding whitespace from the in-process MCP API keys.
+
+        Secret Manager values routinely carry a trailing newline and an HTTP
+        header value cannot contain one, so ``Bearer <key>\n`` can never equal
+        any inbound Authorization header: the endpoint then rejects every caller
+        (including this backend's own MCP self-connection) with no other signal.
+        Empty / whitespace-only still normalizes to a falsy value, which both
+        auth wrappers read as "no usable key" and fail closed on.
+        """
+        return value.strip() if isinstance(value, str) else value
 
     def _jira_integration(self) -> dict[str, Any]:
         if self.mcp_jira_transport == "stdio":
