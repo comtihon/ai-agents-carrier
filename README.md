@@ -41,6 +41,16 @@ API at `http://localhost:8000`. Health check: `GET /health`.
 | `PUBSUB_DELETE_ORPHANED_SUBSCRIPTIONS` | `true` | Delete a backend-created subscription once its last trigger step is gone |
 | `OAUTH_ENABLED` | `false` | Enable JWT Bearer auth on all endpoints |
 | `OAUTH_JWKS_URL` | — | JWKS endpoint for token validation |
+| `OAUTH_ISSUER` | — | Expected token issuer; also where the userinfo endpoint is derived from |
+| `OAUTH_AUDIENCE` | — | Expected audience; audience is not verified when unset |
+| `AUTH_ENFORCE_PERMISSIONS` | `false` | Enforce the role→permission model. Off = every authenticated caller has full access, and denials are only reported (see [Role-based permissions](#role-based-permissions)) |
+| `AUTH_PROJECT_ID` | — | Identity-provider project whose roles claim is read (machine tokens carry `urn:zitadel:iam:org:project:<id>:roles`) |
+| `AUTH_ACCESS_ROLES` | `[]` | Roles allowed to reach the API at all. Allow-list: an unlisted role is denied |
+| `AUTH_READ_ROLES` | `[]` | Roles granted READ (`GET`/`HEAD`/`OPTIONS`, and the `list_*` / `get_*` tools) |
+| `AUTH_WRITE_ROLES` | `[]` | Roles granted WRITE (`POST`/`PUT`/`PATCH`, creates, updates, run control) |
+| `AUTH_DELETE_ROLES` | `[]` | Roles granted DELETE (`DELETE`, and the `delete_*` tools) |
+| `AUTH_ADMIN_ROLES` | `[]` | Roles granted ADMIN — python steps that run on the backend pod. Keep this narrowest |
+| `MANAGEMENT_MCP_API_KEY` | — | Static key for `/mcp/management`. Capped below ADMIN: a shared secret cannot be attributed to a person |
 | `OPENHANDS_BASE_URL` | `http://openhands:3000` | OpenHands service URL |
 | `OPENHANDS_API_KEY` | — | OpenHands auth token |
 | `OPENHANDS_MOCK_MODE` | `true` | Return stub results instead of calling OpenHands |
@@ -48,6 +58,65 @@ API at `http://localhost:8000`. Health check: `GET /health`.
 | `DOCKER_REGISTRY_PASSWORD` | — | Registry password / token for pulling private images |
 | `META_LLM_PROVIDER` | — | LLM provider for post-agent analysis (`anthropic` or `openai`; defaults to `LLM_PROVIDER`) |
 | `META_LLM_MODEL` | `claude-haiku-4-5-20251001` | Model for post-agent meta-analysis (haiku recommended for cost/speed) |
+
+### Role-based permissions
+
+Authentication answers *who is calling*; this answers *what they may do*. Five
+coarse tiers, and the mapping from identity-provider role names onto them is
+entirely configuration, so no deployment's role names live in this repository:
+
+| tier | grants |
+|---|---|
+| ACCESS | may reach the API at all — the tenancy gate |
+| READ | read workflows, runs, definitions, data sources, traces |
+| WRITE | create, edit and run workflows; control runs |
+| DELETE | delete workflows, runs, agents, data sources |
+| ADMIN | python steps that execute on the backend pod (see [`python`](#python--python-script)) |
+
+ADMIN is not "WRITE plus a bit": its blast radius is the backend process and
+every credential it holds, not the data.
+
+**How a requirement is derived.** REST routes take theirs from the HTTP method
+(`GET`→READ, `POST`/`PUT`/`PATCH`→WRITE, `DELETE`→DELETE, anything unknown→WRITE),
+so a newly added route inherits a sane requirement instead of defaulting to
+unprotected. The tool surfaces — `/mcp/management` and the chat agent, which both
+arrive as one `POST` — cannot use the method, so their shared implementations in
+`app/application/management_tools.py` and `app/application/run_control.py` are
+each gated individually. The mapping is asserted in
+`tests/unit/test_tool_permission_gates.py`, so a new tool fails the suite until
+it is classified.
+
+**Principals that are not users.** The `/mcp/management` static API key is a
+shared secret with no person behind it: it gets READ/WRITE/DELETE and never
+ADMIN. Callers that authenticate by another mechanism and carry no roles at all —
+Slack HMAC callbacks, signed webhooks, Pub/Sub triggers, agent-container
+callbacks — bypass this model entirely (see `_UNPROTECTED_PREFIXES` in
+`app/api/middleware/auth.py`); nothing about enforcement changes them.
+
+**Shadow mode.** With `AUTH_ENFORCE_PERMISSIONS=false` the model is still
+evaluated on every authenticated request and every would-be denial is logged
+while the request is served, so turning enforcement on is an evidence-based
+decision. Read the evidence before flipping it:
+
+```bash
+# Every caller that would be locked out, over the last week
+gcloud logging read \
+  'resource.type="k8s_container"
+   AND resource.labels.namespace_name="langgraph"
+   AND textPayload:"RBAC shadow"' \
+  --project <gcp-project> --freshness=7d --format='value(textPayload)' | sort | uniq -c | sort -rn
+```
+
+Each line names the subject id, the permission it would have been denied, the
+roles it actually holds, and the method and path. An empty result over a full
+business cycle is the go signal; a subject with `roles=[]` is the expected
+failure and means its token carries no roles claim — the identity provider needs
+to assert roles for that client (and the client to request the roles scope)
+*before* enforcement goes on, not after.
+
+Recommended order: deploy with enforcement off → read the query above → fix any
+roleless client → enforce in a non-production environment → enforce in
+production.
 
 ### MCP integrations
 
@@ -341,6 +410,15 @@ returned the same way, so both must be JSON-serialisable.
 Set `sandbox: false` to keep the legacy behaviour — `exec` inside the backend
 process, with full access to its environment and libraries. Use it only for
 trusted infrastructure code.
+
+**`local` is not a security boundary.** It clears the environment and filters
+imports, which stops an honest script from reaching the backend by accident, but
+the child process shares the pod: a script can read the mounted service-account
+token with a plain `open()`. Only `docker` and `k8s` put a kernel boundary in the
+way. So when `AUTH_ENFORCE_PERMISSIONS` is on, a python step needs ADMIN unless
+it names `sandbox_runtime: docker` or `k8s` — `sandbox: false`, `local` and an
+unset runtime are all the same privilege, and gating only the first would leave
+ADMIN a formality that any WRITE holder walks around by leaving a field unset.
 
 Sandbox defaults come from `SCRIPT_SANDBOX_IMAGE`, `SCRIPT_SANDBOX_TIMEOUT` and
 `SCRIPT_SANDBOX_MEMORY_MB`; a step can override the first two.
