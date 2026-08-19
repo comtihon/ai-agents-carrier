@@ -171,7 +171,6 @@ def _rlimit_preexec(memory_mb: int, cpu_seconds: int):
         # No core dumps, and a cap on what a runaway script can write out.
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024, 64 * 1024 * 1024))
-        os.setsid()
 
     return _apply
 

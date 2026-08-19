@@ -276,3 +276,108 @@ async def test_source_ids_are_slugged_from_the_topic():
     assert _pubsub_source_id("projects/p/topics/Order.Events") == "pubsub-order-events"
     assert _pubsub_source_id("orders") == "pubsub-orders"
     assert _pubsub_source_id("") == "pubsub-topic"
+
+
+# ─── syncing registrations with the definition ─────────────────────────────────
+
+from types import SimpleNamespace  # noqa: E402 - test-local helper import
+
+from app.infrastructure.triggers.pubsub_subscriber import PubSubSubscriberManager  # noqa: E402
+from tests.unit.test_pubsub_subscriber import FakeSubscriber  # noqa: E402
+
+
+def _runner_with(steps: list[dict], workflow_id: str = "orders-wf") -> SimpleNamespace:
+    return SimpleNamespace(id=workflow_id, steps=steps)
+
+
+def _with_subscriber(container: ApplicationContainer, client: FakeSubscriber) -> PubSubSubscriberManager:
+    manager = PubSubSubscriberManager(client_factory=lambda: client)
+    manager.start()
+    container.pubsub_subscriber = manager
+    return manager
+
+
+async def test_removing_the_pubsub_node_releases_its_subscription():
+    client = FakeSubscriber()
+    container = _container()
+    manager = _with_subscriber(container, client)
+    step = {"id": "on_order", "type": "pubsub", "topic": "orders"}
+
+    await container._register_pubsub_steps(_runner_with([step]))
+    path = manager.registrations()["orders-wf:on_order"]
+
+    # Saved again with the trigger node deleted.
+    await container._register_pubsub_steps(_runner_with([{"id": "work", "type": "llm"}]))
+
+    assert manager.registrations() == {}
+    assert manager._streams == {}
+
+
+async def test_saving_an_unchanged_workflow_keeps_the_stream():
+    client = FakeSubscriber()
+    container = _container()
+    manager = _with_subscriber(container, client)
+    step = {"id": "on_order", "type": "pubsub", "topic": "orders"}
+
+    await container._register_pubsub_steps(_runner_with([step]))
+    path = manager.registrations()["orders-wf:on_order"]
+    future = manager._streams[path].future
+
+    await container._register_pubsub_steps(_runner_with([step]))
+
+    assert manager._streams[path].future is future
+    assert client.subscribed == [path]
+
+
+async def test_two_workflows_on_one_datasource_share_the_subscription():
+    source = DataSourceDefinition(
+        id="orders-events",
+        kind="pubsub",
+        pubsub=PubSubSpec(topic="orders", subscription="projects/proj/subscriptions/shared"),
+    )
+    client = FakeSubscriber(existing={"projects/proj/subscriptions/shared"})
+    container = _container(FakeDataSourceBackend({"orders-events": source}))
+    manager = _with_subscriber(container, client)
+    step = {"id": "on_order", "type": "pubsub", "datasource": "orders-events"}
+
+    await container._register_pubsub_steps(_runner_with([step], "wf-a"))
+    await container._register_pubsub_steps(_runner_with([step], "wf-b"))
+
+    path = "projects/proj/subscriptions/shared"
+    # One stream feeding both workflows, so both see every event.
+    assert client.subscribed == [path]
+    assert manager.consumers_of(path) == ["wf-a:on_order", "wf-b:on_order"]
+
+
+async def test_a_broken_step_leaves_the_other_triggers_registered():
+    client = FakeSubscriber()
+    container = _container(FakeDataSourceBackend())
+    manager = _with_subscriber(container, client)
+
+    await container._register_pubsub_steps(_runner_with([
+        {"id": "on_order", "type": "pubsub", "topic": "orders"},
+        {"id": "broken", "type": "pubsub", "datasource": "ghost"},
+    ]))
+
+    assert list(manager.registrations()) == ["orders-wf:on_order"]
+
+
+async def test_deleting_the_workflow_releases_its_subscriptions():
+    from unittest.mock import AsyncMock
+
+    client = FakeSubscriber()
+    container = _container()
+    manager = _with_subscriber(container, client)
+    await container._register_pubsub_steps(
+        _runner_with([{"id": "on_order", "type": "pubsub", "topic": "orders"}])
+    )
+    path = manager.registrations()["orders-wf:on_order"]
+
+    # refresh_runner is what every delete path funnels through; no definition
+    # left means the workflow is gone.
+    container.workflow_backend = AsyncMock()
+    container.workflow_backend.get = AsyncMock(return_value=None)
+    await container.refresh_runner("orders-wf")
+
+    assert manager.registrations() == {}
+    assert manager._streams == {}

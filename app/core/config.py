@@ -137,6 +137,13 @@ class Settings(BaseSettings):
     # dropped by default — redelivering it forever would be a poison pill.
     # Set false to nack instead (topic-level retry / dead-lettering).
     pubsub_drop_invalid_messages: bool = Field(default=True, alias="PUBSUB_DROP_INVALID_MESSAGES")
+    # When the last trigger step using a backend-created subscription goes away
+    # (node removed, workflow deleted), delete the subscription too instead of
+    # leaving it to accrue a backlog. Subscriptions named by a step or
+    # datasource are never deleted — they are not the backend's to remove.
+    pubsub_delete_orphaned_subscriptions: bool = Field(
+        default=True, alias="PUBSUB_DELETE_ORPHANED_SUBSCRIPTIONS",
+    )
 
     # --- OAuth ---
     oauth_enabled: bool = Field(default=False, alias="OAUTH_ENABLED")
@@ -239,6 +246,15 @@ class Settings(BaseSettings):
     # base_url is an OAuth-protected external URL and agents need to call back
     # via an internal cluster URL instead. Defaults to base_url when not set.
     agent_callback_url: str | None = Field(default=None, alias="AGENT_CALLBACK_URL")
+
+    # --- Python script sandbox (workflow `python` steps with sandbox: true) ---
+    # Image used by the docker / k8s sandbox runtimes.  Must contain a Python
+    # interpreter on PATH; no backend dependencies are needed inside it.
+    script_sandbox_image: str = Field(default="python:3.12-slim", alias="SCRIPT_SANDBOX_IMAGE")
+    # Wall-clock limit for a sandboxed script, in seconds.
+    script_sandbox_timeout: float = Field(default=60.0, alias="SCRIPT_SANDBOX_TIMEOUT")
+    # Memory cap for a sandboxed script, in MiB.
+    script_sandbox_memory_mb: int = Field(default=512, alias="SCRIPT_SANDBOX_MEMORY_MB")
 
     # --- Docker registry auth (used by DockerRuntime to pull private images) ---
     # Set DOCKER_REGISTRY_USERNAME + DOCKER_REGISTRY_PASSWORD to enable auth.
