@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -15,33 +16,58 @@ logger = logging.getLogger(__name__)
 # guarded by _ManagementAuthWrapper instead (see app.api.app).
 _UNPROTECTED_PATHS = {"/health", "/ready", "/mcp/management"}
 
-# Path prefixes that bypass authentication.
-# /copilotkit is the CopilotKit runtime endpoint — it has no user-specific data
-# and cannot reach the backend API without the frontend actions providing their
-# own authenticated calls.  Secure at the network / API-gateway level instead.
-# /api/v1/callbacks are approval callback URLs sent to external systems (Slack, etc.)
-# where the caller has no credentials; the run_id UUID in the path is the secret.
+# Prefixes exempt for every method, because each already authenticates itself by
+# another mechanism. Nothing belongs here on the grounds that it is "internal":
+# the prod ingress serves "/", so every route below is reachable from the
+# internet and needs a credential of its own.
 _UNPROTECTED_PREFIXES = (
-    "/copilotkit",
-    "/api/v1/callbacks/",
+    # Slack posts these with an X-Slack-Signature HMAC, verified in
+    # app.api.routes.callbacks._verify_slack_signature.
+    "/api/v1/callbacks/slack/",
+    # Webhook triggers carry an X-Webhook-Signature HMAC over the raw body,
+    # keyed per workflow or by WEBHOOK_SECRET.
     "/api/v1/webhooks/",
-    # Agent output/progress callbacks — posted by spawned agent containers that
-    # have no user credentials.  The run_id UUID in the path acts as the shared
-    # secret; secure at the network level (cluster-internal traffic only).
-    "/api/v1/runs/",
-    # Data sources MCP — this backend must be able to reach its own mounted
-    # endpoint at startup/refresh time without a user JWT (there is no user
-    # in that flow). The mount is guarded instead by a dedicated bearer-token
-    # wrapper around the mounted app (see app.api.app._DatasourcesAuthWrapper).
+    # Data sources MCP — this backend must reach its own mounted endpoint at
+    # startup/refresh time without a user JWT (there is no user in that flow).
+    # Guarded by a dedicated bearer-token wrapper around the mounted app
+    # (see app.api.app._DatasourcesAuthWrapper).
     "/mcp/datasources",
-    # Management MCP — same reasoning as /mcp/datasources: BaseHTTPMiddleware in
-    # front of a FastMCP streamable-HTTP app is unverified, so the prefix is
-    # exempted here and guarded by a dedicated bearer-token wrapper around the
-    # mounted app instead (see app.api.app._ManagementAuthWrapper), which fails
-    # closed when no API key is configured.  Listed as a "/"-terminated prefix so
-    # it cannot also exempt a sibling path like /mcp/managementfoo.
+    # Management MCP — same reasoning: BaseHTTPMiddleware in front of a FastMCP
+    # streamable-HTTP app is unverified, so the prefix is exempted here and
+    # guarded by app.api.app._ManagementAuthWrapper instead, which fails closed
+    # when no API key is configured. Listed "/"-terminated so it cannot also
+    # exempt a sibling path like /mcp/managementfoo.
     "/mcp/management/",
 )
+
+# (method, prefix) pairs exempt only for that HTTP method.
+_UNPROTECTED_METHOD_PREFIXES = (
+    # Approve/reject links rendered as Slack buttons and opened in a browser. A
+    # link click cannot carry an Authorization header, so the GET forms stay
+    # open and the run_id is their only credential. The POST forms are API calls
+    # and are authenticated normally.
+    ("GET", "/api/v1/callbacks/"),
+)
+
+# Callbacks posted by spawned agent containers, which hold no user credentials —
+# the run_id acts as their bearer capability. Matched exactly rather than by a
+# "/api/v1/runs/" prefix so that a route added to this router later is not
+# silently unauthenticated. (Run control is unaffected either way: it lives under
+# /api/v1/workflows/runs/..., which this prefix never covered.) Note
+# "/agent/reply" is deliberately absent — the frontend calls it and sends a token.
+_AGENT_CALLBACK_PATH = re.compile(
+    r"^/api/v1/runs/[^/]+/agent/(?:output|question|input|progress)$"
+)
+
+
+def _is_unprotected(method: str, path: str) -> bool:
+    """Whether `method path` may bypass user authentication."""
+    if path in _UNPROTECTED_PATHS or path.startswith(_UNPROTECTED_PREFIXES):
+        return True
+    for exempt_method, prefix in _UNPROTECTED_METHOD_PREFIXES:
+        if method == exempt_method and path.startswith(prefix):
+            return True
+    return bool(_AGENT_CALLBACK_PATH.match(path))
 
 
 class OAuthMiddleware(BaseHTTPMiddleware):
@@ -51,10 +77,7 @@ class OAuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
-        if (
-            path in _UNPROTECTED_PATHS
-            or path.startswith(_UNPROTECTED_PREFIXES)
-        ):
+        if _is_unprotected(request.method, path):
             return await call_next(request)
 
         auth_header = request.headers.get("Authorization", "")
