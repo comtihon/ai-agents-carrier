@@ -168,7 +168,21 @@ class AgentToolCliSpec(BaseModel):
     cwd: str | None = None
     # Files that must exist under cwd for the call to make sense.
     requires_files: list[str] = Field(default_factory=list)
+    timeout_seconds: int = 60
     description: str = ""
+
+
+class AgentToolWorkspaceHook(BaseModel):
+    """A command run once per restored workspace repo before the agent starts.
+
+    Used by tools that keep a per-repo cache or index — the agent runs the hook
+    only in repos that already contain ``requires_files``, and never fails the
+    run because of it.
+    """
+
+    args: list[str] = Field(default_factory=list)
+    requires_files: list[str] = Field(default_factory=list)
+    timeout_seconds: int = 120
 
 
 class AgentToolSpec(BaseModel):
@@ -190,6 +204,8 @@ class AgentToolSpec(BaseModel):
     bash_match: str | None = None
     # MCP-style tool name → CLI invocation template.
     cli_tools: dict[str, AgentToolCliSpec] = Field(default_factory=dict)
+    # Optional per-repo command run after the workspace is restored.
+    workspace_hook: AgentToolWorkspaceHook | None = None
 
 
 # Env vars that look like credentials by suffix but belong to the backend only.
