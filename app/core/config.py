@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from functools import lru_cache
 from typing import Any, Literal
 
@@ -73,18 +74,67 @@ class ServiceIdentityConfig(BaseModel):
 
 
 class McpIntegrationConfig(BaseModel):
-    """Resolved configuration for a single MCP server."""
+    """One MCP server an agent may be granted.
+
+    Declared entirely in configuration (``MCP_INTEGRATIONS``) so that neither
+    the backend nor the agent image carries knowledge of any specific server —
+    the same contract ``AgentToolSpec`` has for bash-level tools.  Adding a
+    server is a values.yaml entry, not a code change.
+
+    Secrets are named, not inlined: ``api_key_env`` points at an env var the
+    deployment fills from a k8s Secret, so the JSON blob itself is safe to keep
+    in a ConfigMap.  ``api_key`` remains available for local ``.env`` use.
+    """
 
     name: str
-    enabled: bool
-    transport: Literal["streamable_http", "sse", "stdio"]
+    enabled: bool = True
+    transport: Literal["streamable_http", "sse", "stdio"] = "streamable_http"
     # HTTP transports
     url: str | None = None
+    # How an HTTP transport authenticates. "bearer" (the default) sends the
+    # token below; "none" states that the endpoint genuinely wants no
+    # credential, which is what keeps a tokenless entry from being reported as
+    # ready when it is really just unconfigured.  Ignored for stdio servers,
+    # which authenticate through ``env`` / ``env_from_config`` instead.
+    auth: Literal["bearer", "none"] = "bearer"
+    # Bearer token: inlined (local dev) or named (production).
     api_key: str | None = None
+    api_key_env: str | None = None
     # stdio transport
     command: str | None = None
     args: list[str] = []
     env: dict[str, str] = {}
+    # env var name → env var to copy the value from, for stdio servers whose
+    # credentials live in the deployment's own secrets.
+    env_from_config: dict[str, str] = {}
+    # False for stdio servers whose CLI cannot be re-hosted over HTTP by the
+    # agent (no --transport/--port flags): the agent then wires them as plain
+    # stdio entries instead of pre-starting an HTTP proxy.
+    prestart_http: bool = True
+    # False for servers the backend must not dial during startup: an agent-side
+    # stdio binary absent from the backend container, or a server this very
+    # process hosts (only reachable once the HTTP server accepts requests).
+    # Such servers are connected later via ``McpToolsProvider.refresh_server``.
+    eager_start: bool = True
+    # "self_datasources" resolves ``url`` to this process's own mounted
+    # /mcp/datasources endpoint at read time; "value" uses ``url`` verbatim.
+    url_from: Literal["value", "self_datasources"] = "value"
+    # Endpoint a spawned agent must dial when it differs from the one the
+    # backend uses — a loopback or in-cluster address the agent's own pod cannot
+    # resolve. Empty means the agent gets ``url``.
+    agent_url: str | None = None
+
+    def resolved_agent_url(self) -> str | None:
+        """The endpoint to hand a spawned agent for this server."""
+        return self.agent_url or self.url
+
+    def resolved_api_key(self) -> str | None:
+        """The bearer token, from the inline value or the named env var."""
+        if self.api_key:
+            return self.api_key
+        if self.api_key_env:
+            return os.environ.get(self.api_key_env) or None
+        return None
 
 
 class AgentToolEnvSpec(BaseModel):
@@ -286,22 +336,14 @@ class Settings(BaseSettings):
     openhands_poll_interval_seconds: float = Field(default=10.0, alias="OPENHANDS_POLL_INTERVAL_SECONDS")
     openhands_mock_mode: bool = Field(default=True, alias="OPENHANDS_MOCK_MODE")
 
-    # --- Figma MCP ---
-    mcp_figma_enabled: bool = Field(default=False, alias="MCP_FIGMA_ENABLED")
-    mcp_figma_transport: Literal["streamable_http", "sse"] = Field(default="streamable_http", alias="MCP_FIGMA_TRANSPORT")
-    mcp_figma_url: str = Field(default="", alias="MCP_FIGMA_URL")
-    mcp_figma_api_key: str | None = Field(default=None, alias="MCP_FIGMA_API_KEY")
-
-    # --- Jira MCP ---
-    mcp_jira_enabled: bool = Field(default=False, alias="MCP_JIRA_ENABLED")
-    mcp_jira_transport: Literal["streamable_http", "sse", "stdio"] = Field(default="streamable_http", alias="MCP_JIRA_TRANSPORT")
-    # HTTP transport fields
-    mcp_jira_url: str = Field(default="", alias="MCP_JIRA_URL")
-    mcp_jira_api_key: str | None = Field(default=None, alias="MCP_JIRA_API_KEY")
-    # stdio transport fields (sooperset/mcp-atlassian via uvx)
-    mcp_jira_jira_url: str | None = Field(default=None, alias="MCP_JIRA_JIRA_URL")
-    mcp_jira_username: str | None = Field(default=None, alias="MCP_JIRA_USERNAME")
-    mcp_jira_api_token: str | None = Field(default=None, alias="MCP_JIRA_API_TOKEN")
+    # --- MCP server registry ---
+    # JSON array declaring every MCP server agents may be granted:
+    #   [{"name": "github", "transport": "streamable_http",
+    #     "url": "https://...", "api_key_env": "GITHUB_MCP_TOKEN"}]
+    # Empty by default: an agent's mcp addon can only enable what is declared
+    # here, and a server that is not declared grants nothing.  The in-process
+    # `datasources` server is always present (see _builtin_mcp_integrations).
+    mcp_integrations_json: str = Field(default="", alias="MCP_INTEGRATIONS")
 
     # --- Standalone LLM API keys (forwarded to Docker/K8s agent containers) ---
     anthropic_api_key: str | None = Field(default=None, alias="ANTHROPIC_API_KEY")
@@ -349,27 +391,6 @@ class Settings(BaseSettings):
     # Other:  plain username / password or personal access token
     docker_registry_username: str | None = Field(default=None, alias="DOCKER_REGISTRY_USERNAME")
     docker_registry_password: str | None = Field(default=None, alias="DOCKER_REGISTRY_PASSWORD")
-
-    # --- Miro MCP ---
-    mcp_miro_enabled: bool = Field(default=False, alias="MCP_MIRO_ENABLED")
-    mcp_miro_transport: Literal["streamable_http", "sse"] = Field(default="streamable_http", alias="MCP_MIRO_TRANSPORT")
-    mcp_miro_url: str = Field(default="", alias="MCP_MIRO_URL")
-    mcp_miro_api_key: str | None = Field(default=None, alias="MCP_MIRO_API_KEY")
-
-    # --- Notion MCP ---
-    mcp_notion_enabled: bool = Field(default=False, alias="MCP_NOTION_ENABLED")
-    mcp_notion_transport: Literal["streamable_http", "sse"] = Field(default="streamable_http", alias="MCP_NOTION_TRANSPORT")
-    mcp_notion_url: str = Field(default="", alias="MCP_NOTION_URL")
-    mcp_notion_api_key: str | None = Field(default=None, alias="MCP_NOTION_API_KEY")
-
-    # --- GitHub MCP ---
-    mcp_github_enabled: bool = Field(default=False, alias="MCP_GITHUB_ENABLED")
-    mcp_github_transport: Literal["streamable_http", "sse"] = Field(default="streamable_http", alias="MCP_GITHUB_TRANSPORT")
-    mcp_github_url: str = Field(default="", alias="MCP_GITHUB_URL")
-    mcp_github_api_key: str | None = Field(default=None, alias="MCP_GITHUB_API_KEY")
-
-    # --- Semble MCP (stdio; agent-side binary — never launched in backend container) ---
-    mcp_semble_enabled: bool = Field(default=True, alias="MCP_SEMBLE_ENABLED")
 
     # --- Data sources MCP (served in-process at /mcp/datasources) ---
     # Connected lazily in the background, never during startup: the mounted
@@ -421,18 +442,6 @@ class Settings(BaseSettings):
         """
         return value.strip() if isinstance(value, str) else value
 
-    def _jira_integration(self) -> dict[str, Any]:
-        if self.mcp_jira_transport == "stdio":
-            env = {k: v for k, v in {
-                "JIRA_URL": self.mcp_jira_jira_url,
-                "JIRA_USERNAME": self.mcp_jira_username,
-                "JIRA_API_TOKEN": self.mcp_jira_api_token,
-            }.items() if v}
-            return dict(name="jira", enabled=self.mcp_jira_enabled, transport="stdio",
-                        command="uvx", args=["mcp-atlassian"], env=env)
-        return dict(name="jira", enabled=self.mcp_jira_enabled, transport=self.mcp_jira_transport,
-                    url=self.mcp_jira_url, api_key=self.mcp_jira_api_key)
-
     def resolved_mcp_datasources_url(self) -> str:
         """URL of the in-process data sources MCP server.
 
@@ -444,6 +453,17 @@ class Settings(BaseSettings):
             return self.mcp_datasources_url
         port = os.environ.get("PORT", "8000")
         return f"http://127.0.0.1:{port}/mcp/datasources"
+
+    def resolved_agent_mcp_datasources_url(self) -> str:
+        """URL of the data sources MCP server as a *spawned agent* must dial it.
+
+        The backend talks to its own mounted endpoint over loopback, which a
+        docker or k8s agent in its own container cannot resolve.  Agents are
+        given the same address they call back on instead — the deployment
+        already has to make that one reachable from an agent.
+        """
+        base = (self.agent_callback_url or self.base_url).rstrip("/")
+        return f"{base}/mcp/datasources"
 
     def resolved_service_auth_private_key(self) -> str | None:
         """Private key of the flat ``SERVICE_AUTH_*`` identity, newlines fixed."""
@@ -638,29 +658,127 @@ class Settings(BaseSettings):
                 result[key] = val
         return result
 
-    def _build_mcp_candidates(self) -> list[dict[str, Any]]:
+    # ── MCP server registry ────────────────────────────────────────────────
+
+    def _builtin_mcp_integrations(self) -> list[McpIntegrationConfig]:
+        """Servers this deployment always knows about, without being declared.
+
+        Only the in-process data sources bridge qualifies: it is not an external
+        integration an operator could point at, it is this process, and it is
+        how every configured data source reaches an agent.  A ``MCP_INTEGRATIONS``
+        entry of the same name overrides the defaults set here.
+        """
         return [
-            dict(name="figma",  enabled=self.mcp_figma_enabled,  transport=self.mcp_figma_transport,  url=self.mcp_figma_url,  api_key=self.mcp_figma_api_key),
-            self._jira_integration(),
-            dict(name="miro",   enabled=self.mcp_miro_enabled,   transport=self.mcp_miro_transport,   url=self.mcp_miro_url,   api_key=self.mcp_miro_api_key),
-            dict(name="notion", enabled=self.mcp_notion_enabled, transport=self.mcp_notion_transport, url=self.mcp_notion_url, api_key=self.mcp_notion_api_key),
-            dict(name="github", enabled=self.mcp_github_enabled, transport=self.mcp_github_transport, url=self.mcp_github_url, api_key=self.mcp_github_api_key),
-            # Bare `semble` starts the MCP stdio server; the CLI takes no repo
-            # positional (repo is a per-call tool argument) and rejects one.
-            dict(name="semble", enabled=self.mcp_semble_enabled, transport="stdio", command="semble", args=[]),
-            # Served by this process at /mcp/datasources — connected lazily.
-            dict(name="datasources", enabled=self.mcp_datasources_enabled, transport="streamable_http",
-                 url=self.resolved_mcp_datasources_url(), api_key=self.mcp_datasources_api_key),
+            McpIntegrationConfig(
+                name="datasources",
+                enabled=self.mcp_datasources_enabled,
+                transport="streamable_http",
+                url_from="self_datasources",
+                # The mount is gated by MCP_DATASOURCES_API_KEY when there is
+                # one, and open to in-cluster callers when there is not — so the
+                # declared auth follows the key rather than assuming either way.
+                auth="bearer" if (self.mcp_datasources_api_key or "").strip() else "none",
+                api_key=self.mcp_datasources_api_key,
+                eager_start=False,
+            ),
         ]
 
+    def _declared_mcp_integrations(self) -> list[McpIntegrationConfig]:
+        """Parse the MCP_INTEGRATIONS JSON array into a typed list."""
+        if not self.mcp_integrations_json:
+            return []
+        raw = json.loads(self.mcp_integrations_json)
+        if not isinstance(raw, list):
+            raise ValueError("MCP_INTEGRATIONS must be a JSON array of server objects")
+        return [McpIntegrationConfig.model_validate(item) for item in raw]
+
+    def all_mcp_integrations(self) -> list[McpIntegrationConfig]:
+        """Every known MCP server, declared or built in, regardless of state.
+
+        Declared entries win over built-in ones of the same name, so a
+        deployment can retarget the data sources bridge without losing it.
+        Placeholders (``url_from``, ``env_from_config``) are resolved here so
+        every caller sees concrete values.
+        """
+        merged: dict[str, McpIntegrationConfig] = {
+            intg.name: intg for intg in self._builtin_mcp_integrations()
+        }
+        for intg in self._declared_mcp_integrations():
+            merged[intg.name] = intg
+        return [self._resolve_mcp_integration(intg) for intg in merged.values()]
+
+    def _resolve_mcp_integration(self, intg: McpIntegrationConfig) -> McpIntegrationConfig:
+        """Fill in the fields that can only be known at read time."""
+        updates: dict[str, Any] = {}
+        if intg.url_from == "self_datasources":
+            updates["url"] = self.resolved_mcp_datasources_url()
+            if not intg.agent_url:
+                updates["agent_url"] = self.resolved_agent_mcp_datasources_url()
+        if intg.env_from_config:
+            env = dict(intg.env)
+            for env_name, config_key in intg.env_from_config.items():
+                value = self.get_config_value(config_key)
+                if value:
+                    env[env_name] = value
+            updates["env"] = env
+        return intg.model_copy(update=updates) if updates else intg
+
     def get_mcp_integrations(self) -> list[McpIntegrationConfig]:
-        candidates = self._build_mcp_candidates()
-        return [McpIntegrationConfig(**c) for c in candidates
-                if c["enabled"] and (c.get("url") or c.get("transport") == "stdio")]
+        """Every MCP server that is enabled and reachable as configured."""
+        return [
+            intg for intg in self.all_mcp_integrations()
+            if intg.enabled and (intg.url or intg.transport == "stdio")
+        ]
+
+    def legacy_mcp_env_servers(self) -> list[str]:
+        """Server names still configured the pre-registry way, if any.
+
+        ``MCP_<NAME>_ENABLED=true`` used to declare a server on its own.  Those
+        vars are inert now (``extra="ignore"``), which would silently drop a
+        capability on upgrade, so startup logs whichever ones are still set and
+        no longer backed by an ``MCP_INTEGRATIONS`` entry.
+        """
+        declared = {intg.name.upper().replace("-", "_") for intg in self.all_mcp_integrations()}
+        reserved = {"DATASOURCES", "INTEGRATIONS"}
+        legacy: list[str] = []
+        for key, value in os.environ.items():
+            match = re.fullmatch(r"MCP_(.+)_ENABLED", key)
+            if not match or value.strip().lower() not in {"1", "true", "yes", "on"}:
+                continue
+            server = match.group(1)
+            if server in reserved or server in declared:
+                continue
+            legacy.append(server.lower())
+        return sorted(legacy)
+
+    def mcp_server_enabled(self, name: str) -> bool:
+        """True when *name* is declared and enabled (reachable or not)."""
+        return any(intg.name == name and intg.enabled for intg in self.all_mcp_integrations())
 
     def list_mcp_candidates(self) -> list[dict[str, Any]]:
-        """Return name + enabled for ALL known MCP servers regardless of URL/enabled state."""
-        return [{"name": c["name"], "enabled": c["enabled"]} for c in self._build_mcp_candidates()]
+        """Return every known MCP server for the UI's mcp addon picker.
+
+        ``configured`` is False when a server is declared but cannot actually be
+        dialled: no URL, no stdio command, or ``auth: bearer`` with no token
+        resolving behind it.  An HTTP endpoint that needs no credential has to
+        say so with ``auth: none`` — otherwise a server whose token was never
+        wired up would be reported as ready and fail only once an agent used it.
+        """
+        candidates: list[dict[str, Any]] = []
+        for intg in self.all_mcp_integrations():
+            if intg.transport == "stdio":
+                configured = bool(intg.command)
+            else:
+                configured = bool(intg.url) and (
+                    intg.auth == "none" or bool(intg.resolved_api_key())
+                )
+            candidates.append({
+                "name": intg.name,
+                "enabled": intg.enabled,
+                "transport": intg.transport,
+                "configured": configured,
+            })
+        return candidates
 
 
 @lru_cache(maxsize=1)

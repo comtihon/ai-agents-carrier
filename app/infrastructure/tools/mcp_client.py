@@ -21,9 +21,6 @@ class McpToolsProvider:
     When no MCP servers are enabled, start() is a no-op and get_tools() returns [].
     """
 
-    # Servers excluded from eager start(); reachable only via refresh_server().
-    _EAGER_START_SKIP: frozenset[str] = frozenset({"semble", "datasources"})
-
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._client: MultiServerMCPClient | None = None
@@ -71,8 +68,8 @@ class McpToolsProvider:
     async def refresh_server(self, name: str) -> None:
         """(Re)connect a single MCP server and swap in its tools atomically.
 
-        Used for servers that are not eager-started (see ``_EAGER_START_SKIP``)
-        and for hot-reloading a server whose tool list changed.  Raises on
+        Used for servers declared with ``eager_start: false`` and for
+        hot-reloading a server whose tool list changed.  Raises on
         connection failure so the caller can retry.
         """
         cfg = self._config_for(name)
@@ -129,19 +126,20 @@ class McpToolsProvider:
                     "transport": integration.transport,
                     "url": integration.url,
                 }
-                if integration.api_key:
-                    cfg["headers"] = {"Authorization": f"Bearer {integration.api_key}"}
+                api_key = integration.resolved_api_key()
+                if api_key:
+                    cfg["headers"] = {"Authorization": f"Bearer {api_key}"}
             return cfg
         return None
 
     def _build_server_configs(self) -> dict[str, dict[str, Any]]:
         configs: dict[str, dict[str, Any]] = {}
         for integration in self._settings.get_mcp_integrations():
-            # These servers are never eager-started: `semble` is an agent-side
-            # stdio binary that is absent from the backend container, and
-            # `datasources` is served by this very process, so it is only
-            # reachable after startup completes (see refresh_server).
-            if integration.name in self._EAGER_START_SKIP:
+            # A server declared with eager_start: false is never dialled during
+            # startup — an agent-side stdio binary absent from the backend
+            # container, or a server this very process hosts and which only
+            # answers once startup completes (see refresh_server).
+            if not integration.eager_start:
                 continue
             cfg = self._config_for(integration.name)
             if cfg is not None:

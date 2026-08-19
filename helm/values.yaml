@@ -64,6 +64,71 @@ secrets: {}
 #         key: API_KEY
 llmIntegrations: []
 
+# MCP servers agents may be granted. Free-form list — any MCP server reachable
+# over streamable HTTP / SSE, or runnable as a stdio command, can be added
+# without code changes. Each entry is rendered into:
+#   ConfigMap: MCP_INTEGRATIONS (JSON-encoded list, minus the secret api key)
+#   Deployment env: the `apiKeyEnv` var from the referenced k8s Secret
+#     (defaults to <NAME>_MCP_API_KEY, uppercased, dashes → underscores)
+# A server declared here is only *grantable*: an agent receives it at spawn time
+# when its `mcp` addon has that server checked, and never otherwise.
+#
+# Fields (all optional except `name` and `transport`):
+#   name          server name, as shown in the UI's mcp addon picker
+#   enabled       false hides it from agents without deleting the entry (default true)
+#   transport     streamable_http | sse | stdio
+#   url           endpoint (HTTP transports)
+#   agentUrl      endpoint a spawned agent must dial instead, when the one
+#                 above is not resolvable from an agent pod
+#   auth          bearer (default) | none. HTTP transports only: `none` states
+#                 the endpoint wants no credential. A bearer entry with no
+#                 token resolving is reported as incomplete rather than ready,
+#                 so an unwired token surfaces before an agent hits it.
+#   apiKeyEnv     env var carrying the bearer token; pair with apiKeySecret
+#   apiKeySecret  {name, key} of the k8s Secret holding that token
+#   command/args  binary + argv (stdio transport)
+#   env           literal env vars for a stdio server
+#   envFromConfig  {ENV_NAME: CONFIG_KEY} — copies a backend env var / .env key
+#                  into the stdio server's env, so its secrets stay in Secrets
+#   prestartHttp  false when the CLI cannot be re-hosted over HTTP by the agent
+#   eagerStart    false when the backend must not dial it during startup
+#
+# Example:
+#   mcpIntegrations:
+#     - name: github
+#       transport: streamable_http
+#       url: https://api.githubcopilot.com/mcp/
+#       apiKeySecret:
+#         name: langgraph-backend-secrets
+#         key: GITHUB_MCP_TOKEN
+#     - name: hubspot
+#       transport: streamable_http
+#       url: https://mcp.hubspot.com/anthropic
+#       apiKeySecret:
+#         name: langgraph-backend-secrets
+#         key: HUBSPOT_MCP_TOKEN
+#     - name: jira
+#       transport: stdio
+#       command: uvx
+#       args: ["mcp-atlassian"]
+#       envFromConfig:
+#         JIRA_URL: MCP_JIRA_JIRA_URL
+#         JIRA_USERNAME: MCP_JIRA_USERNAME
+#         JIRA_API_TOKEN: MCP_JIRA_API_TOKEN
+#     - name: semble
+#       transport: stdio
+#       command: semble
+#       prestartHttp: false     # CLI has no --transport/--port flags
+#       eagerStart: false       # agent-side binary, absent from this container
+#
+# The in-process `datasources` server is always available and needs no entry
+# here — it is how every configured data source reaches an agent. The backend
+# dials it over loopback and hands agents AGENT_CALLBACK_URL (or BASE_URL)
+# + /mcp/datasources instead, so set MCP_DATASOURCES_API_KEY to let them in.
+# Toggle it with MCP_DATASOURCES_ENABLED, or declare an entry named
+# `datasources` to override its addressing.
+mcpIntegrations: []
+
 # Graph definitions mounted as YAML files under GRAPH_DEFINITIONS_PATH.
 # Key becomes the file name (without .yaml extension), value is the YAML content.
 graphs: {}
