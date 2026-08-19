@@ -40,9 +40,30 @@ async def test_network_modules_are_blocked():
 
 
 async def test_backend_libraries_are_not_importable():
-    # -S keeps site-packages off sys.path, so the backend's deps are gone.
-    with pytest.raises(ScriptSandboxError, match="No module named 'pydantic'"):
+    # -S keeps site-packages off sys.path, and the bootstrap then tears down the
+    # loaders entirely, so anything not pre-imported is refused by name.
+    with pytest.raises(ScriptSandboxError, match="'pydantic' is not available"):
         await run_script("import pydantic\noutput = 1", {})
+
+
+async def test_import_machinery_cannot_be_used_to_reach_a_blocked_module():
+    """``importlib.import_module`` never consults ``builtins.__import__``.
+
+    Filtering the builtin alone therefore left a three-line path to arbitrary
+    process execution, which is why the loaders are removed as well.
+    """
+    escape = (
+        "import importlib\n"
+        "output = importlib.import_module('subprocess').run(['id'])\n"
+    )
+    with pytest.raises(ScriptSandboxError, match="not available in sandboxed scripts"):
+        await run_script(escape, {})
+
+
+async def test_os_backing_module_cannot_be_reached():
+    """``posix.system`` survives deleting ``os.system``, so posix is blocked too."""
+    with pytest.raises(ScriptSandboxError, match="not available in sandboxed scripts"):
+        await run_script("import posix\noutput = 1", {})
 
 
 async def test_timeout_kills_a_runaway_script():

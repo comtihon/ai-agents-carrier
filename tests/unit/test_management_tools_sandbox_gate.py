@@ -54,7 +54,12 @@ def deps(backend: _FakeWorkflowBackend) -> ManagementDeps:
 
 
 UNSANDBOXED = [{"id": "danger", "type": "python", "sandbox": False, "code": "print(1)"}]
-SANDBOXED = [{"id": "safe", "type": "python", "code": "print(1)"}]
+# "Sandboxed" means isolated by something the script cannot reach around: the
+# local runtime shares the backend pod, so it needs ADMIN like `sandbox: false`.
+SANDBOXED = [
+    {"id": "safe", "type": "python", "sandbox_runtime": "k8s", "code": "print(1)"}
+]
+DEFAULT_RUNTIME = [{"id": "onpod", "type": "python", "code": "print(1)"}]
 
 API_KEY_PERMISSIONS = AuthorizationPolicy(enforce=True).permissions_for_api_key()
 ADMIN_PERMISSIONS = frozenset(Permission)
@@ -119,3 +124,18 @@ async def test_refusal_is_returned_as_text_not_raised(deps) -> None:
     )
 
     assert isinstance(result, str)
+
+
+@pytest.mark.asyncio
+async def test_api_key_principal_cannot_create_a_step_on_the_default_runtime(
+    deps, backend
+) -> None:
+    """A python step that names no runtime gets `local`, i.e. the backend pod."""
+    set_current_permissions(API_KEY_PERMISSIONS)
+
+    result = await management_tools.create_workflow(
+        deps, "wf", "WF", "desc", json.dumps(DEFAULT_RUNTIME)
+    )
+
+    assert "admin" in result.lower()
+    assert backend.created == []
