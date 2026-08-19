@@ -38,6 +38,7 @@ API at `http://localhost:8000`. Health check: `GET /health`.
 | `PUBSUB_ACK_DEADLINE_SECONDS` | `60` | Ack deadline for created subscriptions |
 | `PUBSUB_MAX_MESSAGES` | `10` | Messages pulled concurrently per subscription |
 | `PUBSUB_DROP_INVALID_MESSAGES` | `true` | Ack (drop) events failing schema validation instead of nacking them |
+| `PUBSUB_DELETE_ORPHANED_SUBSCRIPTIONS` | `true` | Delete a backend-created subscription once its last trigger step is gone |
 | `OAUTH_ENABLED` | `false` | Enable JWT Bearer auth on all endpoints |
 | `OAUTH_JWKS_URL` | — | JWKS endpoint for token validation |
 | `OPENHANDS_BASE_URL` | `http://openhands:3000` | OpenHands service URL |
@@ -304,7 +305,10 @@ Routes to one of several targets based on a condition expression. Conditions are
 
 **Expression syntax**: any Python expression using state variables. `&&` / `||` / `===` / `!==` are accepted as JS aliases and rewritten to Python equivalents. Available builtins: `len`, `str`, `int`, `float`, `bool`, `abs`, `min`, `max`, `sum`, `round`, `any`, `all`, `sorted`, `isinstance`.
 
-### `python` — inline Python
+### `python` — Python script
+
+Either inline `code` or a script from the library (`script_id`). When both are
+present the library copy wins, so a step always runs what the library holds.
 
 ```yaml
 - id: transform
@@ -312,7 +316,41 @@ Routes to one of several targets based on a condition expression. Conditions are
   code: |
     output = state["items"][0]["value"]
   output_key: result
+
+- id: normalize
+  type: python
+  script_id: normalize-payload    # from the script library
+  sandbox: true                   # default — isolated execution
+  sandbox_runtime: local          # local | docker | k8s
+  sandbox_image: python:3.12-slim # docker / k8s only
+  timeout_seconds: 60
+  output_key: normalized
 ```
+
+**Sandbox.** Enabled by default: the script runs in an isolated interpreter with
+no access to the backend's env vars, tools, bash, installed libraries or system
+dependencies. `state` arrives as JSON and the value assigned to `output` is
+returned the same way, so both must be JSON-serialisable.
+
+| runtime  | isolation |
+|----------|-----------|
+| `local`  | child `python -I -S` process: empty environment, no site-packages, throw-away cwd, CPU/memory rlimits, wall-clock timeout. Process-level only — no kernel namespaces. |
+| `docker` | throw-away container: networking disabled, read-only rootfs, no inherited env, memory limit, all capabilities dropped. |
+| `k8s`    | one-shot `Never`-restart pod: service-account token unmounted, read-only rootfs, resource limits, deleted after the run. |
+
+Set `sandbox: false` to keep the legacy behaviour — `exec` inside the backend
+process, with full access to its environment and libraries. Use it only for
+trusted infrastructure code.
+
+Sandbox defaults come from `SCRIPT_SANDBOX_IMAGE`, `SCRIPT_SANDBOX_TIMEOUT` and
+`SCRIPT_SANDBOX_MEMORY_MB`; a step can override the first two.
+
+### Script library
+
+Reusable scripts live in MongoDB (`script_definitions`) and are referenced by
+`script_id`. Each has a name, a description and the code. Saving from a Python
+node is a save-by-name: an existing name answers `409` so the UI can ask before
+overwriting.
 
 ### `cron` — scheduled trigger
 
@@ -363,6 +401,14 @@ Instead of repeating topic and schema, a step can point at a pre-configured `kin
 ```
 
 `subscription` may name an existing subscription to pull from. When it is left out, the backend creates one (`{PUBSUB_SUBSCRIPTION_PREFIX}{workflow-id}-{step-id}`) on first use and saves it back into the data sources — as an update to the source the step named, or as a new `pubsub-<topic>` source — so the next workflow can reuse it instead of creating another.
+
+**Several workflows on one topic.** Every workflow that triggers on a topic gets every event, whichever way it is configured:
+
+- Steps without a `subscription` each get their own, which is Pub/Sub's own fan-out.
+- Steps that name the *same* subscription (typically by sharing a `pubsub` data source) are served by a single streaming pull with several consumers behind it, and one arriving message starts a run for each of them. Opening one pull per step would make them compete, and Pub/Sub would hand each event to only one workflow. Each consumer's own `schema` still applies: a workflow whose schema does not match the event simply does not run.
+- Backend replicas do compete on purpose: several replicas pull the same subscription, so an event starts one run cluster-wide rather than one per pod.
+
+**When a trigger goes away.** Saving a workflow syncs its registrations, so deleting a `pubsub` node (or the whole workflow) stops the pull for it. Once a subscription has no trigger step left anywhere, the backend also deletes it — but only if it created it: a subscription named by a step or data source is never removed. Set `PUBSUB_DELETE_ORPHANED_SUBSCRIPTIONS=false` to keep them. Shutdown never deletes anything: events published while the backend is down are waiting on restart.
 
 Requires `PUBSUB_ENABLED=true` and `PUBSUB_PROJECT_ID` (see the configuration table); the service account needs `roles/pubsub.subscriber`, plus `roles/pubsub.editor` if the backend is to create subscriptions itself. Messages that fail schema validation are acknowledged and dropped so they cannot be redelivered forever — set `PUBSUB_DROP_INVALID_MESSAGES=false` to nack them instead and let topic-level retry or dead-lettering handle them.
 
@@ -495,6 +541,13 @@ POST   /api/v1/agents                         register an agent
 GET    /api/v1/agents/{id}                    get agent definition
 PUT    /api/v1/agents/{id}                    update agent definition
 DELETE /api/v1/agents/{id}                    delete agent definition
+
+# Scripts (Python script library)
+GET    /api/v1/scripts                        list scripts
+POST   /api/v1/scripts                        create script (409 on name clash; `overwrite: true` to replace)
+GET    /api/v1/scripts/{id}                   get script
+PUT    /api/v1/scripts/{id}                   update script
+DELETE /api/v1/scripts/{id}                   delete script
 
 # Data sources
 GET    /api/v1/datasources                    list data sources

@@ -670,6 +670,14 @@ class YamlGraphRunner:
               issue_key: "{ticket_id}"
             code: |                    # python only — executed with ``state`` dict in scope;
               output = state["x"] + 1  #   set ``output`` variable to store the result
+            script_id: my-script       # python only — run a library script instead
+                                       #   of the inline ``code`` above
+            sandbox: true              # python only — default true: run isolated,
+                                       #   with no access to the backend's env vars,
+                                       #   tools, bash or installed libraries
+            sandbox_runtime: local     # python only — local | docker | k8s
+            sandbox_image: python:3.12-slim  # python only — docker/k8s image override
+            timeout_seconds: 60        # python only — sandbox wall-clock limit
             source: github             # data_source only — DataSourceDefinition id
             operation: list_repos      # data_source only — operation to invoke
             params:                    # data_source only — operation inputs;
@@ -1893,36 +1901,85 @@ class YamlGraphRunner:
 
         return node
 
+    async def _resolve_script_code(self, step: dict[str, Any]) -> str:
+        """Return the code a ``python`` step should run.
+
+        ``script_id`` points at a ScriptDefinition in the library; when set it
+        wins over any inline ``code`` left on the step (the UI keeps the last
+        loaded body around so the node still shows something when the library
+        is unreachable).
+        """
+        script_id = step.get("script_id")
+        if not script_id:
+            return step.get("code", "")
+        if self._script_backend is None:
+            raise ValueError(
+                f"step references script '{script_id}' but no script backend is configured"
+            )
+        script = await self._script_backend.get(script_id)
+        if script is None:
+            raise ValueError(f"Script '{script_id}' not found in the library")
+        return script.code
+
     def _python_node(self, step: dict[str, Any]):
-        """Execute inline Python code.
+        """Execute a Python script, inline or from the script library.
 
-        The code runs with a ``state`` dict injected as a local variable so
-        that any state value can be read via ``state["key"]``.  The code
-        should assign an ``output`` variable; its value is stored under
-        ``output_key`` (defaults to the step id).
+        The code runs with a ``state`` dict in scope so that any state value
+        can be read via ``state["key"]``.  The code should assign an ``output``
+        variable; its value is stored under ``output_key`` (defaults to the
+        step id).
 
-        The step runs in a thread-pool executor to avoid blocking the event
-        loop.  Standard-library imports are available; builtins are not
-        restricted (the workflow is trusted infrastructure code).
+        Sandboxing
+        ----------
+        ``sandbox`` (default ``True``) runs the script in an isolated
+        interpreter with no access to the backend's env vars, tools, bash or
+        installed libraries — see ``script_sandbox``.  ``sandbox_runtime``
+        selects ``local`` (child process, default), ``docker`` or ``k8s``.
+
+        With ``sandbox: false`` the script is exec'd inside the backend process
+        in a thread-pool executor: standard-library imports are available and
+        builtins are not restricted (trusted infrastructure code only).
         """
         graph_id = self.id
 
         async def node(state: dict) -> dict:
             step_id = step["id"]
-            code = step.get("code", "")
             output_key = step.get("output_key") or step_id
+            sandbox = step.get("sandbox", True)
+            sandbox_runtime = step.get("sandbox_runtime") or "local"
 
-            logger.info("[%s] step '%s' running (python)", graph_id, step_id)
+            logger.info(
+                "[%s] step '%s' running (python, sandbox=%s%s)",
+                graph_id, step_id, sandbox, f"/{sandbox_runtime}" if sandbox else "",
+            )
             try:
-                local_vars: dict[str, Any] = {"state": dict(state), "output": None}
-                compiled = compile(code, f"<workflow:{graph_id}:{step_id}>", "exec")
+                code = await self._resolve_script_code(step)
 
-                def _run() -> None:
-                    exec(compiled, {"__builtins__": __builtins__}, local_vars)  # noqa: S102
+                if sandbox:
+                    from app.core.config import get_settings
+                    from app.infrastructure.orchestration.script_sandbox import run_script
 
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, _run)
-                result = local_vars.get("output")
+                    settings = get_settings()
+                    result = await run_script(
+                        code,
+                        dict(state),
+                        runtime=sandbox_runtime,
+                        timeout=float(step.get("timeout_seconds") or settings.script_sandbox_timeout),
+                        image=step.get("sandbox_image") or settings.script_sandbox_image,
+                        memory_mb=settings.script_sandbox_memory_mb,
+                        namespace=settings.agent_namespace,
+                    )
+                else:
+                    local_vars: dict[str, Any] = {"state": dict(state), "output": None}
+                    compiled = compile(code, f"<workflow:{graph_id}:{step_id}>", "exec")
+
+                    def _run() -> None:
+                        exec(compiled, {"__builtins__": __builtins__}, local_vars)  # noqa: S102
+
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, _run)
+                    result = local_vars.get("output")
+
                 logger.info("[%s] step '%s' finished", graph_id, step_id)
                 return {output_key: result}
             except Exception as exc:

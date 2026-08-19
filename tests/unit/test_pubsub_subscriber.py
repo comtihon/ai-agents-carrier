@@ -56,6 +56,7 @@ class FakeSubscriber:
         self.existing = existing or set()
         self.created: list[dict] = []
         self.subscribed: list[str] = []
+        self.deleted: list[str] = []
         self.callbacks: dict[str, callable] = {}
         self.closed = False
 
@@ -73,6 +74,12 @@ class FakeSubscriber:
         self.subscribed.append(subscription)
         self.callbacks[subscription] = callback
         return FakeFuture()
+
+    def delete_subscription(self, request):  # noqa: ANN001
+        if request["subscription"] not in self.existing:
+            raise NotFound(f"Subscription not found: {request['subscription']}")
+        self.existing.discard(request["subscription"])
+        self.deleted.append(request["subscription"])
 
     def close(self) -> None:
         self.closed = True
@@ -165,17 +172,20 @@ async def test_an_existing_subscription_is_reused_and_not_reported():
 
 
 @pytest.mark.asyncio
-async def test_re_registering_a_step_replaces_its_stream():
+async def test_re_registering_a_step_keeps_its_stream_alive():
+    """Saving a workflow must not interrupt delivery for its own triggers."""
     client = FakeSubscriber()
     manager = _manager(client)
     manager.start()
     spec = PubSubTriggerSpec(topic="orders", project_id="proj")
 
-    await manager.register("wf", "step", spec, lambda p, m: asyncio.sleep(0))
-    first = manager._registrations["wf:step"].future
+    path = await manager.register("wf", "step", spec, lambda p, m: asyncio.sleep(0))
+    first = manager._streams[path].future
     await manager.register("wf", "step", spec, lambda p, m: asyncio.sleep(0))
 
-    assert first.cancelled is True
+    assert first.cancelled is False
+    assert client.subscribed == [path]
+    assert client.deleted == []
     assert len(manager.registrations()) == 1
 
 
@@ -307,19 +317,22 @@ async def test_a_non_json_body_arrives_as_raw_text():
 
 
 @pytest.mark.asyncio
-async def test_stop_cancels_every_stream_and_closes_the_client():
+async def test_stop_cancels_every_stream_but_keeps_the_subscriptions():
+    """Shutdown must not delete: events published while down have to survive."""
     client = FakeSubscriber()
     manager = _manager(client)
     manager.start()
     spec = PubSubTriggerSpec(topic="orders", project_id="proj")
-    await manager.register("wf", "step", spec, lambda p, m: asyncio.sleep(0))
-    future = manager._registrations["wf:step"].future
+    path = await manager.register("wf", "step", spec, lambda p, m: asyncio.sleep(0))
+    future = manager._streams[path].future
 
     manager.stop()
 
     assert future.cancelled is True
     assert manager.registrations() == {}
     assert client.closed is True
+    assert client.deleted == []
+    assert path in client.existing
 
 
 # ─── schema check ─────────────────────────────────────────────────────────────
@@ -345,3 +358,311 @@ def test_schema_checks_type_required_keys_and_property_types():
         validate_event_payload({"id": 5}, schema, "label")
     with pytest.raises(ValueError, match="payload is list, expected object"):
         validate_event_payload([], schema, "label")
+
+
+# ─── several workflows on one topic ───────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_two_steps_sharing_a_subscription_both_get_every_event():
+    """One subscription, two consumers: Pub/Sub would give the event to one of
+    them if we opened two streams, so the manager opens one and fans out."""
+    client = FakeSubscriber(existing={"projects/proj/subscriptions/shared"})
+    manager = _manager(client)
+    manager.start()
+    spec = PubSubTriggerSpec(topic="orders", project_id="proj", subscription="shared")
+    started: list[str] = []
+
+    async def cb_a(payload, meta):
+        started.append("a")
+
+    async def cb_b(payload, meta):
+        started.append("b")
+
+    path = await manager.register("wf-a", "on_order", spec, cb_a)
+    assert await manager.register("wf-b", "on_order", spec, cb_b) == path
+
+    # One stream, two consumers.
+    assert client.subscribed == [path]
+    assert manager.consumers_of(path) == ["wf-a:on_order", "wf-b:on_order"]
+
+    message = FakeMessage({"order_id": "A-1"})
+    await _deliver(client, path, message)
+
+    assert sorted(started) == ["a", "b"]
+    assert message.acked is True
+
+
+@pytest.mark.asyncio
+async def test_separate_default_subscriptions_are_separate_streams():
+    """Without a named subscription each step gets its own, which is Pub/Sub's
+    own fan-out — every workflow still sees every event."""
+    client = FakeSubscriber()
+    manager = _manager(client)
+    manager.start()
+    spec = PubSubTriggerSpec(topic="orders", project_id="proj")
+
+    path_a = await manager.register("wf-a", "on_order", spec, lambda p, m: asyncio.sleep(0))
+    path_b = await manager.register("wf-b", "on_order", spec, lambda p, m: asyncio.sleep(0))
+
+    assert path_a != path_b
+    assert sorted(client.subscribed) == sorted([path_a, path_b])
+    assert [c["topic"] for c in client.created] == ["projects/proj/topics/orders"] * 2
+
+
+@pytest.mark.asyncio
+async def test_a_shared_subscription_applies_each_consumers_own_schema():
+    client = FakeSubscriber(existing={"projects/proj/subscriptions/shared"})
+    manager = _manager(client)
+    manager.start()
+    started: list[str] = []
+
+    def spec_with(schema):
+        return PubSubTriggerSpec(
+            topic="orders", project_id="proj", subscription="shared", event_schema=schema,
+        )
+
+    path = await manager.register(
+        "wf-orders", "on_order", spec_with({"type": "object", "required": ["order_id"]}),
+        lambda p, m: _record(started, "orders"),
+    )
+    await manager.register(
+        "wf-refunds", "on_refund", spec_with({"type": "object", "required": ["refund_id"]}),
+        lambda p, m: _record(started, "refunds"),
+    )
+
+    message = FakeMessage({"order_id": "A-1"})
+    await _deliver(client, path, message)
+
+    # Only the workflow whose schema matches runs; the event is still acked.
+    assert started == ["orders"]
+    assert message.acked is True
+
+
+@pytest.mark.asyncio
+async def test_one_failing_consumer_does_not_redeliver_to_the_others():
+    client = FakeSubscriber(existing={"projects/proj/subscriptions/shared"})
+    manager = _manager(client)
+    manager.start()
+    spec = PubSubTriggerSpec(topic="orders", project_id="proj", subscription="shared")
+    started: list[str] = []
+
+    async def ok(payload, meta):
+        started.append("ok")
+
+    async def boom(payload, meta):
+        raise RuntimeError("mongo down")
+
+    path = await manager.register("wf-a", "s", spec, ok)
+    await manager.register("wf-b", "s", spec, boom)
+
+    message = FakeMessage({"order_id": "A-1"})
+    await _deliver(client, path, message)
+
+    # Acked: a redelivery would run wf-a twice, which is worse than wf-b missing
+    # one event (logged).
+    assert started == ["ok"]
+    assert (message.acked, message.nacked) == (True, False)
+
+
+@pytest.mark.asyncio
+async def test_a_shared_subscription_nacks_when_no_consumer_could_start():
+    client = FakeSubscriber(existing={"projects/proj/subscriptions/shared"})
+    manager = _manager(client)
+    manager.start()
+    spec = PubSubTriggerSpec(topic="orders", project_id="proj", subscription="shared")
+
+    async def boom(payload, meta):
+        raise RuntimeError("mongo down")
+
+    path = await manager.register("wf-a", "s", spec, boom)
+    await manager.register("wf-b", "s", spec, boom)
+
+    message = FakeMessage({"order_id": "A-1"})
+    await _deliver(client, path, message)
+
+    assert (message.acked, message.nacked) == (False, True)
+
+
+async def _record(sink: list[str], name: str) -> None:
+    sink.append(name)
+
+
+# ─── releasing subscriptions ──────────────────────────────────────────────────
+
+def _wait_for(predicate, timeout: float = 2.0) -> bool:
+    """Wait for the daemon thread that deletes a subscription."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+@pytest.mark.asyncio
+async def test_the_last_consumer_leaving_stops_and_deletes_our_subscription():
+    client = FakeSubscriber()
+    manager = _manager(client)
+    manager.start()
+    spec = PubSubTriggerSpec(topic="orders", project_id="proj")
+    path = await manager.register("wf", "on_order", spec, lambda p, m: asyncio.sleep(0))
+    future = manager._streams[path].future
+
+    manager.unregister("wf", "on_order")
+
+    assert future.cancelled is True
+    assert manager.registrations() == {}
+    assert _wait_for(lambda: client.deleted == [path]), client.deleted
+
+
+@pytest.mark.asyncio
+async def test_a_subscription_survives_while_another_workflow_still_uses_it():
+    client = FakeSubscriber(existing={"projects/proj/subscriptions/shared"})
+    manager = _manager(client)
+    manager.start()
+    spec = PubSubTriggerSpec(topic="orders", project_id="proj", subscription="shared")
+    started: list[str] = []
+
+    path = await manager.register("wf-a", "s", spec, lambda p, m: _record(started, "a"))
+    await manager.register("wf-b", "s", spec, lambda p, m: _record(started, "b"))
+
+    manager.unregister("wf-a", "s")
+
+    assert manager._streams[path].future.cancelled is False
+    assert manager.consumers_of(path) == ["wf-b:s"]
+    # wf-b keeps receiving.
+    await _deliver(client, path, FakeMessage({"order_id": "A-1"}))
+    assert started == ["b"]
+
+
+@pytest.mark.asyncio
+async def test_a_subscription_we_did_not_create_is_never_deleted():
+    client = FakeSubscriber(existing={"projects/proj/subscriptions/mine"})
+    manager = _manager(client)
+    manager.start()
+    spec = PubSubTriggerSpec(topic="orders", project_id="proj", subscription="mine")
+    await manager.register("wf", "s", spec, lambda p, m: asyncio.sleep(0))
+
+    manager.unregister("wf", "s")
+
+    assert manager.registrations() == {}
+    assert _wait_for(lambda: client.deleted != [], timeout=0.3) is False
+    assert "projects/proj/subscriptions/mine" in client.existing
+
+
+@pytest.mark.asyncio
+async def test_deletion_can_be_turned_off():
+    client = FakeSubscriber()
+    manager = _manager(client, delete_orphaned_subscriptions=False)
+    manager.start()
+    path = await manager.register(
+        "wf", "s", PubSubTriggerSpec(topic="orders", project_id="proj"), lambda p, m: asyncio.sleep(0),
+    )
+
+    manager.unregister("wf", "s")
+
+    assert _wait_for(lambda: client.deleted != [], timeout=0.3) is False
+    assert path in client.existing
+
+
+# ─── syncing a workflow's steps ───────────────────────────────────────────────
+
+def _entry(step_id: str, spec: PubSubTriggerSpec, sink: list[str]):
+    return (step_id, spec, lambda p, m: _record(sink, step_id))
+
+
+@pytest.mark.asyncio
+async def test_sync_releases_a_step_the_definition_no_longer_has():
+    client = FakeSubscriber()
+    manager = _manager(client)
+    manager.start()
+    spec = PubSubTriggerSpec(topic="orders", project_id="proj")
+    sink: list[str] = []
+
+    await manager.sync_workflow("wf", [_entry("on_order", spec, sink), _entry("on_refund", spec, sink)])
+    assert sorted(manager.registrations()) == ["wf:on_order", "wf:on_refund"]
+    refund_path = manager.registrations()["wf:on_refund"]
+
+    # The user deleted the on_refund node and saved.
+    await manager.sync_workflow("wf", [_entry("on_order", spec, sink)])
+
+    assert list(manager.registrations()) == ["wf:on_order"]
+    assert _wait_for(lambda: client.deleted == [refund_path]), client.deleted
+
+
+@pytest.mark.asyncio
+async def test_sync_does_not_disturb_the_steps_that_stayed():
+    client = FakeSubscriber()
+    manager = _manager(client)
+    manager.start()
+    spec = PubSubTriggerSpec(topic="orders", project_id="proj")
+    sink: list[str] = []
+
+    await manager.sync_workflow("wf", [_entry("on_order", spec, sink)])
+    path = manager.registrations()["wf:on_order"]
+    future = manager._streams[path].future
+
+    await manager.sync_workflow("wf", [_entry("on_order", spec, sink)])
+
+    # Same stream, no re-subscribe, nothing deleted and recreated.
+    assert manager._streams[path].future is future
+    assert client.subscribed == [path]
+    assert client.created == [client.created[0]]
+    assert client.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_sync_with_no_entries_releases_everything():
+    client = FakeSubscriber()
+    manager = _manager(client)
+    manager.start()
+    spec = PubSubTriggerSpec(topic="orders", project_id="proj")
+    sink: list[str] = []
+    await manager.sync_workflow("wf", [_entry("on_order", spec, sink)])
+    path = manager.registrations()["wf:on_order"]
+
+    await manager.sync_workflow("wf", [])
+
+    assert manager.registrations() == {}
+    assert _wait_for(lambda: client.deleted == [path]), client.deleted
+
+
+@pytest.mark.asyncio
+async def test_a_step_that_moves_to_another_subscription_releases_the_old_one():
+    client = FakeSubscriber()
+    manager = _manager(client)
+    manager.start()
+    sink: list[str] = []
+
+    old_path = await manager.register(
+        "wf", "s", PubSubTriggerSpec(topic="orders", project_id="proj"), lambda p, m: asyncio.sleep(0),
+    )
+    new_path = await manager.register(
+        "wf", "s",
+        PubSubTriggerSpec(topic="orders", project_id="proj", subscription="shared"),
+        lambda p, m: _record(sink, "s"),
+    )
+
+    assert new_path != old_path
+    assert manager.registrations() == {"wf:s": new_path}
+    assert _wait_for(lambda: client.deleted == [old_path]), client.deleted
+
+
+@pytest.mark.asyncio
+async def test_a_failed_registration_keeps_the_previous_one():
+    """A transient GCP error on save must not unsubscribe a live trigger."""
+    client = FakeSubscriber()
+    manager = _manager(client)
+    manager.start()
+    spec = PubSubTriggerSpec(topic="orders", project_id="proj")
+    sink: list[str] = []
+    await manager.sync_workflow("wf", [_entry("on_order", spec, sink)])
+    path = manager.registrations()["wf:on_order"]
+
+    broken = PubSubTriggerSpec(topic="orders", project_id="")  # topic_path() raises
+    await manager.sync_workflow("wf", [_entry("on_order", broken, sink)])
+
+    assert manager.registrations() == {"wf:on_order": path}
+    assert client.deleted == []

@@ -32,6 +32,10 @@ from app.infrastructure.persistence.data_source_backend import (
     DataSourceDefinitionBackend,
     MongoDataSourceBackend,
 )
+from app.infrastructure.persistence.script_backend import (
+    MongoScriptBackend,
+    ScriptDefinitionBackend,
+)
 from app.infrastructure.persistence.workflow_backend import (
     LocalFilesWorkflowBackend,
     MongoWorkflowBackend,
@@ -70,6 +74,9 @@ class ApplicationContainer:
     # steps and for the /mcp/datasources tools.
     data_source_backend: DataSourceDefinitionBackend | None = None
     data_source_executor: DataSourceExecutor | None = None
+    # Python script library backend — None when MongoDB is not configured or in
+    # legacy test setups.  Required for `python` steps that use `script_id`.
+    script_backend: ScriptDefinitionBackend | None = None
     # Mints the service's own OAuth2 access token for outbound calls that use
     # `service_identity` auth — None in legacy test setups.
     service_token_provider: ServiceTokenProvider | None = None
@@ -100,6 +107,7 @@ class ApplicationContainer:
             self.pubsub_subscriber = PubSubSubscriberManager(
                 subscription_prefix=self.settings.pubsub_subscription_prefix,
                 drop_invalid_messages=self.settings.pubsub_drop_invalid_messages,
+                delete_orphaned_subscriptions=self.settings.pubsub_delete_orphaned_subscriptions,
                 on_subscription_created=self._save_pubsub_subscription,
             )
         if self.pubsub_subscriber is not None:
@@ -164,6 +172,8 @@ class ApplicationContainer:
             runner._data_source_backend = self.data_source_backend
         if self.data_source_executor is not None:
             runner._data_source_executor = self.data_source_executor
+        if self.script_backend is not None:
+            runner._script_backend = self.script_backend
         if self.service_token_provider is not None:
             runner._service_token_provider = self.service_token_provider
 
@@ -260,14 +270,19 @@ class ApplicationContainer:
                 await self._register_pubsub_steps(runner)
 
     async def _register_pubsub_steps(self, runner: YamlGraphRunner) -> None:
-        """Subscribe every ``pubsub`` trigger step of *runner*.
+        """Make the subscriber's registrations match *runner*'s ``pubsub`` steps.
 
-        A step that cannot subscribe (missing topic, unknown datasource, GCP
-        error) is logged and skipped — one broken trigger must not stop the
-        remaining workflows from loading.
+        Syncing rather than re-registering is what lets a removed ``pubsub`` node
+        drop its subscription: steps the definition no longer has are released,
+        and a subscription whose last consumer is gone is torn down.
+
+        A step that cannot yield a spec (missing topic, unknown datasource) is
+        logged and left out — one broken trigger must not stop the remaining
+        workflows from loading.
         """
         if self.pubsub_subscriber is None:
             return
+        entries = []
         for step in runner.steps:
             if step.get("type") != "pubsub":
                 continue
@@ -279,18 +294,8 @@ class ApplicationContainer:
                     step["id"], runner.id, exc,
                 )
                 continue
-            try:
-                await self.pubsub_subscriber.register(
-                    runner.id,
-                    step["id"],
-                    spec,
-                    self._make_pubsub_job(runner.id, step),
-                )
-            except Exception:
-                logger.exception(
-                    "Subscribing Pub/Sub step '%s' of workflow '%s' failed",
-                    step["id"], runner.id,
-                )
+            entries.append((step["id"], spec, self._make_pubsub_job(runner.id, step)))
+        await self.pubsub_subscriber.sync_workflow(runner.id, entries)
 
     async def _build_pubsub_spec(self, step: dict) -> PubSubTriggerSpec:
         """Resolve a ``pubsub`` step into a subscriber spec.
@@ -528,10 +533,12 @@ class ApplicationContainer:
         """
         if self.workflow_backend is None:
             return
-        # Always clear stale cron jobs for this workflow first
+        # Always clear stale cron jobs for this workflow first. Pub/Sub
+        # registrations are *not* cleared here: dropping them before re-reading
+        # the definition would cancel (and delete) a subscription the saved
+        # definition still wants. _register_pubsub_steps syncs instead, and the
+        # deleted-workflow branch below unregisters explicitly.
         self.cron_scheduler.unregister_workflow(workflow_id)
-        if self.pubsub_subscriber is not None:
-            self.pubsub_subscriber.unregister_workflow(workflow_id)
         defn = await self.workflow_backend.get(workflow_id)
         if defn is not None:
             runner = build_runner_from_definition(
@@ -551,6 +558,8 @@ class ApplicationContainer:
             await self._register_pubsub_steps(runner)
             logger.info("Registry runner refreshed for workflow '%s'", workflow_id)
         else:
+            if self.pubsub_subscriber is not None:
+                self.pubsub_subscriber.unregister_workflow(workflow_id)
             self.yaml_graph_registry._runners.pop(workflow_id, None)
             logger.info("Registry runner removed for workflow '%s'", workflow_id)
 
@@ -956,6 +965,8 @@ def build_container(settings: Settings) -> ApplicationContainer:
     agent_backend = MongoAgentBackend(settings.mongodb_uri, settings.mongodb_database)
     # Data source definitions are likewise MongoDB-only.
     data_source_backend = MongoDataSourceBackend(settings.mongodb_uri, settings.mongodb_database)
+    # Python script library is likewise MongoDB-only.
+    script_backend = MongoScriptBackend(settings.mongodb_uri, settings.mongodb_database)
     service_token_provider = ServiceTokenProvider(settings)
     data_source_executor = DataSourceExecutor(token_provider=service_token_provider)
     checkpointer = MongoDBCheckpointSaver(
@@ -976,6 +987,7 @@ def build_container(settings: Settings) -> ApplicationContainer:
         agent_backend=agent_backend,
         data_source_backend=data_source_backend,
         data_source_executor=data_source_executor,
+        script_backend=script_backend,
         service_token_provider=service_token_provider,
         checkpointer=checkpointer,
         pvc_lease_repository=pvc_lease_repository,

@@ -23,6 +23,7 @@ from app.api.routes.agents import router as agents_router
 from app.api.routes.callbacks import router as callbacks_router
 from app.api.routes.chat import router as chat_router
 from app.api.routes.datasources import router as datasources_router
+from app.api.routes.scripts import router as scripts_router
 from app.api.routes.health import router as health_router
 from app.api.routes.llm import router as llm_router
 from app.api.routes.webhooks import router as webhooks_router
@@ -483,6 +484,7 @@ def create_app() -> FastAPI:
     app.include_router(workflows_router, prefix=settings.api_prefix)
     app.include_router(agents_router, prefix=settings.api_prefix)
     app.include_router(datasources_router, prefix=settings.api_prefix)
+    app.include_router(scripts_router, prefix=settings.api_prefix)
     app.include_router(llm_router, prefix=settings.api_prefix)
     app.include_router(chat_router, prefix=settings.api_prefix)
     app.include_router(webhooks_router, prefix=settings.api_prefix)
