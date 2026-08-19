@@ -326,6 +326,12 @@ class Settings(BaseSettings):
     # base_url is an OAuth-protected external URL and agents need to call back
     # via an internal cluster URL instead. Defaults to base_url when not set.
     agent_callback_url: str | None = Field(default=None, alias="AGENT_CALLBACK_URL")
+    # Existing KSA that agent pods run as. Empty means the agent chart creates
+    # its own ServiceAccount, which carries no Workload Identity annotation and
+    # no RBAC — fine locally, wrong in a cluster where agents need an identity
+    # of their own (and must not inherit the backend's). A `serviceAccount.*`
+    # entry in an agent's helm_values overrides this.
+    agent_service_account: str | None = Field(default=None, alias="AGENT_SERVICE_ACCOUNT")
 
     # --- Python script sandbox (workflow `python` steps with sandbox: true) ---
     # Image used by the docker / k8s sandbox runtimes.  Must contain a Python

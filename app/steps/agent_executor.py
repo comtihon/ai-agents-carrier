@@ -640,6 +640,7 @@ async def execute_agent_step(
             registry_password=settings.docker_registry_password,
             agent_namespace=settings.agent_namespace,
             callback_override_url=settings.agent_callback_url,
+            agent_service_account=settings.agent_service_account,
         )
         agent_config_payload = _build_agent_config(agent_def, settings, step=step, run_id=run_id, state=state)
         resolved_env_vars: dict[str, str] = agent_config_payload.get("env_vars") or {}
