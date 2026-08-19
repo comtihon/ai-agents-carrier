@@ -1,4 +1,4 @@
-"""Claude SDK agent using the langgraph-backend HTTP protocol.
+"""Claude SDK agent using the ai-agents-carrier HTTP protocol.
 
 This example shows how to write a Claude-based agent that:
 1. Receives input from the backend via POST /start

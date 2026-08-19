@@ -1,4 +1,4 @@
-"""LangGraph agent using the langgraph-backend HTTP protocol.
+"""LangGraph agent using the ai-agents-carrier HTTP protocol.
 
 This example shows how to write a LangGraph-based agent that:
 1. Receives input from the backend via POST /start

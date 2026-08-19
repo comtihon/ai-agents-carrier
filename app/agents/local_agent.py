@@ -1,6 +1,6 @@
 """Built-in local LangGraph ReAct agent.
 
-Runs inline inside the langgraph-backend process — no subprocess, no HTTP.
+Runs inline inside the ai-agents-carrier process — no subprocess, no HTTP.
 Called directly by ``app.steps.agent_executor`` when ``runtime == "local"``.
 
 The implementation mirrors ``langgraph-agent/langgraph/agent.py`` but is

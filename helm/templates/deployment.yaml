@@ -1,20 +1,20 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "langgraph-backend.fullname" . }}
+  name: {{ include "ai-agents-carrier.fullname" . }}
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "langgraph-backend.name" . }}
+      app.kubernetes.io/name: {{ include "ai-agents-carrier.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: {{ include "langgraph-backend.name" . }}
+        app.kubernetes.io/name: {{ include "ai-agents-carrier.name" . }}
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
-      serviceAccountName: {{ include "langgraph-backend.fullname" . }}
+      serviceAccountName: {{ include "ai-agents-carrier.fullname" . }}
       containers:
         - name: backend
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -25,7 +25,7 @@ spec:
 {{- if or .Values.config .Values.llmIntegrations }}
           envFrom:
             - configMapRef:
-                name: {{ include "langgraph-backend.fullname" . }}-config
+                name: {{ include "ai-agents-carrier.fullname" . }}-config
 {{- end }}
 {{- if or .Values.secrets .Values.llmIntegrations }}
           env:
@@ -70,7 +70,7 @@ spec:
       volumes:
         - name: graph-definitions
           configMap:
-            name: {{ include "langgraph-backend.fullname" . }}-graphs
+            name: {{ include "ai-agents-carrier.fullname" . }}-graphs
 {{- end }}
       nodeSelector:
 {{ toYaml .Values.nodeSelector | indent 8 }}

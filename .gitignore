@@ -211,4 +211,5 @@ __marimo__/
 graphify-out/
 
 # npm/helm package tarballs
+ai-agents-carrier-*.tgz
 langgraph-backend-*.tgz

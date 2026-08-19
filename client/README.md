@@ -1,7 +1,7 @@
-# langgraph-backend Agent Client
+# AI Agents Carrier Agent Client
 
 This directory contains the reusable `agent_server` package and examples showing
-how to write agents compatible with the `langgraph-backend` HTTP agent protocol.
+how to write agents compatible with the `ai-agents-carrier` HTTP agent protocol.
 
 ## Overview
 

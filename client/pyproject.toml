@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "langgraph-backend-client"
+name = "ai-agents-carrier-client"
 version = "0.1.0"
-description = "Example agents and utilities for the langgraph-backend agent runtime."
+description = "Example agents and utilities for the ai-agents-carrier agent runtime."
 readme = "../README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
