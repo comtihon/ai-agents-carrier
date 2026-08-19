@@ -120,9 +120,144 @@ production.
 
 ### MCP integrations
 
-Each integration is configured with three env vars: `MCP_<NAME>_ENABLED=true`, `MCP_<NAME>_URL`, `MCP_<NAME>_API_KEY`. Supported names: `FIGMA`, `JIRA`, `MIRO`, `NOTION`, `GITHUB`.
+MCP servers are declared in configuration, not in code — the same contract
+`AGENT_TOOLS` has for bash-level tools. Adding a server is a `values.yaml` entry;
+nothing in the backend or the agent image knows any server name.
 
-Jira also supports a stdio transport via `uvx mcp-atlassian` — set `MCP_JIRA_TRANSPORT=stdio` and provide `MCP_JIRA_JIRA_URL`, `MCP_JIRA_USERNAME`, `MCP_JIRA_API_TOKEN`.
+**Grant chain.** A server travels from the chart to a running agent in four steps:
+
+1. **Declare** it in `mcpIntegrations` (helm) → rendered into `MCP_INTEGRATIONS`
+   (a JSON array in the ConfigMap) plus one `secretKeyRef` env var per token.
+2. **Offer** it: `GET /api/v1/agents/mcp-integrations` lists every declared
+   server with `enabled` and `configured`, which is what the UI's mcp addon
+   renders. A declared server with an unresolved token shows as
+   `configured: false` rather than disappearing.
+3. **Check** it in an agent's `mcp` addon. This is the only thing that grants a
+   server: no addon means no servers, and a name the registry does not declare
+   grants nothing.
+4. **Spawn**: `POST /start` carries `agent_config.mcp_servers` — the checked
+   servers only, each with its endpoint or argv and its *resolved* credentials.
+   The agent writes them to `mcp.json` and connects; nothing is special-cased on
+   its side either.
+
+Bash-level tools follow the same path through `AGENT_TOOLS` and the `tools`
+addon, with one extra step: the agent registers a granted tool only if its
+`command` is actually on PATH, and the runtime shadows every command it was not
+granted with an exit-127 stub.
+
+```yaml
+mcpIntegrations:
+  - name: github
+    transport: streamable_http
+    url: https://api.githubcopilot.com/mcp/
+    apiKeySecret:                      # → GITHUB_MCP_API_KEY from this Secret
+      name: langgraph-backend-secrets
+      key: GITHUB_MCP_TOKEN
+  - name: jira                         # stdio: sooperset/mcp-atlassian via uvx
+    transport: stdio
+    command: uvx
+    args: ["mcp-atlassian"]
+    envFromConfig:                     # copies backend env vars into its env
+      JIRA_URL: MCP_JIRA_JIRA_URL
+      JIRA_USERNAME: MCP_JIRA_USERNAME
+      JIRA_API_TOKEN: MCP_JIRA_API_TOKEN
+  - name: semble
+    transport: stdio
+    command: semble
+    prestartHttp: false                # CLI has no --transport/--port flags
+    eagerStart: false                  # agent-side binary, not in this container
+```
+
+| Field | Meaning |
+|---|---|
+| `name` | Server name, as shown in the mcp addon picker |
+| `enabled` | `false` hides it from agents without deleting the entry (default `true`) |
+| `transport` | `streamable_http` \| `sse` \| `stdio` |
+| `url` | Endpoint (HTTP transports) |
+| `agentUrl` | Endpoint a spawned agent must dial, when `url` is not resolvable from an agent pod |
+| `apiKeyEnv` / `apiKeySecret` | Env var carrying the bearer token, and the Secret filling it. Defaults to `<NAME>_MCP_API_KEY` |
+| `command` / `args` | Binary and argv (stdio transport) |
+| `env` / `envFromConfig` | Literal env vars, or ones copied from a backend env var / `.env` key |
+| `prestartHttp` | `false` when the CLI cannot be re-hosted over HTTP by the agent |
+| `eagerStart` | `false` when the backend must not dial the server during startup |
+
+Tokens are referenced by env var name, never inlined: the JSON blob lives in a
+ConfigMap, so `apiKeyEnv` + `apiKeySecret` keeps the secret in a Secret. For a
+local `.env`, `MCP_INTEGRATIONS` accepts an inline `api_key` instead.
+
+**How a server authenticates.** Four mechanisms, and which one applies is a
+property of the vendor, not a choice:
+
+| Mechanism | Declare it as | Works from a backend? |
+|---|---|---|
+| Static bearer token (PAT, app token, copilot token) | HTTP entry, `apiKeyEnv` + `apiKeySecret` | Yes — this is the normal case |
+| Static token read by a self-hosted server | stdio entry, `envFromConfig` | Yes |
+| No credential (localhost dev servers) | HTTP entry, `auth: none` | Yes |
+| User-delegated OAuth 2.1 (auth code + PKCE, often with dynamic client registration) | — | **No** |
+
+The last row is the one that bites. A vendor whose only MCP auth is delegated
+OAuth needs a human to complete a browser consent flow, so no deployment-time
+configuration reaches it — `mcp.hubspot.com`, `mcp.notion.com`,
+`mcp.miro.com` and Figma's hosted endpoint are all in this category today. This
+is not something `SERVICE_AUTH_*` can paper over: that facility implements the
+OAuth2 **JWT bearer** grant (RFC 7523), a client-to-authorization-server flow,
+and these vendors do not offer a client-credentials or JWT-bearer grant for MCP
+at all. Two ways around it:
+
+- **Self-host a server that takes a static token.** Notion's official
+  `@notionhq/notion-mcp-server` reads an internal-integration token from
+  `NOTION_TOKEN`, so it becomes an ordinary stdio entry with `envFromConfig`.
+- **Skip MCP and use a data source.** The vendor's REST API almost always
+  accepts a static token even when its MCP server does not. This is the right
+  answer for HubSpot: its remote MCP server is OAuth-2.1-only, while its REST API
+  takes a private-app token — so it goes in as a data source and reaches agents
+  through the `datasources` bridge. (`@hubspot/mcp-server` on npm is tooling for
+  building HubSpot apps, not a CRM-data server, so it is not a substitute.)
+
+Because a tokenless HTTP entry is far more often an unfinished one than a
+genuinely open endpoint, `auth` defaults to `bearer`: an entry with no token
+resolving is reported `configured: false` in the picker instead of looking ready
+and failing at first use. State `auth: none` to opt out.
+
+**MCP entry or bash tool?** Both registries end at the same agent, so pick by
+what the thing actually is:
+
+| The binary… | Goes in | Why |
+|---|---|---|
+| serves MCP over stdio or HTTP (`semble`, `uvx mcp-atlassian`) | `mcpIntegrations` | The server publishes its own tool schemas and instructions; hand-writing them as `cli_tools` would duplicate what it already declares |
+| is only a CLI (`graphify`, `kubectl`, `gcloud`) | `AGENT_TOOLS` | Nothing to introspect, so the invocations are declared as `cli_tools` — and the agent gets a PATH check plus exit-127 stubbing of the binary for agents without the grant |
+
+`semble` is an MCP server (`semble[mcp]`, bare `semble` speaks stdio JSON-RPC) that
+happens to live in the agent image rather than behind a URL, which is exactly what
+`eagerStart: false` + `prestartHttp: false` express. `graphify` has no MCP mode, so
+it is a tool. A binary that is both is declared once, on whichever side you want
+the agent to use.
+
+One consequence worth knowing: an ungranted MCP server's launcher is *not*
+stubbed on PATH the way an ungranted tool's command is, so an agent can still
+invoke that binary from bash. Conversely, a command a granted stdio server needs
+is never stubbed on behalf of some other ungranted entry — one entry's denial does
+not revoke another's grant.
+
+**Migrating from the per-server env vars.** `MCP_<NAME>_ENABLED` / `_URL` /
+`_API_KEY` are no longer read. Port each one to an `mcpIntegrations` entry —
+`MCP_FOO_URL` becomes `url`, `MCP_FOO_API_KEY` becomes an `apiKeySecret`, and
+Jira's stdio vars become `envFromConfig` as shown above. Stale vars are ignored
+rather than rejected, so startup logs every `MCP_<NAME>_ENABLED=true` that has no
+matching entry: check the log after upgrading, because an unported server simply
+stops being offered.
+
+**Data sources are not MCP entries.** The in-process `datasources` server is
+always available and needs no declaration — every data source configured through
+`/api/v1/datasources` becomes an MCP tool (`ds_<source>_<operation>`) on it, and
+the backend executes those calls itself with the source's stored credentials. So
+an API that only offers REST (or one whose MCP server needs an OAuth flow this
+registry cannot drive) is added as a data source, and agents reach it by
+checking `datasources` in their mcp addon. The backend dials the mount over
+loopback while agents are handed `AGENT_CALLBACK_URL` (or `BASE_URL`) +
+`/mcp/datasources` — set `MCP_DATASOURCES_API_KEY` so they are let in. Disable
+the bridge with `MCP_DATASOURCES_ENABLED=false`, or declare an entry named
+`datasources` to override its addressing.
 
 ### Docker runtime — private registry auth
 
@@ -469,24 +604,26 @@ Entry-point step. The backend subscribes to the topic on startup (and whenever t
       order_id: { type: string }
 ```
 
-Instead of repeating topic and schema, a step can point at a pre-configured `kind: pubsub` data source; step fields override whatever the source sets:
+Instead of repeating topic and schema, a step can point at a pre-configured [event](#events); step fields override whatever the event sets:
 
 ```yaml
 - id: trigger
   type: pubsub
-  datasource: orders-events           # supplies topic, schema and subscription
+  event: orders-events                # supplies topic, schema and subscription
   output_key: event
 ```
 
-`subscription` may name an existing subscription to pull from. When it is left out, the backend creates one (`{PUBSUB_SUBSCRIPTION_PREFIX}{workflow-id}-{step-id}`) on first use and saves it back into the data sources — as an update to the source the step named, or as a new `pubsub-<topic>` source — so the next workflow can reuse it instead of creating another.
+`datasource:` is the pre-events spelling of `event:` and still resolves, so workflows written before events existed keep working.
+
+`subscription` may name an existing subscription to pull from. When it is left out, the backend creates one (`{PUBSUB_SUBSCRIPTION_PREFIX}{workflow-id}-{step-id}`) on first use and saves it back into the events — as an update to the event the step named, or as a new `pubsub-<topic>` event — so the next workflow can reuse it instead of creating another.
 
 **Several workflows on one topic.** Every workflow that triggers on a topic gets every event, whichever way it is configured:
 
 - Steps without a `subscription` each get their own, which is Pub/Sub's own fan-out.
-- Steps that name the *same* subscription (typically by sharing a `pubsub` data source) are served by a single streaming pull with several consumers behind it, and one arriving message starts a run for each of them. Opening one pull per step would make them compete, and Pub/Sub would hand each event to only one workflow. Each consumer's own `schema` still applies: a workflow whose schema does not match the event simply does not run.
+- Steps that name the *same* subscription (typically by sharing an event) are served by a single streaming pull with several consumers behind it, and one arriving message starts a run for each of them. Opening one pull per step would make them compete, and Pub/Sub would hand each event to only one workflow. Each consumer's own `schema` still applies: a workflow whose schema does not match the event simply does not run.
 - Backend replicas do compete on purpose: several replicas pull the same subscription, so an event starts one run cluster-wide rather than one per pod.
 
-**When a trigger goes away.** Saving a workflow syncs its registrations, so deleting a `pubsub` node (or the whole workflow) stops the pull for it. Once a subscription has no trigger step left anywhere, the backend also deletes it — but only if it created it: a subscription named by a step or data source is never removed. Set `PUBSUB_DELETE_ORPHANED_SUBSCRIPTIONS=false` to keep them. Shutdown never deletes anything: events published while the backend is down are waiting on restart.
+**When a trigger goes away.** Saving a workflow syncs its registrations, so deleting a `pubsub` node (or the whole workflow) stops the pull for it. Once a subscription has no trigger step left anywhere, the backend also deletes it — but only if it created it: a subscription named by a step or event is never removed. Set `PUBSUB_DELETE_ORPHANED_SUBSCRIPTIONS=false` to keep them. Shutdown never deletes anything: events published while the backend is down are waiting on restart.
 
 Requires `PUBSUB_ENABLED=true` and `PUBSUB_PROJECT_ID` (see the configuration table); the service account needs `roles/pubsub.subscriber`, plus `roles/pubsub.editor` if the backend is to create subscriptions itself. Messages that fail schema validation are acknowledged and dropped so they cannot be redelivered forever — set `PUBSUB_DROP_INVALID_MESSAGES=false` to nack them instead and let topic-level retry or dead-lettering handle them.
 
@@ -596,6 +733,32 @@ Errors are captured as `{"error": "..."}` under `output_key` so the next step ca
 
 ---
 
+## Events
+
+An event is a Google Cloud Pub/Sub topic a workflow can be triggered by. Definitions live in MongoDB (`event_definitions`) and are managed through `/api/v1/events`, the chat assistant, or copilot_ui.
+
+```yaml
+id: orders-events
+name: Order events
+description: Shop orders
+topic: orders                    # short name, or projects/<p>/topics/orders
+subscription: ""                 # blank: created on first use and saved back here
+project_id: ""                   # blank: the backend-wide PUBSUB_PROJECT_ID
+event_schema:                    # blank: every message starts a run
+  type: object
+  required: [order_id]
+  properties:
+    order_id: { type: string }
+```
+
+An event carries no base URL, credentials or operations — it is not called, it is subscribed to. `pubsub` trigger steps point at one with `event: <id>` instead of repeating the topic, schema and subscription in every workflow; see [`pubsub` — Google Cloud Pub/Sub trigger](#pubsub--google-cloud-pubsub-trigger).
+
+**Names are checked.** `POST /api/v1/events` answers `409` when another event already uses the name, so the UI can offer to overwrite that one instead of quietly creating a second event nobody can tell apart. `PUT` is the overwrite.
+
+**Events used to be data sources** with `kind: "pubsub"`. Creating one that way is now a `422`; `scripts/migrations/2026-08-19_move_pubsub_datasources_to_events.py` moves any that already exist (ids are preserved, so `datasource:` references keep resolving). Run it with `--apply` after deploying.
+
+---
+
 ## API
 
 ```
@@ -633,6 +796,11 @@ POST   /api/v1/datasources                    create data source
 GET    /api/v1/datasources/{id}               get data source definition
 PUT    /api/v1/datasources/{id}               update data source definition
 DELETE /api/v1/datasources/{id}               delete data source definition
+GET    /api/v1/events                         list events
+POST   /api/v1/events                         create event (409 on a duplicate name)
+GET    /api/v1/events/{id}                    get event definition
+PUT    /api/v1/events/{id}                    update event definition
+DELETE /api/v1/events/{id}                    delete event definition
 ALL    /mcp/datasources                       MCP (streamable-http) tools for all operations
 
 # Agent callbacks (called by running agent containers)

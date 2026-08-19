@@ -14,6 +14,7 @@ from langchain_core.language_models import BaseChatModel
 from pymongo import MongoClient
 
 from app.core.config import Settings
+from app.domain.models.event_definition import EventDefinition
 from app.domain.models.graph_run import GraphRun
 from app.infrastructure.config.graph_loader import (
     YamlGraphRegistry,
@@ -31,6 +32,10 @@ from app.infrastructure.persistence.agent_backend import (
 from app.infrastructure.persistence.data_source_backend import (
     DataSourceDefinitionBackend,
     MongoDataSourceBackend,
+)
+from app.infrastructure.persistence.event_backend import (
+    EventDefinitionBackend,
+    MongoEventBackend,
 )
 from app.infrastructure.persistence.script_backend import (
     MongoScriptBackend,
@@ -74,6 +79,10 @@ class ApplicationContainer:
     # steps and for the /mcp/datasources tools.
     data_source_backend: DataSourceDefinitionBackend | None = None
     data_source_executor: DataSourceExecutor | None = None
+    # Event definition backend — None when MongoDB is not configured or in
+    # legacy test setups.  Required for `pubsub` trigger steps that name an
+    # event, and for the subscription write-back.
+    event_backend: EventDefinitionBackend | None = None
     # Python script library backend — None when MongoDB is not configured or in
     # legacy test setups.  Required for `python` steps that use `script_id`.
     script_backend: ScriptDefinitionBackend | None = None
@@ -300,33 +309,28 @@ class ApplicationContainer:
     async def _build_pubsub_spec(self, step: dict) -> PubSubTriggerSpec:
         """Resolve a ``pubsub`` step into a subscriber spec.
 
-        A step may name a pre-configured ``kind="pubsub"`` datasource, in which
-        case that source supplies topic / subscription / schema and the step's
-        own fields override whatever it sets.
+        A step may name a pre-configured event, in which case that event
+        supplies topic / subscription / schema and the step's own fields
+        override whatever it sets.  ``datasource`` is the pre-events spelling
+        of ``event`` and is still honoured: it resolves against the events
+        first (the migration keeps ids), then against a leftover
+        ``kind="pubsub"`` data source.
         """
         topic = (step.get("topic") or "").strip()
         subscription = (step.get("subscription") or "").strip()
         event_schema = step.get("schema") or None
         project_id = (step.get("project_id") or "").strip()
-        datasource_id = (step.get("datasource") or "").strip()
+        event_id = (step.get("event") or step.get("datasource") or "").strip()
 
-        if datasource_id:
-            if self.data_source_backend is None:
-                raise ValueError(
-                    f"step references datasource '{datasource_id}' but no data source backend is configured"
-                )
-            source = await self.data_source_backend.get(datasource_id)
-            if source is None:
-                raise ValueError(f"datasource '{datasource_id}' not found")
-            if source.kind != "pubsub" or source.pubsub is None:
-                raise ValueError(f"datasource '{datasource_id}' is not a Pub/Sub source")
-            topic = topic or source.pubsub.topic
-            subscription = subscription or source.pubsub.subscription
-            project_id = project_id or source.pubsub.project_id
-            event_schema = event_schema or source.pubsub.event_schema
+        if event_id:
+            source = await self._resolve_event_source(event_id)
+            topic = topic or source.topic
+            subscription = subscription or source.subscription
+            project_id = project_id or source.project_id
+            event_schema = event_schema or source.event_schema
 
         if not topic:
-            raise ValueError("no topic configured (set `topic`, or point `datasource` at a Pub/Sub source)")
+            raise ValueError("no topic configured (set `topic`, or point `event` at an event)")
 
         return PubSubTriggerSpec(
             topic=topic,
@@ -335,61 +339,86 @@ class ApplicationContainer:
             event_schema=event_schema,
             ack_deadline_seconds=int(step.get("ack_deadline_seconds") or self.settings.pubsub_ack_deadline_seconds),
             max_messages=int(step.get("max_messages") or self.settings.pubsub_max_messages),
-            datasource_id=datasource_id,
+            datasource_id=event_id,
+        )
+
+    async def _resolve_event_source(self, event_id: str) -> EventDefinition:
+        """The event *event_id* names, from the events or from a legacy source.
+
+        Raises ``ValueError`` when it resolves to nothing usable, so the caller
+        can log the step as broken and leave the other triggers alone.
+        """
+        if self.event_backend is not None:
+            event = await self.event_backend.get(event_id)
+            if event is not None:
+                return event
+        if self.data_source_backend is None:
+            if self.event_backend is None:
+                raise ValueError(
+                    f"step references event '{event_id}' but no event backend is configured"
+                )
+            raise ValueError(f"event '{event_id}' not found")
+        source = await self.data_source_backend.get(event_id)
+        if source is None:
+            raise ValueError(f"event '{event_id}' not found")
+        if source.kind != "pubsub" or source.pubsub is None:
+            raise ValueError(f"'{event_id}' is not an event")
+        return EventDefinition(
+            id=source.id,
+            name=source.name,
+            description=source.description,
+            topic=source.pubsub.topic,
+            subscription=source.pubsub.subscription,
+            project_id=source.pubsub.project_id,
+            event_schema=source.pubsub.event_schema,
         )
 
     async def _save_pubsub_subscription(self, spec: PubSubTriggerSpec, subscription_path: str) -> None:
-        """Persist a just-created subscription as a ``pubsub`` datasource.
+        """Persist a just-created subscription as an event.
 
         A subscription created from scratch is only useful to the next workflow
-        if it can be found again, so it is written back: onto the datasource the
-        step named, or as a new source keyed by topic.
+        if it can be found again, so it is written back: onto the event the
+        step named, or as a new event keyed by topic.
         """
-        if self.data_source_backend is None:
+        if self.event_backend is None:
             return
-        from app.domain.models.data_source_definition import DataSourceDefinition, PubSubSpec
 
         if spec.datasource_id:
-            source = await self.data_source_backend.get(spec.datasource_id)
-            if source is None or source.pubsub is None:
+            event = await self.event_backend.get(spec.datasource_id)
+            if event is None:
                 return
-            if source.pubsub.subscription == subscription_path:
+            if event.subscription == subscription_path:
                 return
-            source.pubsub.subscription = subscription_path
-            source.touch()
-            await self.data_source_backend.update(source.id, source)
+            event.subscription = subscription_path
+            event.touch()
+            await self.event_backend.update(event.id, event)
             logger.info(
-                "Pub/Sub subscription %s saved onto datasource '%s'",
+                "Pub/Sub subscription %s saved onto event '%s'",
                 subscription_path, spec.datasource_id,
             )
             return
 
-        source_id = _pubsub_source_id(spec.topic)
-        existing = await self.data_source_backend.get(source_id)
+        event_id = _pubsub_source_id(spec.topic)
+        existing = await self.event_backend.get(event_id)
         if existing is not None:
-            if existing.pubsub is None:
-                return
-            if existing.pubsub.subscription != subscription_path:
-                existing.pubsub.subscription = subscription_path
+            if existing.subscription != subscription_path:
+                existing.subscription = subscription_path
                 existing.touch()
-                await self.data_source_backend.update(existing.id, existing)
+                await self.event_backend.update(existing.id, existing)
             return
 
-        defn = DataSourceDefinition(
-            id=source_id,
+        defn = EventDefinition(
+            id=event_id,
             name=spec.topic,
             description="Created from a workflow Pub/Sub trigger",
-            kind="pubsub",
-            pubsub=PubSubSpec(
-                topic=spec.topic,
-                subscription=subscription_path,
-                project_id=spec.project_id,
-                event_schema=spec.event_schema,
-            ),
+            topic=spec.topic,
+            subscription=subscription_path,
+            project_id=spec.project_id,
+            event_schema=spec.event_schema,
         )
         defn.touch()
-        await self.data_source_backend.create(defn)
-        logger.info("Pub/Sub datasource '%s' created for topic %s", source_id, spec.topic)
+        await self.event_backend.create(defn)
+        logger.info("Event '%s' created for topic %s", event_id, spec.topic)
 
     def _make_pubsub_job(self, workflow_id: str, step: dict):
         """Build the event callback that starts a run for one pubsub step."""
@@ -841,10 +870,12 @@ class ApplicationContainer:
             await self.agent_backend.close()
         if isinstance(self.data_source_backend, MongoDataSourceBackend):
             await self.data_source_backend.close()
+        if isinstance(self.event_backend, MongoEventBackend):
+            await self.event_backend.close()
 
 
 def _pubsub_source_id(topic: str) -> str:
-    """Stable datasource id for a topic: ``pubsub-<last path segment>``."""
+    """Stable event id for a topic: ``pubsub-<last path segment>``."""
     name = topic.rsplit("/", 1)[-1] if topic else "topic"
     slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", name).strip("-").lower() or "topic"
     return f"pubsub-{slug}"
@@ -965,6 +996,8 @@ def build_container(settings: Settings) -> ApplicationContainer:
     agent_backend = MongoAgentBackend(settings.mongodb_uri, settings.mongodb_database)
     # Data source definitions are likewise MongoDB-only.
     data_source_backend = MongoDataSourceBackend(settings.mongodb_uri, settings.mongodb_database)
+    # Events (Pub/Sub topics workflows subscribe to) are likewise MongoDB-only.
+    event_backend = MongoEventBackend(settings.mongodb_uri, settings.mongodb_database)
     # Python script library is likewise MongoDB-only.
     script_backend = MongoScriptBackend(settings.mongodb_uri, settings.mongodb_database)
     service_token_provider = ServiceTokenProvider(settings)
@@ -987,6 +1020,7 @@ def build_container(settings: Settings) -> ApplicationContainer:
         agent_backend=agent_backend,
         data_source_backend=data_source_backend,
         data_source_executor=data_source_executor,
+        event_backend=event_backend,
         script_backend=script_backend,
         service_token_provider=service_token_provider,
         checkpointer=checkpointer,

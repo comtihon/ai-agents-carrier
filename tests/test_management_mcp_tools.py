@@ -18,6 +18,7 @@ from app.domain.models.graph_run import GraphRun
 from app.infrastructure.orchestration.default_workflow import build_default_workflow
 from app.infrastructure.persistence.mongo import MongoGraphRunRepository
 from tests.test_datasources_api import InMemoryDataSourceBackend
+from tests.test_events_api import InMemoryEventBackend
 
 _EXPECTED_TOOLS = {
     "list_workflows", "run_workflow", "list_runs", "get_run",
@@ -25,6 +26,7 @@ _EXPECTED_TOOLS = {
     "list_agents", "get_agent", "create_agent", "update_agent", "delete_agent",
     "list_datasources", "create_datasource", "update_datasource",
     "create_pubsub_datasource", "list_pubsub_subscriptions",
+    "list_events", "create_event", "update_event", "delete_event",
     "delete_datasource", "import_datasource_schema",
     "create_datasource_from_schema", "add_datasource_operations_from_schema",
     "terminate_run", "retry_run", "restart_from_step", "approve_run", "reject_run",
@@ -34,13 +36,14 @@ _EXPECTED_TOOLS = {
 class _Container:
     """Minimal ApplicationContainer stand-in for the management handlers."""
 
-    def __init__(self, *, data_source_backend=None, run_repository=None) -> None:
+    def __init__(self, *, data_source_backend=None, event_backend=None, run_repository=None) -> None:
         self.yaml_graph_registry = MagicMock()
         self.yaml_graph_registry.list_definitions.return_value = []
         self.run_repository = run_repository or AsyncMock()
         self.workflow_backend = None
         self.agent_backend = None
         self.data_source_backend = data_source_backend
+        self.event_backend = event_backend
         self.refresh_runner = None
         self.settings = MagicMock()
         self.live_runners: dict = {}
@@ -94,7 +97,7 @@ async def test_registers_the_full_tool_set(mcp):
     _register(mcp, _Container())
     tools = await mcp.list_tools()
     assert {t.name for t in tools} == _EXPECTED_TOOLS
-    assert len(tools) == 26
+    assert len(tools) == 30
 
 
 async def test_ask_user_is_not_exposed_over_mcp(mcp):
@@ -204,12 +207,12 @@ async def test_list_datasources_matches_the_agent_tool(mcp):
     assert agent_result in mcp_result
 
 
-async def test_create_pubsub_datasource_stores_topic_and_schema(mcp):
-    backend = InMemoryDataSourceBackend()
-    _register(mcp, _Container(data_source_backend=backend))
+async def test_create_event_stores_topic_and_schema(mcp):
+    backend = InMemoryEventBackend()
+    _register(mcp, _Container(event_backend=backend))
 
-    result = str(await mcp.call_tool("create_pubsub_datasource", {
-        "source_id": "orders-events",
+    result = str(await mcp.call_tool("create_event", {
+        "event_id": "orders-events",
         "name": "Order events",
         "topic": "orders",
         "event_schema_json": '{"type": "object", "required": ["order_id"]}',
@@ -217,31 +220,30 @@ async def test_create_pubsub_datasource_stores_topic_and_schema(mcp):
 
     assert "created" in result
     stored = await backend.get("orders-events")
-    assert stored.kind == "pubsub"
-    assert stored.pubsub.topic == "orders"
-    assert stored.pubsub.event_schema == {"type": "object", "required": ["order_id"]}
+    assert stored.topic == "orders"
+    assert stored.event_schema == {"type": "object", "required": ["order_id"]}
     # No subscription named: one gets created (and saved back) on first use.
-    assert stored.pubsub.subscription == ""
+    assert stored.subscription == ""
 
 
-async def test_create_pubsub_datasource_rejects_a_missing_topic(mcp):
-    backend = InMemoryDataSourceBackend()
-    _register(mcp, _Container(data_source_backend=backend))
+async def test_create_event_rejects_a_missing_topic(mcp):
+    backend = InMemoryEventBackend()
+    _register(mcp, _Container(event_backend=backend))
 
-    result = str(await mcp.call_tool("create_pubsub_datasource", {
-        "source_id": "orders-events", "name": "Order events", "topic": "  ",
+    result = str(await mcp.call_tool("create_event", {
+        "event_id": "orders-events", "name": "Order events", "topic": "  ",
     }))
 
     assert "needs a topic" in result
     assert await backend.get("orders-events") is None
 
 
-async def test_create_pubsub_datasource_rejects_invalid_schema_json(mcp):
-    backend = InMemoryDataSourceBackend()
-    _register(mcp, _Container(data_source_backend=backend))
+async def test_create_event_rejects_invalid_schema_json(mcp):
+    backend = InMemoryEventBackend()
+    _register(mcp, _Container(event_backend=backend))
 
-    result = str(await mcp.call_tool("create_pubsub_datasource", {
-        "source_id": "orders-events", "name": "n", "topic": "orders",
+    result = str(await mcp.call_tool("create_event", {
+        "event_id": "orders-events", "name": "n", "topic": "orders",
         "event_schema_json": "{not json",
     }))
 
@@ -249,19 +251,75 @@ async def test_create_pubsub_datasource_rejects_invalid_schema_json(mcp):
     assert await backend.get("orders-events") is None
 
 
-async def test_list_datasources_describes_a_pubsub_source_by_topic(mcp):
-    backend = InMemoryDataSourceBackend()
-    from app.domain.models.data_source_definition import DataSourceDefinition
-    await backend.create(DataSourceDefinition.model_validate({
-        "id": "orders-events",
-        "name": "Order events",
-        "description": "Shop orders",
-        "kind": "pubsub",
-        "pubsub": {"topic": "orders"},
-    }))
-    _register(mcp, _Container(data_source_backend=backend))
+async def test_create_event_refuses_a_name_another_event_already_uses(mcp):
+    backend = InMemoryEventBackend()
+    _register(mcp, _Container(event_backend=backend))
+    await mcp.call_tool("create_event", {
+        "event_id": "orders-events", "name": "Order events", "topic": "orders",
+    })
 
-    result = str(await mcp.call_tool("list_datasources", {}))
+    result = str(await mcp.call_tool("create_event", {
+        "event_id": "orders-v2", "name": "Order events", "topic": "orders-v2",
+    }))
+
+    assert "already exists" in result
+    assert await backend.get("orders-v2") is None
+
+
+async def test_create_pubsub_datasource_still_writes_an_event(mcp):
+    """The pre-events tool name keeps working for agents mid-conversation."""
+    backend = InMemoryEventBackend()
+    _register(mcp, _Container(event_backend=backend))
+
+    result = str(await mcp.call_tool("create_pubsub_datasource", {
+        "source_id": "orders-events", "name": "Order events", "topic": "orders",
+    }))
+
+    assert "created" in result
+    assert (await backend.get("orders-events")).topic == "orders"
+
+
+async def test_update_event_changes_only_what_it_names(mcp):
+    backend = InMemoryEventBackend()
+    _register(mcp, _Container(event_backend=backend))
+    await mcp.call_tool("create_event", {
+        "event_id": "orders-events", "name": "Order events", "topic": "orders",
+        "event_schema_json": '{"type": "object"}',
+    })
+
+    result = str(await mcp.call_tool("update_event", {
+        "event_id": "Order events", "subscription": "projects/p/subscriptions/mine",
+    }))
+
+    assert "updated" in result
+    stored = await backend.get("orders-events")
+    assert stored.subscription == "projects/p/subscriptions/mine"
+    assert stored.topic == "orders"
+    assert stored.event_schema == {"type": "object"}
+
+
+async def test_delete_event_removes_it(mcp):
+    backend = InMemoryEventBackend()
+    _register(mcp, _Container(event_backend=backend))
+    await mcp.call_tool("create_event", {
+        "event_id": "orders-events", "name": "Order events", "topic": "orders",
+    })
+
+    result = str(await mcp.call_tool("delete_event", {"event_id": "orders-events"}))
+
+    assert "deleted" in result
+    assert await backend.get("orders-events") is None
+
+
+async def test_list_events_describes_an_event_by_topic(mcp):
+    backend = InMemoryEventBackend()
+    _register(mcp, _Container(event_backend=backend))
+    await mcp.call_tool("create_event", {
+        "event_id": "orders-events", "name": "Order events", "topic": "orders",
+        "description": "Shop orders",
+    })
+
+    result = str(await mcp.call_tool("list_events", {}))
 
     assert "topic: orders" in result
     assert "subscription: (created on first use)" in result

@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from app.infrastructure.config.graph_loader import YamlGraphRegistry
     from app.infrastructure.persistence.agent_backend import AgentDefinitionBackend
     from app.infrastructure.persistence.data_source_backend import DataSourceDefinitionBackend
+    from app.infrastructure.persistence.event_backend import EventDefinitionBackend
     from app.infrastructure.persistence.mongo import MongoGraphRunRepository
     from app.infrastructure.persistence.workflow_backend import WorkflowDefinitionBackend
 
@@ -123,6 +124,7 @@ class ManagementDeps:
     workflow_backend: "WorkflowDefinitionBackend | None" = None
     agent_backend: "AgentDefinitionBackend | None" = None
     data_source_backend: "DataSourceDefinitionBackend | None" = None
+    event_backend: "EventDefinitionBackend | None" = None
     refresh_runner: "Callable[[str], Awaitable[None]] | None" = None
     refresh_datasources: "Callable[[], Awaitable[None]] | None" = None
     # PubSubSubscriberManager when Pub/Sub triggers are enabled, else None.
@@ -144,6 +146,7 @@ def deps_from_container(
         workflow_backend=getattr(container, "workflow_backend", None),
         agent_backend=getattr(container, "agent_backend", None),
         data_source_backend=getattr(container, "data_source_backend", None),
+        event_backend=getattr(container, "event_backend", None),
         refresh_runner=getattr(container, "refresh_runner", None),
         refresh_datasources=refresh_datasources,
         pubsub_subscriber=getattr(container, "pubsub_subscriber", None),
@@ -218,6 +221,30 @@ async def _resolve_datasource_id(deps: ManagementDeps, query: str):
         return None, f"Ambiguous — multiple matches: {cands}"
     available = ", ".join(f"{s.id} ({s.name})" for s in sources) or "none"
     return None, f"Data source '{query}' not found. Available: {available}"
+
+
+async def _resolve_event_id(deps: ManagementDeps, query: str):
+    """Returns (resolved_id, None) or (None, error_str)."""
+    if deps.event_backend is None:
+        return None, "event_backend not configured"
+    events = await deps.event_backend.list()
+    for e in events:
+        if e.id == query:
+            return e.id, None
+    for e in events:
+        if (e.name or "").lower() == query.lower():
+            return e.id, None
+    matches = [
+        e for e in events
+        if query.lower() in e.id.lower() or query.lower() in (e.name or "").lower()
+    ]
+    if len(matches) == 1:
+        return matches[0].id, None
+    if matches:
+        cands = ", ".join(f"{e.id} ({e.name})" for e in matches)
+        return None, f"Ambiguous — multiple matches: {cands}"
+    available = ", ".join(f"{e.id} ({e.name})" for e in events) or "none"
+    return None, f"Event '{query}' not found. Available: {available}"
 
 
 async def _publish_datasources(deps: ManagementDeps) -> None:
@@ -574,6 +601,164 @@ async def delete_agent(deps: ManagementDeps, agent_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Event tools
+#
+# An event is a Pub/Sub topic a workflow can be triggered by.  Events used to
+# be data sources with kind="pubsub"; they are a resource of their own because
+# nothing about base URL, auth or operations applies to them.
+# ---------------------------------------------------------------------------
+
+@requires(Permission.READ)
+async def list_events(deps: ManagementDeps) -> str:
+    """List the events (Pub/Sub topics) workflows can be triggered by."""
+    if deps.event_backend is None:
+        return "Event backend not configured."
+    events = await deps.event_backend.list()
+    if not events:
+        return "No events found."
+    return "\n".join(
+        f"- **{e.id}** ({e.name or e.id}): {e.description or '(no description)'} — "
+        f"topic: {e.topic or '(unset)'}, "
+        f"subscription: {e.subscription or '(created on first use)'}"
+        for e in events
+    )
+
+
+@requires(Permission.WRITE)
+async def create_event(
+    deps: ManagementDeps,
+    event_id: str,
+    name: str,
+    topic: str,
+    event_schema_json: str = "",
+    subscription: str = "",
+    project_id: str = "",
+    description: str = "",
+) -> str:
+    """Register a Pub/Sub topic as a reusable event.
+
+    An event exists so ``pubsub`` trigger steps can point at
+    ``event: <event_id>`` instead of repeating topic, schema and subscription
+    in every workflow.  Leave *subscription* empty to have one created (and
+    saved back here) the first time a workflow subscribes.
+    """
+    if deps.event_backend is None:
+        return "Event creation unavailable: no persistent backend configured."
+    if not topic.strip():
+        return "An event needs a topic."
+    event_schema: dict | None = None
+    if event_schema_json:
+        try:
+            event_schema = json.loads(event_schema_json)
+        except json.JSONDecodeError as exc:
+            return f"Invalid event_schema_json: {exc}"
+        if not isinstance(event_schema, dict):
+            return "event_schema_json must be a JSON object."
+
+    existing = await deps.event_backend.get(event_id)
+    if existing is not None:
+        return f"Event '{event_id}' already exists. Use update_event to modify it."
+    clash = await deps.event_backend.get_by_name(name) if name else None
+    if clash is not None:
+        return (
+            f"An event named '{name}' already exists (id '{clash.id}'). "
+            "Pick another name, or use update_event to change that one."
+        )
+
+    from app.domain.models.event_definition import EventDefinition
+    try:
+        defn = EventDefinition.model_validate({
+            "id": event_id,
+            "name": name,
+            "description": description,
+            "topic": topic.strip(),
+            "subscription": subscription.strip(),
+            "project_id": project_id.strip(),
+            "event_schema": event_schema,
+        })
+    except Exception as exc:
+        return f"Invalid event definition: {exc}"
+
+    await deps.event_backend.create(defn)
+    return (
+        f"Event '{event_id}' created for topic '{topic}'"
+        + (f" using subscription '{subscription}'." if subscription else " (subscription created on first use).")
+    )
+
+
+@requires(Permission.WRITE)
+async def update_event(
+    deps: ManagementDeps,
+    event_id: str,
+    name: str | None = None,
+    description: str | None = None,
+    topic: str | None = None,
+    subscription: str | None = None,
+    project_id: str | None = None,
+    event_schema_json: str | None = None,
+) -> str:
+    """Change an existing event; omitted fields keep their stored value."""
+    if deps.event_backend is None:
+        return "Event updates unavailable: no persistent backend configured."
+    resolved, err = await _resolve_event_id(deps, event_id)
+    if err:
+        return err
+    existing = await deps.event_backend.get(resolved)
+    if existing is None:
+        return f"Event '{resolved}' not found."
+
+    payload = existing.model_dump(mode="json")
+    if name is not None:
+        clash = await deps.event_backend.get_by_name(name)
+        if clash is not None and clash.id != resolved:
+            return f"An event named '{name}' already exists (id '{clash.id}')."
+        payload["name"] = name
+    if description is not None:
+        payload["description"] = description
+    if topic is not None:
+        payload["topic"] = topic.strip()
+    if subscription is not None:
+        payload["subscription"] = subscription.strip()
+    if project_id is not None:
+        payload["project_id"] = project_id.strip()
+    if event_schema_json is not None:
+        try:
+            event_schema = json.loads(event_schema_json)
+        except json.JSONDecodeError as exc:
+            return f"Invalid event_schema_json: {exc}"
+        if not isinstance(event_schema, dict):
+            return "event_schema_json must be a JSON object."
+        payload["event_schema"] = event_schema
+
+    if not (payload.get("topic") or "").strip():
+        return "An event needs a topic."
+
+    from app.domain.models.event_definition import EventDefinition
+    try:
+        defn = EventDefinition.model_validate(payload)
+    except Exception as exc:
+        return f"Invalid event definition: {exc}"
+
+    await deps.event_backend.update(resolved, defn)
+    return f"Event '{resolved}' updated."
+
+
+@requires(Permission.DELETE)
+async def delete_event(deps: ManagementDeps, event_id: str) -> str:
+    """Delete an event. Workflow steps still pointing at it stop resolving."""
+    if deps.event_backend is None:
+        return "Event deletion unavailable: no persistent backend configured."
+    resolved, err = await _resolve_event_id(deps, event_id)
+    if err:
+        return err
+    existing = await deps.event_backend.get(resolved)
+    if existing is None:
+        return f"Event '{resolved}' not found."
+    await deps.event_backend.delete(resolved)
+    return f"Event '{resolved}' deleted."
+
+
+# ---------------------------------------------------------------------------
 # Data source tools
 # ---------------------------------------------------------------------------
 
@@ -586,13 +771,7 @@ async def list_datasources(deps: ManagementDeps) -> str:
         return "No data sources found."
     lines = []
     for s in sources:
-        if s.kind == "pubsub" and s.pubsub is not None:
-            detail = (
-                f"topic: {s.pubsub.topic or '(unset)'}, "
-                f"subscription: {s.pubsub.subscription or '(created on first use)'}"
-            )
-        else:
-            detail = "operations: " + (", ".join(op.name for op in s.operations) or "(no operations)")
+        detail = "operations: " + (", ".join(op.name for op in s.operations) or "(no operations)")
         lines.append(
             f"- **{s.id}** ({s.name or s.id}, {s.kind}): "
             f"{s.description or '(no description)'} — {detail}"
@@ -611,52 +790,9 @@ async def create_pubsub_datasource(
     project_id: str = "",
     description: str = "",
 ) -> str:
-    """Register a Pub/Sub topic as a reusable data source.
-
-    Such a source has no operations — it exists so ``pubsub`` trigger steps can
-    point at ``datasource: <source_id>`` instead of repeating topic, schema and
-    subscription in every workflow.  Leave *subscription* empty to have one
-    created (and saved back here) the first time a workflow subscribes.
-    """
-    if deps.data_source_backend is None:
-        return "Data source creation unavailable: no persistent backend configured."
-    if not topic.strip():
-        return "A Pub/Sub data source needs a topic."
-    event_schema: dict | None = None
-    if event_schema_json:
-        try:
-            event_schema = json.loads(event_schema_json)
-        except json.JSONDecodeError as exc:
-            return f"Invalid event_schema_json: {exc}"
-        if not isinstance(event_schema, dict):
-            return "event_schema_json must be a JSON object."
-
-    existing = await deps.data_source_backend.get(source_id)
-    if existing is not None:
-        return f"Data source '{source_id}' already exists. Use update_datasource to modify it."
-
-    from app.domain.models.data_source_definition import DataSourceDefinition
-    try:
-        defn = DataSourceDefinition.model_validate({
-            "id": source_id,
-            "name": name,
-            "description": description,
-            "kind": "pubsub",
-            "pubsub": {
-                "topic": topic.strip(),
-                "subscription": subscription.strip(),
-                "project_id": project_id.strip(),
-                "event_schema": event_schema,
-            },
-        })
-    except Exception as exc:
-        return f"Invalid data source definition: {exc}"
-
-    await deps.data_source_backend.create(defn)
-    await _publish_datasources(deps)
-    return (
-        f"Pub/Sub data source '{source_id}' created for topic '{topic}'"
-        + (f" using subscription '{subscription}'." if subscription else " (subscription created on first use).")
+    """Deprecated spelling of ``create_event`` — Pub/Sub topics are events now."""
+    return await create_event(
+        deps, source_id, name, topic, event_schema_json, subscription, project_id, description,
     )
 
 

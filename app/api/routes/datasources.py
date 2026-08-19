@@ -219,10 +219,13 @@ def _require_backend(container: ApplicationContainer) -> None:
 
 def _build_definition(data: dict[str, Any]) -> DataSourceDefinition:
     """Validate the payload into a definition, mapping errors onto HTTP 422."""
-    if data.get("kind") == "pubsub" and not (data.get("pubsub") or {}).get("topic"):
+    # Pub/Sub topics are their own resource now — a data source is a callable
+    # API.  Existing kind="pubsub" documents still deserialise (the migration
+    # script moves them), but no new one can be written here.
+    if data.get("kind") == "pubsub":
         raise HTTPException(
             status_code=422,
-            detail="A pubsub data source needs pubsub.topic",
+            detail="Pub/Sub topics are events now — use /events instead of a pubsub data source",
         )
     try:
         defn = DataSourceDefinition.model_validate(data)

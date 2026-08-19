@@ -2,8 +2,8 @@
 
 Covers the three seams between an arriving event and a workflow run: the node
 that republishes the event into state, the container code that turns a step (or
-the data source it points at) into a subscriber spec, and the hook that saves a
-freshly created subscription back into the data sources.
+the event it points at) into a subscriber spec, and the hook that saves a
+freshly created subscription back onto the event.
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from langchain_core.messages import AIMessage
 from app.core.config import Settings
 from app.core.container import ApplicationContainer, _pubsub_source_id
 from app.domain.models.data_source_definition import DataSourceDefinition, PubSubSpec
+from app.domain.models.event_definition import EventDefinition
 from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner
 from app.infrastructure.tools.mcp_client import McpToolsProvider
 from app.infrastructure.triggers.pubsub_subscriber import PubSubTriggerSpec
@@ -106,7 +107,40 @@ class FakeDataSourceBackend:
         return list(self.sources.values())
 
 
-def _container(backend: FakeDataSourceBackend | None = None, **setting_overrides) -> ApplicationContainer:
+class FakeEventBackend:
+    def __init__(self, events: dict[str, EventDefinition] | None = None) -> None:
+        self.events = events or {}
+        self.created: list[EventDefinition] = []
+        self.updated: list[EventDefinition] = []
+
+    async def get(self, event_id):
+        return self.events.get(event_id)
+
+    async def get_by_name(self, name):
+        return next((e for e in self.events.values() if e.name == name), None)
+
+    async def create(self, definition):
+        self.created.append(definition)
+        self.events[definition.id] = definition
+        return definition
+
+    async def update(self, event_id, definition):
+        self.updated.append(definition)
+        self.events[event_id] = definition
+        return definition
+
+    async def delete(self, event_id):
+        self.events.pop(event_id, None)
+
+    async def list(self):
+        return list(self.events.values())
+
+
+def _container(
+    backend: FakeEventBackend | None = None,
+    data_sources: FakeDataSourceBackend | None = None,
+    **setting_overrides,
+) -> ApplicationContainer:
     settings = Settings(
         PUBSUB_ENABLED=True,
         PUBSUB_PROJECT_ID="proj",
@@ -121,7 +155,8 @@ def _container(backend: FakeDataSourceBackend | None = None, **setting_overrides
         yaml_graph_registry=MagicMock(),
         mongo_provider=MagicMock(),
     )
-    container.data_source_backend = backend
+    container.event_backend = backend
+    container.data_source_backend = data_sources
     return container
 
 
@@ -143,21 +178,18 @@ async def test_a_step_supplies_its_own_topic_and_schema():
     assert spec.ack_deadline_seconds == 60
 
 
-async def test_a_step_can_take_everything_from_a_pubsub_datasource():
-    source = DataSourceDefinition(
+async def test_a_step_can_take_everything_from_an_event():
+    event = EventDefinition(
         id="orders-events",
-        kind="pubsub",
-        pubsub=PubSubSpec(
-            topic="orders",
-            subscription="projects/proj/subscriptions/shared",
-            project_id="other",
-            event_schema={"type": "object"},
-        ),
+        topic="orders",
+        subscription="projects/proj/subscriptions/shared",
+        project_id="other",
+        event_schema={"type": "object"},
     )
-    container = _container(FakeDataSourceBackend({"orders-events": source}))
+    container = _container(FakeEventBackend({"orders-events": event}))
 
     spec = await container._build_pubsub_spec({
-        "id": "on_order", "type": "pubsub", "datasource": "orders-events",
+        "id": "on_order", "type": "pubsub", "event": "orders-events",
     })
 
     assert spec.topic == "orders"
@@ -167,23 +199,50 @@ async def test_a_step_can_take_everything_from_a_pubsub_datasource():
     assert spec.datasource_id == "orders-events"
 
 
-async def test_step_fields_override_the_datasource():
-    source = DataSourceDefinition(
-        id="orders-events",
-        kind="pubsub",
-        pubsub=PubSubSpec(topic="orders", subscription="sub-a", event_schema={"type": "object"}),
+async def test_step_fields_override_the_event():
+    event = EventDefinition(
+        id="orders-events", topic="orders", subscription="sub-a",
+        event_schema={"type": "object"},
     )
-    container = _container(FakeDataSourceBackend({"orders-events": source}))
+    container = _container(FakeEventBackend({"orders-events": event}))
 
     spec = await container._build_pubsub_spec({
         "id": "on_order",
         "type": "pubsub",
-        "datasource": "orders-events",
+        "event": "orders-events",
         "topic": "orders-v2",
         "subscription": "sub-b",
     })
 
     assert (spec.topic, spec.subscription) == ("orders-v2", "sub-b")
+
+
+async def test_the_pre_events_datasource_key_still_resolves_against_the_events():
+    """Workflows written before events existed keep working unchanged."""
+    event = EventDefinition(id="pubsub-orders", topic="orders")
+    container = _container(FakeEventBackend({"pubsub-orders": event}))
+
+    spec = await container._build_pubsub_spec({
+        "id": "on_order", "type": "pubsub", "datasource": "pubsub-orders",
+    })
+
+    assert spec.topic == "orders"
+
+
+async def test_an_unmigrated_pubsub_datasource_is_still_read():
+    """Until the migration script runs, the topic may only exist over there."""
+    source = DataSourceDefinition(
+        id="orders-events", kind="pubsub", pubsub=PubSubSpec(topic="orders"),
+    )
+    container = _container(
+        FakeEventBackend(), data_sources=FakeDataSourceBackend({"orders-events": source}),
+    )
+
+    spec = await container._build_pubsub_spec({
+        "id": "on_order", "type": "pubsub", "datasource": "orders-events",
+    })
+
+    assert spec.topic == "orders"
 
 
 async def test_a_step_without_a_topic_is_rejected():
@@ -195,41 +254,41 @@ async def test_a_step_without_a_topic_is_rejected():
 
 async def test_pointing_at_a_non_pubsub_datasource_is_rejected():
     source = DataSourceDefinition(id="github", kind="http", base_url="https://api.github.com")
-    container = _container(FakeDataSourceBackend({"github": source}))
+    container = _container(
+        FakeEventBackend(), data_sources=FakeDataSourceBackend({"github": source}),
+    )
 
-    with pytest.raises(ValueError, match="not a Pub/Sub source"):
+    with pytest.raises(ValueError, match="not an event"):
         await container._build_pubsub_spec({
-            "id": "on_order", "type": "pubsub", "datasource": "github",
+            "id": "on_order", "type": "pubsub", "event": "github",
         })
 
 
-async def test_pointing_at_a_missing_datasource_is_rejected():
-    container = _container(FakeDataSourceBackend())
+async def test_pointing_at_a_missing_event_is_rejected():
+    container = _container(FakeEventBackend())
 
     with pytest.raises(ValueError, match="not found"):
         await container._build_pubsub_spec({
-            "id": "on_order", "type": "pubsub", "datasource": "ghost",
+            "id": "on_order", "type": "pubsub", "event": "ghost",
         })
 
 
 # ─── write-back ───────────────────────────────────────────────────────────────
 
-async def test_a_created_subscription_lands_on_the_datasource_it_came_from():
-    source = DataSourceDefinition(
-        id="orders-events", kind="pubsub", pubsub=PubSubSpec(topic="orders"),
-    )
-    backend = FakeDataSourceBackend({"orders-events": source})
+async def test_a_created_subscription_lands_on_the_event_it_came_from():
+    event = EventDefinition(id="orders-events", topic="orders")
+    backend = FakeEventBackend({"orders-events": event})
     container = _container(backend)
     spec = PubSubTriggerSpec(topic="orders", project_id="proj", datasource_id="orders-events")
 
     await container._save_pubsub_subscription(spec, "projects/proj/subscriptions/aac-wf-step")
 
-    assert backend.updated[0].pubsub.subscription == "projects/proj/subscriptions/aac-wf-step"
+    assert backend.updated[0].subscription == "projects/proj/subscriptions/aac-wf-step"
     assert backend.created == []
 
 
-async def test_an_inline_trigger_gets_a_new_pubsub_datasource():
-    backend = FakeDataSourceBackend()
+async def test_an_inline_trigger_gets_a_new_event():
+    backend = FakeEventBackend()
     container = _container(backend)
     spec = PubSubTriggerSpec(
         topic="projects/proj/topics/orders",
@@ -241,19 +300,18 @@ async def test_an_inline_trigger_gets_a_new_pubsub_datasource():
 
     created = backend.created[0]
     assert created.id == "pubsub-orders"
-    assert created.kind == "pubsub"
-    assert created.pubsub.topic == "projects/proj/topics/orders"
-    assert created.pubsub.subscription == "projects/proj/subscriptions/aac-wf-step"
-    assert created.pubsub.event_schema == {"type": "object"}
+    assert created.topic == "projects/proj/topics/orders"
+    assert created.subscription == "projects/proj/subscriptions/aac-wf-step"
+    assert created.event_schema == {"type": "object"}
 
 
 async def test_write_back_is_idempotent():
-    source = DataSourceDefinition(
+    event = EventDefinition(
         id="pubsub-orders",
-        kind="pubsub",
-        pubsub=PubSubSpec(topic="orders", subscription="projects/proj/subscriptions/aac-wf-step"),
+        topic="orders",
+        subscription="projects/proj/subscriptions/aac-wf-step",
     )
-    backend = FakeDataSourceBackend({"pubsub-orders": source})
+    backend = FakeEventBackend({"pubsub-orders": event})
     container = _container(backend)
 
     await container._save_pubsub_subscription(
@@ -264,7 +322,7 @@ async def test_write_back_is_idempotent():
     assert (backend.created, backend.updated) == ([], [])
 
 
-async def test_write_back_without_a_datasource_backend_is_a_no_op():
+async def test_write_back_without_an_event_backend_is_a_no_op():
     container = _container(None)
     # Must not raise — a Mongo-less deployment still runs pubsub triggers.
     await container._save_pubsub_subscription(
@@ -272,7 +330,7 @@ async def test_write_back_without_a_datasource_backend_is_a_no_op():
     )
 
 
-async def test_source_ids_are_slugged_from_the_topic():
+async def test_event_ids_are_slugged_from_the_topic():
     assert _pubsub_source_id("projects/p/topics/Order.Events") == "pubsub-order-events"
     assert _pubsub_source_id("orders") == "pubsub-orders"
     assert _pubsub_source_id("") == "pubsub-topic"
@@ -329,16 +387,16 @@ async def test_saving_an_unchanged_workflow_keeps_the_stream():
     assert client.subscribed == [path]
 
 
-async def test_two_workflows_on_one_datasource_share_the_subscription():
-    source = DataSourceDefinition(
+async def test_two_workflows_on_one_event_share_the_subscription():
+    event = EventDefinition(
         id="orders-events",
-        kind="pubsub",
-        pubsub=PubSubSpec(topic="orders", subscription="projects/proj/subscriptions/shared"),
+        topic="orders",
+        subscription="projects/proj/subscriptions/shared",
     )
     client = FakeSubscriber(existing={"projects/proj/subscriptions/shared"})
-    container = _container(FakeDataSourceBackend({"orders-events": source}))
+    container = _container(FakeEventBackend({"orders-events": event}))
     manager = _with_subscriber(container, client)
-    step = {"id": "on_order", "type": "pubsub", "datasource": "orders-events"}
+    step = {"id": "on_order", "type": "pubsub", "event": "orders-events"}
 
     await container._register_pubsub_steps(_runner_with([step], "wf-a"))
     await container._register_pubsub_steps(_runner_with([step], "wf-b"))
@@ -351,12 +409,12 @@ async def test_two_workflows_on_one_datasource_share_the_subscription():
 
 async def test_a_broken_step_leaves_the_other_triggers_registered():
     client = FakeSubscriber()
-    container = _container(FakeDataSourceBackend())
+    container = _container(FakeEventBackend())
     manager = _with_subscriber(container, client)
 
     await container._register_pubsub_steps(_runner_with([
         {"id": "on_order", "type": "pubsub", "topic": "orders"},
-        {"id": "broken", "type": "pubsub", "datasource": "ghost"},
+        {"id": "broken", "type": "pubsub", "event": "ghost"},
     ]))
 
     assert list(manager.registrations()) == ["orders-wf:on_order"]

@@ -29,6 +29,7 @@ from app.api.routes.agents import router as agents_router
 from app.api.routes.callbacks import router as callbacks_router
 from app.api.routes.chat import router as chat_router
 from app.api.routes.datasources import router as datasources_router
+from app.api.routes.events import router as events_router
 from app.api.routes.scripts import router as scripts_router
 from app.api.routes.health import router as health_router
 from app.api.routes.llm import router as llm_router
@@ -451,6 +452,7 @@ async def lifespan(app: FastAPI):
         refresh_runner=container.refresh_runner,
         agent_backend=container.agent_backend,
         data_source_backend=container.data_source_backend,
+        event_backend=container.event_backend,
         refresh_datasources=_make_datasources_refresher(container),
         # The chat agent is the platform's internal agent: it gets the same MCP
         # tools the workflow steps do, resolved per invocation.
@@ -533,6 +535,7 @@ def create_app() -> FastAPI:
     app.include_router(workflows_router, prefix=settings.api_prefix)
     app.include_router(agents_router, prefix=settings.api_prefix)
     app.include_router(datasources_router, prefix=settings.api_prefix)
+    app.include_router(events_router, prefix=settings.api_prefix)
     app.include_router(scripts_router, prefix=settings.api_prefix)
     app.include_router(llm_router, prefix=settings.api_prefix)
     app.include_router(chat_router, prefix=settings.api_prefix)

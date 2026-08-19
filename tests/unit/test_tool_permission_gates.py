@@ -97,6 +97,11 @@ EXPECTED_TOOL_PERMISSIONS: dict[str, Permission] = {
     "delete_datasource": Permission.DELETE,
     "create_pubsub_datasource": Permission.WRITE,
     "list_pubsub_subscriptions": Permission.READ,
+    # events (Pub/Sub topics workflows are triggered by)
+    "list_events": Permission.READ,
+    "create_event": Permission.WRITE,
+    "update_event": Permission.WRITE,
+    "delete_event": Permission.DELETE,
     # Fetches an arbitrary remote URL with optional credentials, so it is a
     # WRITE-tier action even though it only returns a description of a spec.
     "import_datasource_schema": Permission.WRITE,
