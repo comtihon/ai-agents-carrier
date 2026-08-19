@@ -131,17 +131,44 @@ class OperationDefinition(BaseModel):
     paginate: Paginate | None = None
 
 
+class PubSubSpec(BaseModel):
+    """Google Cloud Pub/Sub topic a ``kind="pubsub"`` data source stands for.
+
+    Such a source is not callable like an HTTP/GraphQL one — it carries no
+    operations.  It exists so a topic (with its event schema and, once one has
+    been created, its subscription) can be configured once and then reused by
+    the ``pubsub`` trigger steps of several workflows.
+    """
+
+    # Short name ("orders") or a fully qualified path
+    # ("projects/p/topics/orders").  The subscriber resolves short names
+    # against the configured project.
+    topic: str = ""
+    # Subscription to pull from.  Empty means "create one on first use" — the
+    # subscriber fills this in and the definition is saved back.
+    subscription: str = ""
+    # Project override; empty means the backend-wide PUBSUB_PROJECT_ID.
+    project_id: str = ""
+    # JSON-schema-ish description of the message payload, used the same way as
+    # an operation's ``response_schema``: top-level type, required keys and
+    # property types.  Named ``event_schema`` because ``schema`` collides with
+    # pydantic's own attribute.
+    event_schema: dict[str, Any] | None = None
+
+
 class DataSourceDefinition(BaseModel):
     """Persistent definition of one remote API exposed as named operations."""
 
     id: str
     name: str = ""
     description: str | None = None
-    kind: Literal["http", "graphql"] = "http"
+    kind: Literal["http", "graphql", "pubsub"] = "http"
     base_url: str = ""
     auth: AnyDataSourceAuth = Field(default_factory=NoAuth)
     default_headers: dict[str, str] = Field(default_factory=dict)
     operations: list[OperationDefinition] = Field(default_factory=list)
+    # Only meaningful when kind == "pubsub".
+    pubsub: PubSubSpec | None = None
     cache: CachePolicy = Field(default_factory=CachePolicy)
     timeout_seconds: float = 30
     retries: RetryPolicy = Field(default_factory=RetryPolicy)

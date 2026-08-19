@@ -65,6 +65,8 @@ class CreateDataSourceRequest(BaseModel):
     auth: dict | None = None
     default_headers: dict[str, str] = Field(default_factory=dict)
     operations: list[dict] = Field(default_factory=list)
+    # kind == "pubsub" only: {topic, subscription, project_id, event_schema}.
+    pubsub: dict | None = None
     cache: dict | None = None
     timeout_seconds: float = 30
     retries: dict | None = None
@@ -79,6 +81,7 @@ class UpdateDataSourceRequest(BaseModel):
     auth: dict | None = None
     default_headers: dict[str, str] | None = None
     operations: list[dict] | None = None
+    pubsub: dict | None = None
     cache: dict | None = None
     timeout_seconds: float | None = None
     retries: dict | None = None
@@ -216,6 +219,11 @@ def _require_backend(container: ApplicationContainer) -> None:
 
 def _build_definition(data: dict[str, Any]) -> DataSourceDefinition:
     """Validate the payload into a definition, mapping errors onto HTTP 422."""
+    if data.get("kind") == "pubsub" and not (data.get("pubsub") or {}).get("topic"):
+        raise HTTPException(
+            status_code=422,
+            detail="A pubsub data source needs pubsub.topic",
+        )
     try:
         defn = DataSourceDefinition.model_validate(data)
     except ValidationError as exc:

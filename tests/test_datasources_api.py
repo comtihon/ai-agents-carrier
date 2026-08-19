@@ -588,3 +588,58 @@ async def test_probe_no_longer_hunts_for_an_openapi_document(client, monkeypatch
     assert body["discovered"] is None
     # Only the base URL was touched — no /openapi.json, /swagger.json, …
     assert requested == ["https://api.test"]
+
+
+# ─── Pub/Sub sources ──────────────────────────────────────────────────────────
+
+def _pubsub_payload(**overrides) -> dict:
+    body = {
+        "id": "orders-events",
+        "name": "Order events",
+        "kind": "pubsub",
+        "pubsub": {
+            "topic": "orders",
+            "event_schema": {"type": "object", "required": ["order_id"]},
+        },
+    }
+    body.update(overrides)
+    return body
+
+
+async def test_pubsub_source_roundtrip_without_a_base_url(client):
+    c, backend = client
+
+    resp = await c.post("/api/v1/datasources", json=_pubsub_payload())
+    assert resp.status_code == 201
+    data = resp.json()
+    assert data["kind"] == "pubsub"
+    assert data["pubsub"]["topic"] == "orders"
+    # No subscription yet: one is created the first time a workflow subscribes.
+    assert data["pubsub"]["subscription"] == ""
+    assert data["operations"] == []
+
+    stored = await backend.get("orders-events")
+    assert stored.pubsub.event_schema == {"type": "object", "required": ["order_id"]}
+
+
+async def test_pubsub_source_without_a_topic_is_rejected(client):
+    c, _ = client
+
+    resp = await c.post(
+        "/api/v1/datasources", json=_pubsub_payload(pubsub={"subscription": "s"}),
+    )
+    assert resp.status_code == 422
+    assert "pubsub.topic" in resp.json()["detail"]
+
+
+async def test_updating_a_pubsub_source_records_the_subscription(client):
+    c, backend = client
+    await c.post("/api/v1/datasources", json=_pubsub_payload())
+
+    resp = await c.put(
+        "/api/v1/datasources/orders-events",
+        json={"pubsub": {"topic": "orders", "subscription": "projects/p/subscriptions/mine"}},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["pubsub"]["subscription"] == "projects/p/subscriptions/mine"
+    assert (await backend.get("orders-events")).pubsub.subscription == "projects/p/subscriptions/mine"

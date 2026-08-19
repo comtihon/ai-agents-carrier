@@ -35,6 +35,7 @@ _STEP_TYPE_MAP: dict[str, str] = {
     "workflow": "workflow",
     "cron": "cron",
     "http": "http",
+    "pubsub": "pubsub",
     "langgraph-agent": "agent",
     "claude-agent": "agent",
 }

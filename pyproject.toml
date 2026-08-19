@@ -33,6 +33,7 @@ dependencies = [
   "aiodocker>=0.21.0,<1.0.0",
   "kubernetes>=28.1.0",
   "google-cloud-storage>=2.18,<3.0",
+  "google-cloud-pubsub>=2.23,<3.0",
   # FastMCP server for /mcp/datasources
   "mcp>=1.9.0,<2.0.0",
   # JMESPath response mapping in data source operations

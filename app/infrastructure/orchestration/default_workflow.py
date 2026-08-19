@@ -301,6 +301,7 @@ def build_default_workflow(
         base_url: str | None = None,
         operations_json: str | None = None,
         auth_json: str | None = None,
+        pubsub_json: str | None = None,
     ) -> str:
         """Update a data source definition. Only provided fields change.
 
@@ -311,10 +312,53 @@ def build_default_workflow(
             base_url: New base URL (omit to keep current).
             operations_json: JSON array replacing ALL operations (omit to keep current).
             auth_json: JSON auth block replacing the current one (omit to keep current).
+            pubsub_json: For kind="pubsub" sources — JSON object
+                {topic, subscription, project_id, event_schema} replacing the
+                current Pub/Sub block (omit to keep current).
         """
         return await core.update_datasource(
-            deps, source_id, name, description, base_url, operations_json, auth_json
+            deps, source_id, name, description, base_url, operations_json, auth_json,
+            pubsub_json,
         )
+
+    @tool
+    async def create_pubsub_datasource(
+        source_id: str,
+        name: str,
+        topic: str,
+        event_schema_json: str = "",
+        subscription: str = "",
+        project_id: str = "",
+        description: str = "",
+    ) -> str:
+        """Register a Pub/Sub topic as a reusable data source for triggers.
+
+        A `pubsub` trigger step can then say `datasource: <source_id>` instead of
+        repeating the topic, event schema and subscription in every workflow.
+
+        Args:
+            source_id: Unique kebab-case identifier (e.g. "orders-events").
+            name: Human-readable display name.
+            topic: Topic short name ("orders") or full path
+                ("projects/<project>/topics/orders").
+            event_schema_json: Optional JSON object describing the message payload —
+                same shape as an operation response_schema ({"type": "object",
+                "required": [...], "properties": {...}}). Events that do not
+                match it never start a run.
+            subscription: Existing subscription to pull from. Leave empty to have
+                one created on first use and saved back onto this data source.
+            project_id: Project override; empty uses the backend's PUBSUB_PROJECT_ID.
+            description: What this topic carries.
+        """
+        return await core.create_pubsub_datasource(
+            deps, source_id, name, topic, event_schema_json, subscription, project_id,
+            description,
+        )
+
+    @tool
+    async def list_pubsub_subscriptions() -> str:
+        """List which workflow steps are subscribed to Pub/Sub, and to what."""
+        return core.list_pubsub_subscriptions(deps)
 
     # --- Data source schema import ---
     #
@@ -417,6 +461,7 @@ def build_default_workflow(
                       create_workflow, update_workflow, delete_workflow,
                       list_agents, get_agent, create_agent, update_agent, delete_agent,
                       list_datasources, create_datasource, update_datasource,
+                      create_pubsub_datasource, list_pubsub_subscriptions,
                       delete_datasource, import_datasource_schema,
                       create_datasource_from_schema,
                       add_datasource_operations_from_schema]
