@@ -1,4 +1,4 @@
-{{- if or .Values.config .Values.llmIntegrations }}
+{{- if or .Values.config .Values.llmIntegrations .Values.mcpIntegrations }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -16,5 +16,32 @@ data:
       {"name": {{ $cfg.name | quote }}, "base_url": {{ $cfg.baseUrl | quote }}, "default_model": {{ $cfg.defaultModel | quote }}, "api_key_env": {{ $envName | quote }}}{{- if ne $i $last }},{{- end }}
 {{- end }}
     ]
+{{- end }}
+{{- if .Values.mcpIntegrations }}
+{{- /*
+  Rendered as the wire shape the backend parses (McpIntegrationConfig): camelCase
+  values become snake_case keys and the bearer token is referenced by env var
+  name only, never inlined — this ConfigMap is not a secret store.
+*/}}
+{{- $servers := list }}
+{{- range $cfg := .Values.mcpIntegrations }}
+{{- $server := dict "name" $cfg.name "transport" (default "streamable_http" $cfg.transport) }}
+{{- if hasKey $cfg "enabled" }}{{- $_ := set $server "enabled" $cfg.enabled }}{{- end }}
+{{- if $cfg.url }}{{- $_ := set $server "url" $cfg.url }}{{- end }}
+{{- if $cfg.urlFrom }}{{- $_ := set $server "url_from" $cfg.urlFrom }}{{- end }}
+{{- if $cfg.agentUrl }}{{- $_ := set $server "agent_url" $cfg.agentUrl }}{{- end }}
+{{- if $cfg.auth }}{{- $_ := set $server "auth" $cfg.auth }}{{- end }}
+{{- if or $cfg.apiKeyEnv $cfg.apiKeySecret }}
+{{- $_ := set $server "api_key_env" (include "ai-agents-carrier.mcpApiKeyEnv" $cfg) }}
+{{- end }}
+{{- if $cfg.command }}{{- $_ := set $server "command" $cfg.command }}{{- end }}
+{{- if $cfg.args }}{{- $_ := set $server "args" $cfg.args }}{{- end }}
+{{- if $cfg.env }}{{- $_ := set $server "env" $cfg.env }}{{- end }}
+{{- if $cfg.envFromConfig }}{{- $_ := set $server "env_from_config" $cfg.envFromConfig }}{{- end }}
+{{- if hasKey $cfg "prestartHttp" }}{{- $_ := set $server "prestart_http" $cfg.prestartHttp }}{{- end }}
+{{- if hasKey $cfg "eagerStart" }}{{- $_ := set $server "eager_start" $cfg.eagerStart }}{{- end }}
+{{- $servers = append $servers $server }}
+{{- end }}
+  MCP_INTEGRATIONS: {{ toJson $servers | quote }}
 {{- end }}
 {{- end }}

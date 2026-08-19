@@ -550,6 +550,17 @@ def create_app() -> FastAPI:
     # actual gate is _DatasourcesAuthWrapper below.
     # Same normalization as _DatasourcesAuthWrapper: an empty / whitespace-only
     # key counts as unset (and fails closed), so it must warn too.
+    # MCP servers used to be declared with MCP_<NAME>_ENABLED / _URL / _API_KEY.
+    # Those vars are ignored now — warn instead of silently losing the server.
+    legacy_mcp = settings.legacy_mcp_env_servers()
+    if legacy_mcp:
+        logger.warning(
+            "MCP_%s_ENABLED is set but MCP servers are declared in MCP_INTEGRATIONS "
+            "now — %s will not be offered to any agent until declared there "
+            "(helm: mcpIntegrations).",
+            "_ENABLED / MCP_".join(s.upper() for s in legacy_mcp),
+            ", ".join(legacy_mcp),
+        )
     if not (settings.mcp_datasources_api_key or "").strip() and settings.oauth_enabled:
         logger.warning(
             "OAUTH_ENABLED is true but MCP_DATASOURCES_API_KEY is not set — "

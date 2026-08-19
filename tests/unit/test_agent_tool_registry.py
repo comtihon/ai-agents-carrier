@@ -8,8 +8,9 @@ Semantics under test:
 - Env vars claimed by any registry tool never ride along in the generic
   credential sweep — they reach an agent only through their tool.
 - Non-tool credentials (ANTHROPIC / HF) are untouched.
-- semble is a stdio MCP candidate on the backend but is never launched inside
-  the backend container (mcp_client skips it).
+- MCP servers follow the same rule: only what MCP_INTEGRATIONS declares is
+  grantable, and a server declared ``eager_start: false`` is never dialled
+  from inside the backend container (mcp_client skips it).
 """
 from __future__ import annotations
 
@@ -52,6 +53,14 @@ REGISTRY = {
     },
 }
 
+# An MCP registry in the same shape — declared by the operator, not the code.
+MCP_REGISTRY = [
+    {"name": "semble", "transport": "stdio", "command": "semble",
+     "prestart_http": False, "eager_start": False},
+    {"name": "tracker-mcp", "transport": "streamable_http",
+     "url": "https://tracker.example/mcp", "api_key_env": "TRACKER_MCP_TOKEN"},
+]
+
 
 @pytest.fixture(autouse=True)
 def _tool_env(monkeypatch):
@@ -60,10 +69,14 @@ def _tool_env(monkeypatch):
     monkeypatch.setenv("TRACKER_USERNAME", "bot@example.com")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-secret")
     monkeypatch.setenv("HF_TOKEN", "hf-secret")
+    monkeypatch.setenv("TRACKER_MCP_TOKEN", "tracker-mcp-secret")
 
 
 def _settings(registry: dict | None = REGISTRY) -> Settings:
-    return Settings(AGENT_TOOLS=json.dumps(registry) if registry else "")
+    return Settings(
+        AGENT_TOOLS=json.dumps(registry) if registry else "",
+        MCP_INTEGRATIONS=json.dumps(MCP_REGISTRY),
+    )
 
 
 def _cfg(addons, registry: dict | None = REGISTRY):
@@ -161,11 +174,25 @@ def test_mcp_addon_with_semble_included_in_mcp_servers():
 
 
 def test_mcp_addon_without_semble_excluded():
-    cfg = _cfg([{"type": "mcp", "servers": {"jira": True}}])
+    cfg = _cfg([{"type": "mcp", "servers": {"tracker-mcp": True}}])
     assert not any(s["name"] == "semble" for s in cfg["mcp_servers"])
 
 
-def test_backend_mcp_client_skips_semble():
-    provider = McpToolsProvider(Settings())
+def test_granted_http_mcp_server_carries_its_resolved_bearer_token():
+    cfg = _cfg([{"type": "mcp", "servers": {"tracker-mcp": True}}])
+    entry = next(s for s in cfg["mcp_servers"] if s["name"] == "tracker-mcp")
+    assert entry["url"] == "https://tracker.example/mcp"
+    assert entry["api_key"] == "tracker-mcp-secret"
+
+
+def test_mcp_server_not_in_registry_is_ignored():
+    cfg = _cfg([{"type": "mcp", "servers": {"tracker-mcp": True, "not-declared": True}}])
+    assert sorted(s["name"] for s in cfg["mcp_servers"]) == ["tracker-mcp"]
+
+
+def test_backend_mcp_client_skips_non_eager_servers():
+    provider = McpToolsProvider(_settings())
     configs = provider._build_server_configs()
-    assert "semble" not in configs
+    assert "semble" not in configs        # eager_start: false
+    assert "datasources" not in configs   # built-in, also eager_start: false
+    assert "tracker-mcp" in configs
