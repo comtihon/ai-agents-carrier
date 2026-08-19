@@ -116,6 +116,30 @@ class OAuthMiddleware(BaseHTTPMiddleware):
         permissions = self.policy.permissions_for_claims(claims)
         request.state.permissions = permissions
 
+        # Shadow mode. With enforcement off the policy grants everything, so the
+        # checks below never fire — but the mapping can still be evaluated and
+        # reported. This is what makes turning enforcement on an evidence-based
+        # decision rather than a hopeful one: any caller that would be locked out
+        # (most likely one holding an opaque token whose userinfo response carries
+        # no project roles) shows up in logs first, while still being served.
+        if not self.policy.enforce:
+            would_grant = self.policy.evaluate_shadow(claims)
+            required_if_enforced = permission_for_method(request.method)
+            if Permission.ACCESS not in would_grant:
+                logger.warning(
+                    "RBAC shadow: subject %s would be DENIED access (no matching role); "
+                    "roles=%s path=%s %s",
+                    claims.get("sub"), sorted(self.policy.roles_of(claims)),
+                    request.method, path,
+                )
+            elif required_if_enforced not in would_grant:
+                logger.warning(
+                    "RBAC shadow: subject %s would be DENIED %s; roles=%s path=%s %s",
+                    claims.get("sub"), required_if_enforced.value,
+                    sorted(self.policy.roles_of(claims)), request.method, path,
+                )
+            return await call_next(request)
+
         # ACCESS is the tenancy gate: an identity the provider issued a valid token
         # for, but which is not entitled to this API at all (a customer, on an
         # identity provider shared with staff).

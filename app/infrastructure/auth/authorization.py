@@ -160,12 +160,30 @@ class AuthorizationPolicy:
         """Permissions granted to a caller holding *roles*."""
         if not self.enforce:
             return frozenset(Permission)
-
         # The tenancy gate is checked first and denies everything on failure, so a
         # customer who happens to hold a role named in read_roles still gets nothing.
+        return self.permissions_for_roles_strict(roles)
+
+    def permissions_for_claims(self, claims: dict[str, Any]) -> frozenset[Permission]:
+        return self.permissions_for_roles(extract_roles(claims, self.project_id))
+
+    def roles_of(self, claims: dict[str, Any]) -> set[str]:
+        """Roles this policy would read from *claims*. Exposed for diagnostics."""
+        return extract_roles(claims, self.project_id)
+
+    def evaluate_shadow(self, claims: dict[str, Any]) -> frozenset[Permission]:
+        """Permissions that *would* be granted if enforcement were on.
+
+        Identical to :meth:`permissions_for_claims` except that it ignores the
+        ``enforce`` flag, so a deployment can measure the effect of turning
+        enforcement on before it does.
+        """
+        return self.permissions_for_roles_strict(self.roles_of(claims))
+
+    def permissions_for_roles_strict(self, roles: set[str]) -> frozenset[Permission]:
+        """Role mapping with the ``enforce`` short-circuit removed."""
         if not (roles & self.access_roles):
             return frozenset()
-
         granted = {Permission.ACCESS}
         for permission, allowed in (
             (Permission.READ, self.read_roles),
@@ -176,9 +194,6 @@ class AuthorizationPolicy:
             if roles & allowed:
                 granted.add(permission)
         return frozenset(granted)
-
-    def permissions_for_claims(self, claims: dict[str, Any]) -> frozenset[Permission]:
-        return self.permissions_for_roles(extract_roles(claims, self.project_id))
 
     def permissions_for_api_key(self) -> frozenset[Permission]:
         """Permissions for the management MCP static key.

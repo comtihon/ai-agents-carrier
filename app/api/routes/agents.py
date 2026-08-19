@@ -74,6 +74,33 @@ async def list_agent_types():
     }
 
 
+@router.get("/tools")
+async def list_agent_tools():
+    """Return the bash-level tools agents can be granted.
+
+    Declared by the operator in ``AGENT_TOOLS``; the UI renders this list in
+    the tools addon instead of a hardcoded set. Secret values never leave the
+    backend — only the env var names a tool fills, and whether every one of
+    them currently resolves.
+    """
+    settings = get_settings()
+    tools = []
+    for name, spec in settings.get_agent_tools().items():
+        resolved = settings.resolve_tool_env(spec)
+        tools.append({
+            "name": name,
+            "label": spec.label or name,
+            "description": spec.description,
+            "command": spec.command,
+            "env_keys": sorted(spec.env),
+            # False when a declared env var has no value behind it — the tool
+            # is grantable but will arrive incomplete.
+            "configured": all(key in resolved for key in spec.env),
+            "cli_tools": sorted(spec.cli_tools),
+        })
+    return tools
+
+
 @router.get("/mcp-integrations")
 async def list_mcp_integrations():
     """Return all known MCP servers with their enabled state."""

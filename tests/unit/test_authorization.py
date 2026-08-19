@@ -211,3 +211,40 @@ def test_ambient_principal_set_and_reset() -> None:
     finally:
         reset_current_permissions(token)
     assert get_current_permissions() == frozenset()
+
+
+# ── shadow mode ──────────────────────────────────────────────────────────────
+# With enforcement off the policy grants everything, so the effect of turning it
+# on has to be measurable some other way. These cover that path, because it is
+# what a rollout decision rests on.
+
+def test_shadow_evaluation_ignores_the_enforce_flag() -> None:
+    policy = _policy(enforce=False)
+    assert policy.permissions_for_claims({"roles": ["CUSTOMER_VIEWER"]}) == frozenset(Permission)
+    assert policy.evaluate_shadow({"roles": ["CUSTOMER_VIEWER"]}) == frozenset()
+
+
+def test_shadow_evaluation_matches_enforcement_for_the_same_roles() -> None:
+    """The two must not drift: shadow logging is only useful if it predicts reality."""
+    enforcing = _policy(enforce=True)
+    shadowing = _policy(enforce=False)
+    for roles in (
+        ["STAFF"],
+        ["STAFF", "AUTHOR"],
+        ["STAFF", "OWNER"],
+        ["STAFF", "PLATFORM_ADMIN"],
+        ["CUSTOMER_VIEWER"],
+        [],
+    ):
+        claims = {"roles": roles}
+        assert shadowing.evaluate_shadow(claims) == enforcing.permissions_for_claims(claims), roles
+
+
+def test_roles_of_reports_what_the_policy_reads() -> None:
+    policy = _policy(project_id="42")
+    assert policy.roles_of({"urn:zitadel:iam:org:project:42:roles": {"STAFF": {}}}) == {"STAFF"}
+
+
+def test_roles_of_is_empty_for_a_token_carrying_no_roles() -> None:
+    """The opaque-token case: userinfo may return a subject and nothing else."""
+    assert _policy().roles_of({"sub": "user-1", "email": "a@b.c"}) == set()

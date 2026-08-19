@@ -8,6 +8,7 @@ still clears it.
 """
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -16,7 +17,7 @@ from langchain_core.language_models.fake_chat_models import FakeMessagesListChat
 from langchain_core.messages import AIMessage
 
 from app.api.app import create_app
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
 from app.core.container import ApplicationContainer
 from app.domain.models.agent_definition import AgentDefinition
 from app.infrastructure.config.graph_loader import YamlGraphRegistry
@@ -160,3 +161,39 @@ async def test_put_addons_accepts_tools_addon(client):
     get_data = get_resp.json()
     tools_addon = next(a for a in get_data["addons"] if a["type"] == "tools")
     assert tools_addon["tools"] == {"github": True, "jira": False, "graphify": True}
+
+
+async def test_list_agent_tools_reports_registry_without_secret_values(client, monkeypatch):
+    c, _ = client
+    monkeypatch.setenv("TRACKER_API_TOKEN", "tracker-secret")
+    monkeypatch.setenv(
+        "AGENT_TOOLS",
+        json.dumps({
+            "tracker": {
+                "label": "Tracker",
+                "description": "issue tracker CLI",
+                "env": {
+                    "TRACKER_TOKEN": {"from_config": "TRACKER_API_TOKEN"},
+                    "TRACKER_URL": {"from_config": "TRACKER_BASE_URL"},
+                },
+            },
+            "grapher": {"command": "grapher", "cli_tools": {"grapher_query": {"args": ["query"]}}},
+        }),
+    )
+    get_settings.cache_clear()
+    try:
+        resp = await c.get("/api/v1/agents/tools")
+        assert resp.status_code == 200
+        by_name = {t["name"]: t for t in resp.json()}
+
+        tracker = by_name["tracker"]
+        assert tracker["label"] == "Tracker"
+        assert tracker["env_keys"] == ["TRACKER_TOKEN", "TRACKER_URL"]
+        # TRACKER_BASE_URL is unset, so the tool is declared but incomplete.
+        assert tracker["configured"] is False
+        assert "tracker-secret" not in resp.text
+
+        assert by_name["grapher"]["command"] == "grapher"
+        assert by_name["grapher"]["cli_tools"] == ["grapher_query"]
+    finally:
+        get_settings.cache_clear()
