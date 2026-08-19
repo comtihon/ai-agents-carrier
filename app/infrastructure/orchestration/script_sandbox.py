@@ -52,11 +52,39 @@ RESULT_MARKER = "__SCRIPT_RESULT__"
 # Modules that would hand a sandboxed script a way out (process spawning,
 # network access, raw memory).  Third-party libraries are already unreachable
 # because the interpreter runs with ``-S`` (no site-packages).
+#
+# The import machinery is on the list as well, and that is the important part:
+# ``importlib.import_module`` does not consult ``builtins.__import__``, so
+# filtering the builtin alone left a three-line path to ``subprocess`` (
+# ``importlib.import_module("subprocess")``, verified).  ``posix``/``nt`` are
+# listed because they are what ``os`` is a wrapper around — ``posix.system``
+# survives deleting ``os.system``.
 _BLOCKED_MODULES = (
     "subprocess", "socket", "ssl", "ctypes", "multiprocessing", "http",
     "urllib", "urllib3", "requests", "httpx", "aiohttp", "ftplib", "smtplib",
     "poplib", "imaplib", "telnetlib", "webbrowser", "xmlrpc", "pty", "tty",
     "fcntl", "mmap", "site",
+    # import machinery and other module loaders
+    "importlib", "imp", "pkgutil", "runpy", "zipimport", "code", "codeop",
+    "_frozen_importlib", "_frozen_importlib_external",
+    # os' backing modules, and the object graph that leads back to them
+    "posix", "nt", "_posixsubprocess", "_socket", "_ssl", "gc", "signal",
+    "resource",
+)
+
+# Pre-imported for the script's benefit before the loaders are torn down: after
+# that only modules already resident in ``sys.modules`` can be imported at all,
+# which is what makes the deny-list above enforceable.  Kept to stdlib that
+# computes rather than reaches out.
+_SANDBOX_STDLIB = (
+    "abc", "array", "base64", "binascii", "bisect", "calendar", "cmath",
+    "collections", "collections.abc", "contextlib", "copy", "csv", "dataclasses",
+    "datetime", "decimal", "difflib", "enum", "fnmatch", "fractions",
+    "functools", "graphlib", "hashlib", "heapq", "hmac", "html", "io",
+    "itertools", "json", "math", "numbers", "operator", "os", "os.path",
+    "pprint", "random", "re", "reprlib", "secrets", "statistics", "string",
+    "struct", "textwrap", "time", "types", "typing", "unicodedata", "uuid",
+    "warnings", "zlib",
 )
 
 # Executed by the sandboxed interpreter.  argv[1] is "-" (read payload from
@@ -84,9 +112,27 @@ for _name in (
 _blocked = {set(_BLOCKED_MODULES)!r}
 _real_import = builtins.__import__
 
+# Load what a script is allowed to use *before* the loaders go away.
+for _name in {tuple(_SANDBOX_STDLIB)!r}:
+    try:
+        _real_import(_name)
+    except Exception:
+        pass
+
+# Remove every way to load a module that is not already resident, so the
+# deny-list below cannot be walked around by asking a different importer.
+sys.meta_path.clear()
+sys.path_hooks.clear()
+sys.path_importer_cache.clear()
+del sys.path[:]
+for _name in list(sys.modules):
+    if _name.split(".")[0] in _blocked:
+        sys.modules.pop(_name, None)
+
 
 def _guarded_import(name, *args, **kwargs):
-    if name.split(".")[0] in _blocked:
+    root = name.split(".")[0]
+    if root in _blocked or root not in sys.modules:
         raise ImportError(
             "module '%s' is not available in sandboxed scripts" % name
         )

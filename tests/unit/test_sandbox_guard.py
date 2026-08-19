@@ -112,8 +112,39 @@ def test_writer_may_not_disable_the_sandbox() -> None:
     assert excinfo.value.step_ids == ["s"]
 
 
-def test_writer_may_submit_sandboxed_steps() -> None:
-    assert_sandbox_allowed([{"id": "s", "type": "python"}], WRITER)
+def test_writer_may_submit_an_isolated_step() -> None:
+    assert_sandbox_allowed(
+        [{"id": "s", "type": "python", "sandbox_runtime": "k8s"}], WRITER
+    )
+    assert_sandbox_allowed(
+        [{"id": "s", "type": "python", "sandbox_runtime": "docker"}], WRITER
+    )
+
+
+def test_writer_may_not_submit_a_step_that_runs_on_the_backend_pod() -> None:
+    """`local` — including the default — is a convenience guard, not a boundary:
+    the script shares the pod filesystem, so it can read the service-account
+    token with a plain `open()`. Letting WRITE have it would make ADMIN a
+    formality that any author walks around by leaving one field unset."""
+    for step in (
+        {"id": "s", "type": "python"},
+        {"id": "s", "type": "python", "sandbox": True},
+        {"id": "s", "type": "python", "sandbox_runtime": "local"},
+        {"id": "s", "type": "python", "sandbox_runtime": "LOCAL"},
+        {"id": "s", "type": "python", "sandbox_runtime": "nonsense"},
+    ):
+        with pytest.raises(SandboxNotPermittedError):
+            assert_sandbox_allowed([step], WRITER)
+
+
+def test_admin_may_submit_a_step_on_the_backend_pod() -> None:
+    assert_sandbox_allowed([{"id": "s", "type": "python"}], ADMIN)
+
+
+def test_non_python_steps_are_never_gated() -> None:
+    assert_sandbox_allowed(
+        [{"id": "a", "type": "http"}, {"id": "b", "type": "llm"}], WRITER
+    )
 
 
 def test_caller_with_no_permissions_is_denied() -> None:
