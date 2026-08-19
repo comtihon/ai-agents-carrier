@@ -18,6 +18,12 @@ from starlette.routing import get_route_path
 from app.api.mcp.datasources_server import get_datasources_mcp, rebuild_datasource_tools
 from app.api.mcp.management_server import get_management_mcp, register_management_tools
 from app.api.middleware.auth import OAuthMiddleware
+from app.infrastructure.auth.authorization import (
+    AuthorizationPolicy,
+    Permission,
+    reset_current_permissions,
+    set_current_permissions,
+)
 from app.api.routes.agent_callbacks import router as agent_callbacks_router
 from app.api.routes.agents import router as agents_router
 from app.api.routes.callbacks import router as callbacks_router
@@ -123,8 +129,10 @@ class _ManagementAuthWrapper:
         api_key: str | None,
         oauth_enabled: bool,
         auth_service: AuthService | None = None,
+        policy: AuthorizationPolicy | None = None,
     ) -> None:
         self._app = app
+        self._policy = policy or AuthorizationPolicy()
         # Strip surrounding whitespace (a Secret Manager value often carries a
         # trailing newline, which no HTTP header value can hold, so an unstripped
         # key could never match); empty / whitespace-only counts as unset.
@@ -147,7 +155,11 @@ class _ManagementAuthWrapper:
         if self._api_key is not None and secrets.compare_digest(
             auth_bytes, b"Bearer " + self._api_key.encode()
         ):
-            await self._app(scope, receive, send)
+            # The static key is capped below ADMIN, so tools guarded on ADMIN
+            # (unsandboxed python steps) refuse it regardless of role config.
+            await self._call_with_principal(
+                self._policy.permissions_for_api_key(), scope, receive, send
+            )
             return
 
         auth_header = auth_bytes.decode("latin-1")
@@ -155,15 +167,38 @@ class _ManagementAuthWrapper:
         if self._oauth_enabled and auth_header.startswith("Bearer "):
             token = auth_header.split(" ", 1)[1]
             try:
-                await self._auth_service.validate_token(token)
+                claims = await self._auth_service.validate_token(token)
             except AuthError as exc:
                 logger.warning("management MCP auth rejected: %s", exc.message)
                 await _send_401(send)
                 return
-            await self._app(scope, receive, send)
+            permissions = self._policy.permissions_for_claims(claims)
+            if Permission.ACCESS not in permissions:
+                logger.warning(
+                    "management MCP authorization rejected: subject %s holds no role "
+                    "granting access",
+                    claims.get("sub"),
+                )
+                await _send_403(send)
+                return
+            await self._call_with_principal(permissions, scope, receive, send)
             return
 
         await _send_401(send)
+
+
+    async def _call_with_principal(self, permissions, scope, receive, send) -> None:
+        """Run the inner app with *permissions* bound for this request's task.
+
+        FastMCP passes no request object to tool bodies, so a tool cannot ask who
+        is calling; it reads the ambient principal instead. Set and reset around
+        the call so nothing leaks between requests.
+        """
+        token = set_current_permissions(permissions)
+        try:
+            await self._app(scope, receive, send)
+        finally:
+            reset_current_permissions(token)
 
 
 class _McpDispatcher:
@@ -202,6 +237,18 @@ async def _send_401(send) -> None:
     await send({
         "type": "http.response.body",
         "body": b'{"detail":"Missing or invalid Authorization header"}',
+    })
+
+
+async def _send_403(send) -> None:
+    await send({
+        "type": "http.response.start",
+        "status": 403,
+        "headers": [(b"content-type", b"application/json")],
+    })
+    await send({
+        "type": "http.response.body",
+        "body": b'{"detail":"Not authorized to access this service"}',
     })
 
 
@@ -463,6 +510,8 @@ def create_app() -> FastAPI:
     app = FastAPI(title=settings.app_name, debug=settings.debug, lifespan=lifespan)
     app.state.settings = settings
     # Built once and shared by OAuthMiddleware and the management MCP gate.
+    authz_policy = AuthorizationPolicy.from_settings(settings)
+    app.state.authz_policy = authz_policy
     auth_service: AuthService | None = None
     if settings.oauth_enabled:
         auth_service = AuthService(
@@ -471,7 +520,7 @@ def create_app() -> FastAPI:
             algorithms=settings.oauth_algorithms,
             audience=settings.oauth_audience,
         )
-        app.add_middleware(OAuthMiddleware, auth_service=auth_service)
+        app.add_middleware(OAuthMiddleware, auth_service=auth_service, policy=authz_policy)
     # CORSMiddleware must be outermost — added after OAuthMiddleware so it wraps it
     app.add_middleware(
         CORSMiddleware,
@@ -527,6 +576,7 @@ def create_app() -> FastAPI:
             api_key=settings.management_mcp_api_key,
             oauth_enabled=settings.oauth_enabled,
             auth_service=auth_service,
+            policy=authz_policy,
         )
     app.mount("/mcp", _McpDispatcher(mcp_routes))
     return app

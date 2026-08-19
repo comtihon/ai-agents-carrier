@@ -508,14 +508,40 @@ async def list_workflows(container: ApplicationContainer = Depends(get_container
     return container.yaml_graph_registry.list_definitions()
 
 
+def _guard_sandbox(request: Request, steps: object) -> None:
+    """Reject unsandboxed python steps unless the caller holds ADMIN.
+
+    Permissions are put on request.state by OAuthMiddleware. When authorization is
+    not enforced the policy grants everything, so this is a no-op — the gate turns
+    on with AUTH_ENFORCE_PERMISSIONS, together with the rest of the model.
+    """
+    from app.infrastructure.auth.authorization import Permission
+    from app.infrastructure.auth.sandbox_guard import (
+        SandboxNotPermittedError,
+        assert_sandbox_allowed,
+    )
+
+    permissions = getattr(request.state, "permissions", None)
+    if permissions is None:
+        # No middleware ran (OAuth disabled, or a direct test client). Fall back to
+        # full permissions so behaviour is unchanged where there is no auth at all.
+        permissions = frozenset(Permission)
+    try:
+        assert_sandbox_allowed(steps, permissions)
+    except SandboxNotPermittedError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
 @router.post("", status_code=201)
 async def create_workflow(
+    request: Request,
     body: WorkflowDefinitionRequest,
     container: ApplicationContainer = Depends(get_container),
 ):
     """Create a new workflow definition and store it in the backend."""
     _require_backend(container)
     assert container.workflow_backend is not None
+    _guard_sandbox(request, body.steps)
 
     existing = await container.workflow_backend.get(body.id)
     if existing is not None:
@@ -818,6 +844,7 @@ async def get_workflow(
 @router.put("/{workflow_id}")
 async def update_workflow(
     workflow_id: str,
+    request: Request,
     body: WorkflowDefinitionUpdateRequest,
     container: ApplicationContainer = Depends(get_container),
 ):
@@ -828,6 +855,8 @@ async def update_workflow(
     """
     _require_backend(container)
     assert container.workflow_backend is not None
+    if body.steps is not None:
+        _guard_sandbox(request, body.steps)
 
     existing = await container.workflow_backend.get(workflow_id)
     if existing is None:

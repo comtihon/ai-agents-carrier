@@ -87,6 +87,61 @@ class McpIntegrationConfig(BaseModel):
     env: dict[str, str] = {}
 
 
+class AgentToolEnvSpec(BaseModel):
+    """How one env var of a tool is filled.
+
+    Either a literal ``value`` or ``from_config`` naming a backend env var /
+    ``.env`` key whose value is copied.  Nothing here is tool-specific — the
+    operator decides which secret feeds which variable.
+    """
+
+    value: str | None = None
+    from_config: str | None = None
+
+
+class AgentToolCliSpec(BaseModel):
+    """A CLI invocation exposed to the agent as an MCP-style tool call.
+
+    ``args`` is an argv template: ``{name}`` placeholders are filled from the
+    tool-call arguments, ``{name|fallback}`` supplies a default.  ``optional``
+    appends extra argv only when that argument is present.  Lets a CLI-only
+    tool (no HTTP MCP mode) be routed through the agent's mcp() gateway without
+    the agent knowing the command's grammar.
+    """
+
+    args: list[str] = Field(default_factory=list)
+    # Tool-call arguments that must be present; missing ones are an error.
+    required: list[str] = Field(default_factory=list)
+    # arg-name → argv fragment appended when the caller supplied that arg.
+    optional: dict[str, list[str]] = Field(default_factory=dict)
+    # Working directory template, e.g. "{repo}".
+    cwd: str | None = None
+    # Files that must exist under cwd for the call to make sense.
+    requires_files: list[str] = Field(default_factory=list)
+    description: str = ""
+
+
+class AgentToolSpec(BaseModel):
+    """One bash-level tool an agent may be granted.
+
+    Declared entirely in configuration (``AGENT_TOOLS``) so that neither the
+    backend nor the agent image carries knowledge of any specific tool: the
+    backend resolves ``env`` and ships it with the tool, the agent checks that
+    ``command`` exists locally and registers what it can actually run.
+    """
+
+    label: str = ""
+    description: str = ""
+    # Binary the agent needs on PATH for this tool to be usable.
+    command: str | None = None
+    # env var name → how to fill it.
+    env: dict[str, AgentToolEnvSpec] = Field(default_factory=dict)
+    # Regex matching bash commands that exercise this tool (UI/gating hint).
+    bash_match: str | None = None
+    # MCP-style tool name → CLI invocation template.
+    cli_tools: dict[str, AgentToolCliSpec] = Field(default_factory=dict)
+
+
 # Env vars that look like credentials by suffix but belong to the backend only.
 _SYSTEM_ONLY_ALIASES = {
     "WEBHOOK_SECRET",
@@ -151,6 +206,24 @@ class Settings(BaseSettings):
     oauth_issuer: str | None = Field(default=None, alias="OAUTH_ISSUER")
     oauth_audience: str | None = Field(default=None, alias="OAUTH_AUDIENCE")
     oauth_algorithms: list[str] = Field(default=["RS256"], alias="OAUTH_ALGORITHMS")
+
+    # --- Role-based authorization (see app.infrastructure.auth.authorization) ---
+    # Off by default so an upgrade cannot lock out an existing deployment; the
+    # policy logs a warning at startup while it is off.
+    auth_enforce_permissions: bool = Field(default=False, alias="AUTH_ENFORCE_PERMISSIONS")
+    # Identity-provider project id, used to read the standard
+    # urn:zitadel:iam:org:project:<id>:roles claim that machine-user tokens carry.
+    auth_project_id: str | None = Field(default=None, alias="AUTH_PROJECT_ID")
+    # Role names, supplied per deployment. Empty lists are meaningful: with
+    # enforcement on, an empty AUTH_ACCESS_ROLES rejects everything (fail closed)
+    # and an empty AUTH_ADMIN_ROLES means nobody can create unsandboxed steps.
+    # AUTH_ACCESS_ROLES is an allow-list: it is what keeps an identity provider
+    # shared with customers from granting them access to this API.
+    auth_access_roles: list[str] = Field(default_factory=list, alias="AUTH_ACCESS_ROLES")
+    auth_read_roles: list[str] = Field(default_factory=list, alias="AUTH_READ_ROLES")
+    auth_write_roles: list[str] = Field(default_factory=list, alias="AUTH_WRITE_ROLES")
+    auth_delete_roles: list[str] = Field(default_factory=list, alias="AUTH_DELETE_ROLES")
+    auth_admin_roles: list[str] = Field(default_factory=list, alias="AUTH_ADMIN_ROLES")
 
     # --- Outbound service identity (OAuth2 JWT bearer grant, RFC 7523) ---
     # When enabled, the backend mints its own access tokens from an OAuth2
@@ -237,6 +310,13 @@ class Settings(BaseSettings):
     groq_api_key: str | None = Field(default=None, alias="GROQ_API_KEY")
     mistral_api_key: str | None = Field(default=None, alias="MISTRAL_API_KEY")
     google_application_credentials_json: str | None = Field(default=None, alias="GOOGLE_APPLICATION_CREDENTIALS_JSON")
+
+    # --- Agent tool registry ---
+    # JSON object declaring the bash-level tools agents may be granted:
+    #   {"<name>": {"command": "...", "env": {"ENV": {"from_config": "KEY"}}}}
+    # Empty by default: an agent's tools addon can only enable what is declared
+    # here, and a tool that is not declared grants nothing.
+    agent_tools_json: str = Field(default="", alias="AGENT_TOOLS")
 
     # --- K8s agent runtime ---
     # Namespace where K8sRuntime deploys agent Helm releases.
@@ -457,6 +537,66 @@ class Settings(BaseSettings):
             if integration.name.lower() == target:
                 return integration
         return None
+
+    def get_agent_tools(self) -> dict[str, AgentToolSpec]:
+        """Parse the AGENT_TOOLS JSON object into a typed registry."""
+        if not self.agent_tools_json:
+            return {}
+        raw = json.loads(self.agent_tools_json)
+        if not isinstance(raw, dict):
+            raise ValueError("AGENT_TOOLS must be a JSON object of {tool_name: spec}")
+        return {name: AgentToolSpec.model_validate(spec) for name, spec in raw.items()}
+
+    def get_config_value(self, key: str) -> str | None:
+        """Read one config key from os.environ, falling back to the .env file.
+
+        Used to resolve a tool's ``from_config`` references.  Unlike
+        ``get_forwardable_config`` this does not filter by credential suffix —
+        a tool needs its endpoint and identity variables too, and the operator
+        named the key explicitly.
+        """
+        val = os.environ.get(key)
+        if val:
+            return val
+        from dotenv import dotenv_values
+        env_file = self.model_config.get("env_file", ".env")
+        if not env_file:
+            return None
+        try:
+            return (dotenv_values(env_file) or {}).get(key) or None
+        except Exception:
+            return None
+
+    def resolve_tool_env(self, spec: AgentToolSpec) -> dict[str, str]:
+        """Resolve a tool's declared env vars to concrete values.
+
+        Unresolvable entries are dropped rather than sent empty, so the agent
+        can tell "not configured" from "configured as empty".
+        """
+        resolved: dict[str, str] = {}
+        for env_name, env_spec in spec.env.items():
+            if env_spec.value is not None:
+                resolved[env_name] = env_spec.value
+                continue
+            if env_spec.from_config:
+                val = self.get_config_value(env_spec.from_config)
+                if val:
+                    resolved[env_name] = val
+        return resolved
+
+    def tool_env_keys(self) -> set[str]:
+        """Every env var name claimed by some tool in the registry.
+
+        These are stripped from the generic credential sweep so that a tool's
+        secrets reach an agent only through that tool.
+        """
+        keys: set[str] = set()
+        for spec in self.get_agent_tools().values():
+            keys.update(spec.env)
+            for env_spec in spec.env.values():
+                if env_spec.from_config:
+                    keys.add(env_spec.from_config)
+        return keys
 
     def get_forwardable_config(self) -> dict[str, str]:
         """Return {NAME: value} for all credential-like env vars currently set.
