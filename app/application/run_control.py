@@ -27,6 +27,8 @@ from typing import TYPE_CHECKING, Any
 
 from langgraph.types import Command
 
+from app.infrastructure.auth.authorization import Permission, missing_permission
+
 if TYPE_CHECKING:
     from app.core.container import ApplicationContainer
     from app.domain.models.graph_run import GraphRun
@@ -42,6 +44,32 @@ class RunControlError(Exception):
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
+
+
+def _require_write() -> None:
+    """Refuse a run-control operation the calling principal may not perform.
+
+    Controlling a live run — terminating it, resuming it past an approval gate,
+    replaying steps — is a mutation, so it needs WRITE. The REST routes already
+    get that from their HTTP method; this check is what gives the same guarantee
+    to the surfaces that reach these cores through a single ``POST``: the
+    ``/mcp/management`` tools, whose transport wrapper checks only the ACCESS
+    tier, and the chat agent's run-control tools.
+
+    Raised rather than returned: every other refusal here is a
+    ``RunControlError``, which REST turns into an HTTPException and the tool
+    surfaces into an error string, so a 403 needs no new failure mode.
+
+    An unbound principal (no authenticating wrapper ran — a Slack approval
+    callback, a webhook, an in-process caller) is allowed; see
+    ``missing_permission``.
+    """
+    if missing_permission(Permission.WRITE):
+        raise RunControlError(
+            403,
+            "Missing 'write' permission: controlling a run requires a role that "
+            "grants write access.",
+        )
 
 
 def _config(thread_id: str) -> dict:
@@ -81,6 +109,7 @@ async def terminate_run(
     container: "ApplicationContainer", run_id: str
 ) -> "GraphRun":
     """Terminate a running agent and mark the run as failed."""
+    _require_write()
     run = await container.run_repository.get(run_id)
     if run is None:
         raise RunControlError(404, "Run not found")
@@ -121,6 +150,7 @@ async def approve_run(
     container: "ApplicationContainer", run_id: str
 ) -> "tuple[GraphRun, YamlGraphRunner]":
     """Claim a waiting run for approval; the caller schedules ``_resume_approved``."""
+    _require_write()
     run = await _claim_for_resume(container, run_id)
     runner = _require_runner(run, container)
 
@@ -139,6 +169,7 @@ async def reject_run(
     container: "ApplicationContainer", run_id: str
 ) -> "tuple[GraphRun, YamlGraphRunner]":
     """Claim a waiting run for rejection; the caller schedules ``_resume_rejected``."""
+    _require_write()
     run = await _claim_for_resume(container, run_id)
     runner = _require_runner(run, container)
 
@@ -218,6 +249,7 @@ async def retry_run(
 
     The caller schedules ``_retry_graph(runner, run, container, resume_input)``.
     """
+    _require_write()
     run = await container.run_repository.get(run_id)
     if run is None:
         raise RunControlError(404, "Run not found")
@@ -280,6 +312,7 @@ async def restart_from_step(
 
     The caller schedules ``_retry_graph(runner, run, container, resume_input)``.
     """
+    _require_write()
     run = await container.run_repository.get(run_id)
     if run is None:
         raise RunControlError(404, "Run not found")

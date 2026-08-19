@@ -1,0 +1,288 @@
+"""Every management operation requires its own tier, on every surface.
+
+The REST API derives the required permission from the HTTP method, which the tool
+surfaces cannot do: the ``/mcp/management`` tools and the chat agent's platform
+tools all arrive as one ``POST``, and the management wrapper checks only the
+ACCESS tier. So the gate lives on the shared cores in
+``app.application.management_tools`` / ``app.application.run_control`` — the same
+functions all three surfaces call — and these tests drive those cores directly
+with an ambient principal, which is how the authenticating ASGI wrapper hands
+identity to a FastMCP tool body.
+
+The distinction that matters throughout: a principal *bound with nothing* is a
+real authenticated caller whose roles grant nothing, and is denied; an *unbound*
+principal means no authenticating wrapper ran at all (OAuth disabled, a Slack
+callback, a Pub/Sub trigger, an in-process call) and is allowed, which is the
+pre-RBAC posture the REST routes fall back to as well.
+"""
+from __future__ import annotations
+
+import pytest
+
+from app.application import management_tools as core
+from app.application import run_control
+from app.application.management_tools import ManagementDeps
+from app.infrastructure.auth.authorization import (
+    Permission,
+    set_current_permissions,
+)
+
+
+ACCESS_ONLY = frozenset({Permission.ACCESS})
+READER = frozenset({Permission.ACCESS, Permission.READ})
+WRITER = frozenset({Permission.ACCESS, Permission.READ, Permission.WRITE})
+DELETER = frozenset(
+    {Permission.ACCESS, Permission.READ, Permission.WRITE, Permission.DELETE}
+)
+
+
+class _FakeWorkflowBackend:
+    def __init__(self) -> None:
+        self.deleted: list[str] = []
+        self.created: list[object] = []
+
+    async def get(self, workflow_id: str):
+        return None
+
+    async def create(self, definition) -> None:
+        self.created.append(definition)
+
+    async def delete(self, workflow_id: str) -> None:
+        self.deleted.append(workflow_id)
+
+
+class _FakeRegistry:
+    def list_definitions(self) -> list[dict]:
+        return [{"id": "wf", "name": "Workflow"}]
+
+
+@pytest.fixture
+def backend() -> _FakeWorkflowBackend:
+    return _FakeWorkflowBackend()
+
+
+@pytest.fixture
+def deps(backend: _FakeWorkflowBackend) -> ManagementDeps:
+    return ManagementDeps(
+        registry=_FakeRegistry(), run_repository=None, workflow_backend=backend
+    )
+
+
+# ── The map itself ────────────────────────────────────────────────────────────
+#
+# Snapshot of every tool the management MCP publishes and the tier it needs. It
+# is asserted against the live registration, so adding a tool fails here until
+# somebody classifies it — the tool equivalent of the method table that covers
+# the REST routes.
+
+EXPECTED_TOOL_PERMISSIONS: dict[str, Permission] = {
+    # workflows / runs
+    "list_workflows": Permission.READ,
+    "run_workflow": Permission.WRITE,
+    "list_runs": Permission.READ,
+    "get_run": Permission.READ,
+    "create_workflow": Permission.WRITE,
+    "update_workflow": Permission.WRITE,
+    "delete_workflow": Permission.DELETE,
+    # agent definitions
+    "list_agents": Permission.READ,
+    "get_agent": Permission.READ,
+    "create_agent": Permission.WRITE,
+    "update_agent": Permission.WRITE,
+    "delete_agent": Permission.DELETE,
+    # data sources
+    "list_datasources": Permission.READ,
+    "create_datasource": Permission.WRITE,
+    "update_datasource": Permission.WRITE,
+    "delete_datasource": Permission.DELETE,
+    "create_pubsub_datasource": Permission.WRITE,
+    "list_pubsub_subscriptions": Permission.READ,
+    # Fetches an arbitrary remote URL with optional credentials, so it is a
+    # WRITE-tier action even though it only returns a description of a spec.
+    "import_datasource_schema": Permission.WRITE,
+    "create_datasource_from_schema": Permission.WRITE,
+    "add_datasource_operations_from_schema": Permission.WRITE,
+    # run control — gated inside app.application.run_control, which raises
+    # RunControlError(403) instead of returning a refusal string.
+    "terminate_run": Permission.WRITE,
+    "retry_run": Permission.WRITE,
+    "restart_from_step": Permission.WRITE,
+    "approve_run": Permission.WRITE,
+    "reject_run": Permission.WRITE,
+}
+
+_RUN_CONTROL_TOOLS = {
+    "terminate_run", "retry_run", "restart_from_step", "approve_run", "reject_run",
+}
+
+
+def _registered_tool_names() -> list[str]:
+    from app.api.mcp.management_server import register_management_tools
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.names: list[str] = []
+
+        def add_tool(self, handler, name: str) -> None:
+            self.names.append(name)
+
+    recorder = _Recorder()
+    register_management_tools(recorder, lambda: None)
+    return recorder.names
+
+
+def test_every_published_tool_is_classified() -> None:
+    assert set(_registered_tool_names()) == set(EXPECTED_TOOL_PERMISSIONS)
+
+
+@pytest.mark.parametrize(
+    "name",
+    sorted(set(EXPECTED_TOOL_PERMISSIONS) - _RUN_CONTROL_TOOLS),
+)
+def test_shared_core_declares_the_expected_permission(name: str) -> None:
+    """The gate is on the core, so both surfaces inherit it."""
+    assert getattr(core, name).required_permission is EXPECTED_TOOL_PERMISSIONS[name]
+
+
+# ── Denials ───────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_reader_cannot_create_a_workflow(deps, backend) -> None:
+    set_current_permissions(READER)
+    result = await core.create_workflow(deps, "wf", "WF", "d", "[]")
+    assert "Not permitted" in result and "write" in result
+    assert backend.created == []
+
+
+@pytest.mark.asyncio
+async def test_reader_cannot_delete_a_workflow(deps, backend) -> None:
+    set_current_permissions(READER)
+    result = await core.delete_workflow(deps, "wf")
+    assert "Not permitted" in result and "delete" in result
+    assert backend.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_writer_cannot_delete_a_workflow(deps, backend) -> None:
+    """WRITE is enough to POST, so without its own tier DELETE would come free."""
+    set_current_permissions(WRITER)
+    result = await core.delete_workflow(deps, "wf")
+    assert "Not permitted" in result and "delete" in result
+    assert backend.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_access_only_principal_cannot_even_list(deps) -> None:
+    set_current_permissions(ACCESS_ONLY)
+    result = core.list_workflows(deps)
+    assert "Not permitted" in result and "read" in result
+
+
+@pytest.mark.asyncio
+async def test_reader_may_list(deps) -> None:
+    set_current_permissions(READER)
+    assert "Not permitted" not in core.list_workflows(deps)
+
+
+@pytest.mark.asyncio
+async def test_deleter_may_delete(deps, backend) -> None:
+    set_current_permissions(DELETER)
+    result = await core.delete_workflow(deps, "wf")
+    assert "Not permitted" not in result
+
+
+@pytest.mark.asyncio
+async def test_unbound_principal_is_allowed(deps, backend) -> None:
+    """No wrapper ran: an internal caller, or a deployment with auth switched off."""
+    result = await core.delete_workflow(deps, "wf")
+    assert "Not permitted" not in result
+
+
+# ── Run control ───────────────────────────────────────────────────────────────
+
+class _FakeRunRepository:
+    async def get(self, run_id: str):
+        return None
+
+    async def claim_for_resume(self, run_id: str):
+        return None
+
+
+class _FakeContainer:
+    def __init__(self) -> None:
+        self.run_repository = _FakeRunRepository()
+        self.live_runners: dict = {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "args"),
+    [
+        (run_control.terminate_run, ()),
+        (run_control.approve_run, ()),
+        (run_control.reject_run, ()),
+        (run_control.retry_run, ()),
+        (run_control.restart_from_step, ("step",)),
+    ],
+)
+async def test_reader_cannot_control_a_run(operation, args) -> None:
+    set_current_permissions(READER)
+    with pytest.raises(run_control.RunControlError) as exc:
+        await operation(_FakeContainer(), "run-1", *args)
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_writer_passes_the_run_control_gate() -> None:
+    """The 404 proves the gate let it through to the run lookup."""
+    set_current_permissions(WRITER)
+    with pytest.raises(run_control.RunControlError) as exc:
+        await run_control.terminate_run(_FakeContainer(), "missing")
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_unbound_principal_passes_the_run_control_gate() -> None:
+    """A Slack approval callback carries no roles and must still work."""
+    with pytest.raises(run_control.RunControlError) as exc:
+        await run_control.terminate_run(_FakeContainer(), "missing")
+    assert exc.value.status_code == 404
+
+
+# ── The REST write path (same gate, different transport) ───────────────────────
+
+UNSANDBOXED = [{"id": "danger", "type": "python", "sandbox": False, "code": "print(1)"}]
+
+
+def _request(permissions=...):
+    from types import SimpleNamespace
+
+    state = SimpleNamespace()
+    if permissions is not ...:
+        state.permissions = permissions
+    return SimpleNamespace(state=state)
+
+
+def test_rest_write_path_refuses_an_unsandboxed_step_without_admin() -> None:
+    """POST/PUT /workflows share this gate; WRITE must not be enough for it."""
+    from fastapi import HTTPException
+
+    from app.api.routes.workflows import _guard_sandbox
+
+    with pytest.raises(HTTPException) as exc:
+        _guard_sandbox(_request(WRITER), UNSANDBOXED)
+    assert exc.value.status_code == 403
+    assert "admin" in str(exc.value.detail).lower()
+
+
+def test_rest_write_path_allows_an_unsandboxed_step_for_admin() -> None:
+    from app.api.routes.workflows import _guard_sandbox
+
+    _guard_sandbox(_request(frozenset(Permission)), UNSANDBOXED)
+
+
+def test_rest_write_path_falls_back_to_full_access_without_middleware() -> None:
+    """OAuth disabled: no middleware ran, so behaviour is the pre-RBAC one."""
+    from app.api.routes.workflows import _guard_sandbox
+
+    _guard_sandbox(_request(), UNSANDBOXED)

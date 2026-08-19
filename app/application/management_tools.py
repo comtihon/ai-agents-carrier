@@ -15,6 +15,8 @@ graph via ``interrupt()`` and only makes sense inside the chat agent.
 from __future__ import annotations
 
 import asyncio
+import functools
+import inspect
 import json
 import logging
 from dataclasses import dataclass
@@ -22,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from app.domain.models.graph_run import GraphRun
+from app.infrastructure.auth.authorization import Permission, missing_permission
 from app.infrastructure.orchestration.yaml_graph import stream_graph_to_pause
 
 if TYPE_CHECKING:
@@ -42,6 +45,58 @@ logger = logging.getLogger(__name__)
 # (the chat agent and /mcp/management) share this set — it is process-global on
 # purpose, and nothing keys off its identity.
 _background_tasks: set[asyncio.Task] = set()
+
+
+def _refusal(required: Permission) -> str:
+    return (
+        f"Not permitted: this operation requires the '{required.value}' permission "
+        "and the calling identity does not hold a role that grants it."
+    )
+
+
+def requires(permission: Permission):
+    """Gate a shared core on *permission*.
+
+    The REST API derives its requirement from the HTTP method, which cannot work
+    here: every tool below is reached by one ``POST`` — to ``/mcp/management``, or
+    to the chat endpoint that hands the same operations to an LLM. Without a gate
+    of their own, holding WRITE (enough to POST) would be enough to delete, and
+    holding only READ would still be enough for everything, because the
+    management-MCP wrapper checks the ACCESS tier alone.
+
+    The decorator is deliberately on the shared core rather than on either
+    surface's wrapper: that is the whole reason this module exists, and a gate
+    attached to one surface would simply be bypassed through the other.
+
+    Refusals are returned as text, not raised. These are tool bodies whose return
+    value is what the model sees, and every other failure here (unknown id,
+    invalid JSON) is reported the same way.
+    """
+    def decorator(fn):
+        if inspect.iscoroutinefunction(fn):
+            @functools.wraps(fn)
+            async def async_gate(*args, **kwargs):
+                if missing_permission(permission):
+                    logger.warning(
+                        "tool %s refused: caller lacks %s", fn.__name__, permission.value
+                    )
+                    return _refusal(permission)
+                return await fn(*args, **kwargs)
+            async_gate.required_permission = permission
+            return async_gate
+
+        @functools.wraps(fn)
+        def gate(*args, **kwargs):
+            if missing_permission(permission):
+                logger.warning(
+                    "tool %s refused: caller lacks %s", fn.__name__, permission.value
+                )
+                return _refusal(permission)
+            return fn(*args, **kwargs)
+        gate.required_permission = permission
+        return gate
+
+    return decorator
 
 
 def _spawn_background(coro, label: str) -> None:
@@ -177,6 +232,7 @@ async def _publish_datasources(deps: ManagementDeps) -> None:
 # Workflow / run tools
 # ---------------------------------------------------------------------------
 
+@requires(Permission.READ)
 def list_workflows(deps: ManagementDeps) -> str:
     defs = deps.registry.list_definitions()
     if not defs:
@@ -188,6 +244,7 @@ def list_workflows(deps: ManagementDeps) -> str:
     return "\n".join(lines)
 
 
+@requires(Permission.WRITE)
 async def run_workflow(
     deps: ManagementDeps,
     workflow_id: str,
@@ -232,6 +289,7 @@ async def run_workflow(
     })
 
 
+@requires(Permission.READ)
 async def list_runs(
     deps: ManagementDeps, workflow_id: str | None = None, limit: int = 10
 ) -> str:
@@ -250,6 +308,7 @@ async def list_runs(
     return "\n".join(lines)
 
 
+@requires(Permission.READ)
 async def get_run(deps: ManagementDeps, run_id: str) -> str:
     run = await deps.run_repository.get(run_id)
     if run is None:
@@ -303,6 +362,7 @@ def _sandbox_denial(steps: Any) -> str | None:
     return None
 
 
+@requires(Permission.WRITE)
 async def create_workflow(
     deps: ManagementDeps, workflow_id: str, name: str, description: str, steps_json: str
 ) -> str:
@@ -331,6 +391,7 @@ async def create_workflow(
     return f"Workflow '{workflow_id}' created with {len(steps)} step(s)."
 
 
+@requires(Permission.WRITE)
 async def update_workflow(
     deps: ManagementDeps,
     workflow_id: str,
@@ -373,6 +434,7 @@ async def update_workflow(
     return f"Workflow '{workflow_id}' updated."
 
 
+@requires(Permission.DELETE)
 async def delete_workflow(deps: ManagementDeps, workflow_id: str) -> str:
     if deps.workflow_backend is None:
         return "Workflow deletion unavailable: no persistent backend configured."
@@ -400,6 +462,7 @@ async def delete_workflow(deps: ManagementDeps, workflow_id: str) -> str:
 # Agent definition tools
 # ---------------------------------------------------------------------------
 
+@requires(Permission.READ)
 async def list_agents(deps: ManagementDeps) -> str:
     if deps.agent_backend is None:
         return "Agent backend not configured."
@@ -410,6 +473,7 @@ async def list_agents(deps: ManagementDeps) -> str:
     return "\n".join(lines)
 
 
+@requires(Permission.READ)
 async def get_agent(deps: ManagementDeps, agent_id: str) -> str:
     if deps.agent_backend is None:
         return "Agent backend not configured."
@@ -423,6 +487,7 @@ async def get_agent(deps: ManagementDeps, agent_id: str) -> str:
     return _json.dumps(agent.model_dump(mode="json"), indent=2, default=str)
 
 
+@requires(Permission.WRITE)
 async def create_agent(
     deps: ManagementDeps,
     agent_id: str,
@@ -457,6 +522,7 @@ async def create_agent(
     return f"Agent '{agent_id}' created."
 
 
+@requires(Permission.WRITE)
 async def update_agent(
     deps: ManagementDeps,
     agent_id: str,
@@ -496,6 +562,7 @@ async def update_agent(
     return f"Agent '{resolved}' updated."
 
 
+@requires(Permission.DELETE)
 async def delete_agent(deps: ManagementDeps, agent_id: str) -> str:
     if deps.agent_backend is None:
         return "Agent backend not configured."
@@ -510,6 +577,7 @@ async def delete_agent(deps: ManagementDeps, agent_id: str) -> str:
 # Data source tools
 # ---------------------------------------------------------------------------
 
+@requires(Permission.READ)
 async def list_datasources(deps: ManagementDeps) -> str:
     if deps.data_source_backend is None:
         return "Data source backend not configured."
@@ -532,6 +600,7 @@ async def list_datasources(deps: ManagementDeps) -> str:
     return "\n".join(lines)
 
 
+@requires(Permission.WRITE)
 async def create_pubsub_datasource(
     deps: ManagementDeps,
     source_id: str,
@@ -591,6 +660,7 @@ async def create_pubsub_datasource(
     )
 
 
+@requires(Permission.READ)
 def list_pubsub_subscriptions(deps: ManagementDeps) -> str:
     """Report which workflow steps are currently subscribed, and to what."""
     if deps.pubsub_subscriber is None:
@@ -603,6 +673,7 @@ def list_pubsub_subscriptions(deps: ManagementDeps) -> str:
     )
 
 
+@requires(Permission.WRITE)
 async def create_datasource(
     deps: ManagementDeps,
     source_id: str,
@@ -655,6 +726,7 @@ async def create_datasource(
     return f"Data source '{source_id}' created with {len(defn.operations)} operation(s)."
 
 
+@requires(Permission.WRITE)
 async def update_datasource(
     deps: ManagementDeps,
     source_id: str,
@@ -780,6 +852,7 @@ def _select_operations(spec: dict, names_csv: str):
     return [available[n] for n in wanted], None
 
 
+@requires(Permission.WRITE)
 async def import_datasource_schema(
     deps: ManagementDeps, schema_url: str, kind: str = "http", auth_json: str = ""
 ) -> str:
@@ -805,6 +878,7 @@ async def import_datasource_schema(
     return "\n".join(lines)
 
 
+@requires(Permission.WRITE)
 async def create_datasource_from_schema(
     deps: ManagementDeps,
     source_id: str,
@@ -871,6 +945,7 @@ async def create_datasource_from_schema(
     )
 
 
+@requires(Permission.WRITE)
 async def add_datasource_operations_from_schema(
     deps: ManagementDeps,
     source_id: str,
@@ -921,6 +996,7 @@ async def add_datasource_operations_from_schema(
     )
 
 
+@requires(Permission.DELETE)
 async def delete_datasource(deps: ManagementDeps, source_id: str) -> str:
     if deps.data_source_backend is None:
         return "Data source deletion unavailable: no persistent backend configured."
