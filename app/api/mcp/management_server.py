@@ -304,10 +304,7 @@ def register_management_tools(
         project_id: str = "",
         description: str = "",
     ) -> str:
-        """Register a Pub/Sub topic as a reusable data source for triggers.
-
-        A `pubsub` trigger step can then say `datasource: <source_id>` instead of
-        repeating the topic, event schema and subscription in every workflow.
+        """Deprecated — use create_event. Registers the topic as an event.
 
         Args:
             source_id: Unique kebab-case identifier (e.g. "orders-events").
@@ -319,7 +316,7 @@ def register_management_tools(
                 "required": [...], "properties": {...}}). Events that do not
                 match it never start a run.
             subscription: Existing subscription to pull from. Leave empty to have
-                one created on first use and saved back onto this data source.
+                one created on first use and saved back onto this event.
             project_id: Project override; empty uses the backend's PUBSUB_PROJECT_ID.
             description: What this topic carries.
         """
@@ -327,6 +324,81 @@ def register_management_tools(
             deps(), source_id, name, topic, event_schema_json, subscription, project_id,
             description,
         )
+
+    async def list_events() -> str:
+        """List the events (Pub/Sub topics) workflows can be triggered by."""
+        return await core.list_events(deps())
+
+    async def create_event(
+        event_id: str,
+        name: str,
+        topic: str,
+        event_schema_json: str = "",
+        subscription: str = "",
+        project_id: str = "",
+        description: str = "",
+    ) -> str:
+        """Register a Pub/Sub topic as a reusable event for triggers.
+
+        A `pubsub` trigger step can then say `event: <event_id>` instead of
+        repeating the topic, event schema and subscription in every workflow.
+
+        Args:
+            event_id: Unique kebab-case identifier (e.g. "orders-events").
+            name: Human-readable display name. Refused when another event
+                already uses it — rename, or update that event instead.
+            topic: Topic short name ("orders") or full path
+                ("projects/<project>/topics/orders").
+            event_schema_json: Optional JSON object describing the message payload —
+                same shape as an operation response_schema ({"type": "object",
+                "required": [...], "properties": {...}}). Events that do not
+                match it never start a run.
+            subscription: Existing subscription to pull from. Leave empty to have
+                one created on first use and saved back onto this event.
+            project_id: Project override; empty uses the backend's PUBSUB_PROJECT_ID.
+            description: What this topic carries.
+        """
+        return await core.create_event(
+            deps(), event_id, name, topic, event_schema_json, subscription, project_id,
+            description,
+        )
+
+    async def update_event(
+        event_id: str,
+        name: str | None = None,
+        description: str | None = None,
+        topic: str | None = None,
+        subscription: str | None = None,
+        project_id: str | None = None,
+        event_schema_json: str | None = None,
+    ) -> str:
+        """Change an existing event; omitted fields keep their stored value.
+
+        Args:
+            event_id: The event id or name.
+            name: New display name (omit to keep current).
+            description: New description (omit to keep current).
+            topic: New topic (omit to keep current).
+            subscription: New subscription to pull from (omit to keep current).
+            project_id: New project override (omit to keep current).
+            event_schema_json: JSON object replacing the event schema (omit to
+                keep current).
+        """
+        return await core.update_event(
+            deps(), event_id, name, description, topic, subscription, project_id,
+            event_schema_json,
+        )
+
+    async def delete_event(event_id: str) -> str:
+        """Permanently delete an event.
+
+        Workflow steps still pointing at it stop resolving, so check
+        list_workflows first.
+
+        Args:
+            event_id: The event id or name.
+        """
+        return await core.delete_event(deps(), event_id)
 
     async def list_pubsub_subscriptions() -> str:
         """List which workflow steps are subscribed to Pub/Sub, and to what."""
@@ -553,6 +625,7 @@ def register_management_tools(
         list_datasources, create_datasource, update_datasource,
         delete_datasource, import_datasource_schema,
         create_pubsub_datasource, list_pubsub_subscriptions,
+        list_events, create_event, update_event, delete_event,
         create_datasource_from_schema, add_datasource_operations_from_schema,
         terminate_run, retry_run, restart_from_step, approve_run, reject_run,
     ]
