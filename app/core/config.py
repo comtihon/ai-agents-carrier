@@ -152,6 +152,24 @@ class Settings(BaseSettings):
     oauth_audience: str | None = Field(default=None, alias="OAUTH_AUDIENCE")
     oauth_algorithms: list[str] = Field(default=["RS256"], alias="OAUTH_ALGORITHMS")
 
+    # --- Role-based authorization (see app.infrastructure.auth.authorization) ---
+    # Off by default so an upgrade cannot lock out an existing deployment; the
+    # policy logs a warning at startup while it is off.
+    auth_enforce_permissions: bool = Field(default=False, alias="AUTH_ENFORCE_PERMISSIONS")
+    # Identity-provider project id, used to read the standard
+    # urn:zitadel:iam:org:project:<id>:roles claim that machine-user tokens carry.
+    auth_project_id: str | None = Field(default=None, alias="AUTH_PROJECT_ID")
+    # Role names, supplied per deployment. Empty lists are meaningful: with
+    # enforcement on, an empty AUTH_ACCESS_ROLES rejects everything (fail closed)
+    # and an empty AUTH_ADMIN_ROLES means nobody can create unsandboxed steps.
+    # AUTH_ACCESS_ROLES is an allow-list: it is what keeps an identity provider
+    # shared with customers from granting them access to this API.
+    auth_access_roles: list[str] = Field(default_factory=list, alias="AUTH_ACCESS_ROLES")
+    auth_read_roles: list[str] = Field(default_factory=list, alias="AUTH_READ_ROLES")
+    auth_write_roles: list[str] = Field(default_factory=list, alias="AUTH_WRITE_ROLES")
+    auth_delete_roles: list[str] = Field(default_factory=list, alias="AUTH_DELETE_ROLES")
+    auth_admin_roles: list[str] = Field(default_factory=list, alias="AUTH_ADMIN_ROLES")
+
     # --- Outbound service identity (OAuth2 JWT bearer grant, RFC 7523) ---
     # When enabled, the backend mints its own access tokens from an OAuth2
     # authorization server using a signed client assertion, and attaches them
