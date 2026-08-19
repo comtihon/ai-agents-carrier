@@ -205,7 +205,7 @@ def build_default_workflow(
         workflow_id: str,
         name: str | None = None,
         description: str | None = None,
-        steps_json: str | None = None,
+        steps_json: str = "",
     ) -> str:
         """Update an existing workflow definition (name, description, and/or steps).
 
@@ -215,7 +215,14 @@ def build_default_workflow(
             description: New description (omit to keep current).
             steps_json: JSON array replacing ALL steps (omit to keep current).
         """
-        return await core.update_workflow(deps, workflow_id, name, description, steps_json)
+        # Annotated `str`, not `str | None`, to stay identical to the MCP tool
+        # of the same name (the surfaces are asserted to match): FastMCP
+        # pre-parses a JSON string argument unless the annotation is exactly
+        # `str`, which makes a `str | None` JSON field impossible to set.
+        # Empty string means "omitted".
+        return await core.update_workflow(
+            deps, workflow_id, name, description, steps_json or None
+        )
 
     @tool
     async def delete_workflow(workflow_id: str) -> str:
@@ -302,9 +309,9 @@ def build_default_workflow(
         name: str | None = None,
         description: str | None = None,
         base_url: str | None = None,
-        operations_json: str | None = None,
-        auth_json: str | None = None,
-        pubsub_json: str | None = None,
+        operations_json: str = "",
+        auth_json: str = "",
+        pubsub_json: str = "",
     ) -> str:
         """Update a data source definition. Only provided fields change.
 
@@ -319,9 +326,14 @@ def build_default_workflow(
                 {topic, subscription, project_id, event_schema} replacing the
                 current Pub/Sub block (omit to keep current).
         """
+        # Annotated `str`, not `str | None`, to stay identical to the MCP tool
+        # of the same name (the surfaces are asserted to match): FastMCP
+        # pre-parses a JSON string argument unless the annotation is exactly
+        # `str`, which makes a `str | None` JSON field impossible to set.
+        # Empty string means "omitted".
         return await core.update_datasource(
-            deps, source_id, name, description, base_url, operations_json, auth_json,
-            pubsub_json,
+            deps, source_id, name, description, base_url,
+            operations_json or None, auth_json or None, pubsub_json or None,
         )
 
     @tool
@@ -403,7 +415,7 @@ def build_default_workflow(
         topic: str | None = None,
         subscription: str | None = None,
         project_id: str | None = None,
-        event_schema_json: str | None = None,
+        event_schema_json: str = "",
     ) -> str:
         """Change an existing event; omitted fields keep their stored value.
 
@@ -417,9 +429,14 @@ def build_default_workflow(
             event_schema_json: JSON object replacing the event schema (omit to
                 keep current).
         """
+        # Annotated `str`, not `str | None`, to stay identical to the MCP tool
+        # of the same name (the surfaces are asserted to match): FastMCP
+        # pre-parses a JSON string argument unless the annotation is exactly
+        # `str`, which makes a `str | None` JSON field impossible to set.
+        # Empty string means "omitted".
         return await core.update_event(
             deps, event_id, name, description, topic, subscription, project_id,
-            event_schema_json,
+            event_schema_json or None,
         )
 
     @tool
