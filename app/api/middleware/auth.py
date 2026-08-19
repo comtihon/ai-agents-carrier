@@ -8,6 +8,11 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.infrastructure.auth.auth_service import AuthError, AuthService
+from app.infrastructure.auth.authorization import (
+    AuthorizationPolicy,
+    Permission,
+    permission_for_method,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,9 +77,17 @@ def _is_unprotected(method: str, path: str) -> bool:
 
 
 class OAuthMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, auth_service: AuthService) -> None:
+    def __init__(
+        self,
+        app,
+        auth_service: AuthService,
+        policy: AuthorizationPolicy | None = None,
+    ) -> None:
         super().__init__(app)
         self.auth_service = auth_service
+        # No policy configured behaves as authentication-only, which is what every
+        # deployment did before permissions existed.
+        self.policy = policy or AuthorizationPolicy()
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
@@ -99,4 +112,56 @@ class OAuthMiddleware(BaseHTTPMiddleware):
             return JSONResponse(status_code=401, content={"detail": e.message})
 
         request.state.jwt_claims = claims
+
+        permissions = self.policy.permissions_for_claims(claims)
+        request.state.permissions = permissions
+
+        # Shadow mode. With enforcement off the policy grants everything, so the
+        # checks below never fire — but the mapping can still be evaluated and
+        # reported. This is what makes turning enforcement on an evidence-based
+        # decision rather than a hopeful one: any caller that would be locked out
+        # (most likely one holding an opaque token whose userinfo response carries
+        # no project roles) shows up in logs first, while still being served.
+        if not self.policy.enforce:
+            would_grant = self.policy.evaluate_shadow(claims)
+            required_if_enforced = permission_for_method(request.method)
+            if Permission.ACCESS not in would_grant:
+                logger.warning(
+                    "RBAC shadow: subject %s would be DENIED access (no matching role); "
+                    "roles=%s path=%s %s",
+                    claims.get("sub"), sorted(self.policy.roles_of(claims)),
+                    request.method, path,
+                )
+            elif required_if_enforced not in would_grant:
+                logger.warning(
+                    "RBAC shadow: subject %s would be DENIED %s; roles=%s path=%s %s",
+                    claims.get("sub"), required_if_enforced.value,
+                    sorted(self.policy.roles_of(claims)), request.method, path,
+                )
+            return await call_next(request)
+
+        # ACCESS is the tenancy gate: an identity the provider issued a valid token
+        # for, but which is not entitled to this API at all (a customer, on an
+        # identity provider shared with staff).
+        if Permission.ACCESS not in permissions:
+            logger.warning(
+                "Authorization rejected: subject %s holds no role granting access",
+                claims.get("sub"),
+            )
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Not authorized to access this service"},
+            )
+
+        required = permission_for_method(request.method)
+        if required not in permissions:
+            logger.warning(
+                "Authorization rejected: subject %s lacks %s for %s %s",
+                claims.get("sub"), required.value, request.method, path,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={"detail": f"Missing '{required.value}' permission"},
+            )
+
         return await call_next(request)

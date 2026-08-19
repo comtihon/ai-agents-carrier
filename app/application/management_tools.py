@@ -279,6 +279,30 @@ async def get_run(deps: ManagementDeps, run_id: str) -> str:
     return "\n".join(parts)
 
 
+def _sandbox_denial(steps: Any) -> str | None:
+    """Refusal message when the calling principal may not disable the sandbox.
+
+    Returns a string because these functions are MCP tool bodies: their return
+    value is what the model sees, so a refusal has to be readable text rather than
+    an exception. `None` means allowed.
+
+    The permissions come from the ambient principal set by the authenticating ASGI
+    wrapper — FastMCP hands tools no request object. An unauthenticated caller
+    resolves to no permissions and is therefore refused, which is the safe default.
+    """
+    from app.infrastructure.auth.authorization import get_current_permissions
+    from app.infrastructure.auth.sandbox_guard import (
+        SandboxNotPermittedError,
+        assert_sandbox_allowed,
+    )
+
+    try:
+        assert_sandbox_allowed(steps, get_current_permissions())
+    except SandboxNotPermittedError as exc:
+        return str(exc)
+    return None
+
+
 async def create_workflow(
     deps: ManagementDeps, workflow_id: str, name: str, description: str, steps_json: str
 ) -> str:
@@ -290,6 +314,10 @@ async def create_workflow(
         return f"Invalid steps_json: {exc}"
     if not isinstance(steps, list):
         return "steps_json must be a JSON array."
+
+    denied = _sandbox_denial(steps)
+    if denied:
+        return denied
 
     existing = await deps.workflow_backend.get(workflow_id)
     if existing is not None:
@@ -334,6 +362,9 @@ async def update_workflow(
             return f"Invalid steps_json: {exc}"
         if not isinstance(steps, list):
             return "steps_json must be a JSON array."
+        denied = _sandbox_denial(steps)
+        if denied:
+            return denied
         defn.steps = steps
 
     await deps.workflow_backend.update(workflow_id, defn)

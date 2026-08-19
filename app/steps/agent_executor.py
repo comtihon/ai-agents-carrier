@@ -23,12 +23,13 @@ on a known port.  The backend then calls::
         "input":         { ... },
         "callback_url":  "<backend_base_url>",
         "agent_config":  {
-            "system_prompt": "...",
-            "model":         "...",
-            "tools":         [...],
-            "mcp_servers":   [...],
-            "credentials":   {...},
-            "extra":         {...}
+            "system_prompt":    "...",
+            "model":            "...",
+            "tools":            [{"name": ..., "command": ..., "env": {...}}],
+            "blocked_commands": [...],
+            "mcp_servers":      [...],
+            "credentials":      {...},
+            "extra":            {...}
         }
     }
 
@@ -75,18 +76,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# --- Tools addon: bash-level credential/binary gating ---
-# The "tools" addon toggles which bash-level integrations an agent may use.
-# Backend ALWAYS sends tool_access={"github":b,"jira":b,"graphify":b} (all
-# false when the addon is absent). Runtimes treat absent/null tool_access as
-# ALL ENABLED (rollout compat) and a present dict as exact (missing key =
-# disabled). When a tool is disabled backend-side we pop its credential keys
-# out of the resolved credentials dict so the agent never receives them.
-_KNOWN_TOOLS: tuple[str, ...] = ("github", "jira", "graphify")
-_TOOL_CREDENTIAL_KEYS: dict[str, set[str]] = {
-    "github": {"MCP_GITHUB_API_KEY", "GITHUB_TOKEN"},
-    "jira": {"MCP_JIRA_API_TOKEN", "JIRA_API_TOKEN", "JIRA_URL", "JIRA_USERNAME"},
-}
+# --- Tools addon: bash-level tool grants ---
+# Which tools exist is declared by the operator in the AGENT_TOOLS registry
+# (see Settings.get_agent_tools); the agent's "tools" addon only toggles names
+# from that registry. Nothing here knows any specific tool: a granted tool is
+# sent as {name, command, env, cli_tools} with its env already resolved, and
+# the env keys a tool claims are stripped from the generic credential sweep so
+# they reach an agent only through that tool. Commands of registry tools the
+# agent was NOT granted are sent as `blocked_commands` so the runtime can
+# shadow them on PATH.
 
 _COMPRESSION_INSTRUCTIONS: dict[str, str] = {
     "lite": (
@@ -187,21 +185,24 @@ def _build_agent_config(
 
     Resolution rules
     ----------------
-    - ``system_prompt``, ``model``, ``tools``: promoted from ``agent_input``
-      when present; otherwise ``None``.
-    - ``mcp_servers``: built from ``settings.get_mcp_integrations()``.
-      Filtered to ``agent_input["tools"]`` when that key is provided.
-    - ``credentials``: API keys from every active LLM integration.
-    - ``tool_access``: ``{tool: bool}`` for every known bash-level tool
-      (github/jira/graphify). Derived from the agent's ``tools`` addon —
-      no addon means strict: all disabled. Credential keys for disabled
-      tools are popped from ``credentials`` before it is returned.
+    - ``system_prompt``, ``model``: promoted from ``agent_input`` when present;
+      otherwise ``None``.
+    - ``mcp_servers``: built from ``settings.get_mcp_integrations()``, filtered
+      to the servers the agent's ``mcp`` addon enables.
+    - ``credentials``: API keys from every active LLM integration plus the
+      generic credential sweep, minus every env var claimed by a tool in the
+      ``AGENT_TOOLS`` registry.
+    - ``tools``: one entry per registry tool the agent's ``tools`` addon
+      enables, carrying its resolved ``env`` and optional ``command`` /
+      ``cli_tools``. No addon → no tools.
+    - ``blocked_commands``: commands of registry tools the agent did not get,
+      for the runtime to shadow on PATH.
     - ``extra``: the entire ``agent_input`` dict forwarded as-is.
     - ``description`` is NOT included.
 
     Note: step-level ``env_vars`` with ``from_config`` are NOT gated here —
     that path is an explicit operator override and deliberately bypasses the
-    tools-addon credential gating above.
+    registry above.
     """
     from app.core.config import McpIntegrationConfig
 
@@ -210,7 +211,6 @@ def _build_agent_config(
     # Promote known keys from agent_input.
     system_prompt = agent_input.get("system_prompt")
     model = agent_input.get("model")
-    tools = agent_input.get("tools")
     llm_provider_name = agent_input.get("llm_provider") or settings.llm_provider
 
     # Resolve provider → inject base_url + api_key_env into extra so the agent
@@ -285,34 +285,44 @@ def _build_agent_config(
         if key_name not in credentials:
             credentials[key_name] = val
 
-    # --- Tools addon gating ---
-    # Build tool_access for every known tool. No addon → strict: all disabled.
-    # Then pop credential keys for disabled tools so the agent never sees them.
-    # NEVER touch LLM / non-tool credentials (ANTHROPIC / OPENROUTER /
-    # GOOGLE_APPLICATION_CREDENTIALS_JSON / HUBSPOT_TOKEN / HF_TOKEN etc.) —
-    # only the keys enumerated in _TOOL_CREDENTIAL_KEYS are ever removed.
+    # --- Tools addon: grants from the AGENT_TOOLS registry ---
+    # A tool the operator never declared grants nothing, and an addon that is
+    # absent grants nothing at all. Every env var any registry tool claims is
+    # removed from the generic sweep first, so a tool's secrets travel with
+    # that tool or not at all — including to agents that have no tools addon.
+    registry = settings.get_agent_tools()
+    for claimed_key in settings.tool_env_keys():
+        credentials.pop(claimed_key, None)
+
     tools_addon = agent_def.tools_addon
     enabled_tools: set[str] = tools_addon.enabled_tools() if tools_addon is not None else set()
-    tool_access: dict[str, bool] = {name: (name in enabled_tools) for name in _KNOWN_TOOLS}
-    for tool_name, cred_keys in _TOOL_CREDENTIAL_KEYS.items():
-        if not tool_access.get(tool_name, False):
-            for cred_key in cred_keys:
-                credentials.pop(cred_key, None)
 
-    # An ENABLED tool needs its full bash-level credential set, not just the
-    # token: curl against $JIRA_URL requires the endpoint and identity vars,
-    # which get_forwardable_config() never picks up (no credential suffix).
-    if tool_access.get("jira"):
-        for cred_key, val in (
-            ("JIRA_URL", settings.mcp_jira_jira_url),
-            ("JIRA_USERNAME", settings.mcp_jira_username),
-            ("JIRA_API_TOKEN", settings.mcp_jira_api_token),
-        ):
-            if val and not credentials.get(cred_key):
-                credentials[cred_key] = val
-    if tool_access.get("github"):
-        if settings.mcp_github_api_key and not credentials.get("GITHUB_TOKEN"):
-            credentials["GITHUB_TOKEN"] = settings.mcp_github_api_key
+    granted_tools: list[dict[str, Any]] = []
+    blocked_commands: list[str] = []
+    for tool_name, spec in registry.items():
+        if tool_name not in enabled_tools:
+            if spec.command:
+                blocked_commands.append(spec.command)
+            continue
+        granted_tools.append({
+            "name": tool_name,
+            "label": spec.label or tool_name,
+            "description": spec.description,
+            "command": spec.command,
+            "env": settings.resolve_tool_env(spec),
+            "bash_match": spec.bash_match,
+            "cli_tools": {
+                cli_name: cli.model_dump(mode="json")
+                for cli_name, cli in spec.cli_tools.items()
+            },
+        })
+
+    unknown = sorted(enabled_tools - set(registry))
+    if unknown:
+        logger.warning(
+            "agent '%s' enables tool(s) %s that are not declared in AGENT_TOOLS — ignored",
+            agent_def.id, ", ".join(unknown),
+        )
 
     # Resolve env_vars from step config
     env_vars: dict[str, str] = {}
@@ -338,10 +348,10 @@ def _build_agent_config(
     return {
         "system_prompt": system_prompt,
         "model": model,
-        "tools": tools,
+        "tools": granted_tools,
+        "blocked_commands": blocked_commands,
         "mcp_servers": mcp_servers,
         "credentials": credentials,
-        "tool_access": tool_access,
         "extra": extra,
         "env_vars": env_vars,
         "expected_output_fields": list(_protocol_keys),
