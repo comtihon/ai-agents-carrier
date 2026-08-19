@@ -343,6 +343,7 @@ def _build_agent_config(
                 cli_name: cli.model_dump(mode="json")
                 for cli_name, cli in spec.cli_tools.items()
             },
+            "workspace_hook": spec.workspace_hook.model_dump(mode="json") if spec.workspace_hook else None,
         })
 
     blocked_commands = list(dict.fromkeys(
