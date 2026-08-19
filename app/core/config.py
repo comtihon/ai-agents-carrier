@@ -120,6 +120,24 @@ class Settings(BaseSettings):
     # --- Webhook / HTTP trigger ---
     webhook_secret: str | None = Field(default=None, alias="WEBHOOK_SECRET")
 
+    # --- Pub/Sub trigger ---
+    # Off by default: with no GCP project (tests, local runs) a subscriber
+    # would only produce credential errors on every startup.
+    pubsub_enabled: bool = Field(default=False, alias="PUBSUB_ENABLED")
+    # Project the short topic / subscription names of a `pubsub` trigger step
+    # resolve against. Fully qualified paths in a step ignore this.
+    pubsub_project_id: str | None = Field(default=None, alias="PUBSUB_PROJECT_ID")
+    # Prefix for subscriptions the backend creates itself, so they are
+    # recognisable in the console and cannot collide with hand-made ones.
+    pubsub_subscription_prefix: str = Field(default="aac-", alias="PUBSUB_SUBSCRIPTION_PREFIX")
+    pubsub_ack_deadline_seconds: int = Field(default=60, alias="PUBSUB_ACK_DEADLINE_SECONDS")
+    # Upper bound on messages pulled concurrently per subscription.
+    pubsub_max_messages: int = Field(default=10, alias="PUBSUB_MAX_MESSAGES")
+    # A message that does not match the step's schema is acknowledged and
+    # dropped by default — redelivering it forever would be a poison pill.
+    # Set false to nack instead (topic-level retry / dead-lettering).
+    pubsub_drop_invalid_messages: bool = Field(default=True, alias="PUBSUB_DROP_INVALID_MESSAGES")
+
     # --- OAuth ---
     oauth_enabled: bool = Field(default=False, alias="OAUTH_ENABLED")
     oauth_jwks_url: str | None = Field(default=None, alias="OAUTH_JWKS_URL")

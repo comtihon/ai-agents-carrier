@@ -70,6 +70,8 @@ class ManagementDeps:
     data_source_backend: "DataSourceDefinitionBackend | None" = None
     refresh_runner: "Callable[[str], Awaitable[None]] | None" = None
     refresh_datasources: "Callable[[], Awaitable[None]] | None" = None
+    # PubSubSubscriberManager when Pub/Sub triggers are enabled, else None.
+    pubsub_subscriber: Any = None
 
 
 def deps_from_container(
@@ -89,6 +91,7 @@ def deps_from_container(
         data_source_backend=getattr(container, "data_source_backend", None),
         refresh_runner=getattr(container, "refresh_runner", None),
         refresh_datasources=refresh_datasources,
+        pubsub_subscriber=getattr(container, "pubsub_subscriber", None),
     )
 
 
@@ -355,6 +358,10 @@ async def delete_workflow(deps: ManagementDeps, workflow_id: str) -> str:
 
     await deps.workflow_backend.delete(workflow_id)
     deps.registry.remove(workflow_id)
+    # Also drops the deleted workflow's cron jobs and Pub/Sub subscriptions —
+    # refresh_runner finds no definition and only unregisters.
+    if deps.refresh_runner is not None:
+        await deps.refresh_runner(workflow_id)
     return f"Workflow '{workflow_id}' deleted."
 
 
@@ -480,12 +487,89 @@ async def list_datasources(deps: ManagementDeps) -> str:
         return "No data sources found."
     lines = []
     for s in sources:
-        ops = ", ".join(op.name for op in s.operations) or "(no operations)"
+        if s.kind == "pubsub" and s.pubsub is not None:
+            detail = (
+                f"topic: {s.pubsub.topic or '(unset)'}, "
+                f"subscription: {s.pubsub.subscription or '(created on first use)'}"
+            )
+        else:
+            detail = "operations: " + (", ".join(op.name for op in s.operations) or "(no operations)")
         lines.append(
             f"- **{s.id}** ({s.name or s.id}, {s.kind}): "
-            f"{s.description or '(no description)'} — operations: {ops}"
+            f"{s.description or '(no description)'} — {detail}"
         )
     return "\n".join(lines)
+
+
+async def create_pubsub_datasource(
+    deps: ManagementDeps,
+    source_id: str,
+    name: str,
+    topic: str,
+    event_schema_json: str = "",
+    subscription: str = "",
+    project_id: str = "",
+    description: str = "",
+) -> str:
+    """Register a Pub/Sub topic as a reusable data source.
+
+    Such a source has no operations — it exists so ``pubsub`` trigger steps can
+    point at ``datasource: <source_id>`` instead of repeating topic, schema and
+    subscription in every workflow.  Leave *subscription* empty to have one
+    created (and saved back here) the first time a workflow subscribes.
+    """
+    if deps.data_source_backend is None:
+        return "Data source creation unavailable: no persistent backend configured."
+    if not topic.strip():
+        return "A Pub/Sub data source needs a topic."
+    event_schema: dict | None = None
+    if event_schema_json:
+        try:
+            event_schema = json.loads(event_schema_json)
+        except json.JSONDecodeError as exc:
+            return f"Invalid event_schema_json: {exc}"
+        if not isinstance(event_schema, dict):
+            return "event_schema_json must be a JSON object."
+
+    existing = await deps.data_source_backend.get(source_id)
+    if existing is not None:
+        return f"Data source '{source_id}' already exists. Use update_datasource to modify it."
+
+    from app.domain.models.data_source_definition import DataSourceDefinition
+    try:
+        defn = DataSourceDefinition.model_validate({
+            "id": source_id,
+            "name": name,
+            "description": description,
+            "kind": "pubsub",
+            "pubsub": {
+                "topic": topic.strip(),
+                "subscription": subscription.strip(),
+                "project_id": project_id.strip(),
+                "event_schema": event_schema,
+            },
+        })
+    except Exception as exc:
+        return f"Invalid data source definition: {exc}"
+
+    await deps.data_source_backend.create(defn)
+    await _publish_datasources(deps)
+    return (
+        f"Pub/Sub data source '{source_id}' created for topic '{topic}'"
+        + (f" using subscription '{subscription}'." if subscription else " (subscription created on first use).")
+    )
+
+
+def list_pubsub_subscriptions(deps: ManagementDeps) -> str:
+    """Report which workflow steps are currently subscribed, and to what."""
+    if deps.pubsub_subscriber is None:
+        return "Pub/Sub triggers are disabled (PUBSUB_ENABLED is false)."
+    registrations = deps.pubsub_subscriber.registrations()
+    if not registrations:
+        return "No Pub/Sub trigger is currently subscribed."
+    return "\n".join(
+        f"- **{key}** → {subscription}" for key, subscription in sorted(registrations.items())
+    )
 
 
 async def create_datasource(
@@ -548,6 +632,7 @@ async def update_datasource(
     base_url: str | None = None,
     operations_json: str | None = None,
     auth_json: str | None = None,
+    pubsub_json: str | None = None,
 ) -> str:
     if deps.data_source_backend is None:
         return "Data source updates unavailable: no persistent backend configured."
@@ -578,6 +663,15 @@ async def update_datasource(
             payload["auth"] = json.loads(auth_json)
         except json.JSONDecodeError as exc:
             return f"Invalid auth_json: {exc}"
+    if pubsub_json is not None:
+        # {topic, subscription, project_id, event_schema} — kind == "pubsub".
+        try:
+            pubsub_block = json.loads(pubsub_json)
+        except json.JSONDecodeError as exc:
+            return f"Invalid pubsub_json: {exc}"
+        if not isinstance(pubsub_block, dict):
+            return "pubsub_json must be a JSON object."
+        payload["pubsub"] = pubsub_block
 
     from app.domain.models.data_source_definition import (
         DataSourceDefinition,

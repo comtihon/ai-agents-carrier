@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import json
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -39,6 +41,10 @@ from app.infrastructure.auth.service_token_provider import ServiceTokenProvider
 from app.infrastructure.datasources.executor import DataSourceExecutor
 from app.infrastructure.tools.mcp_client import McpToolsProvider
 from app.infrastructure.triggers.cron_scheduler import CronScheduler
+from app.infrastructure.triggers.pubsub_subscriber import (
+    PubSubSubscriberManager,
+    PubSubTriggerSpec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +79,9 @@ class ApplicationContainer:
     # approval-resume uses the exact definition snapshot from run start.
     live_runners: dict[str, YamlGraphRunner] = field(default_factory=dict)
     cron_scheduler: CronScheduler = field(default_factory=CronScheduler)
+    # Built in startup() when PUBSUB_ENABLED — None means pubsub triggers are
+    # parsed and stored but nothing subscribes to them.
+    pubsub_subscriber: PubSubSubscriberManager | None = None
     pvc_lease_repository: MongoPvcLeaseRepository | None = None
     agent_task_repository: MongoAgentTaskRepository | None = None
     warm_pod_repository: MongoWarmPodRepository | None = None
@@ -87,6 +96,14 @@ class ApplicationContainer:
             self.service_token_provider.validate_configuration()
         await self.mcp_tools_provider.start()
         self.cron_scheduler.start()
+        if self.settings.pubsub_enabled and self.pubsub_subscriber is None:
+            self.pubsub_subscriber = PubSubSubscriberManager(
+                subscription_prefix=self.settings.pubsub_subscription_prefix,
+                drop_invalid_messages=self.settings.pubsub_drop_invalid_messages,
+                on_subscription_created=self._save_pubsub_subscription,
+            )
+        if self.pubsub_subscriber is not None:
+            self.pubsub_subscriber.start()
         if self.workflow_backend is not None:
             await self._load_registry()
         self._recover_task = asyncio.create_task(self._recover_incomplete_runs())
@@ -206,6 +223,7 @@ class ApplicationContainer:
                 runner._callback_base_url = self.settings.agent_callback_url or self.settings.base_url
         logger.info("Loaded %d workflow definition(s) from backend", len(definitions))
         self._setup_all_cron_triggers()
+        await self._setup_all_pubsub_triggers()
 
     def _setup_all_cron_triggers(self) -> None:
         for wf_id in self.yaml_graph_registry.list_ids():
@@ -230,6 +248,216 @@ class ApplicationContainer:
                     schedule,
                     self._make_cron_job(runner.id, request_template),
                 )
+
+    # ── Pub/Sub triggers ─────────────────────────────────────────────────────
+
+    async def _setup_all_pubsub_triggers(self) -> None:
+        if self.pubsub_subscriber is None:
+            return
+        for wf_id in self.yaml_graph_registry.list_ids():
+            runner = self.yaml_graph_registry.get(wf_id)
+            if runner:
+                await self._register_pubsub_steps(runner)
+
+    async def _register_pubsub_steps(self, runner: YamlGraphRunner) -> None:
+        """Subscribe every ``pubsub`` trigger step of *runner*.
+
+        A step that cannot subscribe (missing topic, unknown datasource, GCP
+        error) is logged and skipped — one broken trigger must not stop the
+        remaining workflows from loading.
+        """
+        if self.pubsub_subscriber is None:
+            return
+        for step in runner.steps:
+            if step.get("type") != "pubsub":
+                continue
+            try:
+                spec = await self._build_pubsub_spec(step)
+            except Exception as exc:
+                logger.error(
+                    "Pub/Sub step '%s' in workflow '%s' is not usable: %s",
+                    step["id"], runner.id, exc,
+                )
+                continue
+            try:
+                await self.pubsub_subscriber.register(
+                    runner.id,
+                    step["id"],
+                    spec,
+                    self._make_pubsub_job(runner.id, step),
+                )
+            except Exception:
+                logger.exception(
+                    "Subscribing Pub/Sub step '%s' of workflow '%s' failed",
+                    step["id"], runner.id,
+                )
+
+    async def _build_pubsub_spec(self, step: dict) -> PubSubTriggerSpec:
+        """Resolve a ``pubsub`` step into a subscriber spec.
+
+        A step may name a pre-configured ``kind="pubsub"`` datasource, in which
+        case that source supplies topic / subscription / schema and the step's
+        own fields override whatever it sets.
+        """
+        topic = (step.get("topic") or "").strip()
+        subscription = (step.get("subscription") or "").strip()
+        event_schema = step.get("schema") or None
+        project_id = (step.get("project_id") or "").strip()
+        datasource_id = (step.get("datasource") or "").strip()
+
+        if datasource_id:
+            if self.data_source_backend is None:
+                raise ValueError(
+                    f"step references datasource '{datasource_id}' but no data source backend is configured"
+                )
+            source = await self.data_source_backend.get(datasource_id)
+            if source is None:
+                raise ValueError(f"datasource '{datasource_id}' not found")
+            if source.kind != "pubsub" or source.pubsub is None:
+                raise ValueError(f"datasource '{datasource_id}' is not a Pub/Sub source")
+            topic = topic or source.pubsub.topic
+            subscription = subscription or source.pubsub.subscription
+            project_id = project_id or source.pubsub.project_id
+            event_schema = event_schema or source.pubsub.event_schema
+
+        if not topic:
+            raise ValueError("no topic configured (set `topic`, or point `datasource` at a Pub/Sub source)")
+
+        return PubSubTriggerSpec(
+            topic=topic,
+            project_id=project_id or (self.settings.pubsub_project_id or ""),
+            subscription=subscription,
+            event_schema=event_schema,
+            ack_deadline_seconds=int(step.get("ack_deadline_seconds") or self.settings.pubsub_ack_deadline_seconds),
+            max_messages=int(step.get("max_messages") or self.settings.pubsub_max_messages),
+            datasource_id=datasource_id,
+        )
+
+    async def _save_pubsub_subscription(self, spec: PubSubTriggerSpec, subscription_path: str) -> None:
+        """Persist a just-created subscription as a ``pubsub`` datasource.
+
+        A subscription created from scratch is only useful to the next workflow
+        if it can be found again, so it is written back: onto the datasource the
+        step named, or as a new source keyed by topic.
+        """
+        if self.data_source_backend is None:
+            return
+        from app.domain.models.data_source_definition import DataSourceDefinition, PubSubSpec
+
+        if spec.datasource_id:
+            source = await self.data_source_backend.get(spec.datasource_id)
+            if source is None or source.pubsub is None:
+                return
+            if source.pubsub.subscription == subscription_path:
+                return
+            source.pubsub.subscription = subscription_path
+            source.touch()
+            await self.data_source_backend.update(source.id, source)
+            logger.info(
+                "Pub/Sub subscription %s saved onto datasource '%s'",
+                subscription_path, spec.datasource_id,
+            )
+            return
+
+        source_id = _pubsub_source_id(spec.topic)
+        existing = await self.data_source_backend.get(source_id)
+        if existing is not None:
+            if existing.pubsub is None:
+                return
+            if existing.pubsub.subscription != subscription_path:
+                existing.pubsub.subscription = subscription_path
+                existing.touch()
+                await self.data_source_backend.update(existing.id, existing)
+            return
+
+        defn = DataSourceDefinition(
+            id=source_id,
+            name=spec.topic,
+            description="Created from a workflow Pub/Sub trigger",
+            kind="pubsub",
+            pubsub=PubSubSpec(
+                topic=spec.topic,
+                subscription=subscription_path,
+                project_id=spec.project_id,
+                event_schema=spec.event_schema,
+            ),
+        )
+        defn.touch()
+        await self.data_source_backend.create(defn)
+        logger.info("Pub/Sub datasource '%s' created for topic %s", source_id, spec.topic)
+
+    def _make_pubsub_job(self, workflow_id: str, step: dict):
+        """Build the event callback that starts a run for one pubsub step."""
+        step_id = step["id"]
+        request_template = step.get("request_template", "")
+
+        async def job(payload: dict, meta: dict) -> None:
+            now = datetime.datetime.now(datetime.timezone.utc)
+            request = request_template or json.dumps(payload)
+            request = (
+                request
+                .replace("{now}", now.isoformat())
+                .replace("{date}", now.strftime("%Y-%m-%d"))
+            )
+            try:
+                if self.workflow_backend is not None:
+                    defn = await self.workflow_backend.get(workflow_id)
+                    if defn is None:
+                        logger.warning("Pub/Sub job: workflow '%s' not found", workflow_id)
+                        return
+                    runner = build_runner_from_definition(
+                        defn,
+                        llm=self.llm,
+                        llm_factory=self.llm_factory,
+                        mcp_tools_provider=self.mcp_tools_provider,
+                        registry=self.yaml_graph_registry,
+                        run_repository=self.run_repository,
+                        openhands=self.openhands,
+                        checkpointer=self.checkpointer,
+                    )
+                    self._inject_runner_dependencies(runner)
+                    runner._callback_base_url = self.settings.agent_callback_url or self.settings.base_url
+                    definition_snapshot: dict | None = defn.to_raw_dict()
+                else:
+                    runner = self.yaml_graph_registry.get(workflow_id)
+                    if runner is None:
+                        logger.warning("Pub/Sub job: workflow '%s' not in registry", workflow_id)
+                        return
+                    definition_snapshot = None
+
+                thread_id = str(uuid4())
+                self.live_runners[thread_id] = runner
+
+                run = GraphRun(
+                    id=thread_id,
+                    graph_id=workflow_id,
+                    user_request=request,
+                    status="running",
+                    workflow_definition=definition_snapshot,
+                )
+                await self.run_repository.create(run)
+                run.step_statuses = {s["id"]: "pending" for s in runner.steps}
+
+                trigger_info = {**meta, "triggered_at": now.isoformat(), "step_id": step_id}
+                initial_state = {
+                    "request": request,
+                    "trigger_payload": payload,
+                    "trigger_info": trigger_info,
+                }
+                logger.info(
+                    "Pub/Sub trigger started run %s for workflow '%s' (message %s)",
+                    thread_id, workflow_id, meta.get("message_id", "?"),
+                )
+                await stream_graph_to_pause(
+                    runner, run, self.run_repository, initial_state, base_url=self.settings.base_url,
+                )
+
+                if run.status in ("completed", "failed", "cancelled", "rejected"):
+                    self.live_runners.pop(thread_id, None)
+            except Exception:
+                logger.exception("Pub/Sub job execution failed for workflow '%s'", workflow_id)
+
+        return job
 
     def _make_cron_job(self, workflow_id: str, request_template: str):
         async def job() -> None:
@@ -302,6 +530,8 @@ class ApplicationContainer:
             return
         # Always clear stale cron jobs for this workflow first
         self.cron_scheduler.unregister_workflow(workflow_id)
+        if self.pubsub_subscriber is not None:
+            self.pubsub_subscriber.unregister_workflow(workflow_id)
         defn = await self.workflow_backend.get(workflow_id)
         if defn is not None:
             runner = build_runner_from_definition(
@@ -318,6 +548,7 @@ class ApplicationContainer:
             runner._callback_base_url = self.settings.agent_callback_url or self.settings.base_url
             self.yaml_graph_registry._runners[workflow_id] = runner
             self._register_cron_steps(runner)
+            await self._register_pubsub_steps(runner)
             logger.info("Registry runner refreshed for workflow '%s'", workflow_id)
         else:
             self.yaml_graph_registry._runners.pop(workflow_id, None)
@@ -586,6 +817,8 @@ class ApplicationContainer:
 
     async def shutdown(self) -> None:
         self.cron_scheduler.stop()
+        if self.pubsub_subscriber is not None:
+            self.pubsub_subscriber.stop()
         for task in (self._recover_task, self._datasources_mcp_task):
             if task is not None and not task.done():
                 task.cancel()
@@ -599,6 +832,13 @@ class ApplicationContainer:
             await self.agent_backend.close()
         if isinstance(self.data_source_backend, MongoDataSourceBackend):
             await self.data_source_backend.close()
+
+
+def _pubsub_source_id(topic: str) -> str:
+    """Stable datasource id for a topic: ``pubsub-<last path segment>``."""
+    name = topic.rsplit("/", 1)[-1] if topic else "topic"
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", name).strip("-").lower() or "topic"
+    return f"pubsub-{slug}"
 
 
 def _fake_llm(reason: str) -> BaseChatModel:

@@ -135,6 +135,10 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
             fields["trigger_payload"] = Any  # type: ignore[assignment]
         if step.get("type") == "cron":
             fields["trigger_info"] = Any  # type: ignore[assignment]
+        # pubsub trigger carries both: the event body and its delivery metadata
+        if step.get("type") == "pubsub":
+            fields["trigger_payload"] = Any  # type: ignore[assignment]
+            fields["trigger_info"] = Any  # type: ignore[assignment]
         # human_approval with a custom output_key writes the bool result there
         if step.get("type") == "human_approval" and "output_key" in step:
             fields[step["output_key"]] = Any  # type: ignore[assignment]
@@ -779,6 +783,10 @@ class YamlGraphRunner:
         # Injected post-construction for `data_source` steps (optional)
         self._data_source_backend: Any = None
         self._data_source_executor: Any = None
+        # Injected post-construction for `python` steps that reference a
+        # library script via `script_id` (optional — inline `code` still works
+        # without it).
+        self._script_backend: Any = None
         # Injected post-construction for `http_call` steps that use
         # `auth: service_identity` (optional — falls back to the process-wide
         # provider built from settings).
@@ -902,6 +910,8 @@ class YamlGraphRunner:
             fn = self._cron_trigger_node(step)
         elif t == "http":
             fn = self._http_trigger_node(step)
+        elif t == "pubsub":
+            fn = self._pubsub_trigger_node(step)
         elif t == "http_call":
             fn = self._http_call_node(step)
         elif t == "data_source":
@@ -920,7 +930,7 @@ class YamlGraphRunner:
         wrapped = self._wrap_with_when(step, wrapped)
         return self._wrap_with_fail_guard(step, wrapped)
 
-    _NO_LOOP_GUARD_TYPES: frozenset = frozenset({"ask_context", "human_approval", "cron", "http", "parallel", "join", "switch", "langgraph-agent", "claude-agent"})
+    _NO_LOOP_GUARD_TYPES: frozenset = frozenset({"ask_context", "human_approval", "cron", "http", "pubsub", "parallel", "join", "switch", "langgraph-agent", "claude-agent"})
     # join handles __failed_step__ itself via failure_policy; all others must abort when
     # a previous step has already written the sentinel into state.
     _NO_FAIL_GUARD_TYPES: frozenset = frozenset({"join"})
@@ -1763,6 +1773,38 @@ class YamlGraphRunner:
         raise ValueError(
             f"Unsupported auth mode '{mode}' — supported: 'service_identity'"
         )
+
+    def _pubsub_trigger_node(self, step: dict[str, Any]):
+        """Pass-through node for Pub/Sub-triggered runs.
+
+        The subscriber seeds the state with ``trigger_payload`` (the decoded
+        message body) and ``trigger_info`` (topic, subscription, message id,
+        publish time, attributes) before the graph starts.  This node republishes
+        the payload under ``output_key`` so downstream steps can template it as
+        ``{event.field}`` — with ``output_key: event`` — and, exactly like the
+        http trigger, fills ``request`` from the payload when the run did not
+        come with one.
+
+        Runs started by hand (not by an event) simply see an empty payload, so a
+        workflow with a pubsub trigger stays testable from the UI.
+        """
+        graph_id = self.id
+        output_key = step.get("output_key", "trigger_payload")
+
+        async def node(state: dict) -> dict:
+            step_id = step["id"]
+            payload = state.get("trigger_payload", {})
+            info = state.get("trigger_info", {})
+            logger.info(
+                "[%s] step '%s' running (pubsub trigger, message %s)",
+                graph_id, step_id, (info or {}).get("message_id", "-"),
+            )
+            updates: dict[str, Any] = {output_key: payload}
+            if payload and not state.get("request"):
+                updates["request"] = json.dumps(payload) if isinstance(payload, dict) else str(payload)
+            return updates
+
+        return node
 
     def _http_call_node(self, step: dict[str, Any]):
         """Make an outbound HTTP request.

@@ -24,6 +24,7 @@ _EXPECTED_TOOLS = {
     "create_workflow", "update_workflow", "delete_workflow",
     "list_agents", "get_agent", "create_agent", "update_agent", "delete_agent",
     "list_datasources", "create_datasource", "update_datasource",
+    "create_pubsub_datasource", "list_pubsub_subscriptions",
     "delete_datasource", "import_datasource_schema",
     "create_datasource_from_schema", "add_datasource_operations_from_schema",
     "terminate_run", "retry_run", "restart_from_step", "approve_run", "reject_run",
@@ -93,7 +94,7 @@ async def test_registers_the_full_tool_set(mcp):
     _register(mcp, _Container())
     tools = await mcp.list_tools()
     assert {t.name for t in tools} == _EXPECTED_TOOLS
-    assert len(tools) == 24
+    assert len(tools) == 26
 
 
 async def test_ask_user_is_not_exposed_over_mcp(mcp):
@@ -201,6 +202,91 @@ async def test_list_datasources_matches_the_agent_tool(mcp):
 
     assert agent_result == "- **github** (GitHub, http): Code host — operations: list_repos"
     assert agent_result in mcp_result
+
+
+async def test_create_pubsub_datasource_stores_topic_and_schema(mcp):
+    backend = InMemoryDataSourceBackend()
+    _register(mcp, _Container(data_source_backend=backend))
+
+    result = str(await mcp.call_tool("create_pubsub_datasource", {
+        "source_id": "orders-events",
+        "name": "Order events",
+        "topic": "orders",
+        "event_schema_json": '{"type": "object", "required": ["order_id"]}',
+    }))
+
+    assert "created" in result
+    stored = await backend.get("orders-events")
+    assert stored.kind == "pubsub"
+    assert stored.pubsub.topic == "orders"
+    assert stored.pubsub.event_schema == {"type": "object", "required": ["order_id"]}
+    # No subscription named: one gets created (and saved back) on first use.
+    assert stored.pubsub.subscription == ""
+
+
+async def test_create_pubsub_datasource_rejects_a_missing_topic(mcp):
+    backend = InMemoryDataSourceBackend()
+    _register(mcp, _Container(data_source_backend=backend))
+
+    result = str(await mcp.call_tool("create_pubsub_datasource", {
+        "source_id": "orders-events", "name": "Order events", "topic": "  ",
+    }))
+
+    assert "needs a topic" in result
+    assert await backend.get("orders-events") is None
+
+
+async def test_create_pubsub_datasource_rejects_invalid_schema_json(mcp):
+    backend = InMemoryDataSourceBackend()
+    _register(mcp, _Container(data_source_backend=backend))
+
+    result = str(await mcp.call_tool("create_pubsub_datasource", {
+        "source_id": "orders-events", "name": "n", "topic": "orders",
+        "event_schema_json": "{not json",
+    }))
+
+    assert "Invalid event_schema_json" in result
+    assert await backend.get("orders-events") is None
+
+
+async def test_list_datasources_describes_a_pubsub_source_by_topic(mcp):
+    backend = InMemoryDataSourceBackend()
+    from app.domain.models.data_source_definition import DataSourceDefinition
+    await backend.create(DataSourceDefinition.model_validate({
+        "id": "orders-events",
+        "name": "Order events",
+        "description": "Shop orders",
+        "kind": "pubsub",
+        "pubsub": {"topic": "orders"},
+    }))
+    _register(mcp, _Container(data_source_backend=backend))
+
+    result = str(await mcp.call_tool("list_datasources", {}))
+
+    assert "topic: orders" in result
+    assert "subscription: (created on first use)" in result
+
+
+async def test_list_pubsub_subscriptions_reports_disabled_triggers(mcp):
+    _register(mcp, _Container())
+
+    result = str(await mcp.call_tool("list_pubsub_subscriptions", {}))
+
+    assert "PUBSUB_ENABLED" in result
+
+
+async def test_list_pubsub_subscriptions_lists_live_registrations(mcp):
+    container = _Container()
+    container.pubsub_subscriber = MagicMock()
+    container.pubsub_subscriber.registrations.return_value = {
+        "orders-wf:on_order": "projects/p/subscriptions/aac-orders-wf-on_order",
+    }
+    _register(mcp, container)
+
+    result = str(await mcp.call_tool("list_pubsub_subscriptions", {}))
+
+    assert "orders-wf:on_order" in result
+    assert "aac-orders-wf-on_order" in result
 
 
 # ---------------------------------------------------------------------------

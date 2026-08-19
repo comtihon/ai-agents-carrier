@@ -32,6 +32,12 @@ API at `http://localhost:8000`. Health check: `GET /health`.
 | `GRAPH_DEFINITIONS_PATH` | `graphs` | Directory of YAML workflow files (localfiles backend) |
 | `BASE_URL` | `http://localhost:8000` | Public URL — used to build approval callback links |
 | `WEBHOOK_SECRET` | — | HMAC-SHA256 secret for incoming webhook signatures |
+| `PUBSUB_ENABLED` | `false` | Subscribe to the topics of `pubsub` trigger steps |
+| `PUBSUB_PROJECT_ID` | — | GCP project short topic / subscription names resolve against |
+| `PUBSUB_SUBSCRIPTION_PREFIX` | `aac-` | Prefix for subscriptions the backend creates itself |
+| `PUBSUB_ACK_DEADLINE_SECONDS` | `60` | Ack deadline for created subscriptions |
+| `PUBSUB_MAX_MESSAGES` | `10` | Messages pulled concurrently per subscription |
+| `PUBSUB_DROP_INVALID_MESSAGES` | `true` | Ack (drop) events failing schema validation instead of nacking them |
 | `OAUTH_ENABLED` | `false` | Enable JWT Bearer auth on all endpoints |
 | `OAUTH_JWKS_URL` | — | JWKS endpoint for token validation |
 | `OPENHANDS_BASE_URL` | `http://openhands:3000` | OpenHands service URL |
@@ -330,6 +336,35 @@ Entry-point step. Listens at `POST /api/v1/webhooks/{workflow-id}`. The request 
 ```
 
 Incoming requests must include an `X-Webhook-Signature` header (HMAC-SHA256 of the body, keyed with `WEBHOOK_SECRET`).
+
+### `pubsub` — Google Cloud Pub/Sub trigger
+
+Entry-point step. The backend subscribes to the topic on startup (and whenever the workflow is saved); each message that matches `schema` creates a new run, with the decoded message body stored under `output_key` and delivery metadata — topic, subscription, message id, publish time, attributes — under `trigger_info`.
+
+```yaml
+- id: trigger
+  type: pubsub
+  topic: orders                       # short name, or projects/<p>/topics/orders
+  output_key: event                   # downstream steps template {event.order_id}
+  schema:                             # optional; non-matching events never start a run
+    type: object
+    required: [order_id]
+    properties:
+      order_id: { type: string }
+```
+
+Instead of repeating topic and schema, a step can point at a pre-configured `kind: pubsub` data source; step fields override whatever the source sets:
+
+```yaml
+- id: trigger
+  type: pubsub
+  datasource: orders-events           # supplies topic, schema and subscription
+  output_key: event
+```
+
+`subscription` may name an existing subscription to pull from. When it is left out, the backend creates one (`{PUBSUB_SUBSCRIPTION_PREFIX}{workflow-id}-{step-id}`) on first use and saves it back into the data sources — as an update to the source the step named, or as a new `pubsub-<topic>` source — so the next workflow can reuse it instead of creating another.
+
+Requires `PUBSUB_ENABLED=true` and `PUBSUB_PROJECT_ID` (see the configuration table); the service account needs `roles/pubsub.subscriber`, plus `roles/pubsub.editor` if the backend is to create subscriptions itself. Messages that fail schema validation are acknowledged and dropped so they cannot be redelivered forever — set `PUBSUB_DROP_INVALID_MESSAGES=false` to nack them instead and let topic-level retry or dead-lettering handle them.
 
 ---
 
