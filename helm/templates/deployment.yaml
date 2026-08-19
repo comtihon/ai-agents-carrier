@@ -14,7 +14,7 @@ spec:
         app.kubernetes.io/name: {{ include "ai-agents-carrier.name" . }}
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
-      serviceAccountName: {{ include "ai-agents-carrier.fullname" . }}
+      serviceAccountName: {{ include "ai-agents-carrier.serviceAccountName" . }}
       containers:
         - name: backend
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

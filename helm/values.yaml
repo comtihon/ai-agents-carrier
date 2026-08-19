@@ -5,6 +5,18 @@ image:
   tag: v1.2.130
   pullPolicy: IfNotPresent
 
+serviceAccount:
+  # Create the ServiceAccount with the release. Set false when it is managed
+  # elsewhere (terraform, for instance) — the deployment and the RoleBinding
+  # then point at `name` without the chart trying to own it.
+  create: true
+  # Empty = the release fullname.
+  name: ""
+  # Annotations for a chart-created ServiceAccount, e.g. binding it to a GCP
+  # service account for Workload Identity:
+  #   iam.gke.io/gcp-service-account: my-gsa@my-project.iam.gserviceaccount.com
+  annotations: {}
+
 service:
   type: ClusterIP
   port: 8000

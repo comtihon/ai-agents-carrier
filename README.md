@@ -602,3 +602,32 @@ LLM_PROVIDER=ollama
 ```
 
 Any entry can be referenced by name in workflow steps via `llm_provider: ollama`.
+
+---
+
+## Deployment (Helm)
+
+The chart in `helm/` renders the deployment, service, ingress, config/secret env wiring and a namespaced RBAC Role that lets the backend manage agent pods.
+
+### ServiceAccount and cloud identity
+
+By default the chart creates a ServiceAccount named after the release and runs the pod as it. That account carries no cloud identity, so anything reaching a cloud API from inside the pod (`gcloud`, Cloud Logging, Pub/Sub) has none either. Two ways to give it one:
+
+```yaml
+# Annotate the chart's own account — GKE Workload Identity needs a matching
+# workloadIdentityUser binding for serviceAccount:<project>.svc.id.goog[<ns>/<name>]
+serviceAccount:
+  annotations:
+    iam.gke.io/gcp-service-account: my-gsa@my-project.iam.gserviceaccount.com
+```
+
+```yaml
+# Or run under an account managed elsewhere (terraform, for instance). The
+# chart then creates no ServiceAccount, and both the deployment and the
+# RoleBinding for the agent-manager Role point at this name.
+serviceAccount:
+  create: false
+  name: langgraph-backend
+```
+
+Either way the chart's Role and RoleBinding keep their release-derived names, so the agent-manager permissions follow whichever account the pod actually uses.
