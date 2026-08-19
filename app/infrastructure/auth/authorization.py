@@ -255,6 +255,45 @@ def get_current_permissions() -> frozenset[Permission]:
     """Permissions bound for this task, or none at all when unauthenticated.
 
     Defaults to the empty set, so a caller that somehow reaches a guarded
-    operation without passing through an authenticating wrapper is denied.
+    operation without passing through an authenticating wrapper is denied. This
+    is the right default for the ADMIN gate (unsandboxed python steps): code
+    execution in this process must never be reachable by an unattributable
+    caller. For the graded data permissions use :func:`missing_permission`, which
+    tells "no principal bound at all" apart from "bound and holds nothing".
     """
     return _current_permissions.get() or frozenset()
+
+
+def get_current_permissions_or_none() -> "frozenset[Permission] | None":
+    """The bound principal, or ``None`` when nothing bound one.
+
+    ``None`` and ``frozenset()`` mean different things and must not be conflated:
+    the first is "no authenticating wrapper ran", the second is "a real caller
+    holds no permission at all".
+    """
+    return _current_permissions.get()
+
+
+def missing_permission(required: Permission) -> Permission | None:
+    """*required*, when the bound principal lacks it; ``None`` when it is allowed.
+
+    Shared by every non-HTTP entrypoint (management MCP tools, the chat agent's
+    platform tools, the run-control cores) so that one operation cannot be
+    reachable at a lower privilege through a different surface than the REST
+    route that performs it.
+
+    An *unbound* principal is allowed. Nothing bound one either because there is
+    no authentication at all (OAuth disabled, or a direct in-process call in a
+    test), or because the caller is the platform itself rather than a user: a
+    Pub/Sub trigger, a cron trigger, a Slack callback, a webhook. Those carry no
+    roles and never will, so denying them would break the platform rather than
+    protect it — and each already authenticates by its own mechanism. This
+    mirrors the fallback the REST routes use when no middleware ran.
+
+    A *bound but empty* principal is denied: that is an authenticated identity
+    whose roles grant nothing, exactly the case enforcement exists for.
+    """
+    permissions = _current_permissions.get()
+    if permissions is None:
+        return None
+    return None if required in permissions else required

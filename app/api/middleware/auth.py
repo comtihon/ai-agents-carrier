@@ -12,6 +12,8 @@ from app.infrastructure.auth.authorization import (
     AuthorizationPolicy,
     Permission,
     permission_for_method,
+    reset_current_permissions,
+    set_current_permissions,
 )
 
 logger = logging.getLogger(__name__)
@@ -138,7 +140,7 @@ class OAuthMiddleware(BaseHTTPMiddleware):
                     claims.get("sub"), required_if_enforced.value,
                     sorted(self.policy.roles_of(claims)), request.method, path,
                 )
-            return await call_next(request)
+            return await self._call_with_principal(permissions, request, call_next)
 
         # ACCESS is the tenancy gate: an identity the provider issued a valid token
         # for, but which is not entitled to this API at all (a customer, on an
@@ -164,4 +166,26 @@ class OAuthMiddleware(BaseHTTPMiddleware):
                 content={"detail": f"Missing '{required.value}' permission"},
             )
 
-        return await call_next(request)
+        return await self._call_with_principal(permissions, request, call_next)
+
+    async def _call_with_principal(self, permissions, request: Request, call_next):
+        """Serve the request with *permissions* bound as the ambient principal.
+
+        The HTTP method is not the whole story. A single authenticated request can
+        reach operations of several tiers: ``POST /api/v1/chat`` (WRITE by method)
+        hands the chat agent a toolset that includes ``delete_workflow``, and the
+        management MCP tools run the same shared cores. Those entrypoints get no
+        request object, so they read the ambient principal instead — binding it
+        here is what stops WRITE from becoming DELETE by going through the agent.
+
+        The value is set before ``call_next`` on purpose: BaseHTTPMiddleware runs
+        the downstream app in a child task, which copies this context at creation
+        and therefore keeps seeing the principal for its whole life, including
+        while a streaming response is still being produced after this method has
+        returned and reset its own copy.
+        """
+        token = set_current_permissions(permissions)
+        try:
+            return await call_next(request)
+        finally:
+            reset_current_permissions(token)
