@@ -2,7 +2,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "langgraph-backend.fullname" . }}-graphs
+  name: {{ include "ai-agents-carrier.fullname" . }}-graphs
 data:
 {{- range $name, $content := .Values.graphs }}
   {{ $name }}.yaml: |

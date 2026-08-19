@@ -1,4 +1,4 @@
-# Sample Dockerfile for a langgraph-backend compatible agent (HTTP protocol).
+# Sample Dockerfile for a ai-agents-carrier compatible agent (HTTP protocol).
 #
 # Build:
 #   docker build -t my-agent .

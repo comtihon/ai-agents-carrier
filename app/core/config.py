@@ -102,7 +102,7 @@ _CREDENTIAL_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_JSON", "_CREDENTIALS"
 
 
 class Settings(BaseSettings):
-    app_name: str = "LangGraph Backend"
+    app_name: str = "AI Agents Carrier"
     environment: str = "local"
     api_prefix: str = "/api/v1"
     debug: bool = False

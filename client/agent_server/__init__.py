@@ -1,4 +1,4 @@
-"""agent_server — reusable FastAPI server for langgraph-backend agents.
+"""agent_server — reusable FastAPI server for ai-agents-carrier agents.
 
 Usage
 -----

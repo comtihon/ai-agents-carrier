@@ -132,6 +132,8 @@ jobs:
           context: .
           push: true
           tags: |
+            ghcr.io/comtihon/ai-agents-carrier:latest
+            ghcr.io/comtihon/ai-agents-carrier:v${{ needs.release.outputs.version }}
             ghcr.io/comtihon/langgraph-backend:latest
             ghcr.io/comtihon/langgraph-backend:v${{ needs.release.outputs.version }}
           cache-from: type=gha

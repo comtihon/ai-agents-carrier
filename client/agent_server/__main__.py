@@ -38,7 +38,7 @@ def _load_agent_fn(agent_path: str):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="langgraph-backend agent server")
+    parser = argparse.ArgumentParser(description="ai-agents-carrier agent server")
     parser.add_argument(
         "--port",
         type=int,

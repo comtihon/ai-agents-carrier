@@ -1,4 +1,4 @@
-{{- $sa := include "langgraph-backend.fullname" . }}
+{{- $sa := include "ai-agents-carrier.fullname" . }}
 {{- $ns := .Release.Namespace }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -7,7 +7,7 @@ metadata:
   name: {{ $sa }}-agent-manager
   namespace: {{ $ns }}
   labels:
-    app.kubernetes.io/name: {{ include "langgraph-backend.name" . }}
+    app.kubernetes.io/name: {{ include "ai-agents-carrier.name" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}
 rules:
   # Helm stores release state as secrets
@@ -28,7 +28,7 @@ metadata:
   name: {{ $sa }}-agent-manager
   namespace: {{ $ns }}
   labels:
-    app.kubernetes.io/name: {{ include "langgraph-backend.name" . }}
+    app.kubernetes.io/name: {{ include "ai-agents-carrier.name" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}
 subjects:
   - kind: ServiceAccount
