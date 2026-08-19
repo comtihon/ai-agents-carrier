@@ -3,7 +3,7 @@ from __future__ import annotations
 from app.runtime.base import AgentRuntime
 
 
-def get_runtime(runtime_type: str, registry_username: str | None = None, registry_password: str | None = None, agent_namespace: str = "langgraph", callback_override_url: str | None = None) -> AgentRuntime:
+def get_runtime(runtime_type: str, registry_username: str | None = None, registry_password: str | None = None, agent_namespace: str = "langgraph", callback_override_url: str | None = None, agent_service_account: str | None = None) -> AgentRuntime:
     """Return an ``AgentRuntime`` instance for the given *runtime_type*.
 
     Parameters
@@ -24,7 +24,11 @@ def get_runtime(runtime_type: str, registry_username: str | None = None, registr
         return DockerRuntime(registry_username=registry_username, registry_password=registry_password)
     if runtime_type == "k8s":
         from app.runtime.k8s import K8sRuntime
-        return K8sRuntime(namespace=agent_namespace, callback_override_url=callback_override_url)
+        return K8sRuntime(
+            namespace=agent_namespace,
+            callback_override_url=callback_override_url,
+            service_account=agent_service_account,
+        )
     raise ValueError(
         f"Unknown runtime type '{runtime_type}'. "
         "Valid values are: 'local', 'docker', 'k8s'."
