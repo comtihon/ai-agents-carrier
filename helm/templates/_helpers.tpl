@@ -24,3 +24,12 @@ must not own.
 {{- define "ai-agents-carrier.serviceAccountName" -}}
 {{- default (include "ai-agents-carrier.fullname" .) .Values.serviceAccount.name -}}
 {{- end -}}
+
+{{/*
+Env var carrying one MCP server's bearer token. Explicit `apiKeyEnv` wins;
+otherwise <NAME>_MCP_API_KEY, so a single secret-ref is enough per server.
+Call with the integration entry as the context.
+*/}}
+{{- define "ai-agents-carrier.mcpApiKeyEnv" -}}
+{{- default (printf "%s_MCP_API_KEY" (upper (replace "-" "_" .name))) .apiKeyEnv -}}
+{{- end }}

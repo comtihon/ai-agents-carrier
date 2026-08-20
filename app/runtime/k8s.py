@@ -30,6 +30,7 @@ class K8sRuntime(AgentRuntime):
     env.AGENT_PORT            — fixed to 8000
     env.BACKEND_CALLBACK_URL  — backend base URL for agent callbacks
     env.RUN_ID                — workflow run identifier
+    serviceAccount.*          — only when the deployment names an existing KSA
 
     Service URL convention
     ----------------------
@@ -40,9 +41,15 @@ class K8sRuntime(AgentRuntime):
         http://<release_name>.<namespace>.svc.cluster.local:8000
     """
 
-    def __init__(self, namespace: str = "default", callback_override_url: str | None = None) -> None:
+    def __init__(
+        self,
+        namespace: str = "default",
+        callback_override_url: str | None = None,
+        service_account: str | None = None,
+    ) -> None:
         self._namespace = namespace
         self._callback_override_url = callback_override_url
+        self._service_account = service_account
         # Maps agent_url → release_name
         self._releases: dict[str, str] = {}
 
@@ -91,6 +98,15 @@ class K8sRuntime(AgentRuntime):
             if isinstance(value, dict):
                 continue
             set_args += ["--set", f"{key}={value}"]
+        # Run the pod as an existing KSA rather than one the chart invents, so it
+        # inherits that account's Workload Identity annotation and RBAC. Skipped
+        # when the agent's own helm_values already say something about
+        # serviceAccount — that loop ran first, and it is the more specific
+        # statement of intent.
+        if self._service_account and not any(a.startswith("serviceAccount.") for a in set_args):
+            set_args += ["--set", "serviceAccount.create=false"]
+            set_args += ["--set", f"serviceAccount.name={self._service_account}"]
+
         set_args += ["--set", f"env.AGENT_PORT={_AGENT_PORT}"]
         effective_url = self.rewrite_callback_url(callback_base_url)
         set_args += ["--set", f"env.BACKEND_CALLBACK_URL={effective_url}"]

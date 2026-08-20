@@ -22,12 +22,12 @@ spec:
           ports:
             - containerPort: 8000
               name: http
-{{- if or .Values.config .Values.llmIntegrations }}
+{{- if or .Values.config .Values.llmIntegrations .Values.mcpIntegrations }}
           envFrom:
             - configMapRef:
                 name: {{ include "ai-agents-carrier.fullname" . }}-config
 {{- end }}
-{{- if or .Values.secrets .Values.llmIntegrations }}
+{{- if or .Values.secrets .Values.llmIntegrations .Values.mcpIntegrations }}
           env:
 {{- range $envKey, $secret := .Values.secrets }}
             - name: {{ $envKey }}
@@ -39,6 +39,15 @@ spec:
 {{- range $cfg := .Values.llmIntegrations }}
 {{- if $cfg.apiKeySecret }}
             - name: {{ default (printf "%s_API_KEY" (upper (replace "-" "_" $cfg.name))) $cfg.apiKeyEnv }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $cfg.apiKeySecret.name }}
+                  key: {{ $cfg.apiKeySecret.key }}
+{{- end }}
+{{- end }}
+{{- range $cfg := .Values.mcpIntegrations }}
+{{- if $cfg.apiKeySecret }}
+            - name: {{ include "ai-agents-carrier.mcpApiKeyEnv" $cfg }}
               valueFrom:
                 secretKeyRef:
                   name: {{ $cfg.apiKeySecret.name }}
