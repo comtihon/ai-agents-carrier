@@ -5,15 +5,13 @@ Responsibilities
 1. Load the ``AgentDefinition`` from the backend by ``agent_id``.
 2. Determine the effective runtime (step ``runtime_override`` > agent ``default_runtime``).
 3. Build the input dict from the workflow state using ``input_mapping``.
-4. Branch on runtime:
-   - **local** — run inline via ``app.agents.local_agent.run_local_agent``.
-     No HTTP, no subprocess.  Returns the output dict directly.
-   - **docker / k8s** — spawn the agent HTTP server, send ``POST /start``,
-     then suspend via LangGraph ``interrupt()`` until the agent callbacks with
-     its output.
+4. Spawn the agent through the runtime — ``local`` (pi-cloud-agent as a child
+   process), ``docker`` (container) or ``k8s`` (Helm release) — send
+   ``POST /start``, then suspend via LangGraph ``interrupt()`` until the agent
+   calls back with its output.  All three speak the same HTTP protocol.
 
-HTTP protocol (docker / k8s)
------------------------------
+HTTP protocol
+-------------
 The backend spawns the agent (``runtime.spawn``) which starts a FastAPI server
 on a known port.  The backend then calls::
 
@@ -49,7 +47,7 @@ import json
 import os
 
 import logging
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -170,8 +168,6 @@ def _build_agent_config(
     state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the ``agent_config`` payload to forward in ``POST /start``.
-
-    Used only for docker / k8s agents.
 
     The payload is built from ``agent_def.agent_input`` (which is passed
     through wholesale as ``extra`` and also promoted to top-level fields when
@@ -557,7 +553,6 @@ async def execute_agent_step(
     run_id: str,
     callback_base_url: str,
     settings: "Settings | None" = None,
-    progress_cb: Callable[[str], Awaitable[None]] | None = None,
     run_repository: Any = None,
     pvc_lease_repository: Any = None,
     agent_task_repository: Any = None,
@@ -593,8 +588,6 @@ async def execute_agent_step(
         uses this to call back with its output.
     settings:
         App ``Settings`` instance.  Resolved lazily if not provided.
-    progress_cb:
-        Optional async callback for progress messages (local runtime only).
 
     Returns
     -------
@@ -647,125 +640,212 @@ async def execute_agent_step(
         if _prev_task:
             input_data = {**input_data, "previous_task": _prev_task}
 
-    # --- 5. Branch on runtime ---
-    if runtime_type == "local":
-        # Run inline — no HTTP, no subprocess.
-        from app.agents.local_agent import run_local_agent
+    # --- 5. Spawn the agent and drive it over HTTP ---
+    # All three runtimes speak the same protocol: spawn, POST /start, then
+    # suspend on an interrupt until the agent calls back with its output.
+    from app.runtime.factory import get_runtime
 
-        logger.info("[step '%s'] running local inline agent", step_id)
-        allowed_mcp = agent_def.mcp_addon.enabled_servers() if agent_def.mcp_addon else set()
-        raw_output = await run_local_agent(
-            agent_input=agent_def.agent_input,
-            input_data=input_data,
-            settings=settings,
-            progress_cb=progress_cb,
-            compression_level=step.get("compression_level", "none"),
-            allowed_mcp=allowed_mcp,
-        )
-        logger.info("[step '%s'] local agent completed, output keys: %s", step_id, list(raw_output))
-    else:
-        # Docker / K8s: use the HTTP protocol with interrupt-based suspension.
-        from app.runtime.factory import get_runtime
+    runtime: AgentRuntime = get_runtime(
+        runtime_type,
+        registry_username=settings.docker_registry_username,
+        registry_password=settings.docker_registry_password,
+        agent_namespace=settings.agent_namespace,
+        callback_override_url=settings.agent_callback_url,
+        agent_service_account=settings.agent_service_account,
+        local_agent_dir=settings.local_agent_dir,
+        local_agent_command=settings.local_agent_command,
+    )
+    agent_config_payload = _build_agent_config(agent_def, settings, step=step, run_id=run_id, state=state)
+    resolved_env_vars: dict[str, str] = agent_config_payload.get("env_vars") or {}
 
-        runtime: AgentRuntime = get_runtime(
-            runtime_type,
-            registry_username=settings.docker_registry_username,
-            registry_password=settings.docker_registry_password,
-            agent_namespace=settings.agent_namespace,
-            callback_override_url=settings.agent_callback_url,
-            agent_service_account=settings.agent_service_account,
-        )
-        agent_config_payload = _build_agent_config(agent_def, settings, step=step, run_id=run_id, state=state)
-        resolved_env_vars: dict[str, str] = agent_config_payload.get("env_vars") or {}
-
-        # --- Warm pod reuse: check if a warm pod is available for this agent ---
-        _is_warm_reuse = False
-        _warm_agent_url: str | None = None
-        if warm_pod_repository is not None and runtime_type == "k8s":
-            _warm_record = await warm_pod_repository.get(run_id, agent_id)
-            if _warm_record is not None:
-                try:
-                    async with httpx.AsyncClient() as _hc:
-                        _hr = await _hc.get(f"{_warm_record.agent_url}/health", timeout=5.0)
-                        if _hr.status_code == 200:
-                            _is_warm_reuse = True
-                            _warm_agent_url = _warm_record.agent_url
-                        else:
-                            # Unhealthy pod — delete stale record, fall through to spawn
-                            try:
-                                await warm_pod_repository.delete(run_id, agent_id)
-                            except Exception:
-                                pass
-                except Exception:
-                    # Pod gone — delete the stale record for this specific agent
-                    try:
-                        await warm_pod_repository.delete(run_id, agent_id)
-                    except Exception:
-                        pass
-
-        # LangGraph reruns the node from scratch on resume. Detect this by checking
-        # whether a container already exists for this run (spawned in the first execution).
-        # If so, skip spawn+start — interrupt() will return immediately with the stored output.
-        _is_resume = (
-            not _is_warm_reuse
-            and hasattr(runtime, "has_container_for_run")
-            and await runtime.has_container_for_run(agent_def, run_id)
-        )
-
-        container_callback_url = callback_base_url  # default; overridden below for docker/non-resume
-        if _is_warm_reuse:
-            # Warm pod still alive — reuse it: send a fresh /start and enter poll loop.
-            agent_url = _warm_agent_url  # type: ignore[assignment]
-            container_callback_url = runtime.rewrite_callback_url(callback_base_url)
-            logger.info("[step '%s'] reusing warm pod at %s for run '%s'", step_id, agent_url, run_id)
+    # --- Warm pod reuse: check if a warm pod is available for this agent ---
+    _is_warm_reuse = False
+    _warm_agent_url: str | None = None
+    if warm_pod_repository is not None and runtime_type == "k8s":
+        _warm_record = await warm_pod_repository.get(run_id, agent_id)
+        if _warm_record is not None:
             try:
-                async with httpx.AsyncClient() as client:
-                    resp = await client.post(
-                        f"{agent_url}/start",
-                        json={
-                            "run_id": run_id,
-                            "task_id": task_key,
-                            "input": input_data,
-                            "callback_url": container_callback_url,
-                            "agent_config": agent_config_payload,
-                        },
-                        timeout=10.0,
-                    )
-                    resp.raise_for_status()
-            except Exception as exc:
-                raise RuntimeError(
-                    f"[step '{step_id}'] Failed to start warm agent at {agent_url}: {exc}"
-                ) from exc
-            if agent_task_repository is not None:
-                from datetime import datetime, timezone
-                _task_doc = {
-                    "_id": task_key,
-                    "run_id": run_id,
-                    "step_id": step_id,
-                    "agent_id": agent_id,
-                    "agent_url": agent_url,
-                    "input": input_data,
-                    "agent_config": agent_config_payload if isinstance(agent_config_payload, dict) else {},
-                    "status": "pending",
-                    "loop_count": 0,
-                    "max_loops": get_settings().agent_max_loops,
-                    "outputs": [],
-                    "created_at": datetime.now(timezone.utc),
-                    "updated_at": datetime.now(timezone.utc),
-                }
+                async with httpx.AsyncClient() as _hc:
+                    _hr = await _hc.get(f"{_warm_record.agent_url}/health", timeout=5.0)
+                    if _hr.status_code == 200:
+                        _is_warm_reuse = True
+                        _warm_agent_url = _warm_record.agent_url
+                    else:
+                        # Unhealthy pod — delete stale record, fall through to spawn
+                        try:
+                            await warm_pod_repository.delete(run_id, agent_id)
+                        except Exception:
+                            pass
+            except Exception:
+                # Pod gone — delete the stale record for this specific agent
                 try:
-                    await agent_task_repository.save_task(_task_doc)
-                except Exception as _e:
-                    logger.warning("[step '%s'] failed to save agent task (warm reuse): %s", step_id, _e)
-        elif not _is_resume:
-            # --- 5a. Spawn the agent HTTP server ---
+                    await warm_pod_repository.delete(run_id, agent_id)
+                except Exception:
+                    pass
+
+    # LangGraph reruns the node from scratch on resume. Detect this by checking
+    # whether a container already exists for this run (spawned in the first execution).
+    # If so, skip spawn+start — interrupt() will return immediately with the stored output.
+    _is_resume = (
+        not _is_warm_reuse
+        and hasattr(runtime, "has_container_for_run")
+        and await runtime.has_container_for_run(agent_def, run_id)
+    )
+
+    container_callback_url = callback_base_url  # default; overridden below for docker/non-resume
+    if _is_warm_reuse:
+        # Warm pod still alive — reuse it: send a fresh /start and enter poll loop.
+        agent_url = _warm_agent_url  # type: ignore[assignment]
+        container_callback_url = runtime.rewrite_callback_url(callback_base_url)
+        logger.info("[step '%s'] reusing warm pod at %s for run '%s'", step_id, agent_url, run_id)
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"{agent_url}/start",
+                    json={
+                        "run_id": run_id,
+                        "task_id": task_key,
+                        "input": input_data,
+                        "callback_url": container_callback_url,
+                        "agent_config": agent_config_payload,
+                    },
+                    timeout=10.0,
+                )
+                resp.raise_for_status()
+        except Exception as exc:
+            raise RuntimeError(
+                f"[step '{step_id}'] Failed to start warm agent at {agent_url}: {exc}"
+            ) from exc
+        if agent_task_repository is not None:
+            from datetime import datetime, timezone
+            _task_doc = {
+                "_id": task_key,
+                "run_id": run_id,
+                "step_id": step_id,
+                "agent_id": agent_id,
+                "agent_url": agent_url,
+                "input": input_data,
+                "agent_config": agent_config_payload if isinstance(agent_config_payload, dict) else {},
+                "status": "pending",
+                "loop_count": 0,
+                "max_loops": get_settings().agent_max_loops,
+                "outputs": [],
+                "created_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(timezone.utc),
+            }
+            try:
+                await agent_task_repository.save_task(_task_doc)
+            except Exception as _e:
+                logger.warning("[step '%s'] failed to save agent task (warm reuse): %s", step_id, _e)
+    elif not _is_resume:
+        # --- 5a. Spawn the agent HTTP server ---
+        agent_url = await runtime.spawn(agent_def, step, run_id, callback_base_url, extra_env=resolved_env_vars)
+        logger.info("[step '%s'] agent server spawned at %s", step_id, agent_url)
+
+        # For Docker, the agent runs in a container where localhost = itself.
+        container_callback_url = runtime.rewrite_callback_url(callback_base_url)
+
+        # --- 5b. Send POST /start to the agent ---
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"{agent_url}/start",
+                    json={
+                        "run_id": run_id,
+                        "task_id": task_key,
+                        "input": input_data,
+                        "callback_url": container_callback_url,
+                        "agent_config": agent_config_payload,
+                    },
+                    timeout=10.0,
+                )
+                resp.raise_for_status()
+        except Exception as exc:
+            try:
+                await runtime.terminate(agent_url)
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"[step '{step_id}'] Failed to start agent at {agent_url}: {exc}"
+            ) from exc
+
+        logger.info(
+            "[step '%s'] agent started — polling run '%s' until output arrives",
+            step_id, run_id,
+        )
+
+        # Write task entity to MongoDB for poll-based tracking
+        if agent_task_repository is not None:
+            from datetime import datetime, timezone
+            _task_doc = {
+                "_id": task_key,
+                "run_id": run_id,
+                "step_id": step_id,
+                "agent_id": agent_id,
+                "agent_url": agent_url,
+                "input": input_data,
+                "agent_config": agent_config_payload if isinstance(agent_config_payload, dict) else {},
+                "status": "pending",
+                "loop_count": 0,
+                "max_loops": get_settings().agent_max_loops,
+                "outputs": [],
+                "created_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(timezone.utc),
+            }
+            try:
+                await agent_task_repository.save_task(_task_doc)
+            except Exception as _e:
+                logger.warning("[step '%s'] failed to save agent task: %s", step_id, _e)
+
+        # Write PVC lease for TTL cleanup
+        pvc_mount_point = step.get("pvc_mount_point")
+        if pvc_mount_point and pvc_lease_repository is not None:
+            from datetime import datetime, timezone
+            from app.runtime.pvc_manager import parse_ttl
+            pvc_name = step.get("pvc_name") or f"pvc-{run_id[:12]}"
+            ttl = parse_ttl(step.get("pvc_ttl", "1h"))
+            expires_at = datetime.now(timezone.utc) + ttl
+            lease = {
+                "pvc_name": pvc_name,
+                "namespace": settings.agent_namespace if settings else "default",
+                "run_id": run_id,
+                "expires_at": expires_at,
+                "created_at": datetime.now(timezone.utc),
+            }
+            try:
+                await pvc_lease_repository.save(lease)
+            except Exception as _exc:
+                logger.warning("Failed to save PVC lease for %s: %s", pvc_name, _exc)
+
+    else:
+        # Retrieve real agent_url from task repository for resume path
+        _stored_task = None
+        if agent_task_repository is not None:
+            _stored_task = await agent_task_repository.get_task(task_key)
+        if _stored_task and _stored_task.get("agent_url"):
+            agent_url = _stored_task["agent_url"]
+        else:
+            # Fall back to runtime lookup (only if method is a coroutine function)
+            import inspect as _inspect
+            _get_url_fn = getattr(runtime, "get_agent_url_for_run", None)
+            agent_url = await _get_url_fn(agent_def, run_id) if _get_url_fn is not None and _inspect.iscoroutinefunction(_get_url_fn) else None
+        if not agent_url:
+            # Stale pod from a failed spawn (e.g. helm timeout before task was saved).
+            # Terminate it and fall through to a fresh spawn below.
+            logger.warning(
+                "[step '%s'] agent_url not found for run '%s' — stale pod detected, terminating and respawning",
+                step_id, run_id,
+            )
+            _terminate_fn = getattr(runtime, "terminate_by_run_id", None)
+            if _terminate_fn is not None:
+                try:
+                    await _terminate_fn(agent_def, run_id)
+                except Exception as _te:
+                    logger.warning("[step '%s'] terminate_by_run_id failed: %s", step_id, _te)
+            _is_resume = False
             agent_url = await runtime.spawn(agent_def, step, run_id, callback_base_url, extra_env=resolved_env_vars)
-            logger.info("[step '%s'] agent server spawned at %s", step_id, agent_url)
-
-            # For Docker, the agent runs in a container where localhost = itself.
+            logger.info("[step '%s'] agent server respawned at %s", step_id, agent_url)
             container_callback_url = runtime.rewrite_callback_url(callback_base_url)
-
-            # --- 5b. Send POST /start to the agent ---
             try:
                 async with httpx.AsyncClient() as client:
                     resp = await client.post(
@@ -786,15 +866,8 @@ async def execute_agent_step(
                 except Exception:
                     pass
                 raise RuntimeError(
-                    f"[step '{step_id}'] Failed to start agent at {agent_url}: {exc}"
+                    f"[step '{step_id}'] Failed to start respawned agent at {agent_url}: {exc}"
                 ) from exc
-
-            logger.info(
-                "[step '%s'] agent started — polling run '%s' until output arrives",
-                step_id, run_id,
-            )
-
-            # Write task entity to MongoDB for poll-based tracking
             if agent_task_repository is not None:
                 from datetime import datetime, timezone
                 _task_doc = {
@@ -815,265 +888,163 @@ async def execute_agent_step(
                 try:
                     await agent_task_repository.save_task(_task_doc)
                 except Exception as _e:
-                    logger.warning("[step '%s'] failed to save agent task: %s", step_id, _e)
-
-            # Write PVC lease for TTL cleanup
-            pvc_mount_point = step.get("pvc_mount_point")
-            if pvc_mount_point and pvc_lease_repository is not None:
-                from datetime import datetime, timezone
-                from app.runtime.pvc_manager import parse_ttl
-                pvc_name = step.get("pvc_name") or f"pvc-{run_id[:12]}"
-                ttl = parse_ttl(step.get("pvc_ttl", "1h"))
-                expires_at = datetime.now(timezone.utc) + ttl
-                lease = {
-                    "pvc_name": pvc_name,
-                    "namespace": settings.agent_namespace if settings else "default",
-                    "run_id": run_id,
-                    "expires_at": expires_at,
-                    "created_at": datetime.now(timezone.utc),
-                }
-                try:
-                    await pvc_lease_repository.save(lease)
-                except Exception as _exc:
-                    logger.warning("Failed to save PVC lease for %s: %s", pvc_name, _exc)
-
+                    logger.warning("[step '%s'] failed to save agent task on respawn: %s", step_id, _e)
         else:
-            # Retrieve real agent_url from task repository for resume path
-            _stored_task = None
-            if agent_task_repository is not None:
-                _stored_task = await agent_task_repository.get_task(task_key)
-            if _stored_task and _stored_task.get("agent_url"):
-                agent_url = _stored_task["agent_url"]
-            else:
-                # Fall back to runtime lookup (only if method is a coroutine function)
-                import inspect as _inspect
-                _get_url_fn = getattr(runtime, "get_agent_url_for_run", None)
-                agent_url = await _get_url_fn(agent_def, run_id) if _get_url_fn is not None and _inspect.iscoroutinefunction(_get_url_fn) else None
-            if not agent_url:
-                # Stale pod from a failed spawn (e.g. helm timeout before task was saved).
-                # Terminate it and fall through to a fresh spawn below.
-                logger.warning(
-                    "[step '%s'] agent_url not found for run '%s' — stale pod detected, terminating and respawning",
-                    step_id, run_id,
-                )
-                _terminate_fn = getattr(runtime, "terminate_by_run_id", None)
-                if _terminate_fn is not None:
-                    try:
-                        await _terminate_fn(agent_def, run_id)
-                    except Exception as _te:
-                        logger.warning("[step '%s'] terminate_by_run_id failed: %s", step_id, _te)
-                _is_resume = False
-                agent_url = await runtime.spawn(agent_def, step, run_id, callback_base_url, extra_env=resolved_env_vars)
-                logger.info("[step '%s'] agent server respawned at %s", step_id, agent_url)
-                container_callback_url = runtime.rewrite_callback_url(callback_base_url)
-                try:
-                    async with httpx.AsyncClient() as client:
-                        resp = await client.post(
-                            f"{agent_url}/start",
-                            json={
-                                "run_id": run_id,
-                                "task_id": task_key,
-                                "input": input_data,
-                                "callback_url": container_callback_url,
-                                "agent_config": agent_config_payload,
-                            },
-                            timeout=10.0,
-                        )
-                        resp.raise_for_status()
-                except Exception as exc:
-                    try:
-                        await runtime.terminate(agent_url)
-                    except Exception:
-                        pass
-                    raise RuntimeError(
-                        f"[step '{step_id}'] Failed to start respawned agent at {agent_url}: {exc}"
-                    ) from exc
-                if agent_task_repository is not None:
-                    from datetime import datetime, timezone
-                    _task_doc = {
-                        "_id": task_key,
-                        "run_id": run_id,
-                        "step_id": step_id,
-                        "agent_id": agent_id,
-                        "agent_url": agent_url,
-                        "input": input_data,
-                        "agent_config": agent_config_payload if isinstance(agent_config_payload, dict) else {},
-                        "status": "pending",
-                        "loop_count": 0,
-                        "max_loops": get_settings().agent_max_loops,
-                        "outputs": [],
-                        "created_at": datetime.now(timezone.utc),
-                        "updated_at": datetime.now(timezone.utc),
-                    }
-                    try:
-                        await agent_task_repository.save_task(_task_doc)
-                    except Exception as _e:
-                        logger.warning("[step '%s'] failed to save agent task on respawn: %s", step_id, _e)
-            else:
-                logger.info("[step '%s'] resuming run '%s' (container already running)", step_id, run_id)
+            logger.info("[step '%s'] resuming run '%s' (container already running)", step_id, run_id)
 
-        # --- 5c. Pull-based polling: poll agent every N seconds until finished/failed/idle ---
-        _poll_interval = get_settings().agent_poll_interval_seconds
-        _max_loops = get_settings().agent_max_loops
-        _loop_count = 0
-        raw_output: dict = {}
+    # --- 5c. Pull-based polling: poll agent every N seconds until finished/failed/idle ---
+    _poll_interval = get_settings().agent_poll_interval_seconds
+    _max_loops = get_settings().agent_max_loops
+    _loop_count = 0
+    raw_output: dict = {}
 
-        while True:
-            await asyncio.sleep(_poll_interval)
+    while True:
+        await asyncio.sleep(_poll_interval)
+        try:
+            async with httpx.AsyncClient() as _hc:
+                _poll_resp = await _hc.get(f"{agent_url}/poll", timeout=10.0)
+                _poll_resp.raise_for_status()
+                _poll_data = _poll_resp.json()
+        except Exception as _poll_exc:
+            logger.warning("[step '%s'] poll failed: %s", step_id, _poll_exc)
+            _loop_count += 1
+            if _loop_count >= _max_loops and agent_task_repository is not None:
+                await agent_task_repository.update_task(task_key, {"status": "failed"})
+            if _loop_count >= _max_loops:
+                raise RuntimeError(f"[step '{step_id}'] agent unreachable after {_max_loops} poll attempts") from _poll_exc
+            continue
+
+        _poll_status = _poll_data.get("status", "idle")
+        _poll_outputs = _poll_data.get("outputs", [])
+
+        if agent_task_repository is not None and _poll_outputs:
             try:
-                async with httpx.AsyncClient() as _hc:
-                    _poll_resp = await _hc.get(f"{agent_url}/poll", timeout=10.0)
-                    _poll_resp.raise_for_status()
-                    _poll_data = _poll_resp.json()
-            except Exception as _poll_exc:
-                logger.warning("[step '%s'] poll failed: %s", step_id, _poll_exc)
-                _loop_count += 1
-                if _loop_count >= _max_loops and agent_task_repository is not None:
-                    await agent_task_repository.update_task(task_key, {"status": "failed"})
-                if _loop_count >= _max_loops:
-                    raise RuntimeError(f"[step '{step_id}'] agent unreachable after {_max_loops} poll attempts") from _poll_exc
-                continue
+                await agent_task_repository.append_outputs(task_key, _poll_outputs)
+            except Exception as _e:
+                logger.warning("[step '%s'] failed to append agent task outputs: %s", step_id, _e)
 
-            _poll_status = _poll_data.get("status", "idle")
-            _poll_outputs = _poll_data.get("outputs", [])
+        # Cache final output from every poll cycle — the "final" output may arrive
+        # while status is still "working" (task_store marks it sent before the
+        # in-memory state["status"] flips to "done"), so we must capture it here
+        # rather than waiting until the "finished" poll cycle (which may see outputs=[]).
+        if not raw_output:
+            for _out in _poll_outputs:
+                if _out.get("type") == "final":
+                    raw_output = _out.get("content", {})
+                    break
 
-            if agent_task_repository is not None and _poll_outputs:
+        # Forward progress messages to run state so the UI can see them.
+        if run_repository is not None and _poll_outputs:
+            _progress_msgs = [
+                out["content"]["message"]
+                for out in _poll_outputs
+                if out.get("type") == "progress"
+                and isinstance(out.get("content"), dict)
+                and out["content"].get("message")
+                and not out["content"]["message"].startswith("__")
+            ]
+            if _progress_msgs:
                 try:
-                    await agent_task_repository.append_outputs(task_key, _poll_outputs)
-                except Exception as _e:
-                    logger.warning("[step '%s'] failed to append agent task outputs: %s", step_id, _e)
+                    _run = await run_repository.get(run_id)
+                    if _run is not None:
+                        _progress_key = f"_agent_progress_{step_id}"
+                        _progress_list = list((_run.state or {}).get(_progress_key, []))
+                        _progress_list.extend(_progress_msgs)
+                        _run.state = {**(_run.state or {}), _progress_key: _progress_list}
+                        _run.touch()
+                        await run_repository.update(_run)
+                except Exception:
+                    pass  # progress is best-effort
 
-            # Cache final output from every poll cycle — the "final" output may arrive
-            # while status is still "working" (task_store marks it sent before the
-            # in-memory state["status"] flips to "done"), so we must capture it here
-            # rather than waiting until the "finished" poll cycle (which may see outputs=[]).
+        if _poll_status == "finished":
+            # raw_output may already be set from an earlier poll cycle (race condition
+            # where "final" output was consumed before status flipped to "finished").
+            # Fall back to scanning _poll_outputs only if not already captured.
             if not raw_output:
-                for _out in _poll_outputs:
+                for _out in reversed(_poll_outputs):
                     if _out.get("type") == "final":
                         raw_output = _out.get("content", {})
                         break
-
-            # Forward progress messages to run state so the UI can see them.
-            if run_repository is not None and _poll_outputs:
-                _progress_msgs = [
-                    out["content"]["message"]
-                    for out in _poll_outputs
-                    if out.get("type") == "progress"
-                    and isinstance(out.get("content"), dict)
-                    and out["content"].get("message")
-                    and not out["content"]["message"].startswith("__")
-                ]
-                if _progress_msgs:
-                    try:
-                        _run = await run_repository.get(run_id)
-                        if _run is not None:
-                            _progress_key = f"_agent_progress_{step_id}"
-                            _progress_list = list((_run.state or {}).get(_progress_key, []))
-                            _progress_list.extend(_progress_msgs)
-                            _run.state = {**(_run.state or {}), _progress_key: _progress_list}
-                            _run.touch()
-                            await run_repository.update(_run)
-                    except Exception:
-                        pass  # progress is best-effort
-
-            if _poll_status == "finished":
-                # raw_output may already be set from an earlier poll cycle (race condition
-                # where "final" output was consumed before status flipped to "finished").
-                # Fall back to scanning _poll_outputs only if not already captured.
-                if not raw_output:
-                    for _out in reversed(_poll_outputs):
-                        if _out.get("type") == "final":
-                            raw_output = _out.get("content", {})
-                            break
-                if not raw_output:
-                    # Final output may have been consumed by a previous poll cycle or
-                    # missed due to a race — check the task repository as fallback.
-                    if agent_task_repository is not None:
-                        _stored = await agent_task_repository.get_task(task_key)
-                        if _stored:
-                            for _out in reversed(_stored.get("outputs", [])):
-                                if isinstance(_out, dict) and _out.get("type") == "final":
-                                    raw_output = _out.get("content", {})
-                                    logger.info("[step '%s'] recovered final output from task repository", step_id)
-                                    break
-                    if not raw_output:
-                        logger.warning("[step '%s'] finished status but no 'final' output found in poll outputs or task repository", step_id)
+            if not raw_output:
+                # Final output may have been consumed by a previous poll cycle or
+                # missed due to a race — check the task repository as fallback.
                 if agent_task_repository is not None:
-                    await agent_task_repository.update_task(task_key, {"status": "finished"})
-                break
-
-            if _poll_status == "failed":
-                if agent_task_repository is not None:
-                    await agent_task_repository.update_task(task_key, {"status": "failed"})
-                raise RuntimeError(f"[step '{step_id}'] agent reported failure")
-
-            if _poll_status == "idle":
-                # Agent lost the task — meta LLM recovery
-                if use_meta_llm:
-                    from app.services.agent_poller import _meta_llm_recovery
-                    _task_for_recovery = {"input": input_data, "outputs": _poll_outputs}
-                    if agent_task_repository is not None:
-                        _stored_task = await agent_task_repository.get_task(task_key)
-                        if _stored_task:
-                            _task_for_recovery = _stored_task
-                    _is_complete = await _meta_llm_recovery(_task_for_recovery, settings)
-                    if _is_complete:
-                        for _out in reversed(_task_for_recovery.get("outputs", [])):
+                    _stored = await agent_task_repository.get_task(task_key)
+                    if _stored:
+                        for _out in reversed(_stored.get("outputs", [])):
                             if isinstance(_out, dict) and _out.get("type") == "final":
                                 raw_output = _out.get("content", {})
+                                logger.info("[step '%s'] recovered final output from task repository", step_id)
                                 break
-                        if agent_task_repository is not None:
-                            await agent_task_repository.update_task(task_key, {"status": "finished"})
-                        break
-                _loop_count += 1
-                if _loop_count >= _max_loops:
-                    if agent_task_repository is not None:
-                        await agent_task_repository.update_task(task_key, {"status": "failed"})
-                    raise RuntimeError(f"[step '{step_id}'] agent idle after {_max_loops} recovery attempts")
-                # Resend task
-                logger.info("[step '%s'] resending task to agent (loop %d/%d)", step_id, _loop_count, _max_loops)
-                if agent_task_repository is not None:
-                    await agent_task_repository.update_task(task_key, {"loop_count": _loop_count})
-                try:
-                    async with httpx.AsyncClient() as _hc2:
-                        _restart_resp = await _hc2.post(
-                            f"{agent_url}/start",
-                            json={"run_id": run_id, "task_id": task_key, "input": input_data, "callback_url": container_callback_url, "agent_config": agent_config_payload},
-                            timeout=10.0,
-                        )
-                        _restart_resp.raise_for_status()
-                except Exception as _restart_exc:
-                    logger.warning("[step '%s'] resend failed: %s", step_id, _restart_exc)
-                continue
-            # status == "working" or unknown — keep polling
+                if not raw_output:
+                    logger.warning("[step '%s'] finished status but no 'final' output found in poll outputs or task repository", step_id)
+            if agent_task_repository is not None:
+                await agent_task_repository.update_task(task_key, {"status": "finished"})
+            break
 
-        # After poll loop: either park as warm pod or terminate.
-        if warm_pod_repository is not None and runtime_type == "k8s":
-            from datetime import datetime, timezone, timedelta
-            from app.infrastructure.persistence.mongo import WarmPodRecord
-            _now = datetime.now(timezone.utc)
-            _release_name = runtime._release_name(agent_def, run_id) if hasattr(runtime, "_release_name") else ""
+        if _poll_status == "failed":
+            if agent_task_repository is not None:
+                await agent_task_repository.update_task(task_key, {"status": "failed"})
+            raise RuntimeError(f"[step '{step_id}'] agent reported failure")
+
+        if _poll_status == "idle":
+            # Agent lost the task — meta LLM recovery
+            if use_meta_llm:
+                from app.services.agent_poller import _meta_llm_recovery
+                _task_for_recovery = {"input": input_data, "outputs": _poll_outputs}
+                if agent_task_repository is not None:
+                    _stored_task = await agent_task_repository.get_task(task_key)
+                    if _stored_task:
+                        _task_for_recovery = _stored_task
+                _is_complete = await _meta_llm_recovery(_task_for_recovery, settings)
+                if _is_complete:
+                    for _out in reversed(_task_for_recovery.get("outputs", [])):
+                        if isinstance(_out, dict) and _out.get("type") == "final":
+                            raw_output = _out.get("content", {})
+                            break
+                    if agent_task_repository is not None:
+                        await agent_task_repository.update_task(task_key, {"status": "finished"})
+                    break
+            _loop_count += 1
+            if _loop_count >= _max_loops:
+                if agent_task_repository is not None:
+                    await agent_task_repository.update_task(task_key, {"status": "failed"})
+                raise RuntimeError(f"[step '{step_id}'] agent idle after {_max_loops} recovery attempts")
+            # Resend task
+            logger.info("[step '%s'] resending task to agent (loop %d/%d)", step_id, _loop_count, _max_loops)
+            if agent_task_repository is not None:
+                await agent_task_repository.update_task(task_key, {"loop_count": _loop_count})
             try:
-                await warm_pod_repository.upsert(WarmPodRecord(
-                    run_id=run_id,
-                    agent_id=agent_id,
-                    agent_url=agent_url,
-                    release_name=_release_name,
-                    created_at=_now,
-                    expires_at=_now + timedelta(hours=24),
-                ))
-                logger.info("[step '%s'] parked warm pod at %s (release=%s)", step_id, agent_url, _release_name)
-            except Exception as _wp_exc:
-                logger.warning("[step '%s'] failed to upsert warm pod record: %s — terminating instead", step_id, _wp_exc)
-                if hasattr(runtime, "terminate_by_run_id"):
-                    await runtime.terminate_by_run_id(agent_def, run_id)
-                else:
-                    try:
-                        await runtime.terminate(agent_url)
-                    except Exception as _exc:
-                        logger.warning("[step '%s'] failed to terminate agent: %s", step_id, _exc)
-        else:
-            # Terminate using run_id label — works whether _containers is populated or not.
+                async with httpx.AsyncClient() as _hc2:
+                    _restart_resp = await _hc2.post(
+                        f"{agent_url}/start",
+                        json={"run_id": run_id, "task_id": task_key, "input": input_data, "callback_url": container_callback_url, "agent_config": agent_config_payload},
+                        timeout=10.0,
+                    )
+                    _restart_resp.raise_for_status()
+            except Exception as _restart_exc:
+                logger.warning("[step '%s'] resend failed: %s", step_id, _restart_exc)
+            continue
+        # status == "working" or unknown — keep polling
+
+    # After poll loop: either park as warm pod or terminate.
+    if warm_pod_repository is not None and runtime_type == "k8s":
+        from datetime import datetime, timezone, timedelta
+        from app.infrastructure.persistence.mongo import WarmPodRecord
+        _now = datetime.now(timezone.utc)
+        _release_name = runtime._release_name(agent_def, run_id) if hasattr(runtime, "_release_name") else ""
+        try:
+            await warm_pod_repository.upsert(WarmPodRecord(
+                run_id=run_id,
+                agent_id=agent_id,
+                agent_url=agent_url,
+                release_name=_release_name,
+                created_at=_now,
+                expires_at=_now + timedelta(hours=24),
+            ))
+            logger.info("[step '%s'] parked warm pod at %s (release=%s)", step_id, agent_url, _release_name)
+        except Exception as _wp_exc:
+            logger.warning("[step '%s'] failed to upsert warm pod record: %s — terminating instead", step_id, _wp_exc)
             if hasattr(runtime, "terminate_by_run_id"):
                 await runtime.terminate_by_run_id(agent_def, run_id)
             else:
@@ -1081,219 +1052,228 @@ async def execute_agent_step(
                     await runtime.terminate(agent_url)
                 except Exception as _exc:
                     logger.warning("[step '%s'] failed to terminate agent: %s", step_id, _exc)
-
-        logger.info(
-            "[step '%s'] agent run '%s' resumed, output keys: %s",
-            step_id, run_id, list(raw_output),
-        )
-
-        # --- 5d-pre. Extract structured output from free-form "result" text ---
-        # Agent pod frameworks wrap Claude's response in {"result": "...", "token_usage": {...}}
-        # even when the Output Protocol or system prompt instructed Claude to return structured
-        # data.  When the step has output_mapping and the raw output is just {"result": "text"},
-        # try to parse that text as JSON or YAML so the structured fields reach output_mapping.
-        _pre_output_mapping = step.get("output_mapping") or {}
-        _expected_keys = set(_pre_output_mapping.keys())
-        if (
-            _expected_keys
-            and isinstance(raw_output.get("result"), str)
-            and not any(k in raw_output for k in _expected_keys)
-        ):
-            import json as _json, re as _re
-            _result_text = raw_output["result"].strip()
-
-            def _try_parse(text: str) -> dict | None:
-                """Try JSON then YAML; return dict if any expected key found."""
-                # JSON attempt
-                try:
-                    _p = _json.loads(text)
-                    if isinstance(_p, dict) and any(k in _p for k in _expected_keys):
-                        return _p
-                except Exception:
-                    pass
-                # YAML attempt (agent system prompts often instruct YAML output)
-                try:
-                    import yaml as _yaml
-                    _p = _yaml.safe_load(text)
-                    if isinstance(_p, dict) and any(k in _p for k in _expected_keys):
-                        return _p
-                except Exception:
-                    pass
-                return None
-
-            # Try: yaml/json code fence, then raw text
-            _parsed_out: dict | None = None
-            _fence = _re.search(
-                r"```(?:yaml|json)?\s*\n?(.*)\n?\s*```", _result_text, _re.DOTALL | _re.IGNORECASE
-            )
-            if _fence:
-                _parsed_out = _try_parse(_fence.group(1).strip())
-            if _parsed_out is None:
-                _parsed_out = _try_parse(_result_text)
-
-            if _parsed_out is None:
-                # Log the raw result so we can diagnose why extraction failed.
-                logger.warning(
-                    "[step '%s'] could not extract structured output from 'result' text "
-                    "(output_mapping has %d fields). Raw result (first 500 chars): %r",
-                    step_id, len(_pre_output_mapping), _result_text[:500],
-                )
-            else:
-                logger.info(
-                    "[step '%s'] extracted structured output from 'result' text "
-                    "(%d/%d output_mapping fields matched)",
-                    step_id,
-                    sum(1 for k in _pre_output_mapping if k in _parsed_out),
-                    len(_pre_output_mapping),
-                )
-                raw_output = {
-                    **_parsed_out,
-                    **{k: v for k, v in raw_output.items() if k not in _parsed_out and k != "result"},
-                }
-
-        # --- 5d. Surface unanswered clarify-tool question, then meta-LLM ---
-        # If the agent called the clarify tool but nobody answered (timeout or skip),
-        # _pending_question is still set in the run's DB state. Re-surface it as an
-        # ask_context interrupt so the UI and Slack can handle it properly — bypassing
-        # meta-LLM which would otherwise decide "proceed" on the partial output.
-        _surfaced_pending = False
-
-        # Deterministic context-sufficiency gate — no LLM needed.
-        # Ideally agents use the clarify tool mid-run so they always exit with
-        # context_sufficient=True.  This gate is a safety net for agents that
-        # still return context_sufficient=False in their final output.
-        if not raw_output.get("context_sufficient", True):
-            questions = raw_output.get("questions", [])
-            if isinstance(questions, list) and questions:
-                logger.warning(
-                    "[step '%s'] context_sufficient=False in final output — agent should use "
-                    "the clarify tool instead of exiting; surfacing %d question(s): %s",
-                    step_id, len(questions), questions,
-                )
-                answers = interrupt({"type": "ask_context", "questions": questions})
-                if isinstance(answers, dict) and answers:
-                    raw_output = {**raw_output, "_clarification_answers": answers}
-                _surfaced_pending = True
-
-        if run_repository is not None:
+    else:
+        # Terminate using run_id label — works whether _containers is populated or not.
+        if hasattr(runtime, "terminate_by_run_id"):
+            await runtime.terminate_by_run_id(agent_def, run_id)
+        else:
             try:
-                fresh_run = await run_repository.get(run_id)
-                pending_q = (fresh_run.state or {}).get("_pending_question") if fresh_run else None
+                await runtime.terminate(agent_url)
+            except Exception as _exc:
+                logger.warning("[step '%s'] failed to terminate agent: %s", step_id, _exc)
+
+    logger.info(
+        "[step '%s'] agent run '%s' resumed, output keys: %s",
+        step_id, run_id, list(raw_output),
+    )
+
+    # --- 5d-pre. Extract structured output from free-form "result" text ---
+    # Agent pod frameworks wrap Claude's response in {"result": "...", "token_usage": {...}}
+    # even when the Output Protocol or system prompt instructed Claude to return structured
+    # data.  When the step has output_mapping and the raw output is just {"result": "text"},
+    # try to parse that text as JSON or YAML so the structured fields reach output_mapping.
+    _pre_output_mapping = step.get("output_mapping") or {}
+    _expected_keys = set(_pre_output_mapping.keys())
+    if (
+        _expected_keys
+        and isinstance(raw_output.get("result"), str)
+        and not any(k in raw_output for k in _expected_keys)
+    ):
+        import json as _json, re as _re
+        _result_text = raw_output["result"].strip()
+
+        def _try_parse(text: str) -> dict | None:
+            """Try JSON then YAML; return dict if any expected key found."""
+            # JSON attempt
+            try:
+                _p = _json.loads(text)
+                if isinstance(_p, dict) and any(k in _p for k in _expected_keys):
+                    return _p
             except Exception:
-                pending_q = None
-            if pending_q:
-                question_text = (
-                    pending_q.get("question", str(pending_q))
-                    if isinstance(pending_q, dict) else str(pending_q)
-                )
-                logger.info(
-                    "[step '%s'] unanswered clarify question detected — surfacing as ask_context",
-                    step_id,
-                )
-                answers = interrupt({"type": "ask_context", "questions": [question_text]})
-                if isinstance(answers, dict) and answers:
-                    raw_output = {**raw_output, "_clarification_answers": answers}
-                # Clear the marker so it doesn't re-trigger on the next resume
-                try:
-                    r2 = await run_repository.get(run_id)
-                    if r2 and "_pending_question" in (r2.state or {}):
-                        r2.state = {k: v for k, v in r2.state.items() if k != "_pending_question"}
-                        r2.touch()
-                        await run_repository.update(r2)
-                except Exception:
-                    pass
-                _surfaced_pending = True
+                pass
+            # YAML attempt (agent system prompts often instruct YAML output)
+            try:
+                import yaml as _yaml
+                _p = _yaml.safe_load(text)
+                if isinstance(_p, dict) and any(k in _p for k in _expected_keys):
+                    return _p
+            except Exception:
+                pass
+            return None
 
-        # --- 5b. Meta-LLM step evaluation ---
-        # Run BEFORE output_mapping validation so the quality gate fires even when
-        # the agent returned plain text instead of structured fields.  This produces
-        # a meaningful "meta-LLM rejected: <reason>" error rather than the opaque
-        # "expected fields not found" message, and prevents downstream steps from
-        # running on obviously bad output.
-        _meta_llm_verdict: dict[str, Any] | None = None
-        _meta_llm_usage: dict[str, int] | None = None
-        if use_meta_llm and not _surfaced_pending:
-            _sc = step.get("success_criteria") if isinstance(step, dict) else None
-            _fc = step.get("fail_criteria") if isinstance(step, dict) else None
-            logger.info(
-                "[step '%s'] running meta-LLM evaluation (success_criteria=%r, fail_criteria=%r)",
-                step_id, _sc, _fc,
+        # Try: yaml/json code fence, then raw text
+        _parsed_out: dict | None = None
+        _fence = _re.search(
+            r"```(?:yaml|json)?\s*\n?(.*)\n?\s*```", _result_text, _re.DOTALL | _re.IGNORECASE
+        )
+        if _fence:
+            _parsed_out = _try_parse(_fence.group(1).strip())
+        if _parsed_out is None:
+            _parsed_out = _try_parse(_result_text)
+
+        if _parsed_out is None:
+            # Log the raw result so we can diagnose why extraction failed.
+            logger.warning(
+                "[step '%s'] could not extract structured output from 'result' text "
+                "(output_mapping has %d fields). Raw result (first 500 chars): %r",
+                step_id, len(_pre_output_mapping), _result_text[:500],
             )
-            _eval = await _meta_llm_evaluate(raw_output, input_data, step_id, settings, _sc, _fc)
+        else:
             logger.info(
-                "[step '%s'] meta-LLM result: passed=%s reason=%r",
-                step_id, _eval["passed"], _eval.get("reason"),
+                "[step '%s'] extracted structured output from 'result' text "
+                "(%d/%d output_mapping fields matched)",
+                step_id,
+                sum(1 for k in _pre_output_mapping if k in _parsed_out),
+                len(_pre_output_mapping),
             )
-            _meta_llm_usage = _eval.get("usage")
-            # Store the meta-LLM verdict regardless of pass/fail so the UI can
-            # always show what the quality gate decided and why.
-            _meta_llm_verdict = {
-                "passed": _eval["passed"],
-                "reason": _eval.get("reason", ""),
+            raw_output = {
+                **_parsed_out,
+                **{k: v for k, v in raw_output.items() if k not in _parsed_out and k != "result"},
             }
-            if not _eval["passed"]:
-                _rejection_reason = _eval["reason"]
-                _rej_output_mapping: dict[str, str] | None = step.get("output_mapping")
-                _rej_output_key: str | None = step.get("output_key")
-                if _rej_output_mapping:
-                    _mapped_for_rejection: dict[str, Any] = {
-                        wk: raw_output[ak]
-                        for ak, wk in _rej_output_mapping.items()
-                        if ak in raw_output
-                    }
-                elif _rej_output_key and "result" in raw_output:
-                    _mapped_for_rejection = {_rej_output_key: raw_output["result"]}
-                else:
-                    _mapped_for_rejection = {}
-                _apply_usage_keys(_mapped_for_rejection, step_id, raw_output, _meta_llm_usage)
-                raise MetaLLMRejectionError(
-                    _rejection_reason,  # clean reason — no step-id prefix noise
-                    mapped_result=_mapped_for_rejection,
-                    reason=_rejection_reason,
-                )
 
-        # Deterministic fail when output_mapping is set but nothing matched.
-        # The agent returned unstructured output (e.g. {"result": "text"}) AND
-        # YAML/JSON extraction above couldn't find any expected fields.
-        # Check for empty/minimal output separately — that's an agent execution
-        # failure (max iterations, tool errors), not a contract violation.
-        _output_mapping_check = step.get("output_mapping") or {}
-        if (
-            not _surfaced_pending
-            and _output_mapping_check
-            and not any(k in raw_output for k in _output_mapping_check)
-            and "context_sufficient" not in raw_output
-        ):
-            _result_val = raw_output.get("result", "")
-            _raw_snippet = str(_result_val or raw_output)[:5000]
-            _token_usage = raw_output.get("token_usage", {})
-            _output_tokens = _token_usage.get("output_tokens", 0) if isinstance(_token_usage, dict) else 0
-            # "(no output)" is LangGraph's fallback when the ReAct loop ends
-            # without a final AI message (max iterations hit, context overflow, etc.)
-            _is_framework_empty = (not _result_val) or _result_val.strip() in ("", "(no output)", "None", "null")
-            if _is_framework_empty:
-                _extra = (
-                    f"Token usage suggests agent worked ({_output_tokens:,} output tokens) "
-                    "but hit max iterations or context limit before producing structured output. "
-                    if _output_tokens > 100 else
-                    "Agent may not have run successfully. "
-                )
-                raise RuntimeError(
-                    f"[step '{step_id}'] Agent returned no usable output. "
-                    f"{_extra}"
-                    f"Token usage: {_token_usage}"
-                )
-            # Use MetaLLMRejectionError so the UI can display the raw output alongside
-            # the error — the agent may have returned a valid message (e.g. "Jira unavailable")
-            # that is useful to show even though it didn't match the structured schema.
-            _raw_mapped: dict[str, Any] = {}
-            _apply_usage_keys(_raw_mapped, step_id, raw_output, _meta_llm_usage)
-            raise MetaLLMRejectionError(
-                f"Agent returned unstructured output — expected fields {list(_output_mapping_check)} not found. "
-                f"Agent said: {_raw_snippet}",
-                mapped_result=_raw_mapped,
-                reason=f"Agent returned plain text instead of structured output. Agent said: {_raw_snippet}",
+    # --- 5d. Surface unanswered clarify-tool question, then meta-LLM ---
+    # If the agent called the clarify tool but nobody answered (timeout or skip),
+    # _pending_question is still set in the run's DB state. Re-surface it as an
+    # ask_context interrupt so the UI and Slack can handle it properly — bypassing
+    # meta-LLM which would otherwise decide "proceed" on the partial output.
+    _surfaced_pending = False
+
+    # Deterministic context-sufficiency gate — no LLM needed.
+    # Ideally agents use the clarify tool mid-run so they always exit with
+    # context_sufficient=True.  This gate is a safety net for agents that
+    # still return context_sufficient=False in their final output.
+    if not raw_output.get("context_sufficient", True):
+        questions = raw_output.get("questions", [])
+        if isinstance(questions, list) and questions:
+            logger.warning(
+                "[step '%s'] context_sufficient=False in final output — agent should use "
+                "the clarify tool instead of exiting; surfacing %d question(s): %s",
+                step_id, len(questions), questions,
             )
+            answers = interrupt({"type": "ask_context", "questions": questions})
+            if isinstance(answers, dict) and answers:
+                raw_output = {**raw_output, "_clarification_answers": answers}
+            _surfaced_pending = True
+
+    if run_repository is not None:
+        try:
+            fresh_run = await run_repository.get(run_id)
+            pending_q = (fresh_run.state or {}).get("_pending_question") if fresh_run else None
+        except Exception:
+            pending_q = None
+        if pending_q:
+            question_text = (
+                pending_q.get("question", str(pending_q))
+                if isinstance(pending_q, dict) else str(pending_q)
+            )
+            logger.info(
+                "[step '%s'] unanswered clarify question detected — surfacing as ask_context",
+                step_id,
+            )
+            answers = interrupt({"type": "ask_context", "questions": [question_text]})
+            if isinstance(answers, dict) and answers:
+                raw_output = {**raw_output, "_clarification_answers": answers}
+            # Clear the marker so it doesn't re-trigger on the next resume
+            try:
+                r2 = await run_repository.get(run_id)
+                if r2 and "_pending_question" in (r2.state or {}):
+                    r2.state = {k: v for k, v in r2.state.items() if k != "_pending_question"}
+                    r2.touch()
+                    await run_repository.update(r2)
+            except Exception:
+                pass
+            _surfaced_pending = True
+
+    # --- 5b. Meta-LLM step evaluation ---
+    # Run BEFORE output_mapping validation so the quality gate fires even when
+    # the agent returned plain text instead of structured fields.  This produces
+    # a meaningful "meta-LLM rejected: <reason>" error rather than the opaque
+    # "expected fields not found" message, and prevents downstream steps from
+    # running on obviously bad output.
+    _meta_llm_verdict: dict[str, Any] | None = None
+    _meta_llm_usage: dict[str, int] | None = None
+    if use_meta_llm and not _surfaced_pending:
+        _sc = step.get("success_criteria") if isinstance(step, dict) else None
+        _fc = step.get("fail_criteria") if isinstance(step, dict) else None
+        logger.info(
+            "[step '%s'] running meta-LLM evaluation (success_criteria=%r, fail_criteria=%r)",
+            step_id, _sc, _fc,
+        )
+        _eval = await _meta_llm_evaluate(raw_output, input_data, step_id, settings, _sc, _fc)
+        logger.info(
+            "[step '%s'] meta-LLM result: passed=%s reason=%r",
+            step_id, _eval["passed"], _eval.get("reason"),
+        )
+        _meta_llm_usage = _eval.get("usage")
+        # Store the meta-LLM verdict regardless of pass/fail so the UI can
+        # always show what the quality gate decided and why.
+        _meta_llm_verdict = {
+            "passed": _eval["passed"],
+            "reason": _eval.get("reason", ""),
+        }
+        if not _eval["passed"]:
+            _rejection_reason = _eval["reason"]
+            _rej_output_mapping: dict[str, str] | None = step.get("output_mapping")
+            _rej_output_key: str | None = step.get("output_key")
+            if _rej_output_mapping:
+                _mapped_for_rejection: dict[str, Any] = {
+                    wk: raw_output[ak]
+                    for ak, wk in _rej_output_mapping.items()
+                    if ak in raw_output
+                }
+            elif _rej_output_key and "result" in raw_output:
+                _mapped_for_rejection = {_rej_output_key: raw_output["result"]}
+            else:
+                _mapped_for_rejection = {}
+            _apply_usage_keys(_mapped_for_rejection, step_id, raw_output, _meta_llm_usage)
+            raise MetaLLMRejectionError(
+                _rejection_reason,  # clean reason — no step-id prefix noise
+                mapped_result=_mapped_for_rejection,
+                reason=_rejection_reason,
+            )
+
+    # Deterministic fail when output_mapping is set but nothing matched.
+    # The agent returned unstructured output (e.g. {"result": "text"}) AND
+    # YAML/JSON extraction above couldn't find any expected fields.
+    # Check for empty/minimal output separately — that's an agent execution
+    # failure (max iterations, tool errors), not a contract violation.
+    _output_mapping_check = step.get("output_mapping") or {}
+    if (
+        not _surfaced_pending
+        and _output_mapping_check
+        and not any(k in raw_output for k in _output_mapping_check)
+        and "context_sufficient" not in raw_output
+    ):
+        _result_val = raw_output.get("result", "")
+        _raw_snippet = str(_result_val or raw_output)[:5000]
+        _token_usage = raw_output.get("token_usage", {})
+        _output_tokens = _token_usage.get("output_tokens", 0) if isinstance(_token_usage, dict) else 0
+        # "(no output)" is LangGraph's fallback when the ReAct loop ends
+        # without a final AI message (max iterations hit, context overflow, etc.)
+        _is_framework_empty = (not _result_val) or _result_val.strip() in ("", "(no output)", "None", "null")
+        if _is_framework_empty:
+            _extra = (
+                f"Token usage suggests agent worked ({_output_tokens:,} output tokens) "
+                "but hit max iterations or context limit before producing structured output. "
+                if _output_tokens > 100 else
+                "Agent may not have run successfully. "
+            )
+            raise RuntimeError(
+                f"[step '{step_id}'] Agent returned no usable output. "
+                f"{_extra}"
+                f"Token usage: {_token_usage}"
+            )
+        # Use MetaLLMRejectionError so the UI can display the raw output alongside
+        # the error — the agent may have returned a valid message (e.g. "Jira unavailable")
+        # that is useful to show even though it didn't match the structured schema.
+        _raw_mapped: dict[str, Any] = {}
+        _apply_usage_keys(_raw_mapped, step_id, raw_output, _meta_llm_usage)
+        raise MetaLLMRejectionError(
+            f"Agent returned unstructured output — expected fields {list(_output_mapping_check)} not found. "
+            f"Agent said: {_raw_snippet}",
+            mapped_result=_raw_mapped,
+            reason=f"Agent returned plain text instead of structured output. Agent said: {_raw_snippet}",
+        )
 
     # Fail fast when the agent returned {"error": "...", "token_usage": {...}} with no
     # "result" key — this is the framework's error format (max iterations, API error, etc.).

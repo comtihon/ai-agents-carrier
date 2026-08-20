@@ -56,6 +56,8 @@ API at `http://localhost:8000`. Health check: `GET /health`.
 | `OPENHANDS_MOCK_MODE` | `true` | Return stub results instead of calling OpenHands |
 | `DOCKER_REGISTRY_USERNAME` | — | Registry username for pulling private images (DockerRuntime) |
 | `DOCKER_REGISTRY_PASSWORD` | — | Registry password / token for pulling private images |
+| `LOCAL_AGENT_DIR` | — | Path to a [pi-cloud-agent](https://github.com/comtihon/pi-cloud-agent) checkout. Required for the `local` agent runtime |
+| `LOCAL_AGENT_COMMAND` | `node src/server.js` | Command that starts the local agent's HTTP server, run with `LOCAL_AGENT_DIR` as cwd |
 | `META_LLM_PROVIDER` | — | LLM provider for post-agent analysis (`anthropic` or `openai`; defaults to `LLM_PROVIDER`) |
 | `META_LLM_MODEL` | `claude-haiku-4-5-20251001` | Model for post-agent meta-analysis (haiku recommended for cost/speed) |
 
@@ -441,7 +443,7 @@ POST /api/v1/callbacks/{run_id}/reject   body: {"reason": "..."}
 
 ### `langgraph-agent` / `claude-agent` — autonomous agent step
 
-Spawns a registered agent, sends the task, suspends until the agent calls back with its result. Supports `local` (in-process), `docker`, and `k8s` runtimes.
+Spawns a registered agent, sends the task, suspends until the agent calls back with its result. The runtime decides *where* the agent runs — `local` (child process of the backend), `docker` (container) or `k8s` (Helm release) — not *what* it is: all three run [pi-cloud-agent](https://github.com/comtihon/pi-cloud-agent) and speak the same HTTP protocol.
 
 ```yaml
 - id: researcher
@@ -565,6 +567,16 @@ Reusable scripts live in MongoDB (`script_definitions`) and are referenced by
 node is a save-by-name: an existing name answers `409` so the UI can ask before
 overwriting.
 
+**Inline bodies are captured on save.** A `python` step saved with inline `code`
+and no `script_id` gets a library entry, and the step is rewritten to point at
+it — whether the save came from the UI, the REST API, the chat assistant or the
+management MCP server. Code an agent writes is therefore findable and editable
+in one place instead of buried in one workflow's definition. The library id is
+`<workflow_id>-<step_id>`, so re-saving updates that one entry and two workflows
+with a `transform` step never fight over the same document. The inline `code`
+stays on the step as the body the node shows when the library is unreachable;
+`script_id` is what runs.
+
 ### `cron` — scheduled trigger
 
 Entry-point step. Registers a cron job; each firing creates a new run.
@@ -632,6 +644,16 @@ Requires `PUBSUB_ENABLED=true` and `PUBSUB_PROJECT_ID` (see the configuration ta
 ## Agents
 
 Agents are registered persistent definitions that `langgraph-agent` / `claude-agent` steps look up by `agent_id`. Each definition stores the runtime type, Docker image, and the `agent_input` dict (system prompt, model, tools, etc.) forwarded to the agent on every run.
+
+**Runtimes.** All three run the same agent — [pi-cloud-agent](https://github.com/comtihon/pi-cloud-agent), the pi coding agent behind an HTTP server — so a workflow behaves the same on a laptop as in a cluster. Only the packaging differs:
+
+| runtime  | how the agent is started | configured by |
+|----------|--------------------------|---------------|
+| `local`  | child process of the backend on a free localhost port | `LOCAL_AGENT_DIR` (a pi-cloud-agent checkout), `LOCAL_AGENT_COMMAND` |
+| `docker` | container, random host port | `image` on the definition, `DOCKER_REGISTRY_*` for private registries |
+| `k8s`    | Helm release in `AGENT_NAMESPACE` | `helm_chart` / `helm_values`, `AGENT_SERVICE_ACCOUNT` |
+
+`local` needs `LOCAL_AGENT_DIR` set — there is no in-process agent to fall back on, and a step whose runtime resolves to `local` without it fails with a configuration error rather than running something different from production. The backend image does not ship the agent, so in a cluster agents belong on `k8s` (or `docker`); `local` is for a laptop with a checkout beside the backend. Definitions written before this — `default_runtime: local` was the old inline LangGraph agent — need switching to `k8s`.
 
 ```yaml
 # Example agent definition (managed via API or copilot_ui)

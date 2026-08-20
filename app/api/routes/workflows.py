@@ -11,6 +11,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, R
 from pydantic import BaseModel, Field
 
 from app.api.dependencies import get_container
+from app.application.script_capture import capture_inline_scripts
 from app.application import run_control
 # _config is defined in run_control (the shared run-control layer); imported here
 # rather than duplicated. The dependency direction is workflows -> run_control.
@@ -547,6 +548,8 @@ async def create_workflow(
     if existing is not None:
         raise HTTPException(status_code=409, detail=f"Workflow '{body.id}' already exists")
 
+    await capture_inline_scripts(body.id, body.steps, container.script_backend)
+
     defn = WorkflowDefinition(
         id=body.id,
         name=body.name,
@@ -863,6 +866,8 @@ async def update_workflow(
         raise HTTPException(status_code=404, detail=f"Workflow '{workflow_id}' not found")
     if existing.readonly:
         raise HTTPException(status_code=403, detail=f"Workflow '{workflow_id}' is read-only")
+
+    await capture_inline_scripts(workflow_id, body.steps, container.script_backend)
 
     defn = WorkflowDefinition(
         id=workflow_id,

@@ -8,12 +8,14 @@ overwrite, and the retry carries ``overwrite: true``.
 from __future__ import annotations
 
 import logging
-import re
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from app.api.dependencies import get_container
+# Shared with the workflow-save capture path so a name-derived id is the same
+# whichever route created it.
+from app.application.script_capture import slugify
 from app.core.container import ApplicationContainer
 from app.domain.models.script_definition import ScriptDefinition
 
@@ -46,11 +48,6 @@ class ScriptUpdateRequest(BaseModel):
 def _require_backend(container: ApplicationContainer) -> None:
     if container.script_backend is None:
         raise HTTPException(status_code=501, detail="Script backend not configured")
-
-
-def slugify(name: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
-    return slug or "script"
 
 
 # ─── Collection routes ────────────────────────────────────────────────────────

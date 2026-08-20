@@ -3,13 +3,17 @@ from __future__ import annotations
 from app.runtime.base import AgentRuntime
 
 
-def get_runtime(runtime_type: str, registry_username: str | None = None, registry_password: str | None = None, agent_namespace: str = "langgraph", callback_override_url: str | None = None, agent_service_account: str | None = None) -> AgentRuntime:
+def get_runtime(runtime_type: str, registry_username: str | None = None, registry_password: str | None = None, agent_namespace: str = "langgraph", callback_override_url: str | None = None, agent_service_account: str | None = None, local_agent_dir: str | None = None, local_agent_command: str | None = None) -> AgentRuntime:
     """Return an ``AgentRuntime`` instance for the given *runtime_type*.
 
     Parameters
     ----------
     runtime_type:
-        One of ``"local"``, ``"docker"``, or ``"k8s"``.
+        One of ``"local"``, ``"docker"``, or ``"k8s"``.  All three run
+        pi-cloud-agent; they differ in how it is packaged.
+    local_agent_dir, local_agent_command:
+        Where the ``local`` runtime finds its pi-cloud-agent checkout and how it
+        starts the server (``LOCAL_AGENT_DIR`` / ``LOCAL_AGENT_COMMAND``).
 
     Raises
     ------
@@ -18,7 +22,7 @@ def get_runtime(runtime_type: str, registry_username: str | None = None, registr
     """
     if runtime_type == "local":
         from app.runtime.local import LocalRuntime
-        return LocalRuntime()
+        return LocalRuntime(agent_dir=local_agent_dir, agent_command=local_agent_command)
     if runtime_type == "docker":
         from app.runtime.docker import DockerRuntime
         return DockerRuntime(registry_username=registry_username, registry_password=registry_password)

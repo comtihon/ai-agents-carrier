@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from app.infrastructure.persistence.data_source_backend import DataSourceDefinitionBackend
     from app.infrastructure.persistence.event_backend import EventDefinitionBackend
     from app.infrastructure.persistence.mongo import MongoGraphRunRepository
+    from app.infrastructure.persistence.script_backend import ScriptDefinitionBackend
     from app.infrastructure.persistence.workflow_backend import WorkflowDefinitionBackend
 
 logger = logging.getLogger(__name__)
@@ -125,6 +126,7 @@ class ManagementDeps:
     agent_backend: "AgentDefinitionBackend | None" = None
     data_source_backend: "DataSourceDefinitionBackend | None" = None
     event_backend: "EventDefinitionBackend | None" = None
+    script_backend: "ScriptDefinitionBackend | None" = None
     refresh_runner: "Callable[[str], Awaitable[None]] | None" = None
     refresh_datasources: "Callable[[], Awaitable[None]] | None" = None
     # PubSubSubscriberManager when Pub/Sub triggers are enabled, else None.
@@ -147,6 +149,7 @@ def deps_from_container(
         agent_backend=getattr(container, "agent_backend", None),
         data_source_backend=getattr(container, "data_source_backend", None),
         event_backend=getattr(container, "event_backend", None),
+        script_backend=getattr(container, "script_backend", None),
         refresh_runner=getattr(container, "refresh_runner", None),
         refresh_datasources=refresh_datasources,
         pubsub_subscriber=getattr(container, "pubsub_subscriber", None),
@@ -389,6 +392,21 @@ def _sandbox_denial(steps: Any) -> str | None:
     return None
 
 
+def _captured_note(captured: list[str]) -> str:
+    """Tell the model which python bodies became library scripts.
+
+    Silent rewriting would make the agent re-send inline code it thinks is still
+    inline; naming the ids lets it reference them directly next time.
+    """
+    if not captured:
+        return ""
+    return (
+        " Inline python bodies were saved to the script library as "
+        + ", ".join(f"'{sid}'" for sid in captured)
+        + " and the steps now reference them by script_id."
+    )
+
+
 @requires(Permission.WRITE)
 async def create_workflow(
     deps: ManagementDeps, workflow_id: str, name: str, description: str, steps_json: str
@@ -410,12 +428,17 @@ async def create_workflow(
     if existing is not None:
         return f"Workflow '{workflow_id}' already exists. Use update_workflow to modify it."
 
+    from app.application.script_capture import capture_inline_scripts
     from app.domain.models.workflow_definition import WorkflowDefinition
+    captured = await capture_inline_scripts(workflow_id, steps, deps.script_backend)
     defn = WorkflowDefinition(id=workflow_id, name=name, description=description, steps=steps)
     await deps.workflow_backend.create(defn)
     if deps.refresh_runner is not None:
         await deps.refresh_runner(workflow_id)
-    return f"Workflow '{workflow_id}' created with {len(steps)} step(s)."
+    return (
+        f"Workflow '{workflow_id}' created with {len(steps)} step(s)."
+        + _captured_note(captured)
+    )
 
 
 @requires(Permission.WRITE)
@@ -439,6 +462,7 @@ async def update_workflow(
     if defn.readonly:
         return f"Workflow '{workflow_id}' is read-only and cannot be modified."
 
+    captured: list[str] = []
     if name is not None:
         defn.name = name
     if description is not None:
@@ -453,12 +477,14 @@ async def update_workflow(
         denied = _sandbox_denial(steps)
         if denied:
             return denied
+        from app.application.script_capture import capture_inline_scripts
+        captured = await capture_inline_scripts(workflow_id, steps, deps.script_backend)
         defn.steps = steps
 
     await deps.workflow_backend.update(workflow_id, defn)
     if deps.refresh_runner is not None:
         await deps.refresh_runner(workflow_id)
-    return f"Workflow '{workflow_id}' updated."
+    return f"Workflow '{workflow_id}' updated." + _captured_note(captured)
 
 
 @requires(Permission.DELETE)
