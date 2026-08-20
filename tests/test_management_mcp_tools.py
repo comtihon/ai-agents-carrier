@@ -487,3 +487,104 @@ async def test_list_runs_clamps_limit_and_passes_workflow_filter(mcp):
         await mcp.call_tool("list_runs", {"workflow_id": "wf1", "limit": 999})
     )
     repo.list_recent.assert_awaited_once_with(limit=20, workflow_id="wf1")
+
+
+# ---------------------------------------------------------------------------
+# JSON-carrying params must survive FastMCP's argument pre-parsing
+# ---------------------------------------------------------------------------
+# FastMCP pre-parses a string argument whenever the annotation is not exactly
+# `str` (mcp/server/fastmcp/utilities/func_metadata.py: `field_info.annotation
+# is not str`). Annotating a JSON param `str | None` therefore turned the
+# payload into a list/dict and then failed validation against that same
+# annotation, so the field could not be set at all — update_datasource could
+# not change operations or credentials, and a stored token could never be
+# rotated. These tests go through `call_tool`, which is the path that pre-parses.
+
+async def test_update_datasource_can_replace_its_operations(mcp):
+    backend = InMemoryDataSourceBackend()
+    _register(mcp, _Container(data_source_backend=backend))
+    await mcp.call_tool("create_datasource", {
+        "source_id": "api", "name": "API", "base_url": "https://api.example",
+        "operations_json": '[{"name": "list_things", "path": "/things"}]',
+    })
+
+    result = str(await mcp.call_tool("update_datasource", {
+        "source_id": "api",
+        "operations_json": '[{"name": "list_things", "path": "/things"},'
+                           ' {"name": "get_thing", "path": "/things/{params.id}",'
+                           '  "params": [{"name": "id", "type": "string", "required": true}]}]',
+    }))
+
+    assert "updated" in result.lower() or "error" not in result.lower()
+    stored = await backend.get("api")
+    assert [op.name for op in stored.operations] == ["list_things", "get_thing"]
+
+
+async def test_update_datasource_can_rotate_the_stored_credential(mcp):
+    backend = InMemoryDataSourceBackend()
+    _register(mcp, _Container(data_source_backend=backend))
+    await mcp.call_tool("create_datasource", {
+        "source_id": "api", "name": "API", "base_url": "https://api.example",
+        "operations_json": '[{"name": "list_things", "path": "/things"}]',
+        "auth_json": '{"type": "bearer", "token": "old-token"}',
+    })
+
+    await mcp.call_tool("update_datasource", {
+        "source_id": "api", "auth_json": '{"type": "bearer", "token": "new-token"}',
+    })
+
+    stored = await backend.get("api")
+    assert stored.auth.token == "new-token"
+    # Untouched fields keep their stored values.
+    assert [op.name for op in stored.operations] == ["list_things"]
+    assert stored.base_url == "https://api.example"
+
+
+async def test_update_datasource_without_json_fields_keeps_them(mcp):
+    backend = InMemoryDataSourceBackend()
+    _register(mcp, _Container(data_source_backend=backend))
+    await mcp.call_tool("create_datasource", {
+        "source_id": "api", "name": "API", "base_url": "https://api.example",
+        "operations_json": '[{"name": "list_things", "path": "/things"}]',
+        "auth_json": '{"type": "bearer", "token": "keep-me"}',
+    })
+
+    await mcp.call_tool("update_datasource", {"source_id": "api", "name": "Renamed"})
+
+    stored = await backend.get("api")
+    assert stored.name == "Renamed"
+    assert stored.auth.token == "keep-me"
+    assert [op.name for op in stored.operations] == ["list_things"]
+
+
+async def test_update_event_can_replace_its_schema(mcp):
+    backend = InMemoryEventBackend()
+    _register(mcp, _Container(event_backend=backend))
+    await mcp.call_tool("create_event", {
+        "event_id": "orders-events", "name": "Order events", "topic": "orders",
+        "event_schema_json": '{"type": "object"}',
+    })
+
+    await mcp.call_tool("update_event", {
+        "event_id": "orders-events",
+        "event_schema_json": '{"type": "object", "required": ["orderId"]}',
+    })
+
+    stored = await backend.get("orders-events")
+    assert stored.event_schema == {"type": "object", "required": ["orderId"]}
+
+
+async def test_update_workflow_can_replace_its_steps(mcp):
+    container = _Container()
+    workflow_backend = AsyncMock()
+    container.workflow_backend = workflow_backend
+    _register(mcp, container)
+
+    result = str(await mcp.call_tool("update_workflow", {
+        "workflow_id": "wf",
+        "steps_json": '[{"id": "one", "type": "python"}, {"id": "two", "type": "python"}]',
+    }))
+
+    # The payload reached the core function as a string it could parse — the
+    # pre-parse bug surfaced here as a validation error before any call landed.
+    assert "Input should be a valid string" not in result
