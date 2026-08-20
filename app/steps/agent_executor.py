@@ -187,8 +187,10 @@ def _build_agent_config(
     ----------------
     - ``system_prompt``, ``model``: promoted from ``agent_input`` when present;
       otherwise ``None``.
-    - ``mcp_servers``: built from ``settings.get_mcp_integrations()``, filtered
-      to the servers the agent's ``mcp`` addon enables.
+    - ``mcp_servers``: built from ``settings.get_mcp_integrations()`` (the
+      ``MCP_INTEGRATIONS`` registry), filtered to the servers the agent's
+      ``mcp`` addon enables.  No addon → no servers.  Bearer tokens are
+      resolved to values here, the same way tool env vars are.
     - ``credentials``: API keys from every active LLM integration plus the
       generic credential sweep, minus every env var claimed by a tool in the
       ``AGENT_TOOLS`` registry.
@@ -196,7 +198,9 @@ def _build_agent_config(
       enables, carrying its resolved ``env`` and optional ``command`` /
       ``cli_tools``. No addon → no tools.
     - ``blocked_commands``: commands of registry tools the agent did not get,
-      for the runtime to shadow on PATH.
+      for the runtime to shadow on PATH — minus any command it does legitimately
+      run, either as a granted tool or as the launcher of a granted stdio MCP
+      server, so one entry's denial never revokes another's grant.
     - ``extra``: the entire ``agent_input`` dict forwarded as-is.
     - ``description`` is NOT included.
 
@@ -268,11 +272,24 @@ def _build_agent_config(
             cmd = [intg.command] if intg.command else []
             cmd += intg.args
             entry["command"] = cmd
+            # Tells the agent whether this server can be re-hosted over HTTP.
+            entry["prestart_http"] = intg.prestart_http
         else:
-            entry["url"] = intg.url
-            if intg.api_key:
-                entry["api_key"] = intg.api_key
+            # An agent may need a different address than the backend uses — the
+            # in-process bridge is loopback here but callback-reachable there.
+            entry["url"] = intg.resolved_agent_url()
+            api_key = intg.resolved_api_key()
+            if api_key:
+                entry["api_key"] = api_key
         mcp_servers.append(entry)
+
+    unknown_mcp = sorted(enabled_mcp - {intg.name for intg in raw_integrations})
+    if unknown_mcp:
+        logger.warning(
+            "agent '%s' enables MCP server(s) %s that are not declared in "
+            "MCP_INTEGRATIONS (or are declared but unreachable) — ignored",
+            agent_def.id, ", ".join(unknown_mcp),
+        )
 
     # --- Credentials (resolved API-key values) ---
     credentials: dict[str, str] = {}
@@ -298,12 +315,23 @@ def _build_agent_config(
     enabled_tools: set[str] = tools_addon.enabled_tools() if tools_addon is not None else set()
 
     granted_tools: list[dict[str, Any]] = []
-    blocked_commands: list[str] = []
+    ungranted_commands: list[str] = []
+    # Commands this agent legitimately runs, whether they arrived as a tool or as
+    # the launcher of a granted stdio MCP server. Shadowing one of these because
+    # some *other*, ungranted registry entry names the same binary would break
+    # the grant that was made — an ungranted `uvx` tool must not stub out the
+    # `uvx` a granted stdio MCP server needs to start.
+    granted_commands: set[str] = {
+        entry["command"][0] for entry in mcp_servers
+        if entry.get("command")
+    }
     for tool_name, spec in registry.items():
         if tool_name not in enabled_tools:
             if spec.command:
-                blocked_commands.append(spec.command)
+                ungranted_commands.append(spec.command)
             continue
+        if spec.command:
+            granted_commands.add(spec.command)
         granted_tools.append({
             "name": tool_name,
             "label": spec.label or tool_name,
@@ -315,7 +343,12 @@ def _build_agent_config(
                 cli_name: cli.model_dump(mode="json")
                 for cli_name, cli in spec.cli_tools.items()
             },
+            "workspace_hook": spec.workspace_hook.model_dump(mode="json") if spec.workspace_hook else None,
         })
+
+    blocked_commands = list(dict.fromkeys(
+        c for c in ungranted_commands if c not in granted_commands
+    ))
 
     unknown = sorted(enabled_tools - set(registry))
     if unknown:
@@ -640,6 +673,7 @@ async def execute_agent_step(
             registry_password=settings.docker_registry_password,
             agent_namespace=settings.agent_namespace,
             callback_override_url=settings.agent_callback_url,
+            agent_service_account=settings.agent_service_account,
         )
         agent_config_payload = _build_agent_config(agent_def, settings, step=step, run_id=run_id, state=state)
         resolved_env_vars: dict[str, str] = agent_config_payload.get("env_vars") or {}
