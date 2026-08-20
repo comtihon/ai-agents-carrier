@@ -170,7 +170,7 @@ def register_management_tools(
         workflow_id: str,
         name: str | None = None,
         description: str | None = None,
-        steps_json: str | None = None,
+        steps_json: str = "",
     ) -> str:
         """Update an existing workflow definition (name, description, and/or steps).
 
@@ -180,8 +180,15 @@ def register_management_tools(
             description: New description (omit to keep current).
             steps_json: JSON array replacing ALL steps (omit to keep current).
         """
+        # NOTE: JSON-carrying params are annotated `str`, never `str | None`.
+        # FastMCP pre-parses a string argument whenever the annotation is not
+        # exactly `str` (mcp/server/fastmcp/utilities/func_metadata.py), so a
+        # `str | None` field turns a valid JSON payload into a list/dict and
+        # then fails validation against its own annotation — making the field
+        # impossible to set. Empty string means "omitted"; `or None` restores
+        # the core function's "None keeps the stored value" contract.
         return await core.update_workflow(
-            deps(), workflow_id, name, description, steps_json
+            deps(), workflow_id, name, description, steps_json or None
         )
 
     async def delete_workflow(workflow_id: str) -> str:
@@ -273,9 +280,9 @@ def register_management_tools(
         name: str | None = None,
         description: str | None = None,
         base_url: str | None = None,
-        operations_json: str | None = None,
-        auth_json: str | None = None,
-        pubsub_json: str | None = None,
+        operations_json: str = "",
+        auth_json: str = "",
+        pubsub_json: str = "",
     ) -> str:
         """Update a data source definition. Only provided fields change.
 
@@ -290,9 +297,16 @@ def register_management_tools(
                 {topic, subscription, project_id, event_schema} replacing the
                 current Pub/Sub block (omit to keep current).
         """
+        # NOTE: JSON-carrying params are annotated `str`, never `str | None`.
+        # FastMCP pre-parses a string argument whenever the annotation is not
+        # exactly `str` (mcp/server/fastmcp/utilities/func_metadata.py), so a
+        # `str | None` field turns a valid JSON payload into a list/dict and
+        # then fails validation against its own annotation — making the field
+        # impossible to set. Empty string means "omitted"; `or None` restores
+        # the core function's "None keeps the stored value" contract.
         return await core.update_datasource(
-            deps(), source_id, name, description, base_url, operations_json, auth_json,
-            pubsub_json,
+            deps(), source_id, name, description, base_url,
+            operations_json or None, auth_json or None, pubsub_json or None,
         )
 
     async def create_pubsub_datasource(
@@ -370,7 +384,7 @@ def register_management_tools(
         topic: str | None = None,
         subscription: str | None = None,
         project_id: str | None = None,
-        event_schema_json: str | None = None,
+        event_schema_json: str = "",
     ) -> str:
         """Change an existing event; omitted fields keep their stored value.
 
@@ -384,9 +398,16 @@ def register_management_tools(
             event_schema_json: JSON object replacing the event schema (omit to
                 keep current).
         """
+        # NOTE: JSON-carrying params are annotated `str`, never `str | None`.
+        # FastMCP pre-parses a string argument whenever the annotation is not
+        # exactly `str` (mcp/server/fastmcp/utilities/func_metadata.py), so a
+        # `str | None` field turns a valid JSON payload into a list/dict and
+        # then fails validation against its own annotation — making the field
+        # impossible to set. Empty string means "omitted"; `or None` restores
+        # the core function's "None keeps the stored value" contract.
         return await core.update_event(
             deps(), event_id, name, description, topic, subscription, project_id,
-            event_schema_json,
+            event_schema_json or None,
         )
 
     async def delete_event(event_id: str) -> str:
