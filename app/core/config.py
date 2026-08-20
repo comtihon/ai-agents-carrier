@@ -391,6 +391,14 @@ class Settings(BaseSettings):
     # entry in an agent's helm_values overrides this.
     agent_service_account: str | None = Field(default=None, alias="AGENT_SERVICE_ACCOUNT")
 
+    # --- Local agent runtime (pi-cloud-agent as a child process) ---
+    # Directory of a pi-cloud-agent checkout (https://github.com/comtihon/pi-cloud-agent).
+    # Empty means the `local` runtime is unavailable and a step must use
+    # `docker` / `k8s` instead — there is no in-process agent to fall back to.
+    local_agent_dir: str = Field(default="", alias="LOCAL_AGENT_DIR")
+    # Command that starts the agent's HTTP server, run with LOCAL_AGENT_DIR as cwd.
+    local_agent_command: str = Field(default="node src/server.js", alias="LOCAL_AGENT_COMMAND")
+
     # --- Python script sandbox (workflow `python` steps with sandbox: true) ---
     # Image used by the docker / k8s sandbox runtimes.  Must contain a Python
     # interpreter on PATH; no backend dependencies are needed inside it.

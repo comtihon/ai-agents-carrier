@@ -22,11 +22,11 @@ class AgentDefinition(BaseModel):
     agent_input:
         All runtime configuration sent to the agent on every run.
         Typical keys: ``system_prompt``, ``model``, ``tools``, ``max_tokens``.
-        For docker/k8s this populates ``AgentConfig`` fields and ``extra``.
-        For the local inline agent this is passed directly to ``run_local_agent``.
+        Populates ``AgentConfig`` fields and ``extra`` for every runtime.
     image:
-        Docker image (docker runtime only).  The CMD is baked into the image;
-        no entrypoint override is needed.
+        Docker image (docker runtime only — ``local`` runs the agent from
+        ``LOCAL_AGENT_DIR``, ``k8s`` from a Helm chart).  The CMD is baked into
+        the image; no entrypoint override is needed.
     helm_chart:
         Helm chart reference (k8s runtime only), e.g.
         ``"oci://ghcr.io/org/chart"`` or a local path.
