@@ -15,7 +15,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from langgraph.types import Command
 from starlette.routing import get_route_path
 
-from app.api.mcp.datasources_server import get_datasources_mcp, rebuild_datasource_tools
+from app.api.mcp.datasources_server import (
+    get_datasources_mcp,
+    rebuild_datasource_tools,
+    reset_current_grant,
+    set_current_grant,
+)
 from app.api.mcp.management_server import get_management_mcp, register_management_tools
 from app.api.middleware.auth import OAuthMiddleware
 from app.infrastructure.auth.authorization import (
@@ -39,6 +44,11 @@ from app.core.config import get_settings
 from app.core.container import ApplicationContainer, build_container
 from app.domain.models.graph_run import GraphRun
 from app.infrastructure.auth.auth_service import AuthError, AuthService
+from app.infrastructure.auth.datasource_grant import (
+    DatasourceGrant,
+    looks_like_grant,
+    verify_grant,
+)
 from app.infrastructure.orchestration.chat_agent_loader import load_chat_agent_config
 from app.infrastructure.orchestration.default_workflow import build_default_workflow
 from app.infrastructure.orchestration.router_agent import build_router_graph
@@ -67,9 +77,23 @@ class _DatasourcesAuthWrapper:
     - ``api_key`` configured but empty / whitespace-only: unusable as a
       credential, so it fails closed regardless of ``oauth_enabled`` rather
       than passing through.
+
+    Spawned agents hold none of the above.  They present a signed *capability
+    grant* instead (``app.infrastructure.auth.datasource_grant``), naming the
+    source/operation pairs their run was granted.  A verified grant passes and
+    is published for the request, so the mounted server can filter itself down
+    to that scope; an invalid one is a 401 like any other bad credential.  The
+    static key keeps its unscoped pass-through — that caller is this backend's
+    own loopback MCP client, not an agent.
     """
 
-    def __init__(self, app, api_key: str | None, oauth_enabled: bool) -> None:
+    def __init__(
+        self,
+        app,
+        api_key: str | None,
+        oauth_enabled: bool,
+        grant_signing_key: str | None = None,
+    ) -> None:
         self._app = app
         # Surrounding whitespace is stripped (Secret Manager values often carry a
         # trailing newline, which no HTTP header value can hold — such a key can
@@ -82,26 +106,66 @@ class _DatasourcesAuthWrapper:
         self._api_key = stripped or None
         configured_empty = api_key is not None and not stripped
         self._fail_closed = self._api_key is None and (oauth_enabled or configured_empty)
+        # Same normalization, same reason: a whitespace-only signing key cannot
+        # sign anything, so it counts as absent and no grant verifies.
+        self._grant_signing_key = (grant_signing_key or "").strip() or None
+
+    def _verify_grant(self, raw_auth: bytes) -> DatasourceGrant | None:
+        """Verify the Authorization header as a capability grant, or ``None``."""
+        if self._grant_signing_key is None or not raw_auth.startswith(b"Bearer "):
+            return None
+        # latin-1 is what Starlette uses for header bytes; it never raises, so a
+        # junk token becomes a junk string and fails verification rather than
+        # the decode raising a 500.
+        token = raw_auth[len(b"Bearer "):].decode("latin-1").strip()
+        if not looks_like_grant(token):
+            return None
+        grant = verify_grant(token, self._grant_signing_key)
+        if grant is not None:
+            logger.debug(
+                "/mcp/datasources: grant accepted for run '%s' (agent '%s')",
+                grant.run_id, grant.agent_id,
+            )
+        return grant
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] != "http":
             await self._app(scope, receive, send)
             return
 
+        headers = dict(scope.get("headers") or ())
+        raw_auth = headers.get(b"authorization", b"")
+        grant: DatasourceGrant | None = None
+
         if self._api_key is not None:
-            headers = dict(scope.get("headers") or ())
             # Compare the raw header bytes: a decoded str can hold non-ASCII
             # characters (any header byte >= 0x80), and secrets.compare_digest
             # raises TypeError on those -> 500 instead of 401.
             expected = b"Bearer " + self._api_key.encode()
-            if not secrets.compare_digest(headers.get(b"authorization", b""), expected):
+            if not secrets.compare_digest(raw_auth, expected):
+                grant = self._verify_grant(raw_auth)
+                if grant is None:
+                    await _send_401(send)
+                    return
+        elif self._fail_closed:
+            grant = self._verify_grant(raw_auth)
+            if grant is None:
                 await _send_401(send)
                 return
-        elif self._fail_closed:
-            await _send_401(send)
-            return
+        else:
+            # Open endpoint (no key, OAuth off).  A caller that nonetheless
+            # presents a valid grant is still held to it — arriving through an
+            # unauthenticated deployment must not widen an agent's scope.
+            grant = self._verify_grant(raw_auth)
 
-        await self._app(scope, receive, send)
+        # Always set it, explicitly to None for an unscoped caller: leaving the
+        # context variable untouched would let one request's scope be read by
+        # the next one to run in the same context.
+        token = set_current_grant(grant)
+        try:
+            await self._app(scope, receive, send)
+        finally:
+            reset_current_grant(token)
 
 
 class _ManagementAuthWrapper:
@@ -572,6 +636,7 @@ def create_app() -> FastAPI:
             get_datasources_mcp().streamable_http_app(),
             api_key=settings.mcp_datasources_api_key,
             oauth_enabled=settings.oauth_enabled,
+            grant_signing_key=settings.resolved_datasource_grant_signing_key(),
         ),
     }
     # Management MCP — the platform's own CRUD + run control tools for external
