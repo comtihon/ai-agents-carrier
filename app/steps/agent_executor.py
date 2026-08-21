@@ -186,7 +186,19 @@ def _build_agent_config(
     - ``mcp_servers``: built from ``settings.get_mcp_integrations()`` (the
       ``MCP_INTEGRATIONS`` registry), filtered to the servers the agent's
       ``mcp`` addon enables.  No addon → no servers.  Bearer tokens are
-      resolved to values here, the same way tool env vars are.
+      resolved to values here, the same way tool env vars are.  The in-process
+      ``datasources`` bridge is the one exception: it is never granted by the
+      ``mcp`` addon, because that would be an all-or-nothing grant over every
+      operation of every registered source.  It is granted per source and per
+      operation by ``datasource`` addons instead, and carries a signed grant
+      rather than the shared API key (see below).
+    - ``datasources`` entry: present iff the agent has at least one
+      ``datasource`` addon naming a source with at least one allowed operation.
+      Its ``api_key`` is a signed capability grant listing the union of those
+      operations — a capability, not a credential: the data source's own secret
+      stays in this process and is resolved per request by the executor.  The
+      grant is minted at spawn time, so editing the addon mid-run does not
+      change what a running agent may do.
     - ``credentials``: API keys from every active LLM integration plus the
       generic credential sweep, minus every env var claimed by a tool in the
       ``AGENT_TOOLS`` registry.
@@ -204,7 +216,7 @@ def _build_agent_config(
     that path is an explicit operator override and deliberately bypasses the
     registry above.
     """
-    from app.core.config import McpIntegrationConfig
+    from app.core.config import DATASOURCES_MCP_NAME, McpIntegrationConfig
 
     agent_input: dict[str, Any] = agent_def.agent_input or {}
 
@@ -261,6 +273,9 @@ def _build_agent_config(
         enabled_mcp = agent_def.mcp_addon.enabled_servers()
     mcp_servers: list[dict[str, Any]] = []
     for intg in raw_integrations:
+        if intg.name == DATASOURCES_MCP_NAME:
+            # Granted only by datasource addons, below — never by a checkbox.
+            continue
         if intg.name not in enabled_mcp:
             continue
         entry: dict[str, Any] = {"name": intg.name, "transport": intg.transport, "env": intg.env}
@@ -279,13 +294,85 @@ def _build_agent_config(
                 entry["api_key"] = api_key
         mcp_servers.append(entry)
 
-    unknown_mcp = sorted(enabled_mcp - {intg.name for intg in raw_integrations})
+    if DATASOURCES_MCP_NAME in enabled_mcp:
+        logger.warning(
+            "agent '%s' still enables the '%s' MCP server in its mcp addon — that "
+            "entry no longer grants anything. Data source access is granted per "
+            "source and per operation by a datasource addon now; attach one with "
+            "the operations this agent needs.",
+            agent_def.id, DATASOURCES_MCP_NAME,
+        )
+
+    unknown_mcp = sorted(
+        enabled_mcp - {intg.name for intg in raw_integrations} - {DATASOURCES_MCP_NAME}
+    )
     if unknown_mcp:
         logger.warning(
             "agent '%s' enables MCP server(s) %s that are not declared in "
             "MCP_INTEGRATIONS (or are declared but unreachable) — ignored",
             agent_def.id, ", ".join(unknown_mcp),
         )
+
+    # --- Datasource addons: one scoped grant over the in-process bridge ---
+    # The union across addons, because an agent may need two sources and each
+    # addon carries one.  Deduplicated per source, order preserved, so the
+    # minted grant is stable for the same set of ticks.
+    granted_operations: dict[str, list[str]] = {}
+    for ds_addon in agent_def.datasource_addons:
+        source_id = (ds_addon.source_id or "").strip()
+        if not source_id:
+            continue
+        operations = granted_operations.setdefault(source_id, [])
+        for operation in ds_addon.allowed_operations:
+            name = (operation or "").strip()
+            if name and name not in operations:
+                operations.append(name)
+    # An addon that names a source but ticks no operation grants nothing, so it
+    # must not even produce an entry — handing over a grant that authorizes
+    # nothing would only make the agent's tool list mysteriously empty.
+    granted_operations = {
+        source_id: operations
+        for source_id, operations in granted_operations.items()
+        if operations
+    }
+    if granted_operations:
+        from app.infrastructure.auth.datasource_grant import DatasourceGrant, mint_grant
+
+        bridge = next(
+            (i for i in raw_integrations if i.name == DATASOURCES_MCP_NAME), None
+        )
+        if bridge is None:
+            logger.warning(
+                "agent '%s' has datasource addon(s) but the '%s' bridge is "
+                "disabled or unreachable (MCP_DATASOURCES_ENABLED) — no data "
+                "source access granted",
+                agent_def.id, DATASOURCES_MCP_NAME,
+            )
+        else:
+            grant_token = mint_grant(
+                DatasourceGrant(
+                    run_id=run_id or "",
+                    agent_id=agent_def.id,
+                    grants=granted_operations,
+                ),
+                settings.resolved_datasource_grant_signing_key(),
+                ttl_seconds=settings.datasource_grant_ttl_seconds,
+            )
+            if grant_token:
+                mcp_servers.append({
+                    "name": bridge.name,
+                    "transport": bridge.transport,
+                    "env": bridge.env,
+                    "url": bridge.resolved_agent_url(),
+                    "api_key": grant_token,
+                })
+                logger.info(
+                    "agent '%s' (run '%s') granted %d data source operation(s) "
+                    "across %d source(s)",
+                    agent_def.id, run_id or "-",
+                    sum(len(v) for v in granted_operations.values()),
+                    len(granted_operations),
+                )
 
     # --- Credentials (resolved API-key values) ---
     credentials: dict[str, str] = {}

@@ -8,7 +8,10 @@ Semantics under test:
   safe to ship in a ConfigMap; the value is resolved at read time.
 - ``eager_start: false`` keeps a server out of the backend's startup dial-out.
 - ``list_mcp_candidates`` reports a declared-but-uncredentialed server as
-  ``configured: false`` instead of hiding it.
+  ``configured: false`` instead of hiding it — but omits the ``datasources``
+  bridge entirely, because a single checkbox for it would be an all-or-nothing
+  grant over every operation of every registered source. Data source access is
+  granted per operation by the ``datasource`` addon instead.
 """
 from __future__ import annotations
 
@@ -208,7 +211,8 @@ def test_candidates_flag_a_declared_server_with_no_token_as_unconfigured():
 
 def test_candidates_list_every_known_server_including_disabled_ones():
     names = sorted(c["name"] for c in _settings().list_mcp_candidates())
-    assert names == ["agent-side", "datasources", "github", "hubspot", "retired", "tracker"]
+    # No "datasources": see test_datasources_bridge_is_never_offered_as_a_checkbox.
+    assert names == ["agent-side", "github", "hubspot", "retired", "tracker"]
 
 
 # ── Split addressing (backend loopback vs agent-reachable) ───────────────────
@@ -285,17 +289,35 @@ def test_agent_side_only_server_is_flagged_as_not_prestartable():
     assert entry["prestart_http"] is False
 
 
-def test_datasources_grant_carries_the_agent_reachable_url_and_its_key():
+def test_the_mcp_addon_can_no_longer_grant_the_datasources_bridge():
+    """Ticking "datasources" in the mcp addon used to hand over the static key
+    and with it every operation of every source. It now grants nothing, and
+    says so in the log rather than failing silently."""
     settings = _settings(
         BASE_URL="https://carrier.example",
         MCP_DATASOURCES_API_KEY="ds-token",
     )
-    entry = next(
-        s for s in _agent_config({"datasources": True}, settings)["mcp_servers"]
-        if s["name"] == "datasources"
-    )
-    assert entry["url"] == "https://carrier.example/mcp/datasources"
-    assert entry["api_key"] == "ds-token"
+    cfg = _agent_config({"datasources": True, "github": True}, settings)
+    names = [s["name"] for s in cfg["mcp_servers"]]
+    assert names == ["github"]
+
+
+def test_datasources_bridge_is_never_offered_as_a_checkbox():
+    """The addon picker must not offer the bridge at all — an operator who could
+    tick it would be granting every source and every operation at once."""
+    for settings in (
+        _settings(MCP_DATASOURCES_API_KEY="ds-token"),
+        _settings(MCP_DATASOURCES_API_KEY=""),
+        _settings(registry=None),
+    ):
+        assert not any(
+            c["name"] == "datasources" for c in settings.list_mcp_candidates()
+        )
+    # It is still a known, dialable integration — the backend's own loopback
+    # MCP client reaches it that way; it is only ungrantable.
+    assert _by_name(
+        _settings().get_mcp_integrations(), "datasources"
+    ) is not None
 
 
 def test_disabled_and_undeclared_servers_cannot_be_granted_by_an_addon():
@@ -385,14 +407,11 @@ def test_an_endpoint_that_wants_no_credential_says_so_explicitly():
     assert next(i for i in settings.get_mcp_integrations() if i.name == "open").resolved_api_key() is None
 
 
-def test_datasources_bridge_is_ready_with_or_without_a_key():
+def test_datasources_bridge_declares_the_auth_its_key_implies():
     # Gated by MCP_DATASOURCES_API_KEY when set, open to in-cluster callers when
-    # not — either way it is not "unconfigured".
+    # not — the declared auth follows the key rather than assuming either way.
     with_key = _settings(MCP_DATASOURCES_API_KEY="ds-token")
     without = _settings(MCP_DATASOURCES_API_KEY="")
-    for settings in (with_key, without):
-        entry = next(c for c in settings.list_mcp_candidates() if c["name"] == "datasources")
-        assert entry["configured"] is True
     assert _by_name(with_key.all_mcp_integrations(), "datasources").auth == "bearer"
     assert _by_name(without.all_mcp_integrations(), "datasources").auth == "none"
 

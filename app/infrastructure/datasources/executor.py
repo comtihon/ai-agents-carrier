@@ -9,6 +9,11 @@ calls each upstream operation exactly once.
 When an operation references a field of an *array* upstream result, the call is
 fanned out — once per element — and the result is a list of
 ``{"<field>": <element value>, "result": <call result>}`` entries.
+
+Values substituted into a URL *path* are percent-encoded and rejected outright
+if they contain a traversal segment — see :meth:`DataSourceExecutor._render_path`
+for why an unencoded path placeholder makes any per-operation allow-list
+meaningless.
 """
 from __future__ import annotations
 
@@ -16,8 +21,10 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import time
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 import jmespath
@@ -73,13 +80,22 @@ class DataSourceExecutor:
                 f"Data source '{source.id}' has no operation '{operation}'"
             )
         levels = self._plan(source, operation)
+        closure = [
+            declared
+            for level in levels
+            for name in level
+            if (declared := source.get_operation(name)) is not None
+        ]
+        # Coerce before the required check so both see the same values. Applied
+        # across the whole closure, not just the target, because `params` is one
+        # flat dict shared by every operation in it.
+        params = _coerce_params(closure, params)
         # Validate required params for every op in the dependency closure up
         # front — not just the target — so a missing param on an upstream op
         # fails clearly before any HTTP call is made instead of surfacing as
         # a confusing downstream error (or a silently wrong request).
-        for level in levels:
-            for name in level:
-                self._check_required_params(source.get_operation(name), params)
+        for op_in_closure in closure:
+            self._check_required_params(op_in_closure, params)
 
         memo: dict[str, Any] = {}
         async with httpx.AsyncClient(timeout=source.timeout_seconds) as client:
@@ -329,9 +345,9 @@ class DataSourceExecutor:
             resp.raise_for_status()
             return resp.json()
 
-        path = self._render(op.path or "", params, memo, bound)
+        path = self._render_path(op, params, memo, bound)
         base = source.base_url.rstrip("/")
-        url = f"{base}/{str(path).lstrip('/')}" if path else base
+        url = f"{base}/{path.lstrip('/')}" if path else base
         method = (op.method or "GET").upper()
 
         # Params already consumed by the path/query template are not repeated
@@ -372,6 +388,48 @@ class DataSourceExecutor:
     # ------------------------------------------------------------------
     # Template rendering
     # ------------------------------------------------------------------
+
+    def _render_path(
+        self,
+        op: OperationDefinition,
+        params: dict[str, Any],
+        memo: dict[str, Any],
+        bound: dict[str, Any],
+    ) -> str:
+        """Render ``op.path`` with every substituted value URL-path-encoded.
+
+        Separate from :meth:`_render` because a path is not just another
+        template: it is spliced into the request URL, so a value carrying ``/``,
+        ``?``, ``#`` or a ``..`` segment does not fill in a placeholder — it
+        retargets the request.  Given ``/projects/{params.id}``, an ``id`` of
+        ``1/../../admin/users?role=all#`` reaches ``/admin/users?role=all``
+        instead, on the same host, carrying the same upstream credential.  That
+        makes any per-operation allow-list decorative: a caller granted one
+        read of one resource can reach anything the credential can.
+
+        So each value is percent-encoded with nothing left safe (``/`` and
+        ``?`` included) and traversal segments are refused rather than encoded,
+        because ``%2e%2e`` is only safe until something normalises it.  Literal
+        text in the template — including its ``/`` separators — is untouched.
+
+        Unlike :meth:`_render`, there is no whole-value shortcut that preserves
+        the native type: a path is a string by the time it reaches the URL, and
+        an operation whose entire path is caller-supplied is precisely the case
+        that must not skip encoding.
+        """
+        template = op.path or ""
+        if not template:
+            return ""
+
+        def _sub(match: "Any") -> str:
+            resolved = self._resolve_ref(
+                match.group(1), match.group(2), params, memo, bound
+            )
+            return _encode_path_value(
+                resolved, op_name=op.name, placeholder=match.group(0)
+            )
+
+        return REF_PATTERN.sub(_sub, template)
 
     def _render(
         self,
@@ -465,6 +523,112 @@ class DataSourceExecutor:
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
+
+# Splits a value into path segments the way both httpx and any upstream server
+# will: forward slashes, and backslashes too, since some servers normalise them.
+_PATH_SEPARATOR_RE = re.compile(r"[/\\]")
+
+# Segments that mean "somewhere else" rather than "a name".
+_TRAVERSAL_SEGMENTS = frozenset({".", ".."})
+
+
+def _encode_path_value(value: Any, *, op_name: str, placeholder: str) -> str:
+    """Percent-encode *value* for use as URL path text, or raise.
+
+    ``quote(..., safe="")`` leaves nothing structural intact, so a value can
+    contribute only a single path segment's worth of characters — ``/`` becomes
+    ``%2F``, ``?`` becomes ``%3F``, ``#`` becomes ``%23``.
+
+    Encoding alone is not enough, though: ``quote("..")`` is ``".."``, so a
+    value of exactly ``..`` would still climb a level of a template like
+    ``/projects/{params.id}/files``.  Traversal segments are therefore rejected
+    before encoding, with the operation named so the error points at the
+    definition rather than at the executor.
+    """
+    if value is None:
+        return ""
+    text = str(value)
+    for segment in _PATH_SEPARATOR_RE.split(text):
+        if segment.strip() in _TRAVERSAL_SEGMENTS:
+            raise ValueError(
+                f"Operation '{op_name}': path placeholder '{placeholder}' "
+                f"resolved to {text!r}, which contains a path-traversal "
+                f"segment; a path parameter may not escape its operation"
+            )
+    return quote(text, safe="")
+
+
+_TRUE_STRINGS = frozenset({"true", "1", "yes", "on"})
+_FALSE_STRINGS = frozenset({"false", "0", "no", "off"})
+
+
+def _coerce_params(
+    ops: list[OperationDefinition], params: dict[str, Any]
+) -> dict[str, Any]:
+    """Coerce caller values to the types their ``ParamSpec`` declares.
+
+    ``ParamSpec.type`` was advisory: an MCP caller got type checking for free
+    from the synthesised tool signature, but the ``data_source`` workflow step
+    passes rendered state straight through, so ``"5"`` reached a ``number`` param
+    and a nonsense value reached it just as easily.  Coercing here means all
+    three callers (MCP, workflow step, try-operation) inherit the same
+    behaviour, and a value that cannot be the declared type fails with the
+    param named instead of producing a silently wrong request.
+
+    Only ``number`` and ``boolean`` are touched — the two with an unambiguous
+    parse from a string.  ``string`` / ``array`` / ``object`` are left alone:
+    stringifying whatever arrived would hide mistakes rather than surface them,
+    and no undeclared key is dropped here because the request builder already
+    allow-lists body and query params to declared names.
+    """
+    coerced = dict(params)
+    for spec in (spec for op in ops for spec in op.params):
+        if spec.name not in coerced or coerced[spec.name] is None:
+            continue
+        if spec.type == "number":
+            coerced[spec.name] = _as_number(spec.name, coerced[spec.name])
+        elif spec.type == "boolean":
+            coerced[spec.name] = _as_boolean(spec.name, coerced[spec.name])
+    return coerced
+
+
+def _as_number(name: str, value: Any) -> int | float:
+    # bool is an int in Python; letting True through as 1 would silently accept
+    # a checkbox where a count was declared.
+    if isinstance(value, bool):
+        raise ValueError(f"Param '{name}' is declared number but got a boolean")
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            return int(text)
+        except ValueError:
+            pass
+        try:
+            return float(text)
+        except ValueError:
+            pass
+    raise ValueError(
+        f"Param '{name}' is declared number but got {value!r}, which is not one"
+    )
+
+
+def _as_boolean(name: str, value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TRUE_STRINGS:
+            return True
+        if text in _FALSE_STRINGS:
+            return False
+    raise ValueError(
+        f"Param '{name}' is declared boolean but got {value!r}, which is not one"
+    )
+
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, default=str)

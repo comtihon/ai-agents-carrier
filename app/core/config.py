@@ -221,6 +221,13 @@ _SYSTEM_ONLY_ALIASES = {
 # Suffixes that identify credential/secret fields worth forwarding to agents.
 _CREDENTIAL_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_JSON", "_CREDENTIALS")
 
+# Name of the built-in, in-process data sources MCP bridge.  Named here because
+# three places have to agree on it: the built-in registry entry, the addon
+# picker that must NOT offer it (see list_mcp_candidates), and the agent
+# spawn path that reaches it only through a scoped grant
+# (app.steps.agent_executor).
+DATASOURCES_MCP_NAME = "datasources"
+
 
 class Settings(BaseSettings):
     app_name: str = "AI Agents Carrier"
@@ -422,6 +429,30 @@ class Settings(BaseSettings):
     mcp_datasources_enabled: bool = Field(default=True, alias="MCP_DATASOURCES_ENABLED")
     mcp_datasources_url: str | None = Field(default=None, alias="MCP_DATASOURCES_URL")
     mcp_datasources_api_key: str | None = Field(default=None, alias="MCP_DATASOURCES_API_KEY")
+    # Signs the per-run capability grants an agent presents to /mcp/datasources
+    # (see app.infrastructure.auth.datasource_grant).  A grant names the exact
+    # source/operation pairs one agent may call; it is NOT a shared credential,
+    # so it must not be the same secret an operator might hand out — hence its
+    # own key, falling back to MCP_DATASOURCES_API_KEY so a deployment that
+    # already has one keeps working without a new secret.  Neither set means no
+    # grant can be minted or verified at all, and datasource addons grant
+    # nothing (fail closed).
+    datasource_grant_signing_key: str | None = Field(
+        default=None, alias="DATASOURCE_GRANT_SIGNING_KEY"
+    )
+    # Lifetime of a minted grant.  Grants are stateless and therefore cannot be
+    # revoked before they expire — terminating a run does not instantly kill its
+    # grant — so this is the revocation window, not just a hygiene setting.
+    datasource_grant_ttl_seconds: int = Field(
+        default=86400, alias="DATASOURCE_GRANT_TTL_SECONDS"
+    )
+    # Host header values the /mcp/datasources DNS-rebinding guard accepts, on
+    # top of loopback. Unset derives them from the agent-facing URL; set this
+    # only when an agent reaches the backend under a name the backend does not
+    # know it has. See Settings.datasources_mcp_allowed_hosts.
+    mcp_datasources_allowed_hosts: list[str] | None = Field(
+        default=None, alias="MCP_DATASOURCES_ALLOWED_HOSTS"
+    )
 
     # --- Management MCP (served in-process at /mcp/management) ---
     # Exposes the platform's own CRUD + run control tools to external MCP
@@ -452,7 +483,11 @@ class Settings(BaseSettings):
         populate_by_name=True,
     )
 
-    @field_validator("mcp_datasources_api_key", "management_mcp_api_key")
+    @field_validator(
+        "mcp_datasources_api_key",
+        "management_mcp_api_key",
+        "datasource_grant_signing_key",
+    )
     @classmethod
     def _strip_api_key(cls, value: str | None) -> str | None:
         """Trim surrounding whitespace from the in-process MCP API keys.
@@ -477,6 +512,46 @@ class Settings(BaseSettings):
             return self.mcp_datasources_url
         port = os.environ.get("PORT", "8000")
         return f"http://127.0.0.1:{port}/mcp/datasources"
+
+    def datasources_mcp_allowed_hosts(self) -> list[str]:
+        """Host header values the ``/mcp/datasources`` mount accepts.
+
+        FastMCP's DNS-rebinding guard defaults to loopback-with-a-port only, so
+        a spawned agent dialling this mount at the deployment's real address
+        would be rejected with a 421 before its request was ever read.  The
+        address is already declared (``AGENT_CALLBACK_URL`` / ``BASE_URL``), so
+        it is derived from there rather than made an extra thing to configure;
+        ``MCP_DATASOURCES_ALLOWED_HOSTS`` overrides when the agent reaches the
+        backend under a name the backend does not know it has (a
+        service-mesh or ingress rewrite, say).  Loopback is always allowed on
+        top of whatever this returns.
+        """
+        if self.mcp_datasources_allowed_hosts is not None:
+            return [h for h in self.mcp_datasources_allowed_hosts if h]
+        from urllib.parse import urlsplit
+
+        netloc = urlsplit(self.resolved_agent_mcp_datasources_url()).netloc
+        if not netloc:
+            return []
+        # Both forms: the declared address may or may not carry a port, and a
+        # client is free to include or omit the default one for the scheme.
+        host = netloc.split("@")[-1]
+        bare = host.rsplit(":", 1)[0] if ":" in host and not host.endswith("]") else host
+        return list(dict.fromkeys([host, bare, f"{bare}:*"]))
+
+    def resolved_datasource_grant_signing_key(self) -> str | None:
+        """Key that signs and verifies ``/mcp/datasources`` capability grants.
+
+        Falls back to ``MCP_DATASOURCES_API_KEY`` so a deployment that already
+        has one needs no new secret to start using scoped datasource addons.
+        ``None`` means no grant can be signed or verified, which every caller
+        treats as "no datasource access" rather than "unrestricted".
+        """
+        for candidate in (self.datasource_grant_signing_key, self.mcp_datasources_api_key):
+            stripped = (candidate or "").strip()
+            if stripped:
+                return stripped
+        return None
 
     def resolved_agent_mcp_datasources_url(self) -> str:
         """URL of the data sources MCP server as a *spawned agent* must dial it.
@@ -694,7 +769,7 @@ class Settings(BaseSettings):
         """
         return [
             McpIntegrationConfig(
-                name="datasources",
+                name=DATASOURCES_MCP_NAME,
                 enabled=self.mcp_datasources_enabled,
                 transport="streamable_http",
                 url_from="self_datasources",
@@ -780,16 +855,26 @@ class Settings(BaseSettings):
         return any(intg.name == name and intg.enabled for intg in self.all_mcp_integrations())
 
     def list_mcp_candidates(self) -> list[dict[str, Any]]:
-        """Return every known MCP server for the UI's mcp addon picker.
+        """Return every grantable MCP server for the UI's mcp addon picker.
 
         ``configured`` is False when a server is declared but cannot actually be
         dialled: no URL, no stdio command, or ``auth: bearer`` with no token
         resolving behind it.  An HTTP endpoint that needs no credential has to
         say so with ``auth: none`` — otherwise a server whose token was never
         wired up would be reported as ready and fail only once an agent used it.
+
+        The in-process ``datasources`` bridge is deliberately absent.  Ticking
+        it here used to hand an agent the static ``MCP_DATASOURCES_API_KEY`` and
+        with it *every* operation of *every* registered data source — writes and
+        deletes included, executed under this backend's own identity.  Data
+        source access is granted per source and per operation by the
+        ``datasource`` addon instead, so offering the bridge as a single
+        all-or-nothing checkbox would just be a way around that allow-list.
         """
         candidates: list[dict[str, Any]] = []
         for intg in self.all_mcp_integrations():
+            if intg.name == DATASOURCES_MCP_NAME:
+                continue
             if intg.transport == "stdio":
                 configured = bool(intg.command)
             else:

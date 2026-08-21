@@ -124,9 +124,34 @@ llmIntegrations: []
 # The in-process `datasources` server is always available and needs no entry
 # here — it is how every configured data source reaches an agent. The backend
 # dials it over loopback and hands agents AGENT_CALLBACK_URL (or BASE_URL)
-# + /mcp/datasources instead, so set MCP_DATASOURCES_API_KEY to let them in.
-# Toggle it with MCP_DATASOURCES_ENABLED, or declare an entry named
-# `datasources` to override its addressing.
+# + /mcp/datasources instead, so set MCP_DATASOURCES_API_KEY for the backend's
+# own loopback client. Toggle it with MCP_DATASOURCES_ENABLED, or declare an
+# entry named `datasources` to override its addressing.
+#
+# It is deliberately NOT offered in the mcp addon picker: ticking it would grant
+# every operation of every registered data source at once, writes and deletes
+# included, executed under this backend's own identity. An agent gets data
+# source access from a `datasource` addon instead — one per source, with the
+# operations ticked individually — and reaches the mount with a signed,
+# per-run capability grant rather than the shared API key. Two settings govern
+# those grants:
+#
+#   DATASOURCE_GRANT_SIGNING_KEY  Signs and verifies them. Falls back to
+#                                 MCP_DATASOURCES_API_KEY, so an existing
+#                                 deployment keeps working; give it its own
+#                                 secret in langgraph-backend-secrets so a
+#                                 shared API key cannot be used to mint one.
+#                                 Neither set → datasource addons grant nothing.
+#   DATASOURCE_GRANT_TTL_SECONDS  Grant lifetime (default 86400). Grants are
+#                                 stateless, so this is the revocation window:
+#                                 terminating a run does not instantly kill its
+#                                 grant.
+#
+# MCP_DATASOURCES_ALLOWED_HOSTS overrides the Host headers the mount's
+# DNS-rebinding guard accepts. Unset, they are derived from AGENT_CALLBACK_URL /
+# BASE_URL (plus loopback), which is what a spawned agent dials; set it only
+# when an agent reaches the backend under a name the backend does not know it
+# has, e.g. behind a service-mesh or ingress rewrite.
 mcpIntegrations: []
 
 # Graph definitions mounted as YAML files under GRAPH_DEFINITIONS_PATH.

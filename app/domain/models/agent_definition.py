@@ -5,7 +5,13 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from app.domain.models.agent_addon import AnyAgentAddon, MCPAddon, S3Addon, ToolsAddon
+from app.domain.models.agent_addon import (
+    AnyAgentAddon,
+    DatasourceAddon,
+    MCPAddon,
+    S3Addon,
+    ToolsAddon,
+)
 
 
 class AgentDefinition(BaseModel):
@@ -77,6 +83,17 @@ class AgentDefinition(BaseModel):
             if addon.type == "tools":
                 return addon  # type: ignore[return-value]
         return None
+
+    @property
+    def datasource_addons(self) -> list[DatasourceAddon]:
+        """Every attached data source addon, in declaration order.
+
+        A list rather than a singleton (unlike ``mcp_addon`` above) because an
+        agent may legitimately need two sources — the effective grant is the
+        union across them.  ``get_addon("datasource")`` would return only the
+        first and silently drop the rest, so never use it for this type.
+        """
+        return [a for a in self.addons if a.type == "datasource"]  # type: ignore[misc]
 
     def get_addon(self, addon_type: str) -> AnyAgentAddon | None:
         for addon in self.addons:

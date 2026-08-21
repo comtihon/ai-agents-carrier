@@ -580,3 +580,226 @@ async def test_service_identity_auth_without_identity_defers_to_the_default(http
     http.handler = lambda call: {}
     await DataSourceExecutor(token_provider=provider).execute(source, "op", {})
     assert provider.identities == [None]
+
+
+# ---------------------------------------------------------------------------
+# Path-template injection
+#
+# The executor used to substitute path placeholders with a bare str() and
+# f-string the result into the URL, so a caller granted one operation could
+# retarget the request anywhere on the same host — while the request still
+# carried that source's credential. With per-operation grants (the `datasource`
+# agent addon) that made the allow-list decorative: one granted read reached
+# everything the credential could.
+# ---------------------------------------------------------------------------
+
+def _one_path_op(**op_overrides) -> DataSourceDefinition:
+    op = {"name": "get", "path": "/projects/{params.id}", "params": [{"name": "id"}]}
+    op.update(op_overrides)
+    return _source(operations=[op])
+
+
+async def test_path_traversal_is_rejected_not_encoded(http):
+    """The exact escape: climb out of /projects and reach another endpoint."""
+    source = _one_path_op()
+    with pytest.raises(ValueError, match="path-traversal"):
+        await DataSourceExecutor().execute(
+            source, "get", {"id": "1/../../admin/users?role=all#"}
+        )
+    # Nothing was sent — the check happens while rendering, before the request.
+    assert http.calls == []
+
+
+async def test_every_traversal_shape_is_rejected(http):
+    source = _one_path_op()
+    for value in (
+        "..",
+        ".",
+        "../admin",
+        "a/../../b",
+        "..\\admin",          # backslash: some servers normalise it too
+        " .. ",               # padded, so a naive == comparison would miss it
+        "a/./b",
+    ):
+        with pytest.raises(ValueError, match="path-traversal"):
+            await DataSourceExecutor().execute(source, "get", {"id": value})
+    assert http.calls == []
+
+
+async def test_a_slash_in_a_path_param_cannot_add_a_segment(http):
+    """No traversal, but still an escape: /projects/{id} must stay one segment."""
+    http.handler = lambda call: {"ok": True}
+    await DataSourceExecutor().execute(source := _one_path_op(), "get", {"id": "1/deliver"})
+    assert http.calls[0]["url"] == "https://api.test/projects/1%2Fdeliver"
+    assert source is not None
+
+
+async def test_query_and_fragment_characters_cannot_escape_the_path(http):
+    """`?` would start a query string and `#` would truncate the path."""
+    http.handler = lambda call: {"ok": True}
+    await DataSourceExecutor().execute(
+        _one_path_op(), "get", {"id": "1?role=admin#x"}
+    )
+    assert http.calls[0]["url"] == "https://api.test/projects/1%3Frole%3Dadmin%23x"
+
+
+async def test_percent_encoded_traversal_is_double_encoded_not_decoded(http):
+    """`%2e%2e%2f` must not become `../` once something normalises the URL."""
+    http.handler = lambda call: {"ok": True}
+    await DataSourceExecutor().execute(_one_path_op(), "get", {"id": "%2e%2e%2fadmin"})
+    assert http.calls[0]["url"] == "https://api.test/projects/%252e%252e%252fadmin"
+
+
+async def test_an_ordinary_value_is_untouched_by_the_encoding(http):
+    http.handler = lambda call: {"ok": True}
+    await DataSourceExecutor().execute(_one_path_op(), "get", {"id": "abc-123_4.json"})
+    assert http.calls[0]["url"] == "https://api.test/projects/abc-123_4.json"
+
+
+async def test_literal_slashes_in_the_template_survive(http):
+    """Only substituted values are encoded; the template's own structure is not."""
+    http.handler = lambda call: {"ok": True}
+    source = _source(operations=[{
+        "name": "get",
+        "path": "/a/b/{params.id}/c/d",
+        "params": [{"name": "id"}],
+    }])
+    await DataSourceExecutor().execute(source, "get", {"id": "x y"})
+    assert http.calls[0]["url"] == "https://api.test/a/b/x%20y/c/d"
+
+
+async def test_a_whole_path_placeholder_is_encoded_too(http):
+    """An operation whose entire path is caller-supplied is exactly the case
+    that must not skip encoding, so the native-type shortcut does not apply."""
+    http.handler = lambda call: {"ok": True}
+    source = _source(operations=[{
+        "name": "get", "path": "{params.p}", "params": [{"name": "p"}],
+    }])
+    await DataSourceExecutor().execute(source, "get", {"p": "admin/users"})
+    assert http.calls[0]["url"] == "https://api.test/admin%2Fusers"
+
+
+async def test_an_upstream_value_in_a_path_is_encoded_as_well(http):
+    """Traversal via an upstream response, not a caller param."""
+    source = _source(operations=[
+        {"name": "whoami", "path": "/me"},
+        {"name": "profile", "path": "/users/{whoami.id}/profile"},
+    ])
+    http.handler = lambda call: (
+        {"id": "a b/c"} if call["url"].endswith("/me") else {"ok": True}
+    )
+    await DataSourceExecutor().execute(source, "profile", {})
+    assert http.calls[-1]["url"] == "https://api.test/users/a%20b%2Fc/profile"
+
+
+async def test_a_missing_path_value_still_renders_empty(http):
+    """Pre-existing behaviour: an unresolvable ref becomes empty, not "None"."""
+    http.handler = lambda call: {"ok": True}
+    source = _source(operations=[{
+        "name": "get", "path": "/x/{params.id}", "params": [
+            {"name": "id", "required": False},
+        ],
+    }])
+    await DataSourceExecutor().execute(source, "get", {})
+    assert http.calls[0]["url"] == "https://api.test/x/"
+
+
+async def test_query_string_params_are_still_encoded_by_httpx_not_here(http):
+    """A param that reaches the query string is httpx's to encode — it must not
+    be double-encoded on the way there."""
+    http.handler = lambda call: {"ok": True}
+    source = _source(operations=[
+        {"name": "search", "path": "/search", "params": [{"name": "q"}]},
+    ])
+    await DataSourceExecutor().execute(source, "search", {"q": "a&b=c/d"})
+    assert http.calls[0]["params"] == {"q": "a&b=c/d"}
+
+
+# ---------------------------------------------------------------------------
+# Param type coercion against ParamSpec
+# ---------------------------------------------------------------------------
+
+async def test_a_numeric_string_becomes_a_number(http):
+    """ParamSpec.type was advisory; the workflow-step caller passes rendered
+    state straight through, so "5" reached a `number` param unchanged."""
+    http.handler = lambda call: {"ok": True}
+    source = _source(operations=[{
+        "name": "search", "path": "/s", "params": [
+            {"name": "limit", "type": "number"},
+            {"name": "ratio", "type": "number"},
+        ],
+    }])
+    await DataSourceExecutor().execute(source, "search", {"limit": "5", "ratio": "1.5"})
+    assert http.calls[0]["params"] == {"limit": 5, "ratio": 1.5}
+
+
+async def test_a_boolean_string_becomes_a_boolean(http):
+    http.handler = lambda call: {"ok": True}
+    source = _source(operations=[{
+        "name": "search", "path": "/s", "params": [
+            {"name": "deep", "type": "boolean"},
+            {"name": "terse", "type": "boolean"},
+        ],
+    }])
+    await DataSourceExecutor().execute(source, "search", {"deep": "TRUE", "terse": "no"})
+    assert http.calls[0]["params"] == {"deep": True, "terse": False}
+
+
+async def test_a_value_that_cannot_be_the_declared_type_is_refused(http):
+    source = _source(operations=[{
+        "name": "search", "path": "/s", "params": [{"name": "limit", "type": "number"}],
+    }])
+    with pytest.raises(ValueError, match="declared number"):
+        await DataSourceExecutor().execute(source, "search", {"limit": "many"})
+    assert http.calls == []
+
+
+async def test_a_boolean_is_not_silently_accepted_as_a_number(http):
+    """bool is an int in Python, so True would otherwise arrive as 1."""
+    source = _source(operations=[{
+        "name": "search", "path": "/s", "params": [{"name": "limit", "type": "number"}],
+    }])
+    with pytest.raises(ValueError, match="declared number but got a boolean"):
+        await DataSourceExecutor().execute(source, "search", {"limit": True})
+
+
+async def test_string_array_and_object_params_are_left_alone(http):
+    """Coercion is limited to the two types with an unambiguous parse."""
+    http.handler = lambda call: {"ok": True}
+    source = _source(operations=[{
+        "name": "create", "method": "POST", "path": "/c", "params": [
+            {"name": "name", "type": "string"},
+            {"name": "tags", "type": "array"},
+            {"name": "body", "type": "object"},
+        ],
+    }])
+    await DataSourceExecutor().execute(
+        source, "create", {"name": "7", "tags": ["a"], "body": {"k": 1}}
+    )
+    assert http.calls[0]["json"] == {"name": "7", "tags": ["a"], "body": {"k": 1}}
+
+
+async def test_coercion_applies_across_the_dependency_closure(http):
+    """`params` is one flat dict shared by every op in the closure."""
+    http.handler = lambda call: (
+        {"id": "u1"} if "/me" in call["url"] else {"ok": True}
+    )
+    source = _source(operations=[
+        {"name": "whoami", "path": "/me", "params": [
+            {"name": "limit", "type": "number"},
+        ]},
+        {"name": "profile", "path": "/users/{whoami.id}"},
+    ])
+    await DataSourceExecutor().execute(source, "profile", {"limit": "3"})
+    assert http.calls[0]["params"] == {"limit": 3}
+
+
+async def test_a_none_value_is_not_coerced_so_optional_stays_optional(http):
+    http.handler = lambda call: {"ok": True}
+    source = _source(operations=[{
+        "name": "search", "path": "/s", "params": [
+            {"name": "limit", "type": "number", "required": False},
+        ],
+    }])
+    await DataSourceExecutor().execute(source, "search", {"limit": None})
+    assert http.calls[0]["params"] == {}
