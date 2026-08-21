@@ -72,6 +72,80 @@ def _require_write() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# The disabled-workflow guard
+# ---------------------------------------------------------------------------
+# One check, one message, every entry point. A workflow carrying enabled=False
+# starts no runs at all: not from POST /workflows/runs, not from
+# POST /webhooks/{workflow_id}, not from a cron or Pub/Sub trigger, not from the
+# `run_workflow` MCP tool, not from a `workflow` step in another workflow, and
+# not by replaying an existing run through retry / restart-from-step. Hiding the
+# UI button is not enforcement; this is.
+#
+# 409 rather than 403: the caller is allowed to start this workflow and holds
+# every permission the request needs — it is the workflow's own state that
+# conflicts with it. Flipping the flag back makes the identical call from the
+# identical principal succeed, which is a conflict, not an authorization
+# failure.
+WORKFLOW_DISABLED_STATUS = 409
+
+
+def workflow_disabled_detail(workflow_id: str, name: str = "") -> str:
+    """The single wording every surface reports for a disabled workflow."""
+    label = workflow_id if not name or name == workflow_id else f"{workflow_id} ({name})"
+    return (
+        f"Workflow '{label}' is disabled and cannot be started. "
+        "Enable it before starting a run."
+    )
+
+
+class WorkflowDisabledError(RunControlError):
+    """A run was refused because its workflow is disabled.
+
+    A RunControlError subclass so every surface that already translates one —
+    REST into an HTTPException, the MCP tools into an error string — reports this
+    refusal with no new failure mode.
+    """
+
+    def __init__(self, workflow_id: str, name: str = "") -> None:
+        super().__init__(WORKFLOW_DISABLED_STATUS, workflow_disabled_detail(workflow_id, name))
+        self.workflow_id = workflow_id
+
+
+def ensure_workflow_enabled(workflow: Any) -> None:
+    """Raise WorkflowDisabledError when *workflow* is disabled.
+
+    Takes anything carrying ``id``/``name``/``enabled`` — a WorkflowDefinition
+    from the backend or a YamlGraphRunner from the registry — so the
+    backend-driven and registry-driven entry points share one guard. Missing
+    attributes read as enabled, which keeps legacy definitions running.
+    """
+    if not getattr(workflow, "enabled", True):
+        raise WorkflowDisabledError(
+            str(getattr(workflow, "id", "?")), str(getattr(workflow, "name", "") or "")
+        )
+
+
+async def ensure_workflow_id_enabled(
+    container: "ApplicationContainer", workflow_id: str
+) -> None:
+    """Guard by id, reading the *current* definition rather than a snapshot.
+
+    Used where only the id is at hand (replaying an existing run). The stored
+    definition wins over the registry copy because the registry is refreshed
+    asynchronously and could still hold a pre-disable runner.
+    """
+    backend = getattr(container, "workflow_backend", None)
+    if backend is not None:
+        defn = await backend.get(workflow_id)
+        if defn is not None:
+            ensure_workflow_enabled(defn)
+            return
+    runner = container.yaml_graph_registry.get(workflow_id)
+    if runner is not None:
+        ensure_workflow_enabled(runner)
+
+
 def _config(thread_id: str) -> dict:
     return {"configurable": {"thread_id": thread_id}}
 
@@ -255,6 +329,11 @@ async def retry_run(
         raise RunControlError(404, "Run not found")
     if run.status != "failed":
         raise RunControlError(409, f"Run is not in failed state (status={run.status})")
+    # Retrying re-executes graph steps, so it is a start like any other and the
+    # guard applies. Approve/reject deliberately do NOT check: a run already
+    # paused at a human gate must stay closable, or disabling a workflow would
+    # strand every in-flight approval with no way to finish or reject it.
+    await ensure_workflow_id_enabled(container, run.graph_id)
 
     runner = container._build_runner_for_recovery(run)
     if runner is None:
@@ -320,6 +399,8 @@ async def restart_from_step(
         raise RunControlError(409, f"Cannot restart a {run.status} run")
     if run.status == "running":
         raise RunControlError(409, "Cannot restart a currently running workflow")
+    # Same reasoning as retry_run: replaying steps starts the workflow again.
+    await ensure_workflow_id_enabled(container, run.graph_id)
 
     runner = container._build_runner_for_recovery(run)
     if runner is None:

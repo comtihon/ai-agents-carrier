@@ -8,6 +8,7 @@ from uuid import uuid4
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 
 from app.api.dependencies import get_container
+from app.application.run_control import WorkflowDisabledError, ensure_workflow_enabled
 from app.core.container import ApplicationContainer
 from app.domain.models.graph_run import GraphRun
 from app.infrastructure.config.graph_loader import build_runner_from_definition
@@ -102,6 +103,14 @@ async def receive_webhook(
         if not signature or not validate_webhook_signature(body, signature, secret):
             logger.warning("Webhook signature validation failed for workflow '%s'", workflow_id)
             raise HTTPException(status_code=403, detail="Invalid or missing webhook signature")
+
+    # Checked only after the signature/token has been verified: an unauthenticated
+    # caller must not be able to probe which workflows exist and which are off.
+    try:
+        ensure_workflow_enabled(runner)
+    except WorkflowDisabledError as exc:
+        logger.info("HTTP trigger refused: %s", exc.detail)
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
     try:
         payload: dict = json.loads(body)

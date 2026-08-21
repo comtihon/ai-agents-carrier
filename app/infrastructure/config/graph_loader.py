@@ -56,6 +56,7 @@ class YamlGraphRegistry:
                 "name": runner.name,
                 "description": runner.description,
                 "readonly": runner.readonly,
+                "enabled": runner.enabled,
                 "steps": [
                     {
                         "id": s["id"],
@@ -95,6 +96,7 @@ def build_registry_from_definitions(
                 checkpointer=checkpointer,
             )
             runner.readonly = defn.readonly
+            runner.enabled = defn.enabled
             runners[runner.id] = runner
             logger.info("Loaded workflow '%s' from backend", runner.id)
         except Exception:
@@ -127,6 +129,7 @@ def build_runner_from_definition(
         checkpointer=checkpointer,
     )
     runner.readonly = definition.readonly
+    runner.enabled = definition.enabled
     runner._registry = registry
     runner._run_repository = run_repository
     return runner
