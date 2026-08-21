@@ -637,7 +637,7 @@ class YamlGraphRunner:
         description: "..."
         steps:
           - id: <node-id>
-            type: llm_structured | llm | mcp | human_approval | execute | workflow | cron | http | http_call | python | data_source | parallel | join | proceed_or | switch
+            type: llm_structured | llm | mcp | human_approval | execute | workflow | cron | http | http_call | python | data_source | parallel | join | proceed_or | switch | storage
             when: <state-key>          # skip node if state[key] is falsy
             system_prompt: "..."       # llm / llm_structured
             user_template: "..."       # {key} placeholders resolved from state
@@ -684,6 +684,9 @@ class YamlGraphRunner:
             sandbox_runtime: local     # python only — local | docker | k8s
             sandbox_image: python:3.12-slim  # python only — docker/k8s image override
             timeout_seconds: 60        # python only — sandbox wall-clock limit
+            action: get                # storage only -- get | set | delete | keys
+            key: "alert-state"         # storage only -- entry name; {state} templated
+            value: {}                  # storage only (set) -- any JSON; {state} templated
             source: github             # data_source only — DataSourceDefinition id
             operation: list_repos      # data_source only — operation to invoke
             params:                    # data_source only — operation inputs;
@@ -760,6 +763,14 @@ class YamlGraphRunner:
     once, on the first branch's data, without needing every branch to arrive or
     succeed.
 
+    ``storage`` steps read and write the workflow's own key/value storage, which
+    survives between runs -- the place for "which alerts have I already sent",
+    not for datasets. It must be switched on for the workflow (``use_storage``);
+    a ``storage`` step in a workflow that has it off fails loudly rather than
+    silently doing nothing. The owning workflow id is taken from the runner, so a
+    step can only ever address its own entries. ``get`` on an absent key yields
+    ``None``, because a first run legitimately has no state yet.
+
     ``http`` steps are entry-point triggers: the ``POST /api/v1/webhooks/{id}``
     endpoint validates an HMAC-SHA256 signature, then starts a run with the
     webhook body stored in the ``trigger_payload`` state key.  When the node
@@ -811,6 +822,11 @@ class YamlGraphRunner:
         self._agent_task_repository: Any = None
         # Injected post-construction for warm pod reuse tracking (optional)
         self._warm_pod_repository: Any = None
+        # Injected post-construction for `storage` steps (optional). The backend
+        # is shared, the scoping is not: every call passes self.id as the owner,
+        # so a step cannot reach another workflow's keys.
+        self._storage_backend: Any = None
+        self._storage_enabled: bool = bool(definition.get("use_storage", False))
         # Injected post-construction for `data_source` steps (optional)
         self._data_source_backend: Any = None
         self._data_source_executor: Any = None
@@ -971,6 +987,8 @@ class YamlGraphRunner:
             fn = self._join_node(step)
         elif t == "proceed_or":
             fn = self._proceed_or_node(step)
+        elif t == "storage":
+            fn = self._storage_node(step)
         elif t == "switch":
             fn = self._switch_node(step)
         else:
@@ -2183,6 +2201,82 @@ class YamlGraphRunner:
             return END
 
         return _select
+
+    def _storage_node(self, step: dict[str, Any]):
+        """Read or write this workflow's own key/value storage.
+
+        Config: ``action`` (``get`` | ``set`` | ``delete`` | ``keys``), ``key``
+        and, for ``set``, ``value`` -- all ``{state}``-templated -- plus the usual
+        ``output_key``.
+
+        The owner is never configurable.  ``workflow_id`` is taken from the
+        runner (``self.id``), so a step cannot name another workflow's storage:
+        the only id it can address is its own.  That is the whole security model
+        and it is structural rather than checked.
+
+        A missing key reads back as ``None`` rather than failing -- a first run
+        has no state yet, and that is normal, not an error.  Everything else
+        fails loudly: storage switched off for the workflow, an unknown action,
+        a missing key name, or a value too large to be bookkeeping.
+        """
+        graph_id = self.id
+
+        async def node(state: dict) -> dict:
+            step_id = step["id"]
+            action = (step.get("action") or "get").lower()
+            output_key = step.get("output_key") or step_id
+            try:
+                if not self._storage_enabled:
+                    raise ValueError(
+                        f"step '{step_id}' uses storage but workflow '{graph_id}' "
+                        f"has it switched off -- enable storage in the workflow "
+                        f"settings first"
+                    )
+                if self._storage_backend is None:
+                    raise ValueError("workflow storage backend not configured")
+
+                if action == "keys":
+                    keys = await self._storage_backend.keys(graph_id)
+                    logger.info(
+                        "[%s] step '%s' storage keys -> %d entry(ies)",
+                        graph_id, step_id, len(keys),
+                    )
+                    return {output_key: keys}
+
+                key = self._render(str(step.get("key") or ""), state).strip()
+                if not key:
+                    raise ValueError(
+                        f"step '{step_id}' needs a non-empty 'key' for action '{action}'"
+                    )
+
+                if action == "get":
+                    value = await self._storage_backend.get(graph_id, key)
+                    logger.info(
+                        "[%s] step '%s' storage get '%s' -> %s",
+                        graph_id, step_id, key, "hit" if value is not None else "miss",
+                    )
+                    return {output_key: value}
+
+                if action == "set":
+                    value = self._render_deep(step.get("value"), state)
+                    await self._storage_backend.set(graph_id, key, value)
+                    logger.info("[%s] step '%s' storage set '%s'", graph_id, step_id, key)
+                    return {output_key: {"key": key, "saved": True}}
+
+                if action == "delete":
+                    await self._storage_backend.delete(graph_id, key)
+                    logger.info("[%s] step '%s' storage delete '%s'", graph_id, step_id, key)
+                    return {output_key: {"key": key, "deleted": True}}
+
+                raise ValueError(
+                    f"step '{step_id}' has unknown storage action '{action}' "
+                    f"(expected get | set | delete | keys)"
+                )
+            except Exception as exc:
+                logger.exception("[%s] step '%s' storage failed", graph_id, step_id)
+                return {output_key: {"error": str(exc)}, "__failed_step__": step_id}
+
+        return node
 
     @staticmethod
     def _switch_node(step: dict[str, Any]) -> Callable:

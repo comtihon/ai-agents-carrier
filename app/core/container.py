@@ -42,6 +42,10 @@ from app.infrastructure.persistence.script_backend import (
     MongoScriptBackend,
     ScriptDefinitionBackend,
 )
+from app.infrastructure.persistence.workflow_storage import (
+    MongoWorkflowStorageBackend,
+    WorkflowStorageBackend,
+)
 from app.infrastructure.persistence.workflow_backend import (
     LocalFilesWorkflowBackend,
     MongoWorkflowBackend,
@@ -87,6 +91,10 @@ class ApplicationContainer:
     # Python script library backend — None when MongoDB is not configured or in
     # legacy test setups.  Required for `python` steps that use `script_id`.
     script_backend: ScriptDefinitionBackend | None = None
+    # Per-workflow key/value storage for `storage` steps. Shared instance; the
+    # per-workflow scoping is enforced by passing the runner's own id on every
+    # call, never by handing a runner a private backend.
+    workflow_storage: WorkflowStorageBackend | None = None
     # Mints the service's own OAuth2 access token for outbound calls that use
     # `service_identity` auth — None in legacy test setups.
     service_token_provider: ServiceTokenProvider | None = None
@@ -186,6 +194,8 @@ class ApplicationContainer:
             runner._script_backend = self.script_backend
         if self.service_token_provider is not None:
             runner._service_token_provider = self.service_token_provider
+        if self.workflow_storage is not None:
+            runner._storage_backend = self.workflow_storage
 
     async def _load_datasources_mcp(self) -> None:
         """Publish data source MCP tools, then connect the local MCP server.
@@ -1017,6 +1027,8 @@ def build_container(settings: Settings) -> ApplicationContainer:
     event_backend = MongoEventBackend(settings.mongodb_uri, settings.mongodb_database)
     # Python script library is likewise MongoDB-only.
     script_backend = MongoScriptBackend(settings.mongodb_uri, settings.mongodb_database)
+    # Per-workflow storage: one collection, entries owned by workflow id.
+    workflow_storage = MongoWorkflowStorageBackend(settings.mongodb_uri, settings.mongodb_database)
     service_token_provider = ServiceTokenProvider(settings)
     data_source_executor = DataSourceExecutor(token_provider=service_token_provider)
     checkpointer = MongoDBCheckpointSaver(
@@ -1039,6 +1051,7 @@ def build_container(settings: Settings) -> ApplicationContainer:
         data_source_executor=data_source_executor,
         event_backend=event_backend,
         script_backend=script_backend,
+        workflow_storage=workflow_storage,
         service_token_provider=service_token_provider,
         checkpointer=checkpointer,
         pvc_lease_repository=pvc_lease_repository,
