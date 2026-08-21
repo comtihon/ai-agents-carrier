@@ -18,6 +18,11 @@ class WorkflowDefinition(BaseModel):
     # documents stored before the field existed keep running as they did.
     enabled: bool = True
     use_meta_llm: bool = True
+    # Opt-in per-workflow key/value storage (see
+    # app.infrastructure.persistence.workflow_storage). Off by default: a
+    # workflow that never asked for state should not silently accumulate any,
+    # and `storage` steps fail loudly rather than no-op when it is off.
+    use_storage: bool = False
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -35,5 +40,6 @@ class WorkflowDefinition(BaseModel):
         if self.ui:
             d["ui"] = self.ui
         d["use_meta_llm"] = self.use_meta_llm
+        d["use_storage"] = self.use_storage
         d["enabled"] = self.enabled
         return d

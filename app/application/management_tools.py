@@ -419,7 +419,8 @@ def _captured_note(captured: list[str]) -> str:
 
 @requires(Permission.WRITE)
 async def create_workflow(
-    deps: ManagementDeps, workflow_id: str, name: str, description: str, steps_json: str
+    deps: ManagementDeps, workflow_id: str, name: str, description: str, steps_json: str,
+    use_storage: bool = False,
 ) -> str:
     if deps.workflow_backend is None:
         return "Workflow creation unavailable: no persistent backend configured."
@@ -441,7 +442,10 @@ async def create_workflow(
     from app.application.script_capture import capture_inline_scripts
     from app.domain.models.workflow_definition import WorkflowDefinition
     captured = await capture_inline_scripts(workflow_id, steps, deps.script_backend)
-    defn = WorkflowDefinition(id=workflow_id, name=name, description=description, steps=steps)
+    defn = WorkflowDefinition(
+        id=workflow_id, name=name, description=description, steps=steps,
+        use_storage=use_storage,
+    )
     await deps.workflow_backend.create(defn)
     if deps.refresh_runner is not None:
         await deps.refresh_runner(workflow_id)
@@ -459,6 +463,7 @@ async def update_workflow(
     description: str | None = None,
     steps_json: str | None = None,
     enabled: bool | None = None,
+    use_storage: bool | None = None,
 ) -> str:
     if deps.workflow_backend is None:
         return "Workflow updates unavailable: no persistent backend configured."
@@ -480,6 +485,8 @@ async def update_workflow(
         defn.description = description
     if enabled is not None:
         defn.enabled = enabled
+    if use_storage is not None:
+        defn.use_storage = use_storage
     if steps_json is not None:
         try:
             steps = json.loads(steps_json)

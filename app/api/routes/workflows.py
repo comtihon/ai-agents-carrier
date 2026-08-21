@@ -72,6 +72,7 @@ class WorkflowDefinitionRequest(BaseModel):
     steps: list[dict[str, Any]] = []
     ui: dict[str, Any] = Field(default_factory=dict)
     use_meta_llm: bool = True
+    use_storage: bool = False
     enabled: bool = True
 
 
@@ -81,6 +82,7 @@ class WorkflowDefinitionUpdateRequest(BaseModel):
     steps: list[dict[str, Any]] = []
     ui: dict[str, Any] = Field(default_factory=dict)
     use_meta_llm: bool = True
+    use_storage: bool = False
     # None (field omitted) keeps the stored value, so a client that predates the
     # flag cannot silently re-enable a workflow by PUTting a full definition.
     enabled: bool | None = None
@@ -574,6 +576,7 @@ async def create_workflow(
         steps=body.steps,
         ui=body.ui,
         use_meta_llm=body.use_meta_llm,
+        use_storage=body.use_storage,
         enabled=body.enabled,
     )
     saved = await container.workflow_backend.create(defn)
@@ -896,6 +899,7 @@ async def update_workflow(
         steps=body.steps,
         ui=body.ui,
         use_meta_llm=body.use_meta_llm,
+        use_storage=body.use_storage,
         enabled=existing.enabled if body.enabled is None else body.enabled,
         created_at=existing.created_at,
     )
