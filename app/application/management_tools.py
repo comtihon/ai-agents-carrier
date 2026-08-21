@@ -267,8 +267,12 @@ def list_workflows(deps: ManagementDeps) -> str:
     defs = deps.registry.list_definitions()
     if not defs:
         return "No workflows are currently configured."
+    # DISABLED is called out inline so a workflow that refuses to start is
+    # identifiable from the listing, without fetching each definition.
     lines = [
-        f"- **{d['id']}** ({d.get('name', d['id'])}): {(d.get('description') or '').strip()}"
+        f"- **{d['id']}** ({d.get('name', d['id'])})"
+        + ("" if d.get("enabled", True) else " [DISABLED]")
+        + f": {(d.get('description') or '').strip()}"
         for d in defs
     ]
     return "\n".join(lines)
@@ -296,6 +300,12 @@ async def run_workflow(
     runner = deps.registry.get(workflow_id)
     if runner is None:
         return f"Workflow '{workflow_id}' not found."
+
+    from app.application.run_control import WorkflowDisabledError, ensure_workflow_enabled
+    try:
+        ensure_workflow_enabled(runner)
+    except WorkflowDisabledError as exc:
+        return exc.detail
 
     run_id = str(uuid4())
     child_run = GraphRun(
@@ -448,6 +458,7 @@ async def update_workflow(
     name: str | None = None,
     description: str | None = None,
     steps_json: str | None = None,
+    enabled: bool | None = None,
 ) -> str:
     if deps.workflow_backend is None:
         return "Workflow updates unavailable: no persistent backend configured."
@@ -467,6 +478,8 @@ async def update_workflow(
         defn.name = name
     if description is not None:
         defn.description = description
+    if enabled is not None:
+        defn.enabled = enabled
     if steps_json is not None:
         try:
             steps = json.loads(steps_json)
@@ -484,7 +497,8 @@ async def update_workflow(
     await deps.workflow_backend.update(workflow_id, defn)
     if deps.refresh_runner is not None:
         await deps.refresh_runner(workflow_id)
-    return f"Workflow '{workflow_id}' updated." + _captured_note(captured)
+    state_note = "" if defn.enabled else " It is disabled and will not start."
+    return f"Workflow '{workflow_id}' updated." + state_note + _captured_note(captured)
 
 
 @requires(Permission.DELETE)

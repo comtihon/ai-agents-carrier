@@ -787,6 +787,10 @@ class YamlGraphRunner:
         self._max_iterations: int = definition.get("max_iterations", 10)
         self._use_meta_llm: bool = definition.get("use_meta_llm", True)
         self.readonly: bool = False  # Set post-construction by build_registry_from_definitions
+        # A disabled workflow starts no runs; see app.application.run_control.
+        # Read off the definition (not post-construction like readonly) so runners
+        # built straight from a YAML dict carry the flag too. Absent means enabled.
+        self.enabled: bool = bool(definition.get("enabled", True))
         self._steps: list[dict[str, Any]] = definition["steps"]
         self._llm = llm
         self._llm_factory = llm_factory
@@ -1719,6 +1723,19 @@ class YamlGraphRunner:
                     graph_id, step_id, child_workflow_id,
                 )
                 return {output_key: {"error": f"workflow '{child_workflow_id}' not found"}}
+
+            # A workflow starting another workflow is an entry point like any
+            # other. Imported inside the node: the guard lives in the
+            # application layer, which imports this module.
+            from app.application.run_control import (
+                WorkflowDisabledError,
+                ensure_workflow_enabled,
+            )
+            try:
+                ensure_workflow_enabled(child_runner)
+            except WorkflowDisabledError as exc:
+                logger.warning("[%s] step '%s': %s", graph_id, step_id, exc.detail)
+                return {output_key: {"error": exc.detail}}
 
             try:
                 child_request = self._render(step.get("input_template", "{request}"), state)

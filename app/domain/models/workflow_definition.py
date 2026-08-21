@@ -13,6 +13,10 @@ class WorkflowDefinition(BaseModel):
     steps: list[dict[str, Any]] = []
     ui: dict[str, Any] = Field(default_factory=dict)
     readonly: bool = False
+    # Disabling a workflow stops every trigger and every manual start (see
+    # app.application.run_control.ensure_workflow_enabled). Defaults to True so
+    # documents stored before the field existed keep running as they did.
+    enabled: bool = True
     use_meta_llm: bool = True
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -31,4 +35,5 @@ class WorkflowDefinition(BaseModel):
         if self.ui:
             d["ui"] = self.ui
         d["use_meta_llm"] = self.use_meta_llm
+        d["enabled"] = self.enabled
         return d

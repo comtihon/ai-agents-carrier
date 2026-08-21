@@ -13,6 +13,7 @@ from uuid import uuid4
 from langchain_core.language_models import BaseChatModel
 from pymongo import MongoClient
 
+from app.application.run_control import WorkflowDisabledError, ensure_workflow_enabled
 from app.core.config import Settings
 from app.domain.models.event_definition import EventDefinition
 from app.domain.models.graph_run import GraphRun
@@ -459,6 +460,14 @@ class ApplicationContainer:
                         return
                     definition_snapshot = None
 
+                # A disabled workflow fires no triggers. The job stays registered
+                # so re-enabling needs no restart; it just declines to run.
+                try:
+                    ensure_workflow_enabled(runner)
+                except WorkflowDisabledError as exc:
+                    logger.info("Pub/Sub trigger skipped: %s", exc.detail)
+                    return
+
                 thread_id = str(uuid4())
                 self.live_runners[thread_id] = runner
 
@@ -525,6 +534,14 @@ class ApplicationContainer:
                         logger.warning("Cron job: workflow '%s' not found in registry", workflow_id)
                         return
                     definition_snapshot = None
+
+                # A disabled workflow fires no triggers. The job stays registered
+                # so re-enabling needs no restart; it just declines to run.
+                try:
+                    ensure_workflow_enabled(runner)
+                except WorkflowDisabledError as exc:
+                    logger.info("Cron trigger skipped: %s", exc.detail)
+                    return
 
                 thread_id = str(uuid4())
                 self.live_runners[thread_id] = runner

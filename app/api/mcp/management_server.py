@@ -171,14 +171,17 @@ def register_management_tools(
         name: str | None = None,
         description: str | None = None,
         steps_json: str = "",
+        enabled: bool | None = None,
     ) -> str:
-        """Update an existing workflow definition (name, description, and/or steps).
+        """Update an existing workflow definition (name, description, steps, enabled).
 
         Args:
             workflow_id: The workflow ID to update.
             name: New display name (omit to keep current).
             description: New description (omit to keep current).
             steps_json: JSON array replacing ALL steps (omit to keep current).
+            enabled: False disables the workflow — every trigger and every manual
+                start is refused until it is set back to True. Omit to keep current.
         """
         # NOTE: JSON-carrying params are annotated `str`, never `str | None`.
         # FastMCP pre-parses a string argument whenever the annotation is not
@@ -188,7 +191,7 @@ def register_management_tools(
         # impossible to set. Empty string means "omitted"; `or None` restores
         # the core function's "None keeps the stored value" contract.
         return await core.update_workflow(
-            deps(), workflow_id, name, description, steps_json or None
+            deps(), workflow_id, name, description, steps_json or None, enabled
         )
 
     async def delete_workflow(workflow_id: str) -> str:

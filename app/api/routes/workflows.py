@@ -15,7 +15,12 @@ from app.application.script_capture import capture_inline_scripts
 from app.application import run_control
 # _config is defined in run_control (the shared run-control layer); imported here
 # rather than duplicated. The dependency direction is workflows -> run_control.
-from app.application.run_control import RunControlError, _config
+from app.application.run_control import (
+    RunControlError,
+    WorkflowDisabledError,
+    _config,
+    ensure_workflow_enabled,
+)
 from app.core.container import ApplicationContainer
 from app.domain.models.graph_run import GraphRun
 from app.domain.models.workflow_definition import WorkflowDefinition
@@ -67,6 +72,7 @@ class WorkflowDefinitionRequest(BaseModel):
     steps: list[dict[str, Any]] = []
     ui: dict[str, Any] = Field(default_factory=dict)
     use_meta_llm: bool = True
+    enabled: bool = True
 
 
 class WorkflowDefinitionUpdateRequest(BaseModel):
@@ -75,6 +81,9 @@ class WorkflowDefinitionUpdateRequest(BaseModel):
     steps: list[dict[str, Any]] = []
     ui: dict[str, Any] = Field(default_factory=dict)
     use_meta_llm: bool = True
+    # None (field omitted) keeps the stored value, so a client that predates the
+    # flag cannot silently re-enable a workflow by PUTting a full definition.
+    enabled: bool | None = None
 
 
 class RestartFromStepRequest(BaseModel):
@@ -509,6 +518,14 @@ async def list_workflows(container: ApplicationContainer = Depends(get_container
     return container.yaml_graph_registry.list_definitions()
 
 
+def _refuse_if_disabled(workflow: object) -> None:
+    """Turn the shared disabled-workflow guard into an HTTP 409."""
+    try:
+        ensure_workflow_enabled(workflow)
+    except WorkflowDisabledError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
 def _guard_sandbox(request: Request, steps: object) -> None:
     """Reject unsandboxed python steps unless the caller holds ADMIN.
 
@@ -557,6 +574,7 @@ async def create_workflow(
         steps=body.steps,
         ui=body.ui,
         use_meta_llm=body.use_meta_llm,
+        enabled=body.enabled,
     )
     saved = await container.workflow_backend.create(defn)
     await container.refresh_runner(body.id)
@@ -620,6 +638,7 @@ async def start_run(
             raise HTTPException(
                 status_code=404, detail=f"Workflow '{body.workflow_id}' not found"
             )
+        _refuse_if_disabled(defn)
         runner = build_runner_from_definition(
             defn,
             llm=container.llm,
@@ -641,6 +660,7 @@ async def start_run(
             raise HTTPException(
                 status_code=404, detail=f"Workflow '{body.workflow_id}' not found"
             )
+        _refuse_if_disabled(runner)
         definition_snapshot = None
 
     thread_id = str(uuid4())
@@ -876,6 +896,7 @@ async def update_workflow(
         steps=body.steps,
         ui=body.ui,
         use_meta_llm=body.use_meta_llm,
+        enabled=existing.enabled if body.enabled is None else body.enabled,
         created_at=existing.created_at,
     )
     saved = await container.workflow_backend.update(workflow_id, defn)
