@@ -123,6 +123,12 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
         "_judge_token_usage":         Annotated[Any, _sum_usage],    # type: ignore[assignment]
     }
     for step in steps:
+        # proceed_or keeps its first-wins latch in state. It must be declared or
+        # LangGraph drops it, and the node would then re-win on every arrival.
+        # _merge_dicts (not _last_wins) so a branch that writes the latch in the
+        # same superstep as another key cannot blank the counter.
+        if step.get("type") == "proceed_or":
+            fields[f"_proceed_or_{step['id']}"] = Annotated[Any, _merge_dicts]  # type: ignore[assignment]
         # Regular output nodes store their result under output_key
         if "output_key" in step:
             fields[step["output_key"]] = Any  # type: ignore[assignment]
@@ -631,7 +637,7 @@ class YamlGraphRunner:
         description: "..."
         steps:
           - id: <node-id>
-            type: llm_structured | llm | mcp | human_approval | execute | workflow | cron | http | http_call | python | data_source
+            type: llm_structured | llm | mcp | human_approval | execute | workflow | cron | http | http_call | python | data_source | parallel | join | proceed_or | switch
             when: <state-key>          # skip node if state[key] is falsy
             system_prompt: "..."       # llm / llm_structured
             user_template: "..."       # {key} placeholders resolved from state
@@ -740,6 +746,19 @@ class YamlGraphRunner:
     ``params``.  The result is stored under ``output_key`` (defaults to the
     step id); failures are captured as ``{"error": "..."}`` so the next node
     can decide how to react.
+
+    ``join`` and ``proceed_or`` are the two fan-in operators.  ``join`` is an AND:
+    it runs after every branch, and ``failure_policy`` decides whether one failed
+    branch fails the join.  ``proceed_or`` is an OR: the first branch to arrive
+    wins, and every later arrival is routed to END so the steps after it run
+    exactly once instead of once per arrival.
+
+    ``proceed_or`` is about *what runs*, not about wall clock.  LangGraph
+    supersteps are globally synchronous, so while any branch is still producing
+    supersteps the steps after the fan-in wait for them; the OR does not let the
+    run overtake a slow branch.  What it does give you is a tail that executes
+    once, on the first branch's data, without needing every branch to arrive or
+    succeed.
 
     ``http`` steps are entry-point triggers: the ``POST /api/v1/webhooks/{id}``
     endpoint validates an HMAC-SHA256 signature, then starts a run with the
@@ -851,6 +870,22 @@ class YamlGraphRunner:
             routes = step.get("routes") or []
             next_val = step.get("next")
 
+            # proceed_or: first arrival continues, later ones are cut to END so
+            # the tail of the graph cannot run twice on an uneven-depth fan-in.
+            if step_type == "proceed_or":
+                dest = next_val or (routes[0].get("next") if routes else None)
+                if not dest or dest not in all_ids:
+                    dest = step_ids[i + 1] if i < len(self._steps) - 1 else None
+                if not dest or dest not in all_ids:
+                    sg.add_edge(sid, END)
+                else:
+                    sg.add_conditional_edges(
+                        sid,
+                        self._make_proceed_or_router(sid, dest),
+                        {dest: dest, END: END},
+                    )
+                continue
+
             if routes:
                 if step_type not in _MULTI_OUTPUT_TYPES and len(routes) > 1:
                     raise ValueError(
@@ -930,6 +965,8 @@ class YamlGraphRunner:
             fn = self._parallel_node(step)
         elif t == "join":
             fn = self._join_node(step)
+        elif t == "proceed_or":
+            fn = self._proceed_or_node(step)
         elif t == "switch":
             fn = self._switch_node(step)
         else:
@@ -938,10 +975,10 @@ class YamlGraphRunner:
         wrapped = self._wrap_with_when(step, wrapped)
         return self._wrap_with_fail_guard(step, wrapped)
 
-    _NO_LOOP_GUARD_TYPES: frozenset = frozenset({"ask_context", "human_approval", "cron", "http", "pubsub", "parallel", "join", "switch", "langgraph-agent", "claude-agent"})
+    _NO_LOOP_GUARD_TYPES: frozenset = frozenset({"ask_context", "human_approval", "cron", "http", "pubsub", "parallel", "join", "proceed_or", "switch", "langgraph-agent", "claude-agent"})
     # join handles __failed_step__ itself via failure_policy; all others must abort when
     # a previous step has already written the sentinel into state.
-    _NO_FAIL_GUARD_TYPES: frozenset = frozenset({"join"})
+    _NO_FAIL_GUARD_TYPES: frozenset = frozenset({"join", "proceed_or"})
 
     def _wrap_with_when(self, step: dict[str, Any], fn: Callable) -> Callable:
         """Skip node if step has a `when` key and state[when] is falsy."""
@@ -2032,6 +2069,103 @@ class YamlGraphRunner:
                 pass
             return {}
         return node
+
+    def _proceed_or_node(self, step: dict[str, Any]) -> Callable:
+        """First-wins fan-in: proceed as soon as *one* upstream branch arrives.
+
+        The mirror image of ``join``.  ``join`` is an AND -- LangGraph schedules
+        equal-depth branches into a single superstep, so it runs once, after all
+        of them.  This node is an OR: the first branch to reach it wins, and every
+        later arrival is cut to END by ``_make_proceed_or_router`` so the tail of
+        the graph cannot run a second time.
+
+        That guard is the whole point, and it cannot live in the node body: Pregel
+        triggers a node once per superstep that writes to it, so an uneven-depth
+        fan-in executes this node again when the slow branch lands.  Without the
+        router, every step after it would run once per arrival.
+
+        Failure handling is deliberately conservative, because a fan-in cannot
+        tell "that was the last branch" from "another is still coming":
+
+        * A failure arriving **before** anything has won does not win and does not
+          clear ``__failed_step__``, so the run fails as it would anywhere else.
+          Failing loudly beats stranding the run with its tail never run.
+        * A failure arriving **after** a branch has already won is discarded --
+          sentinel cleared -- because a late loser must not retroactively fail a
+          run that already proceeded.
+
+        Note two limits, both shared with ``join``.  Wall clock is not among the
+        benefits: supersteps are globally synchronous, so while any branch is
+        still producing supersteps the steps after this node wait for them --
+        ``proceed_or`` changes *what runs and how often*, not *when*.  And a step
+        that records its error in state instead of raising (a ``python`` step with
+        ``stop_on_failure`` unset, say) has not "failed" for this purpose: it
+        counts as a normal arrival and can win, so gate on its error payload
+        downstream if that matters.
+        """
+        step_id = step["id"]
+        graph_id = self.id
+        key = f"_proceed_or_{step_id}"
+
+        async def node(state: dict) -> dict:
+            latch = state.get(key) or {}
+            arrivals = int(latch.get("arrivals") or 0) + 1
+            already_won = bool(latch.get("won"))
+            failed = state.get("__failed_step__")
+
+            if failed and failed != step_id:
+                if already_won:
+                    # A branch already carried the run onward; this late failure
+                    # must not undo it, so drop the sentinel and stop here.
+                    logger.info(
+                        "[%s] step '%s' arrival %d discarded -- branch '%s' failed "
+                        "after the run had already proceeded",
+                        graph_id, step_id, arrivals, failed,
+                    )
+                    return {
+                        key: {"arrivals": arrivals, "won": True, "last_won": False},
+                        "__failed_step__": None,
+                    }
+                # Nothing has won yet. Leave the sentinel in place so the run
+                # fails instead of ending quietly with the tail never run.
+                logger.warning(
+                    "[%s] step '%s' arrival %d failed (branch '%s') with no "
+                    "successful branch yet -- failing the run",
+                    graph_id, step_id, arrivals, failed,
+                )
+                return {key: {"arrivals": arrivals, "won": False, "last_won": False}}
+
+            if already_won:
+                logger.info(
+                    "[%s] step '%s' arrival %d ignored -- already proceeded",
+                    graph_id, step_id, arrivals,
+                )
+                return {key: {"arrivals": arrivals, "won": True, "last_won": False}}
+
+            logger.info(
+                "[%s] step '%s' proceeding on arrival %d", graph_id, step_id, arrivals,
+            )
+            return {key: {"arrivals": arrivals, "won": True, "last_won": True}}
+
+        return node
+
+    def _make_proceed_or_router(
+        self, step_id: str, dest: str
+    ) -> Callable[[dict], str]:
+        """Route the winning arrival onward and every later one to END."""
+        graph_id = self.id
+        key = f"_proceed_or_{step_id}"
+
+        def _select(state: dict) -> str:
+            latch = state.get(key) or {}
+            if latch.get("last_won"):
+                return dest
+            logger.debug(
+                "[%s] proceed_or '%s': late arrival routed to END", graph_id, step_id,
+            )
+            return END
+
+        return _select
 
     @staticmethod
     def _switch_node(step: dict[str, Any]) -> Callable:
