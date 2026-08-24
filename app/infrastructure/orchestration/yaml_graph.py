@@ -2056,7 +2056,12 @@ class YamlGraphRunner:
                 return {output_key: result}
             except Exception as exc:
                 logger.exception("[%s] step '%s' python failed", graph_id, step_id)
-                return {output_key: {"error": str(exc)}}
+                # Some failures carry no message (a bare TimeoutError, an
+                # ApiException with an empty body), and "error": "" tells the
+                # reader nothing at all. Fall back to the exception type so the
+                # failure is at least identifiable.
+                detail = str(exc) or type(exc).__name__
+                return {output_key: {"error": detail}}
 
         return node
 
