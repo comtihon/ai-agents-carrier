@@ -348,6 +348,23 @@ async def list_runs(
     return "\n".join(lines)
 
 
+# Caps for get_run's rendering: enough to see what a run produced, bounded so a
+# run carrying a large fetch cannot flood the caller's context.
+_GET_RUN_MAX_KEYS = 12
+_GET_RUN_MAX_CHARS = 600
+
+
+def _compact(value: Any) -> str:
+    """JSON-encode *value* on one line, truncated, with its size noted."""
+    try:
+        text = json.dumps(value, default=str, ensure_ascii=False)
+    except Exception:  # noqa: BLE001 — rendering must never break the tool
+        text = str(value)
+    if len(text) <= _GET_RUN_MAX_CHARS:
+        return text
+    return f"{text[:_GET_RUN_MAX_CHARS]}… [{len(text)} chars total]"
+
+
 @requires(Permission.READ)
 async def get_run(deps: ManagementDeps, run_id: str) -> str:
     run = await deps.run_repository.get(run_id)
@@ -363,18 +380,32 @@ async def get_run(deps: ManagementDeps, run_id: str) -> str:
         for step_id, status in run.step_statuses.items():
             parts.append(f"  - {step_id}: {status}")
     if run.state:
-        # Include output values for failed/finished steps — skip internal keys
+        # Render every non-internal state value, compactly. The previous version
+        # only surfaced `.error` and `.status` sub-keys, so a step whose output was
+        # any other shape showed as a bare key name — which made this tool unable
+        # to answer the question it exists for ("what did the run actually
+        # produce?"). Values are JSON-encoded and truncated instead, so the shape
+        # is always visible and the response still cannot run away.
         output_keys = [k for k in run.state if not k.startswith("_")]
         if output_keys:
             parts.append("State keys: " + ", ".join(output_keys))
-            for k in output_keys[:8]:  # cap to avoid huge responses
-                v = run.state[k]
-                if isinstance(v, dict) and "error" in v:
-                    parts.append(f"  {k}.error: {v['error'][:300]}")
-                elif isinstance(v, dict) and "status" in v:
-                    parts.append(f"  {k}.status: {v.get('status')} {str(v.get('body',''))[:200]}")
-    if run.error:
-        parts.append(f"Error: {run.error[:500]}")
+            for k in output_keys[:_GET_RUN_MAX_KEYS]:
+                parts.append(f"  {k}: {_compact(run.state[k])}")
+            if len(output_keys) > _GET_RUN_MAX_KEYS:
+                parts.append(
+                    f"  … {len(output_keys) - _GET_RUN_MAX_KEYS} more key(s) not shown"
+                )
+    # A run carries no `error` attribute; failures are recorded in state by the
+    # step that caught them (`error`) and by the fail sentinel
+    # (`__failed_step__`). Reading run.error raised AttributeError here, which
+    # made get_run fail for every run, successful ones included.
+    state = run.state if isinstance(run.state, dict) else {}
+    failed_step = state.get("__failed_step__")
+    if failed_step:
+        parts.append(f"Failed step: {failed_step}")
+    err = state.get("error")
+    if err:
+        parts.append(f"Error: {str(err)[:500]}")
     return "\n".join(parts)
 
 
