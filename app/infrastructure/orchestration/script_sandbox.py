@@ -395,19 +395,35 @@ async def _run_k8s(
             except Exception:  # noqa: BLE001 — best-effort cleanup
                 logger.debug("k8s sandbox: cleanup failed for %s", name, exc_info=True)
 
+    # Every call below is bounded twice: `_request_timeout` stops the client from
+    # blocking on a stalled connection, and asyncio.wait_for stops a wedged worker
+    # thread from holding the step open. Without them the create calls sat outside
+    # the step's timeout entirely -- that only ever covered the wait loop below --
+    # so a single unreachable API server hung the step forever, logging nothing.
+    api_timeout = min(30.0, timeout)
+
+    async def _api(call) -> Any:
+        return await asyncio.wait_for(loop.run_in_executor(None, call), timeout=api_timeout)
+
     try:
-        await loop.run_in_executor(
-            None, lambda: core.create_namespaced_config_map(namespace=namespace, body=cm_body),
+        await _api(
+            lambda: core.create_namespaced_config_map(
+                namespace=namespace, body=cm_body, _request_timeout=api_timeout,
+            )
         )
-        await loop.run_in_executor(
-            None, lambda: core.create_namespaced_pod(namespace=namespace, body=pod_body),
+        await _api(
+            lambda: core.create_namespaced_pod(
+                namespace=namespace, body=pod_body, _request_timeout=api_timeout,
+            )
         )
 
         deadline = loop.time() + timeout
         phase = "Pending"
         while loop.time() < deadline:
-            pod = await loop.run_in_executor(
-                None, lambda: core.read_namespaced_pod(name=name, namespace=namespace),
+            pod = await _api(
+                lambda: core.read_namespaced_pod(
+                    name=name, namespace=namespace, _request_timeout=api_timeout,
+                )
             )
             phase = pod.status.phase or "Pending"
             if phase in ("Succeeded", "Failed"):
@@ -416,8 +432,10 @@ async def _run_k8s(
         else:
             raise ScriptSandboxError(f"sandboxed script timed out after {timeout}s")
 
-        stdout = await loop.run_in_executor(
-            None, lambda: core.read_namespaced_pod_log(name=name, namespace=namespace),
+        stdout = await _api(
+            lambda: core.read_namespaced_pod_log(
+                name=name, namespace=namespace, _request_timeout=api_timeout,
+            )
         )
         if phase == "Failed":
             raise ScriptSandboxError(f"sandboxed script failed: {stdout.strip()[-2000:]}")
