@@ -34,6 +34,7 @@ script itself prints is preserved and ignored by the parser.
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import base64
 import json
@@ -164,12 +165,36 @@ def _as_text(value: Any) -> str:
     return value or ""
 
 
+def _unwrap_bytes_repr(text: str) -> str:
+    """Undo a bytes value that was str()'d into "b'...'" before reaching us.
+
+    Belt and braces for the client quirk described at the log-read site: if a
+    caller ever gets the deserialized form anyway, the marker is still in there,
+    just escaped. Only attempted when the text has exactly that shape, so real
+    script output that merely happens to begin with b' is left alone.
+    """
+    stripped = text.strip()
+    if len(stripped) > 3 and stripped[0] == "b" and stripped[1] in "'\"" and stripped[-1] == stripped[1]:
+        try:
+            value = ast.literal_eval(stripped)
+        except (ValueError, SyntaxError):
+            return text
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+    return text
+
+
 def _parse_result(stdout: Any) -> Any:
     """Extract the JSON result the bootstrap printed on its marker line."""
     stdout = _as_text(stdout)
-    for line in reversed(stdout.splitlines()):
-        if line.startswith(RESULT_MARKER):
-            return json.loads(line[len(RESULT_MARKER):]).get("output")
+    # Scan as-is first, then again after unwrapping a bytes repr. Testing
+    # `RESULT_MARKER in stdout` to decide whether to unwrap does not work: in the
+    # trapped form the marker IS present as literal characters, just never at the
+    # start of a line, so that check skips the very case it means to catch.
+    for candidate in (stdout, _unwrap_bytes_repr(stdout)):
+        for line in reversed(candidate.splitlines()):
+            if line.startswith(RESULT_MARKER):
+                return json.loads(line[len(RESULT_MARKER):]).get("output")
     # Include what the script did print. The bootstrap writes the marker as its
     # last act, so reaching here means it exited before that -- and the reason is
     # almost always sitting in the output we were throwing away.
@@ -460,11 +485,19 @@ async def _run_k8s(
         # few times before believing the emptiness.
         stdout = ""
         for _attempt in range(5):
+            # `_preload_content=False` returns the raw HTTPResponse instead of
+            # letting the client deserialize. That matters: this endpoint's
+            # declared response type is `str`, and the client's primitive
+            # deserializer applies str() to the raw bytes -- yielding the *text*
+            # "b'...\\n'", a bytes repr trapped in a string, which no amount of
+            # decoding downstream can undo.
             raw_log = await _api(
                 lambda: core.read_namespaced_pod_log(
-                    name=name, namespace=namespace, _request_timeout=api_timeout,
+                    name=name, namespace=namespace,
+                    _preload_content=False, _request_timeout=api_timeout,
                 )
             )
+            raw_log = getattr(raw_log, "data", raw_log)
             # The client hands back bytes here, not str. Left undecoded, every
             # `line.startswith(RESULT_MARKER)` compared bytes to str and was
             # quietly False, so a script that had run perfectly was reported as

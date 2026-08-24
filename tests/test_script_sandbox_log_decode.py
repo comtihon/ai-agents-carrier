@@ -49,6 +49,22 @@ def test_undecodable_bytes_do_not_crash_the_parser():
         _parse_result(b"\xff\xfe not utf-8")
 
 
+def test_a_bytes_repr_trapped_in_a_string_is_still_parsed():
+    """The kubernetes client str()s the raw bytes when the declared response type
+    is `str`, producing the *text* "b'...'". The real fix is to bypass that
+    deserialization, but the marker is recoverable either way."""
+    trapped = repr(f"\n{RESULT_MARKER}{_PAYLOAD}\n".encode())
+
+    assert _parse_result(trapped) == {"ok": True, "py": "3.12.14"}
+
+
+def test_real_output_beginning_with_b_quote_is_not_mangled():
+    """The unwrap must be narrow: legitimate output may start with b'."""
+    log = f"b'not really bytes'\n{RESULT_MARKER}{_PAYLOAD}\n"
+
+    assert _parse_result(log) == {"ok": True, "py": "3.12.14"}
+
+
 @pytest.mark.parametrize(
     "value,expected",
     [(b"abc", "abc"), ("abc", "abc"), (None, ""), (b"", ""), ("", "")],
