@@ -24,9 +24,10 @@ _EXPECTED_TOOLS = {
     "list_workflows", "run_workflow", "list_runs", "get_run",
     "create_workflow", "update_workflow", "delete_workflow",
     "list_agents", "get_agent", "create_agent", "update_agent", "delete_agent",
-    "list_datasources", "create_datasource", "update_datasource",
+    "list_datasources", "get_datasource", "create_datasource", "update_datasource",
     "create_pubsub_datasource", "list_pubsub_subscriptions",
-    "list_events", "create_event", "update_event", "delete_event",
+    "list_scripts", "get_script", "create_script", "update_script", "delete_script",
+    "list_events", "get_event", "create_event", "update_event", "delete_event",
     "delete_datasource", "import_datasource_schema",
     "create_datasource_from_schema", "add_datasource_operations_from_schema",
     "terminate_run", "retry_run", "restart_from_step", "approve_run", "reject_run",
@@ -97,7 +98,7 @@ async def test_registers_the_full_tool_set(mcp):
     _register(mcp, _Container())
     tools = await mcp.list_tools()
     assert {t.name for t in tools} == _EXPECTED_TOOLS
-    assert len(tools) == 30
+    assert len(tools) == 37
 
 
 async def test_ask_user_is_not_exposed_over_mcp(mcp):
