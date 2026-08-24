@@ -385,25 +385,32 @@ async def _run_k8s(
         ),
     )
 
-    async def _cleanup() -> None:
-        for call in (
-            lambda: core.delete_namespaced_pod(name=name, namespace=namespace, grace_period_seconds=0),
-            lambda: core.delete_namespaced_config_map(name=name, namespace=namespace),
-        ):
-            try:
-                await loop.run_in_executor(None, call)
-            except Exception:  # noqa: BLE001 — best-effort cleanup
-                logger.debug("k8s sandbox: cleanup failed for %s", name, exc_info=True)
-
     # Every call below is bounded twice: `_request_timeout` stops the client from
     # blocking on a stalled connection, and asyncio.wait_for stops a wedged worker
-    # thread from holding the step open. Without them the create calls sat outside
-    # the step's timeout entirely -- that only ever covered the wait loop below --
-    # so a single unreachable API server hung the step forever, logging nothing.
+    # thread from holding the step open.
     api_timeout = min(30.0, timeout)
 
     async def _api(call) -> Any:
         return await asyncio.wait_for(loop.run_in_executor(None, call), timeout=api_timeout)
+
+    async def _cleanup() -> None:
+        # Bounded like the rest, and for the same reason: cleanup is awaited in a
+        # `finally`, so an unreachable API server here delays the step's error by
+        # as long as the deletes take to give up -- turning a prompt failure back
+        # into the hang this whole path was fixed for.
+        for call in (
+            lambda: core.delete_namespaced_pod(
+                name=name, namespace=namespace, grace_period_seconds=0,
+                _request_timeout=api_timeout,
+            ),
+            lambda: core.delete_namespaced_config_map(
+                name=name, namespace=namespace, _request_timeout=api_timeout,
+            ),
+        ):
+            try:
+                await _api(call)
+            except Exception:  # noqa: BLE001 — best-effort cleanup
+                logger.debug("k8s sandbox: cleanup failed for %s", name, exc_info=True)
 
     try:
         await _api(
