@@ -267,7 +267,29 @@ class DataSourceExecutor:
             else:  # offset
                 extra[paginate.param] = offset
 
-            raw = await self._request_with_retry(client, source, op, params, memo, bound, extra)
+            try:
+                raw = await self._request_with_retry(
+                    client, source, op, params, memo, bound, extra
+                )
+            except httpx.HTTPStatusError as exc:
+                # Django REST Framework's PageNumberPagination raises NotFound
+                # past the last page, so a paginated DRF endpoint never answers
+                # with the empty page the stop-check below waits for -- it 404s.
+                # Treat that as end-of-pages, but only once a page has already
+                # come back: a 404 on the very first request is a wrong path or
+                # a deleted resource and must still fail loudly.
+                if (
+                    paginate.type in ("page", "offset")
+                    and exc.response.status_code == 404
+                    and pages
+                ):
+                    logger.debug(
+                        "data source '%s' operation '%s': 404 after %d page(s) "
+                        "-- treating as end of pages",
+                        source.id, op.name, len(pages),
+                    )
+                    break
+                raise
             mapped = self._post_process(op, raw)
             # Without a `mapping`, a dict-shaped page never looks "empty" and
             # page/offset pagination would loop to max_pages, returning raw
@@ -286,6 +308,19 @@ class DataSourceExecutor:
                     break
                 page_number += 1
                 offset += len(mapped) if isinstance(mapped, list) else 1
+        else:
+            # The for-loop ran to completion, i.e. max_pages was reached without
+            # any stop condition firing. The result is very likely truncated, and
+            # a caller that silently believes it has everything is the dangerous
+            # case (for an alerting workflow, a short read reads as "nothing to
+            # report"). There is no channel to return a warning on, so say it
+            # loudly in the log.
+            logger.warning(
+                "data source '%s' operation '%s': stopped at the max_pages limit "
+                "(%d) -- the result is probably incomplete, raise max_pages or "
+                "narrow the query",
+                source.id, op.name, paginate.max_pages,
+            )
 
         return _combine_pages(pages)
 

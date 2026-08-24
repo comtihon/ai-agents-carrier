@@ -420,7 +420,7 @@ def _captured_note(captured: list[str]) -> str:
 @requires(Permission.WRITE)
 async def create_workflow(
     deps: ManagementDeps, workflow_id: str, name: str, description: str, steps_json: str,
-    use_storage: bool = False,
+    use_storage: bool = False, enabled: bool = True,
 ) -> str:
     if deps.workflow_backend is None:
         return "Workflow creation unavailable: no persistent backend configured."
@@ -444,14 +444,18 @@ async def create_workflow(
     captured = await capture_inline_scripts(workflow_id, steps, deps.script_backend)
     defn = WorkflowDefinition(
         id=workflow_id, name=name, description=description, steps=steps,
-        use_storage=use_storage,
+        use_storage=use_storage, enabled=enabled,
     )
     await deps.workflow_backend.create(defn)
     if deps.refresh_runner is not None:
         await deps.refresh_runner(workflow_id)
+    # Say so when it is created disabled: a workflow that exists but will not
+    # start is easy to forget about, and silence here reads as "it is live".
+    state_note = "" if enabled else " It is disabled and will not start until enabled."
+    storage_note = " Storage is enabled." if use_storage else ""
     return (
         f"Workflow '{workflow_id}' created with {len(steps)} step(s)."
-        + _captured_note(captured)
+        + state_note + storage_note + _captured_note(captured)
     )
 
 
