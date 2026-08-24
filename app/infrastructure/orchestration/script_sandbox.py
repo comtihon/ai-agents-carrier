@@ -157,8 +157,16 @@ class ScriptSandboxError(RuntimeError):
     """Raised when a sandboxed script fails to run or returns no result."""
 
 
-def _parse_result(stdout: str) -> Any:
+def _as_text(value: Any) -> str:
+    """Coerce a log payload to str, whether the client returned bytes or str."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value or ""
+
+
+def _parse_result(stdout: Any) -> Any:
     """Extract the JSON result the bootstrap printed on its marker line."""
+    stdout = _as_text(stdout)
     for line in reversed(stdout.splitlines()):
         if line.startswith(RESULT_MARKER):
             return json.loads(line[len(RESULT_MARKER):]).get("output")
@@ -452,11 +460,17 @@ async def _run_k8s(
         # few times before believing the emptiness.
         stdout = ""
         for _attempt in range(5):
-            stdout = await _api(
+            raw_log = await _api(
                 lambda: core.read_namespaced_pod_log(
                     name=name, namespace=namespace, _request_timeout=api_timeout,
                 )
-            ) or ""
+            )
+            # The client hands back bytes here, not str. Left undecoded, every
+            # `line.startswith(RESULT_MARKER)` compared bytes to str and was
+            # quietly False, so a script that had run perfectly was reported as
+            # producing no result -- and bytes.strip() is truthy, so the
+            # empty-output check waved it through too.
+            stdout = _as_text(raw_log)
             if stdout.strip():
                 break
             await asyncio.sleep(0.5)
