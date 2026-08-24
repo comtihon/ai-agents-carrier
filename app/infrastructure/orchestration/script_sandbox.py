@@ -439,13 +439,41 @@ async def _run_k8s(
         else:
             raise ScriptSandboxError(f"sandboxed script timed out after {timeout}s")
 
-        stdout = await _api(
-            lambda: core.read_namespaced_pod_log(
-                name=name, namespace=namespace, _request_timeout=api_timeout,
-            )
-        )
+        # A pod can report Succeeded a moment before its logs are retrievable,
+        # and an empty read here is indistinguishable from a script that printed
+        # nothing -- which surfaced as the useless "produced no result". Retry a
+        # few times before believing the emptiness.
+        stdout = ""
+        for _attempt in range(5):
+            stdout = await _api(
+                lambda: core.read_namespaced_pod_log(
+                    name=name, namespace=namespace, _request_timeout=api_timeout,
+                )
+            ) or ""
+            if stdout.strip():
+                break
+            await asyncio.sleep(0.5)
+
         if phase == "Failed":
             raise ScriptSandboxError(f"sandboxed script failed: {stdout.strip()[-2000:]}")
+        if not stdout.strip():
+            # Say what the container actually did. Without this the error names
+            # only the symptom, and the cause (OOMKilled, an image that never
+            # started, a truncated log) is invisible.
+            state = ""
+            try:
+                statuses = pod.status.container_statuses or []
+                if statuses:
+                    term = statuses[0].state.terminated if statuses[0].state else None
+                    if term is not None:
+                        state = (
+                            f" container exit={term.exit_code} reason={term.reason!r}"
+                        )
+            except Exception:  # noqa: BLE001 — diagnostics must not mask the error
+                pass
+            raise ScriptSandboxError(
+                f"sandboxed script produced no output (phase={phase}{state})"
+            )
         return _parse_result(stdout)
     finally:
         await _cleanup()
