@@ -182,7 +182,10 @@ def build_default_workflow(
         )
 
     @tool
-    async def create_workflow(workflow_id: str, name: str, description: str, steps_json: str) -> str:
+    async def create_workflow(
+        workflow_id: str, name: str, description: str, steps_json: str,
+        use_storage: bool = False, enabled: bool = True,
+    ) -> str:
         """Create a new workflow definition and register it immediately.
 
         Args:
@@ -197,8 +200,20 @@ def build_default_workflow(
                 http_call (outbound HTTP), langgraph-agent, claude-agent,
                 data_source (invoke a DataSourceDefinition operation).
                 Example: [{"id": "trigger", "type": "http"}, {"id": "research", "type": "llm_structured", "system_prompt": "...", "output": [{"name": "summary", "type": "str", "description": "..."}]}]
+                Also available: storage (this workflow's own key/value state).
+            use_storage: Turn on this workflow's private key/value storage. Off by
+                default, and a `storage` step in a workflow that has it off fails
+                loudly rather than quietly not persisting -- so set it while
+                creating, not afterwards.
+            enabled: Pass False to create the workflow already disabled. A
+                workflow carrying a `cron` or `pubsub` trigger is eligible to fire
+                as soon as it is registered, so one that is not ready yet must be
+                created disabled rather than disabled in a second call.
         """
-        return await core.create_workflow(deps, workflow_id, name, description, steps_json)
+        return await core.create_workflow(
+            deps, workflow_id, name, description, steps_json,
+            use_storage=use_storage, enabled=enabled,
+        )
 
     @tool
     async def update_workflow(
@@ -207,6 +222,7 @@ def build_default_workflow(
         description: str | None = None,
         steps_json: str = "",
         enabled: bool | None = None,
+        use_storage: bool | None = None,
     ) -> str:
         """Update an existing workflow definition (name, description, steps, enabled).
 
@@ -224,7 +240,8 @@ def build_default_workflow(
         # `str`, which makes a `str | None` JSON field impossible to set.
         # Empty string means "omitted".
         return await core.update_workflow(
-            deps, workflow_id, name, description, steps_json or None, enabled
+            deps, workflow_id, name, description, steps_json or None, enabled,
+            use_storage,
         )
 
     @tool

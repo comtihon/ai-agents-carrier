@@ -589,3 +589,24 @@ async def test_update_workflow_can_replace_its_steps(mcp):
     # The payload reached the core function as a string it could parse — the
     # pre-parse bug surfaced here as a validation error before any call landed.
     assert "Input should be a valid string" not in result
+
+
+async def test_create_workflow_can_be_called_disabled_and_with_storage():
+    """Both flags must be reachable from the MCP surface, not just the core.
+
+    They were added to the core first and the wrapper kept its old four-argument
+    signature, so `enabled=False` and `use_storage=True` were silently dropped: a
+    workflow carrying a cron trigger came out live, and its `storage` steps came
+    out failing. Neither shows up as an error at creation time, which is what
+    makes it worth pinning here.
+    """
+    mcp = build_management_mcp()
+    _register(mcp, _Container())
+    schemas = {t.name: t.inputSchema for t in await mcp.list_tools()}
+
+    create_props = schemas["create_workflow"]["properties"]
+    assert "enabled" in create_props, "cannot create a workflow already disabled"
+    assert "use_storage" in create_props, "cannot create a workflow with storage on"
+
+    update_props = schemas["update_workflow"]["properties"]
+    assert "use_storage" in update_props, "cannot turn storage on after the fact"
