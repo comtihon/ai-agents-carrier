@@ -250,6 +250,19 @@ async def _resolve_event_id(deps: ManagementDeps, query: str):
     return None, f"Event '{query}' not found. Available: {available}"
 
 
+async def _resolve_script_id(deps: ManagementDeps, query: str):
+    """Accept a script id or its display name, like the other resolvers."""
+    if deps.script_backend is None:
+        return None, "Script library not configured."
+    found = await deps.script_backend.get(query)
+    if found is not None:
+        return found.id, None
+    found = await deps.script_backend.get_by_name(query)
+    if found is not None:
+        return found.id, None
+    return None, f"Script '{query}' not found."
+
+
 async def _publish_datasources(deps: ManagementDeps) -> None:
     if deps.refresh_datasources is not None:
         try:
@@ -843,6 +856,235 @@ async def delete_event(deps: ManagementDeps, event_id: str) -> str:
 # ---------------------------------------------------------------------------
 # Data source tools
 # ---------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# Script library
+#
+# `python` steps reference reusable scripts by `script_id`, and create_workflow
+# captures inline bodies into the library automatically -- so the library fills
+# up on its own but, until now, could only be read or emptied through the UI.
+# Dead scripts from deleted workflows had no way out at all.
+# --------------------------------------------------------------------------
+
+@requires(Permission.READ)
+async def list_scripts(deps: ManagementDeps) -> str:
+    """List the Python scripts in the library that `python` steps can reference.
+
+    Shows each script's size rather than its body: a library holding a few
+    thousand-line scripts would otherwise flood the reply.
+    """
+    if deps.script_backend is None:
+        return "Script library not configured."
+    scripts = await deps.script_backend.list()
+    if not scripts:
+        return "No scripts found."
+    return "\n".join(
+        f"- **{sc.id}** ({sc.name or sc.id}): {sc.description or '(no description)'} — "
+        f"{len(sc.code)} chars, {len(sc.code.splitlines())} lines"
+        for sc in sorted(scripts, key=lambda x: x.id)
+    )
+
+
+@requires(Permission.READ)
+async def get_script(deps: ManagementDeps, script_id: str, include_code: bool = True) -> str:
+    """Read one script from the library.
+
+    Args:
+        script_id: The script id or its display name.
+        include_code: Set False for just the metadata, when the body would be
+            too long to be worth returning.
+    """
+    resolved, err = await _resolve_script_id(deps, script_id)
+    if err:
+        return err
+    script = await deps.script_backend.get(resolved)
+    if script is None:
+        return f"Script '{script_id}' not found."
+    head = (
+        f"Script: {script.id}\nName: {script.name or '(unnamed)'}\n"
+        f"Description: {script.description or '(none)'}\n"
+        f"Size: {len(script.code)} chars, {len(script.code.splitlines())} lines"
+    )
+    if not include_code:
+        return head
+    return head + "\n--- code ---\n" + script.code
+
+
+@requires(Permission.WRITE)
+async def create_script(
+    deps: ManagementDeps, script_id: str, name: str, code: str, description: str = ""
+) -> str:
+    """Add a Python script to the library so `python` steps can reference it.
+
+    Args:
+        script_id: Unique kebab-case identifier (e.g. "csm-deadline-compute").
+        name: Human-readable display name, unique within the library.
+        code: The script body. It runs with a `state` dict in scope and must set
+            `output`; it cannot import project modules, so it has to be
+            self-contained.
+        description: What the script does — shown in the library and node picker.
+    """
+    if deps.script_backend is None:
+        return "Script library not configured."
+    existing = await deps.script_backend.get(script_id)
+    if existing is not None:
+        return (
+            f"Script '{script_id}' already exists ({len(existing.code)} chars). "
+            f"Use update_script to change it."
+        )
+    from app.domain.models.script_definition import ScriptDefinition
+    defn = ScriptDefinition(
+        id=script_id, name=name, description=description or None, code=code
+    )
+    await deps.script_backend.create(defn)
+    return (
+        f"Script '{script_id}' created ({len(code)} chars, "
+        f"{len(code.splitlines())} lines)."
+    )
+
+
+@requires(Permission.WRITE)
+async def update_script(
+    deps: ManagementDeps,
+    script_id: str,
+    name: str | None = None,
+    code: str | None = None,
+    description: str | None = None,
+) -> str:
+    """Change a script in the library; omitted fields keep their stored value.
+
+    Args:
+        script_id: The script id or its display name.
+        name: New display name (omit to keep current).
+        code: New body (omit to keep current).
+        description: New description (omit to keep current).
+    """
+    resolved, err = await _resolve_script_id(deps, script_id)
+    if err:
+        return err
+    script = await deps.script_backend.get(resolved)
+    if script is None:
+        return f"Script '{script_id}' not found."
+    before = len(script.code)
+    if name is not None:
+        script.name = name
+    if description is not None:
+        script.description = description
+    if code is not None:
+        script.code = code
+    await deps.script_backend.update(resolved, script)
+    # Report the size change: a script that silently became empty, or shrank by
+    # half, is worth noticing at the point of the edit.
+    delta = f" ({before} -> {len(script.code)} chars)" if code is not None else ""
+    return f"Script '{resolved}' updated{delta}."
+
+
+@requires(Permission.DELETE)
+async def delete_script(deps: ManagementDeps, script_id: str) -> str:
+    """Remove a script from the library.
+
+    Refuses while a workflow still references it: deleting one out from under a
+    `python` step turns that step into a runtime failure with a confusing
+    message, and the reference is cheap to check first.
+
+    Args:
+        script_id: The script id or its display name.
+    """
+    resolved, err = await _resolve_script_id(deps, script_id)
+    if err:
+        return err
+    if deps.workflow_backend is not None:
+        users = []
+        for wf in await deps.workflow_backend.list():
+            for step in wf.steps or []:
+                if isinstance(step, dict) and step.get("script_id") == resolved:
+                    users.append(f"{wf.id}:{step.get('id')}")
+        if users:
+            return (
+                f"Script '{resolved}' is still referenced by {', '.join(users)}. "
+                f"Point those steps elsewhere first, or delete the workflow."
+            )
+    await deps.script_backend.delete(resolved)
+    return f"Script '{resolved}' deleted."
+
+
+@requires(Permission.READ)
+async def get_event(deps: ManagementDeps, event_id: str) -> str:
+    """Read one event in full, including its payload schema.
+
+    list_events deliberately omits the schema; without this there was no way to
+    see what an event actually validates against.
+
+    Args:
+        event_id: The event id or its display name.
+    """
+    resolved, err = await _resolve_event_id(deps, event_id)
+    if err:
+        return err
+    event = await deps.event_backend.get(resolved)
+    if event is None:
+        return f"Event '{event_id}' not found."
+    lines = [
+        f"Event: {event.id}",
+        f"Name: {event.name or '(unnamed)'}",
+        f"Topic: {event.topic or '(unset)'}",
+        f"Subscription: {event.subscription or '(created on first use)'}",
+        f"Project: {event.project_id or '(backend default)'}",
+        f"Description: {event.description or '(none)'}",
+    ]
+    if event.event_schema:
+        lines.append("Schema: " + json.dumps(event.event_schema, ensure_ascii=False))
+    else:
+        lines.append("Schema: (none — every message is accepted)")
+    return "\n".join(lines)
+
+
+@requires(Permission.READ)
+async def get_datasource(deps: ManagementDeps, source_id: str) -> str:
+    """Read one data source in full: auth type, and every operation's shape.
+
+    list_datasources gives only operation names, so the paths, params, templates
+    and mappings were previously invisible from here -- which also made
+    update_datasource dangerous, since it replaces the whole operation list and
+    there was no way to read the current one back first.
+
+    Secrets are never returned: the auth block is reported by type only.
+
+    Args:
+        source_id: The data source id or its display name.
+    """
+    resolved, err = await _resolve_datasource_id(deps, source_id)
+    if err:
+        return err
+    source = await deps.data_source_backend.get(resolved)
+    if source is None:
+        return f"Data source '{source_id}' not found."
+    lines = [
+        f"Data source: {source.id}",
+        f"Name: {source.name or '(unnamed)'}",
+        f"Kind: {source.kind}",
+        f"Base URL: {source.base_url or '(unset)'}",
+        f"Auth: {getattr(source.auth, 'type', 'none')} (secret values not shown)",
+        f"Timeout: {source.timeout_seconds}s, retries: {source.retries.attempts}",
+        f"Operations ({len(source.operations)}):",
+    ]
+    for op in source.operations:
+        detail = {
+            "name": op.name,
+            "method": op.method,
+            "path": op.path,
+            "query": (op.query[:200] + "…") if op.query and len(op.query) > 200 else op.query,
+            "variables": op.variables,
+            "params": [
+                {"name": p.name, "type": p.type, "required": p.required} for p in op.params
+            ],
+            "mapping": op.mapping,
+            "paginate": op.paginate.model_dump() if op.paginate else None,
+        }
+        lines.append("  " + json.dumps({k: v for k, v in detail.items() if v is not None},
+                                       ensure_ascii=False))
+    return "\n".join(lines)
+
 
 @requires(Permission.READ)
 async def list_datasources(deps: ManagementDeps) -> str:

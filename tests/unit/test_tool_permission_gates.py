@@ -92,13 +92,21 @@ EXPECTED_TOOL_PERMISSIONS: dict[str, Permission] = {
     "delete_agent": Permission.DELETE,
     # data sources
     "list_datasources": Permission.READ,
+    "get_datasource": Permission.READ,
     "create_datasource": Permission.WRITE,
     "update_datasource": Permission.WRITE,
     "delete_datasource": Permission.DELETE,
     "create_pubsub_datasource": Permission.WRITE,
     "list_pubsub_subscriptions": Permission.READ,
+    # script library — `python` steps reference these by script_id
+    "list_scripts": Permission.READ,
+    "get_script": Permission.READ,
+    "create_script": Permission.WRITE,
+    "update_script": Permission.WRITE,
+    "delete_script": Permission.DELETE,
     # events (Pub/Sub topics workflows are triggered by)
     "list_events": Permission.READ,
+    "get_event": Permission.READ,
     "create_event": Permission.WRITE,
     "update_event": Permission.WRITE,
     "delete_event": Permission.DELETE,

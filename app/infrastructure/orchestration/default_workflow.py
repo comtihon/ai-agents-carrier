@@ -275,6 +275,78 @@ def build_default_workflow(
         return await core.list_datasources(deps)
 
     @tool
+    async def get_datasource(source_id: str) -> str:
+        """Read one data source in full: auth type and every operation's shape.
+
+        Read this before calling update_datasource: that tool replaces the whole
+        operation list, so without the current definition an update silently
+        drops the operations it does not mention. Secrets are never returned.
+
+        Args:
+            source_id: The data source id or name.
+        """
+        return await core.get_datasource(deps, source_id)
+
+    @tool
+    async def list_scripts() -> str:
+        """List the Python scripts in the library that `python` steps reference."""
+        return await core.list_scripts(deps)
+
+    @tool
+    async def get_script(script_id: str, include_code: bool = True) -> str:
+        """Read one script from the library.
+
+        Args:
+            script_id: The script id or name.
+            include_code: False for metadata only, when the body is long.
+        """
+        return await core.get_script(deps, script_id, include_code)
+
+    @tool
+    async def create_script(
+        script_id: str, name: str, code: str, description: str = ""
+    ) -> str:
+        """Add a Python script to the library for `python` steps to reference.
+
+        Args:
+            script_id: Unique kebab-case identifier (e.g. "csm-deadline-compute").
+            name: Human-readable display name, unique in the library.
+            code: The script body. Runs with a `state` dict in scope and must set
+                `output`. It cannot import project modules, so it must be
+                self-contained; only the sandbox's allowed stdlib is available.
+            description: What the script does.
+        """
+        return await core.create_script(deps, script_id, name, code, description)
+
+    @tool
+    async def update_script(
+        script_id: str,
+        name: str | None = None,
+        code: str | None = None,
+        description: str | None = None,
+    ) -> str:
+        """Change a library script; omitted fields keep their stored value.
+
+        Args:
+            script_id: The script id or name.
+            name: New display name (omit to keep current).
+            code: New body (omit to keep current).
+            description: New description (omit to keep current).
+        """
+        return await core.update_script(deps, script_id, name, code, description)
+
+    @tool
+    async def delete_script(script_id: str) -> str:
+        """Remove a script from the library.
+
+        Refused while a workflow step still references it.
+
+        Args:
+            script_id: The script id or name.
+        """
+        return await core.delete_script(deps, script_id)
+
+    @tool
     async def create_datasource(
         source_id: str,
         name: str,
@@ -374,6 +446,19 @@ def build_default_workflow(
     async def list_events() -> str:
         """List the events (Pub/Sub topics) workflows can be triggered by."""
         return await core.list_events(deps)
+
+    @tool
+    async def get_event(event_id: str) -> str:
+        """Read one event in full, including its payload schema.
+
+        list_events omits the schema, so this is the only way to see what an
+        event validates incoming messages against — and a message that fails
+        that schema never starts a run.
+
+        Args:
+            event_id: The event id or name.
+        """
+        return await core.get_event(deps, event_id)
 
     @tool
     async def create_event(
@@ -559,7 +644,9 @@ def build_default_workflow(
     platform_tools = [list_workflows, run_workflow, list_runs, get_run, ask_user,
                       create_workflow, update_workflow, delete_workflow,
                       list_agents, get_agent, create_agent, update_agent, delete_agent,
-                      list_datasources, create_datasource, update_datasource,
+                      list_datasources, get_datasource, create_datasource, update_datasource,
+                      list_scripts, get_script, create_script, update_script, delete_script,
+                      get_event,
                       create_pubsub_datasource, list_pubsub_subscriptions,
                       list_events, create_event, update_event, delete_event,
                       delete_datasource, import_datasource_schema,
