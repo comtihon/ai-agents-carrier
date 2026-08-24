@@ -86,6 +86,12 @@ _SANDBOX_STDLIB = (
     "pprint", "random", "re", "reprlib", "secrets", "statistics", "string",
     "struct", "textwrap", "time", "types", "typing", "unicodedata", "uuid",
     "warnings", "zlib",
+    # Private modules the public ones import lazily, on first use rather than at
+    # import time. They have to be pre-imported here or the loaders are gone by
+    # the time they are wanted: datetime.strptime reaches for _strptime the first
+    # time it is called, which made strptime raise ImportError in every sandboxed
+    # script while `import datetime` looked perfectly fine.
+    "_strptime", "_pydatetime", "_pydecimal", "_compat_pickle", "encodings.idna",
 )
 
 # Executed by the sandboxed interpreter.  argv[1] is "-" (read payload from
