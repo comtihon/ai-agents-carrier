@@ -2042,11 +2042,19 @@ class YamlGraphRunner:
                         namespace=settings.agent_namespace,
                     )
                 else:
-                    local_vars: dict[str, Any] = {"state": dict(state), "output": None}
+                    # Single namespace for globals and locals -- see the same
+                    # fix in script_sandbox's bootstrap. Two namespaces make a
+                    # top-level `def` invisible to another function's body, so
+                    # any script with helpers fails on NameError.
+                    local_vars: dict[str, Any] = {
+                        "__builtins__": __builtins__,
+                        "state": dict(state),
+                        "output": None,
+                    }
                     compiled = compile(code, f"<workflow:{graph_id}:{step_id}>", "exec")
 
                     def _run() -> None:
-                        exec(compiled, {"__builtins__": __builtins__}, local_vars)  # noqa: S102
+                        exec(compiled, local_vars, local_vars)  # noqa: S102
 
                     loop = asyncio.get_event_loop()
                     await loop.run_in_executor(None, _run)

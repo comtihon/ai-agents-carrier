@@ -142,10 +142,18 @@ def _guarded_import(name, *args, **kwargs):
 
 builtins.__import__ = _guarded_import
 
-_scope = {{"state": _payload.get("state") or {{}}, "output": None}}
-_globals = {{"__name__": "__sandbox__", "__builtins__": builtins}}
+# One namespace for globals AND locals. Passing two made every top-level `def`
+# bind into locals while its body resolved names against globals, so any script
+# whose helpers called each other died with NameError -- which is most scripts
+# doing real work. Module-level code expects a single namespace; give it one.
+_scope = {{
+    "__name__": "__sandbox__",
+    "__builtins__": builtins,
+    "state": _payload.get("state") or {{}},
+    "output": None,
+}}
 
-exec(compile(_payload.get("code") or "", "<script>", "exec"), _globals, _scope)
+exec(compile(_payload.get("code") or "", "<script>", "exec"), _scope, _scope)
 
 sys.stdout.flush()
 _result = json.dumps({{"output": _scope.get("output")}}, default=str)
