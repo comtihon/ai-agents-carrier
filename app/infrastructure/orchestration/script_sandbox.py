@@ -162,7 +162,14 @@ def _parse_result(stdout: str) -> Any:
     for line in reversed(stdout.splitlines()):
         if line.startswith(RESULT_MARKER):
             return json.loads(line[len(RESULT_MARKER):]).get("output")
-    raise ScriptSandboxError("sandboxed script produced no result")
+    # Include what the script did print. The bootstrap writes the marker as its
+    # last act, so reaching here means it exited before that -- and the reason is
+    # almost always sitting in the output we were throwing away.
+    tail = stdout.strip()[-1000:]
+    raise ScriptSandboxError(
+        "sandboxed script produced no result marker; output was: "
+        + (repr(tail) if tail else "(empty)")
+    )
 
 
 def _payload_json(code: str, state: dict[str, Any]) -> str:
