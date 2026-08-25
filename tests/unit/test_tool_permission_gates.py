@@ -78,6 +78,7 @@ def deps(backend: _FakeWorkflowBackend) -> ManagementDeps:
 EXPECTED_TOOL_PERMISSIONS: dict[str, Permission] = {
     # workflows / runs
     "list_workflows": Permission.READ,
+    "get_workflow": Permission.READ,
     "run_workflow": Permission.WRITE,
     "list_runs": Permission.READ,
     "get_run": Permission.READ,
