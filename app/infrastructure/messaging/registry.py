@@ -57,11 +57,14 @@ def reset_providers() -> None:
 
 
 def _load_builtins() -> None:
-    """Import the bundled providers so their decorators have run.
+    """Make sure the bundled providers are registered.
 
-    Done lazily rather than in ``__init__`` so that importing the base classes
-    never drags in httpx or the settings object.
+    Registration is explicit rather than left to ``@register_provider``'s import
+    side effect: the module is cached after the first import, so relying on the
+    side effect would silently fail to restore ``slack`` for any caller that had
+    cleared the registry.  The import itself is cheap and is done lazily here so
+    that importing the base classes never drags in httpx or the settings object.
     """
-    if _PROVIDERS:
-        return
-    from app.infrastructure.messaging import slack  # noqa: F401
+    from app.infrastructure.messaging.slack import SlackProvider
+
+    _PROVIDERS.setdefault(SlackProvider.name, SlackProvider)
