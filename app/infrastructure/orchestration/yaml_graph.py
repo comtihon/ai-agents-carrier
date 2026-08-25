@@ -726,7 +726,12 @@ class YamlGraphRunner:
                                        #   so the next node can decide to retry.
             workflow_id: <id>          # workflow only — child workflow to spawn
             input_template: "{request}"  # workflow only — request passed to child
-            schedule: "0 9 * * 1-5"   # cron only — 5-field cron expression (UTC)
+            schedule: "0 9 * * 1-5"   # cron only — 5-field cron expression
+            timezone: Europe/Berlin    # cron only — zone the schedule is read in;
+                                       #   defaults to UTC. Name the zone for any
+                                       #   "09:00 local" schedule: a fixed UTC hour
+                                       #   is an hour off for half the year wherever
+                                       #   DST applies.
             request_template: "..."    # cron only — initial request; supports {now}, {date}
             url: "https://..."         # http_call only — endpoint; {key} templates resolved
             method: POST               # http_call only — GET | POST | PUT | PATCH | DELETE

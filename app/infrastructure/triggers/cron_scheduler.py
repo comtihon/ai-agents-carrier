@@ -32,20 +32,41 @@ class CronScheduler:
         step_id: str,
         cron_expr: str,
         callback: Callable[[], Awaitable[None]],
+        timezone: str = "UTC",
     ) -> None:
         """Register (or replace) a cron job for a workflow step.
 
         *cron_expr* is a standard 5-field cron expression, e.g. ``"0 9 * * 1-5"``.
+
+        *timezone* is the zone the expression is read in, defaulting to UTC.
+        A schedule that means "09:00 local, every working day" cannot be
+        expressed in UTC at all: any fixed UTC hour is an hour off for half the
+        year wherever the region observes DST. Naming the zone instead lets
+        APScheduler recompute the next fire time per occurrence, so the job
+        keeps meaning 09:00 across the switch. An unknown zone falls back to
+        UTC rather than silently dropping the trigger.
         """
         job_key = f"{workflow_id}:{step_id}"
         self._remove_job(job_key)
         try:
-            trigger = CronTrigger.from_crontab(cron_expr, timezone="UTC")
+            tz = timezone or "UTC"
+            try:
+                trigger = CronTrigger.from_crontab(cron_expr, timezone=tz)
+            except Exception:
+                if tz == "UTC":
+                    raise
+                logger.warning(
+                    "Cron job for workflow=%s step=%s names unknown timezone %r "
+                    "— falling back to UTC",
+                    workflow_id, step_id, tz,
+                )
+                tz = "UTC"
+                trigger = CronTrigger.from_crontab(cron_expr, timezone=tz)
             job = self._scheduler.add_job(callback, trigger, id=job_key, replace_existing=True)
             self._jobs[job_key] = job.id
             logger.info(
-                "Cron job registered: workflow=%s step=%s schedule=%r",
-                workflow_id, step_id, cron_expr,
+                "Cron job registered: workflow=%s step=%s schedule=%r tz=%s",
+                workflow_id, step_id, cron_expr, tz,
             )
         except Exception:
             logger.exception(
