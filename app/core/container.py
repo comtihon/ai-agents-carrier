@@ -277,6 +277,7 @@ class ApplicationContainer:
                     step["id"],
                     schedule,
                     self._make_cron_job(runner.id, request_template),
+                    timezone=str(step.get("timezone") or "UTC"),
                 )
 
     # ── Pub/Sub triggers ─────────────────────────────────────────────────────
