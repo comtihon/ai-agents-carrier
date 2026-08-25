@@ -461,6 +461,57 @@ def _captured_note(captured: list[str]) -> str:
     )
 
 
+@requires(Permission.READ)
+async def get_workflow(
+    deps: ManagementDeps, workflow_id: str, include_steps: bool = True
+) -> str:
+    """Read one workflow in full: its flags and its steps.
+
+    list_workflows returns only id, name and description, so until this existed
+    the steps and the flags were unreadable from here -- while update_workflow
+    replaces the *entire* step list. That combination is the dangerous one: an
+    update had to be composed blind, and a caller who did not already know the
+    current steps could only overwrite them. Read this first.
+
+    It also surfaces `use_storage`, which is otherwise invisible: a `storage`
+    step in a workflow whose flag is off fails at run time, and there was no way
+    to check the flag beforehand.
+
+    Args:
+        workflow_id: The workflow id or its display name.
+        include_steps: False for flags only, when the step list is long.
+    """
+    if deps.workflow_backend is None:
+        return "Workflow backend not configured."
+    resolved, err = await _resolve_workflow_id(deps, workflow_id)
+    if err:
+        return err
+    defn = await deps.workflow_backend.get(resolved)
+    if defn is None:
+        return f"Workflow '{workflow_id}' not found."
+
+    steps = defn.steps or []
+    lines = [
+        f"Workflow: {defn.id}",
+        f"Name: {defn.name or '(unnamed)'}",
+        f"Description: {defn.description or '(none)'}",
+        f"Enabled: {defn.enabled}",
+        f"Use storage: {defn.use_storage}",
+        f"Use meta LLM: {defn.use_meta_llm}",
+        f"Read-only: {defn.readonly}",
+        f"Steps: {len(steps)}"
+        + (" — " + ", ".join(f"{st.get('id')}({st.get('type')})" for st in steps
+                             if isinstance(st, dict)) if steps else ""),
+    ]
+    if include_steps and steps:
+        # The whole point is to be able to feed this straight back into
+        # update_workflow, so the steps are returned complete rather than
+        # truncated -- pass include_steps=False when only the flags are wanted.
+        lines.append("steps_json:")
+        lines.append(json.dumps(steps, ensure_ascii=False))
+    return "\n".join(lines)
+
+
 @requires(Permission.WRITE)
 async def create_workflow(
     deps: ManagementDeps, workflow_id: str, name: str, description: str, steps_json: str,

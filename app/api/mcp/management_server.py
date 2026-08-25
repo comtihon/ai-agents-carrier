@@ -144,6 +144,20 @@ def register_management_tools(
         """
         return await core.get_run(deps(), run_id)
 
+    async def get_workflow(workflow_id: str, include_steps: bool = True) -> str:
+        """Read one workflow in full: its flags and its complete step list.
+
+        Call this before update_workflow: that tool replaces the entire step
+        list, so composing an update without the current steps can only
+        overwrite them. Also the only way to see `use_storage`, which decides
+        whether `storage` steps work at all.
+
+        Args:
+            workflow_id: The workflow id or name.
+            include_steps: False for flags only, when the step list is long.
+        """
+        return await core.get_workflow(deps(), workflow_id, include_steps)
+
     async def create_workflow(
         workflow_id: str, name: str, description: str, steps_json: str,
         use_storage: bool = False, enabled: bool = True,
@@ -156,12 +170,12 @@ def register_management_tools(
             description: What this workflow does.
             steps_json: JSON array of step objects. Each step must have "id" and "type".
                 Supported types: http (webhook trigger), cron (scheduled trigger),
-                llm_structured (LLM with structured output), llm (free-form LLM),
+                llm (free-form LLM),
                 mcp (single MCP tool call), human_approval (pause for approval),
                 execute (OpenHands code execution), workflow (child workflow),
                 http_call (outbound HTTP), langgraph-agent, claude-agent,
                 data_source (invoke a DataSourceDefinition operation).
-                Example: [{"id": "trigger", "type": "http"}, {"id": "research", "type": "llm_structured", "system_prompt": "...", "output": [{"name": "summary", "type": "str", "description": "..."}]}]
+                Example: [{"id": "trigger", "type": "http"}, {"id": "classify", "type": "llm", "system_prompt": "...", "user_template": "...", "output_key": "verdict"}]
                 Also available: storage (this workflow's own key/value state),
                 slack (post/reply/read/DM/delete via a messaging provider).
             use_storage: Turn on this workflow's private key/value storage. Off by
@@ -810,7 +824,7 @@ def register_management_tools(
         return await core.delete_message(deps(), channel, message_id, provider)
 
     handlers = [
-        list_workflows, run_workflow, list_runs, get_run,
+        list_workflows, get_workflow, run_workflow, list_runs, get_run,
         create_workflow, update_workflow, delete_workflow,
         list_agents, get_agent, create_agent, update_agent, delete_agent,
         list_datasources, get_datasource, create_datasource, update_datasource,
