@@ -160,8 +160,35 @@ def deps_from_container(
 # Resolvers (private helpers over deps)
 # ---------------------------------------------------------------------------
 
+async def _unregistered_workflow_ids(deps: ManagementDeps) -> list[str]:
+    """Ids that are stored but absent from the registry.
+
+    A workflow whose graph fails to build is logged and skipped by the loader,
+    so it never enters the registry — while its definition stays in the backing
+    store, untouched. Best-effort: a store that cannot be listed simply yields
+    nothing.
+    """
+    if deps.workflow_backend is None:
+        return []
+    try:
+        stored = await deps.workflow_backend.list()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("could not list stored workflows: %s", exc)
+        return []
+    registered = {d["id"] for d in deps.registry.list_definitions()}
+    return sorted(d.id for d in stored if d.id not in registered)
+
+
 async def _resolve_workflow_id(deps: ManagementDeps, query: str):
-    """Returns (resolved_id, None) or (None, error_str)."""
+    """Returns (resolved_id, None) or (None, error_str).
+
+    Resolution prefers the registry, then falls back to the backing store. The
+    fallback is what makes a broken workflow repairable: one whose graph fails
+    to build is skipped by the loader, so registry-only resolution rendered it
+    simultaneously invisible to `get_workflow` and unreachable by
+    `update_workflow` — the two tools needed to diagnose and fix it. The
+    definition was never gone, only unresolvable.
+    """
     defs = deps.registry.list_definitions()
     for d in defs:
         if d["id"] == query:
@@ -175,8 +202,33 @@ async def _resolve_workflow_id(deps: ManagementDeps, query: str):
     if matches:
         cands = ", ".join(f"{d['id']} ({d.get('name', d['id'])})" for d in matches)
         return None, f"Ambiguous — multiple matches: {cands}"
+
+    # Registry miss: the store may still hold it (build failure, or a
+    # definition saved since the last refresh). Exact id only — fuzzy matching
+    # against unbuildable workflows would be guessing.
+    if deps.workflow_backend is not None:
+        try:
+            stored = await deps.workflow_backend.get(query)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("workflow store lookup for %r failed: %s", query, exc)
+            stored = None
+        if stored is not None:
+            logger.info(
+                "workflow '%s' resolved from the store, not the registry — "
+                "its graph most likely failed to build",
+                query,
+            )
+            return stored.id, None
+
     available = ", ".join(f"{d['id']} ({d.get('name', d['id'])})" for d in defs) or "none"
-    return None, f"Workflow '{query}' not found. Available: {available}"
+    message = f"Workflow '{query}' not found. Available: {available}"
+    broken = await _unregistered_workflow_ids(deps)
+    if broken:
+        message += (
+            ". Stored but not registered (their graphs failed to build): "
+            + ", ".join(broken)
+        )
+    return None, message
 
 
 async def _resolve_agent_id(deps: ManagementDeps, query: str):
