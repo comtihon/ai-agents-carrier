@@ -22,12 +22,12 @@ steps:
     output_key: webhook_data
 
   # ── 2. Context gathering (agentic, MCP-powered) ───────────────────────────
-  # The LLM loops, calling Jira and GitHub MCP tools, until it has enough
-  # context to fill the structured output fields, then calls submit_output.
+  # An agent container loops over the Jira and GitHub MCP tools until it has
+  # enough context, then returns its findings. `output_mapping` lifts the
+  # agent's keys into workflow state for the steps below.
   - id: gather_context
-    type: llm_structured
-    bind_mcp_tools: true
-    max_iterations: 25
+    type: claude-agent
+    agent_id: context-gatherer      # must exist in /api/v1/agents
     system_prompt: |
       You are a context-gathering assistant. Your goal is to collect everything
       needed to implement the request described in the incoming webhook payload.
@@ -42,42 +42,43 @@ steps:
          reliable source for the correct repo.
       4. For each discovered GitHub repository, fetch the relevant source files
          and code sections via the GitHub MCP tool.
-      5. Once you have located the directly relevant files and code, call
-         submit_output immediately with a concise summary.
+      5. Once you have located the directly relevant files and code, return
+         your findings immediately as a concise summary.
 
       The GitHub organisation for all repositories is `example-github-org`.
       Always use this as the `owner` parameter in GitHub tool calls.
 
       ## Stopping rules
 
-      - Call submit_output as soon as you have found the relevant code —
-        do NOT fetch extra files for completeness.
+      - Return as soon as you have found the relevant code — do NOT fetch
+        extra files for completeness.
       - If a code search returns 0 results, move on without retrying.
       - If you hit a GitHub rate-limit error, stop all GitHub searches and
-        call submit_output with what you have gathered so far.
+        return what you have gathered so far.
       - Never say "I have all the context I need" and then make another tool
-        call. If you have reached that conclusion, your next action must be
-        submit_output.
+        call. If you have reached that conclusion, return your findings.
+
+      ## Return format
+
+      Return a JSON object with exactly these keys:
+
+      - `ticket_id` — the primary Jira ticket ID from the webhook (e.g. PROJ-123).
+      - `repo` — GitHub repository in owner/repo format. Use the value from
+        jira_get_issue_development_info when available.
+      - `context` — concise summary (3-6 paragraphs) covering the ticket
+        description and acceptance criteria, any linked tickets, the relevant
+        repository and branch, and the key files / code sections that need to
+        change. Write a summary — do NOT paste raw file contents into this field.
     user_template: |
       Webhook payload:
       {webhook_data}
-    output:
-      - name: ticket_id
-        type: str
-        description: >
-          The primary Jira ticket ID extracted from the webhook (e.g. PROJ-123).
-      - name: repo
-        type: str
-        description: >
-          GitHub repository in owner/repo format (e.g. example-github-org/my-service).
-          Use the value from jira_get_issue_development_info when available.
-      - name: context
-        type: str
-        description: >
-          Concise summary (3-6 paragraphs) covering: the ticket description and
-          acceptance criteria, any linked tickets, the relevant repository and
-          branch, and the key files / code sections that need to change.
-          Write a summary — do NOT paste raw file contents into this field.
+    # The agent is asked (in its prompt) to return ticket_id, repo and context;
+    # output_mapping copies those keys into workflow state under the same names.
+    output_mapping:
+      ticket_id: ticket_id
+      repo: repo
+      context: context
+    output_key: gather_context_raw
 
   # ── 3. Planning (single LLM call) ────────────────────────────────────────
   # Produces a numbered, step-by-step implementation plan from the gathered

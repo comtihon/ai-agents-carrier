@@ -18,13 +18,11 @@ from langchain_core.language_models import BaseChatModel
 from app.infrastructure.notifications.webhook_notifier import send_approval_notification
 
 logger = logging.getLogger(__name__)
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
-from langchain_core.tools import StructuredTool
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
-from pydantic import BaseModel, Field, create_model
 
 from app.domain.models.graph_run import GraphRun
 from app.infrastructure.tools.mcp_client import McpToolsProvider
@@ -132,10 +130,6 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
         # Regular output nodes store their result under output_key
         if "output_key" in step:
             fields[step["output_key"]] = Any  # type: ignore[assignment]
-        # llm_structured stores each named output field directly in state
-        if step.get("type") == "llm_structured":
-            for out_field in step.get("output", []):
-                fields[out_field["name"]] = Any  # type: ignore[assignment]
         # http trigger carries the raw webhook body; cron trigger carries schedule metadata
         if step.get("type") == "http":
             fields["trigger_payload"] = Any  # type: ignore[assignment]
@@ -637,19 +631,11 @@ class YamlGraphRunner:
         description: "..."
         steps:
           - id: <node-id>
-            type: llm_structured | llm | mcp | human_approval | execute | workflow | cron | http | http_call | python | data_source | parallel | join | proceed_or | switch | storage | slack
+            type: llm | mcp | human_approval | execute | workflow | cron | http | http_call | python | data_source | parallel | join | proceed_or | switch | storage | slack
             when: <state-key>          # skip node if state[key] is falsy
-            system_prompt: "..."       # llm / llm_structured
+            system_prompt: "..."       # llm
             user_template: "..."       # {key} placeholders resolved from state
             output_key: <key>          # where to store the result
-            bind_mcp_tools: true       # llm_structured only – set false to hide MCP tools
-            max_iterations: 25         # llm_structured only – override default iteration cap
-            fail_if_false:             # llm_structured only – fail the run if any listed bool
-              - success                #   output field is False (uses 'error'/'summary' as detail)
-            output:                    # llm_structured only
-              - name: needs_jira
-                type: bool
-                description: "..."
             tool: <tool-name>          # mcp only
             tool_input:                # mcp only – dict of {key}-templated values
               query: "{request}"
@@ -706,7 +692,7 @@ class YamlGraphRunner:
             operation: list_repos      # data_source only — operation to invoke
             params:                    # data_source only — operation inputs;
               owner: "{repo_owner}"    #   values support {key} templates
-            routes:                    # llm_structured / switch / langgraph-agent /
+            routes:                    # switch / langgraph-agent /
                                        #   claude-agent — multiple branches
               - when: <state-key>      # route taken when state[key] is truthy
                 next: <node-id>
@@ -882,7 +868,7 @@ class YamlGraphRunner:
         sg.add_edge(START, step_ids[0])
 
         _MULTI_OUTPUT_TYPES = frozenset(
-            {"llm_structured", "switch", "langgraph-agent", "claude-agent", "human_approval"}
+            {"switch", "langgraph-agent", "claude-agent", "human_approval"}
         )
 
         for i, step in enumerate(self._steps):
@@ -925,8 +911,8 @@ class YamlGraphRunner:
                 if step_type not in _MULTI_OUTPUT_TYPES and len(routes) > 1:
                     raise ValueError(
                         f"Step '{sid}' (type={step_type}) cannot have more than "
-                        f"1 route; only llm_structured, switch, langgraph-agent, "
-                        f"and claude-agent support multiple routes."
+                        f"1 route; only switch, langgraph-agent, and "
+                        f"claude-agent support multiple routes."
                     )
                 # A direct edge skips the router, so any route carrying
                 # wait_seconds must go through add_conditional_edges to honor it.
@@ -969,8 +955,13 @@ class YamlGraphRunner:
     def _make_node(self, step: dict[str, Any]):
         t = step["type"]
         if t == "llm_structured":
-            fn = self._llm_structured_node(step)
-        elif t in ("langgraph-agent", "claude-agent"):
+            raise ValueError(
+                f"Step '{step['id']}' in graph '{self.id}' uses the removed step "
+                f"type 'llm_structured'. Replace it with 'langgraph-agent' or "
+                f"'claude-agent'; the structured `output` spec becomes the agent "
+                f"step's `output_mapping`."
+            )
+        if t in ("langgraph-agent", "claude-agent"):
             fn = self._agent_node(step)
         elif t == "llm":
             fn = self._llm_node(step)
@@ -1324,9 +1315,6 @@ class YamlGraphRunner:
             return chosen["next"]
         return router
 
-    _SUBMIT_TOOL = "submit_output"
-    _MAX_ITERATIONS = 25
-
     def _agent_node(self, step: dict[str, Any]):
         """Node factory for ``langgraph-agent`` and ``claude-agent`` step types.
 
@@ -1384,135 +1372,6 @@ class YamlGraphRunner:
                     }
                 logger.error("[%s] step '%s' raised: %s", graph_id, step_id, _step_exc)
                 return {"__failed_step__": step_id, "error": str(_step_exc)}
-
-        return node
-
-    # DEPRECATED: use langgraph-agent or claude-agent instead
-    def _llm_structured_node(self, step: dict[str, Any]):
-        graph_id = self.id
-        base_llm = self._get_llm_for_step(step)
-
-        async def node(state: dict) -> dict:
-            step_id = step["id"]
-            logger.info("[%s] step '%s' running (llm_structured)", graph_id, step_id)
-
-            output_model = self._build_output_model(step["output"])
-            submit_tool = StructuredTool(
-                name=self._SUBMIT_TOOL,
-                description=(
-                    "Call this when you have gathered all necessary information "
-                    "and are ready to return the final structured result."
-                ),
-                args_schema=output_model,
-                func=lambda **kwargs: kwargs,  # never actually invoked
-            )
-
-            # bind_mcp_tools defaults to True for backward compat; set to false
-            # on steps that only reason about text and should not call MCP tools
-            # (prevents the LLM from invoking unneeded/restricted server tools).
-            mcp_tools = self._mcp.get_tools() if step.get("bind_mcp_tools", True) else []
-            llm = base_llm.bind_tools(mcp_tools + [submit_tool])
-
-            system_prompt = step.get("system_prompt", "")
-            user_message = self._render(step.get("user_template", "{request}"), state)
-            messages: list = [
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=user_message),
-            ]
-            logger.info(
-                "[%s] step '%s' → LLM | system: %s | user: %s",
-                graph_id, step_id, system_prompt, user_message,
-            )
-
-            max_iterations = step.get("max_iterations", self._MAX_ITERATIONS)
-            for iteration in range(1, max_iterations + 1):
-                response = await llm.ainvoke(messages)
-                messages.append(response)
-                tool_calls = response.tool_calls or []
-                logger.info(
-                    "[%s] step '%s' ← LLM (iter %d) | content: %r | tool_calls: %s",
-                    graph_id, step_id, iteration, response.content,
-                    [{"name": tc["name"], "args": tc["args"]} for tc in tool_calls],
-                )
-
-                if not tool_calls:
-                    logger.warning(
-                        "[%s] step '%s' iteration %d: LLM returned no tool calls, nudging to call %s",
-                        graph_id, step_id, iteration, self._SUBMIT_TOOL,
-                    )
-                    messages.append(HumanMessage(
-                        content=f"Please call `{self._SUBMIT_TOOL}` to submit your final answer."
-                    ))
-                    continue
-
-                # Check for submit_output before executing side-effect tools
-                submit_tc = next((tc for tc in tool_calls if tc["name"] == self._SUBMIT_TOOL), None)
-                if submit_tc is not None:
-                    args = submit_tc["args"]
-                    required_fields = [o["name"] for o in step.get("output", [])]
-                    missing = [f for f in required_fields if f not in args or args[f] is None or args[f] == ""]
-                    if missing:
-                        logger.warning(
-                            "[%s] step '%s' submit_output rejected — missing/empty fields: %s",
-                            graph_id, step_id, missing,
-                        )
-                        messages.append(ToolMessage(
-                            content=(
-                                f"submit_output rejected: the following required fields are "
-                                f"missing or empty: {missing}. "
-                                f"Call submit_output again and fill in EVERY required field. "
-                                f"Write SHORT summaries (3–5 sentences each) — do NOT try to "
-                                f"copy raw file contents into the fields. Summarise what you found."
-                            ),
-                            tool_call_id=submit_tc["id"],
-                        ))
-                        continue
-                    logger.info("[%s] step '%s' finished: %s", graph_id, step_id, args)
-                    # fail_if_false: list of bool output fields that must be True
-                    for field in step.get("fail_if_false", []):
-                        if field in args and not args[field]:
-                            detail = args.get("error") or args.get("summary") or ""
-                            raise ValueError(
-                                f"[{graph_id}] step '{step_id}' failed: "
-                                f"'{field}' is false. {detail}".strip()
-                            )
-                    return args
-
-                # Execute MCP tool calls and feed results back
-                for tc in tool_calls:
-                    tool_name = tc["name"]
-                    server = self._mcp.get_tool_server(tool_name)
-                    server_tag = f" (server: {server})" if server else ""
-                    tool = self._mcp.get_tool(tool_name)
-                    if tool:
-                        logger.info(
-                            "[%s] step '%s' → tool '%s'%s | args: %s",
-                            graph_id, step_id, tool_name, server_tag, tc["args"],
-                        )
-                        try:
-                            result = await tool.ainvoke(tc["args"])
-                            content = self._extract_mcp_text(result)
-                        except Exception as exc:
-                            logger.exception(
-                                "[%s] step '%s' tool '%s'%s failed",
-                                graph_id, step_id, tool_name, server_tag,
-                            )
-                            content = str(exc)
-                    else:
-                        logger.warning(
-                            "[%s] step '%s' unknown tool requested: '%s'",
-                            graph_id, step_id, tool_name,
-                        )
-                        content = f"Tool '{tool_name}' is not available"
-                    logger.info(
-                        "[%s] step '%s' ← tool '%s'%s | result: %s",
-                        graph_id, step_id, tool_name, server_tag, content,
-                    )
-                    messages.append(ToolMessage(content=content, tool_call_id=tc["id"]))
-
-            raise ValueError(
-                f"[{graph_id}] step '{step_id}': reached {max_iterations} iterations without structured output"
-            )
 
         return node
 
@@ -1612,7 +1471,7 @@ class YamlGraphRunner:
         async def node(state: dict) -> dict:
             if questions_key:
                 raw = state.get(questions_key) or []
-                # llm_structured outputs str, not list — split on newlines if needed
+                # an upstream step may emit str, not list — split on newlines
                 if isinstance(raw, str):
                     questions = _parse_questions_string(raw)
                 else:
@@ -2634,16 +2493,3 @@ class YamlGraphRunner:
         if isinstance(value, list):
             return [cls._render_deep(item, state) for item in value]
         return value
-
-    @staticmethod
-    def _build_output_model(output_spec: list[dict[str, Any]]) -> type[BaseModel]:
-        """Dynamically build a Pydantic model from the ``output`` spec list."""
-        _type_map: dict[str, type] = {"bool": bool, "str": str, "int": int, "float": float}
-        fields: dict[str, Any] = {
-            o["name"]: (
-                _type_map.get(o.get("type", "str"), str),
-                Field(description=o.get("description", "")),
-            )
-            for o in output_spec
-        }
-        return create_model("StructuredOutput", **fields)

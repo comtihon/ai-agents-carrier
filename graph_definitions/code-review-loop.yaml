@@ -11,32 +11,32 @@ steps:
     user_template: "{request}"
 
   - id: execute
-    type: llm_structured
-    max_loops: 3
+    type: claude-agent
+    agent_id: engineer            # must exist in /api/v1/agents
     system_prompt: >
       You are a software engineer. Implement the plan.
-      Previous feedback (if any): {feedback}
+      Previous feedback (if any): {feedback}.
+      Return a JSON object with `result` (description of what was implemented)
+      and `code` (the code written).
     user_template: "Plan: {plan}\nPrevious feedback: {feedback}"
-    output:
-      - name: result
-        type: str
-        description: "Description of what was implemented"
-      - name: code
-        type: str
-        description: "The code written"
+    output_mapping:
+      result: result
+      code: code
+    output_key: execute_raw
 
   - id: code_review
-    type: llm_structured
-    max_loops: 3
-    system_prompt: "You are a code reviewer. Review the implementation against the plan."
+    type: claude-agent
+    agent_id: reviewer            # must exist in /api/v1/agents
+    system_prompt: >
+      You are a code reviewer. Review the implementation against the plan.
+      Return a JSON object with `feedback` (review notes; if passing, confirm
+      what was done well) and `passed` (true if the implementation passes
+      review, false if it needs revision).
     user_template: "Plan: {plan}\nImplementation: {result}\nCode:\n{code}"
-    output:
-      - name: feedback
-        type: str
-        description: "Review feedback. If passing, confirm what was done well."
-      - name: passed
-        type: bool
-        description: "True if the implementation passes review, False if it needs revision"
+    output_mapping:
+      feedback: feedback
+      passed: passed
+    output_key: code_review_raw
     routes:
       - when: passed
         next: notify

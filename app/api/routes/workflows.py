@@ -33,7 +33,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/workflows", tags=["workflows"])
 
 _STEP_TYPE_MAP: dict[str, str] = {
-    "llm_structured": "llm",  # DEPRECATED: use langgraph-agent or claude-agent instead
     "llm": "llm",
     "mcp": "fetch",
     "human_approval": "approval",

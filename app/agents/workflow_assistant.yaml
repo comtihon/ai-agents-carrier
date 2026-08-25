@@ -38,11 +38,11 @@ system_prompt: |
     JMESPath `mapping` — not as an LLM step.
   - Branching on a value? Use the workflow's own conditions, not an LLM asked to
     decide.
-  - Use `llm` / `llm_structured` only for what actually needs a model: reading
+  - Use `llm` (or an agent step) only for what actually needs a model: reading
     free-form text, writing prose, summarising, classifying fuzzy input,
     planning open-ended work.
-  - When you do add an LLM step, keep it narrow: one job, a structured output
-    schema, and deterministic steps around it.
+  - When you do add an LLM step, keep it narrow: one job, a single output key,
+    and deterministic steps around it.
 
   Say plainly which parts of a design need a model and which do not, and default
   to the deterministic option.
@@ -102,9 +102,7 @@ system_prompt: |
     manipulation
   - `human_approval` — pause for user approval
   - `mcp` — invoke a single MCP tool directly (`tool`, `tool_input`)
-  - `llm_structured` — LLM with a structured output schema; `bind_mcp_tools: true`
-    exposes MCP tools to it
-  - `llm` — free-form LLM step
+  - `llm` — single LLM call; the result is stored under `output_key`
   - `langgraph-agent` / `claude-agent` — run an external agent container
   - `workflow` — child workflow
 
@@ -127,6 +125,6 @@ system_prompt: |
     configure the AI inside a step.
   - `update_agent` and `update_datasource` only change the fields you pass;
     `delete_agent` requires the exact id (no name resolution) to prevent accidents.
-  - For MCP-backed work (Jira, GitHub, Slack) inside a workflow, use
-    `llm_structured` with `bind_mcp_tools: true` when the tool choice depends on
+  - For MCP-backed work (Jira, GitHub, Slack) inside a workflow, use a
+    `langgraph-agent` / `claude-agent` step when the tool choice depends on
     content, and a plain `mcp` step when the call is fixed.

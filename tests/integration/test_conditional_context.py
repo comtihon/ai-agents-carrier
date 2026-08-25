@@ -1,5 +1,6 @@
 """
-Integration test: conditional MCP fetching driven by llm_structured output.
+Integration test: conditional MCP fetching driven by an agent step's
+``output_mapping`` (the replacement for the removed ``llm_structured`` type).
 
 Replaces: test_classifier_flow.py
 
@@ -14,7 +15,7 @@ Scenarios
 """
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -29,13 +30,14 @@ _GRAPH = {
     "steps": [
         {
             "id": "classify",
-            "type": "llm_structured",
+            "type": "claude-agent",
+            "agent_id": "classifier",
             "system_prompt": "Decide which context sources are needed.",
             "user_template": "{request}",
-            "output": [
-                {"name": "needs_jira", "type": "bool", "description": "Jira context needed"},
-                {"name": "needs_github", "type": "bool", "description": "GitHub context needed"},
-            ],
+            "output_mapping": {
+                "needs_jira": "needs_jira",
+                "needs_github": "needs_github",
+            },
         },
         {
             "id": "fetch_jira",
@@ -86,18 +88,20 @@ def _make_tools():
 async def test_github_only() -> None:
     """Classifier picks GitHub → GitHub tool called, Jira skipped."""
     jira_tool, github_tool = _make_tools()
-    llm = make_mock_llm(
-        structured_responses=[{"needs_jira": False, "needs_github": True}],
-        text_responses=["summary using github data"],
-    )
+    llm = make_mock_llm(text_responses=["summary using github data"])
+    classify = {"needs_jira": False, "needs_github": True}
     client, mongo = await build_int_client(
         _GRAPH, llm, mcp_tools={"jira_search": jira_tool, "github_search": github_tool}
     )
     try:
-        resp = await client.post(
-            "/api/v1/workflows/runs",
-            json={"workflow_id": _GRAPH_ID, "user_request": "add dark mode to acme/app"},
-        )
+        with patch(
+            "app.steps.agent_executor.execute_agent_step",
+            new=AsyncMock(return_value=classify),
+        ):
+            resp = await client.post(
+                "/api/v1/workflows/runs",
+                json={"workflow_id": _GRAPH_ID, "user_request": "add dark mode to acme/app"},
+            )
         assert resp.status_code == 200, resp.text
         run_id = resp.json()["id"]
 
@@ -116,18 +120,20 @@ async def test_github_only() -> None:
 async def test_jira_only() -> None:
     """Classifier picks Jira → Jira tool called, GitHub skipped."""
     jira_tool, github_tool = _make_tools()
-    llm = make_mock_llm(
-        structured_responses=[{"needs_jira": True, "needs_github": False}],
-        text_responses=["summary using jira data"],
-    )
+    llm = make_mock_llm(text_responses=["summary using jira data"])
+    classify = {"needs_jira": True, "needs_github": False}
     client, mongo = await build_int_client(
         _GRAPH, llm, mcp_tools={"jira_search": jira_tool, "github_search": github_tool}
     )
     try:
-        resp = await client.post(
-            "/api/v1/workflows/runs",
-            json={"workflow_id": _GRAPH_ID, "user_request": "check issues for PRJ-42"},
-        )
+        with patch(
+            "app.steps.agent_executor.execute_agent_step",
+            new=AsyncMock(return_value=classify),
+        ):
+            resp = await client.post(
+                "/api/v1/workflows/runs",
+                json={"workflow_id": _GRAPH_ID, "user_request": "check issues for PRJ-42"},
+            )
         assert resp.status_code == 200, resp.text
         run_id = resp.json()["id"]
 
@@ -145,18 +151,20 @@ async def test_jira_only() -> None:
 async def test_both_needed() -> None:
     """Classifier picks both → both tools called."""
     jira_tool, github_tool = _make_tools()
-    llm = make_mock_llm(
-        structured_responses=[{"needs_jira": True, "needs_github": True}],
-        text_responses=["summary using both"],
-    )
+    llm = make_mock_llm(text_responses=["summary using both"])
+    classify = {"needs_jira": True, "needs_github": True}
     client, mongo = await build_int_client(
         _GRAPH, llm, mcp_tools={"jira_search": jira_tool, "github_search": github_tool}
     )
     try:
-        resp = await client.post(
-            "/api/v1/workflows/runs",
-            json={"workflow_id": _GRAPH_ID, "user_request": "cross-reference jira and github"},
-        )
+        with patch(
+            "app.steps.agent_executor.execute_agent_step",
+            new=AsyncMock(return_value=classify),
+        ):
+            resp = await client.post(
+                "/api/v1/workflows/runs",
+                json={"workflow_id": _GRAPH_ID, "user_request": "cross-reference jira and github"},
+            )
         assert resp.status_code == 200, resp.text
 
         jira_tool.ainvoke.assert_called_once()
@@ -169,18 +177,20 @@ async def test_both_needed() -> None:
 async def test_neither_needed() -> None:
     """Classifier picks neither → both MCP steps skipped entirely."""
     jira_tool, github_tool = _make_tools()
-    llm = make_mock_llm(
-        structured_responses=[{"needs_jira": False, "needs_github": False}],
-        text_responses=["answer from request alone"],
-    )
+    llm = make_mock_llm(text_responses=["answer from request alone"])
+    classify = {"needs_jira": False, "needs_github": False}
     client, mongo = await build_int_client(
         _GRAPH, llm, mcp_tools={"jira_search": jira_tool, "github_search": github_tool}
     )
     try:
-        resp = await client.post(
-            "/api/v1/workflows/runs",
-            json={"workflow_id": _GRAPH_ID, "user_request": "simple question"},
-        )
+        with patch(
+            "app.steps.agent_executor.execute_agent_step",
+            new=AsyncMock(return_value=classify),
+        ):
+            resp = await client.post(
+                "/api/v1/workflows/runs",
+                json={"workflow_id": _GRAPH_ID, "user_request": "simple question"},
+            )
         assert resp.status_code == 200, resp.text
         run_id = resp.json()["id"]
 
