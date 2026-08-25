@@ -415,6 +415,15 @@ class Settings(BaseSettings):
     # Memory cap for a sandboxed script, in MiB.
     script_sandbox_memory_mb: int = Field(default=512, alias="SCRIPT_SANDBOX_MEMORY_MB")
 
+    # --- Run-state divergence probe (see stream_graph_to_pause) ---
+    # Diagnostic for the dual-state cleanup: after every streamed chunk,
+    # compare the hand-merged `current_state` the runner maintains against the
+    # LangGraph checkpoint's own reducer-applied values, and log any key that
+    # differs. Read-only — it never changes what is persisted. Costs one extra
+    # checkpoint read per node, so it is meant to be switched off again once
+    # the divergences it finds have been fixed.
+    state_divergence_probe: bool = Field(default=False, alias="STATE_DIVERGENCE_PROBE")
+
     # --- Docker registry auth (used by DockerRuntime to pull private images) ---
     # Set DOCKER_REGISTRY_USERNAME + DOCKER_REGISTRY_PASSWORD to enable auth.
     # GAR:    username=oauth2accesstoken  password=$(gcloud auth print-access-token)
