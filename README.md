@@ -321,7 +321,7 @@ name: My Workflow
 description: "..."
 steps:
   - id: step-one
-    type: llm_structured
+    type: llm
     ...
   - id: step-two
     type: human_approval
@@ -334,27 +334,12 @@ Steps run sequentially. Each step can be skipped with `when: <state-key>` — th
 
 ## Step types
 
-### `llm_structured` — agentic LLM with structured output
-
-Runs a tool-calling loop until the LLM emits a `submit_output` call with all required fields.
-
-```yaml
-- id: gather_context
-  type: llm_structured
-  system_prompt: "..."
-  user_template: "Ticket: {ticket_id}"   # {key} resolved from state
-  bind_mcp_tools: true                   # expose MCP tools to LLM (default true)
-  max_iterations: 25
-  fail_if_false:                         # fail run if any listed bool field is false
-    - success
-  output:
-    - name: context
-      type: str
-      description: "..."
-    - name: needs_jira
-      type: bool
-      description: "..."
-```
+> **Removed: `llm_structured`.** It ran a whole tool-calling loop inside one
+> graph node, so nothing in it was checkpointed: a restart mid-loop replayed
+> every tool call from scratch. Use `langgraph-agent` / `claude-agent` for
+> tool-using work — its `output_mapping` replaces the `output` schema — or a
+> plain `llm` step when one call is enough. A workflow still carrying an
+> `llm_structured` step fails to load with a message naming the step.
 
 ### `llm` — single LLM call
 

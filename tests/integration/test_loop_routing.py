@@ -1,12 +1,17 @@
 """
-Integration test: llm_structured conditional routing with a revision loop.
+Integration test: conditional routing with a revision loop.
 
 Workflow under test  (code-review-loop):
-  plan (llm) → execute (llm_structured) → code_review (llm_structured)
-                      ↑                           |
-                      └───── needs revision ───────┘
-                                                  |
-                                          passed → notify (http_call)
+  plan (llm) → execute (llm) → code_review (llm) → gate (python) → route (switch)
+                      ↑                                                  |
+                      └───────────── needs revision ─────────────────────┘
+                                                                         |
+                                                          passed → notify (http_call)
+
+``llm_structured`` used to be both the worker and the brancher in one node.
+It is gone, so the loop is now assembled from the pieces that replaced it:
+plain ``llm`` steps do the work (and carry the ``max_loops`` guard), a
+``python`` step derives the boolean, and a ``switch`` step does the branching.
 
 Scenario
 ────────
@@ -24,6 +29,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from tests.integration.conftest import build_int_client, make_mock_llm
 
+# Derives the routing boolean from the reviewer's prose. Runs in-process
+# (sandbox: false) so the test does not need a sandbox runtime.
+_GATE_CODE = 'output = "lgtm" in (state.get("feedback") or "").lower()'
+
 _WORKFLOW = {
     "id": "code-review-loop",
     "max_iterations": 5,
@@ -37,25 +46,30 @@ _WORKFLOW = {
         },
         {
             "id": "execute",
-            "type": "llm_structured",
+            "type": "llm",
             "max_loops": 3,
+            "output_key": "result",
             "system_prompt": "Implement the plan.",
             "user_template": "Plan: {plan}",
-            "output": [
-                {"name": "result", "type": "str", "description": "What was implemented"},
-                {"name": "code",   "type": "str", "description": "The code written"},
-            ],
         },
         {
             "id": "code_review",
-            "type": "llm_structured",
+            "type": "llm",
             "max_loops": 3,
+            "output_key": "feedback",
             "system_prompt": "Review the implementation.",
             "user_template": "Plan: {plan}\nResult: {result}",
-            "output": [
-                {"name": "feedback", "type": "str",  "description": "Review feedback"},
-                {"name": "passed",   "type": "bool", "description": "True if it passes"},
-            ],
+        },
+        {
+            "id": "gate",
+            "type": "python",
+            "sandbox": False,
+            "code": _GATE_CODE,
+            "output_key": "passed",
+        },
+        {
+            "id": "route",
+            "type": "switch",
             "routes": [
                 {"when": "passed", "next": "notify"},
                 {"next": "execute"},
@@ -80,16 +94,12 @@ async def test_code_review_loop_with_revision() -> None:
     Visit counts must reflect 2 runs of execute and 2 runs of code_review.
     """
     llm = make_mock_llm(
-        text_responses=["step-by-step plan"],
-        structured_responses=[
-            # execute run 1 — has a bug
-            {"result": "implementation v1 (has a bug)", "code": "def f(): pass  # bug"},
-            # code_review run 1 — rejects, routes back to execute
-            {"feedback": "Found a bug in the implementation", "passed": False},
-            # execute run 2 — fixed
-            {"result": "fixed implementation", "code": "def f(): return 42"},
-            # code_review run 2 — passes, routes to notify
-            {"feedback": "LGTM, implementation is correct", "passed": True},
+        text_responses=[
+            "step-by-step plan",                     # plan
+            "implementation v1 (has a bug)",         # execute run 1
+            "Found a bug in the implementation",     # code_review run 1 — rejects
+            "fixed implementation",                  # execute run 2
+            "LGTM, implementation is correct",       # code_review run 2 — passes
         ],
     )
 
@@ -131,11 +141,7 @@ async def test_code_review_passes_first_time() -> None:
     Visit counts: execute=1, code_review=1.
     """
     llm = make_mock_llm(
-        text_responses=["short plan"],
-        structured_responses=[
-            {"result": "perfect implementation", "code": "def f(): return 42"},
-            {"feedback": "LGTM", "passed": True},
-        ],
+        text_responses=["short plan", "perfect implementation", "LGTM"],
     )
 
     client, mongo = await build_int_client(_WORKFLOW, llm)
@@ -164,20 +170,9 @@ async def test_loop_guard_fails_run_when_max_loops_exceeded() -> None:
     If code_review always rejects, the run must fail after max_loops=3 executions
     of the execute step (4th attempt raises ValueError → run.status='failed').
     """
-    llm = make_mock_llm(
-        text_responses=["plan"],
-        structured_responses=[
-            # execute runs 1, 2, 3 (max_loops=3) — each followed by reject
-            {"result": "bad impl", "code": "broken"},
-            {"feedback": "still broken", "passed": False},
-            {"result": "bad impl", "code": "broken"},
-            {"feedback": "still broken", "passed": False},
-            {"result": "bad impl", "code": "broken"},
-            {"feedback": "still broken", "passed": False},
-            # 4th attempt at execute — loop guard fires
-            {"result": "bad impl", "code": "broken"},
-        ],
-    )
+    # The last entry repeats forever, so every review after the first rejects
+    # and the loop keeps sending the run back to execute until the guard fires.
+    llm = make_mock_llm(text_responses=["plan", "bad impl", "still broken"])
 
     client, mongo = await build_int_client(_WORKFLOW, llm)
     try:
@@ -201,9 +196,10 @@ async def test_loop_guard_fails_run_when_max_loops_exceeded() -> None:
 
 
 @pytest.mark.asyncio
-async def test_single_output_non_llm_structured_raises() -> None:
+async def test_single_output_step_multi_route_raises() -> None:
     """
-    A non-llm_structured step with more than 1 route must raise ValueError at build time.
+    A single-output step with more than 1 route must raise ValueError at build time.
+    Only switch / langgraph-agent / claude-agent / human_approval may branch.
     """
     from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner
     from unittest.mock import MagicMock
@@ -277,7 +273,7 @@ def _make_agent_route_runner(verdict: str) -> YamlGraphRunner:
 )
 async def test_agent_step_multi_route_branches(verdict: str, expected_key: str) -> None:
     """A langgraph-agent step with 2 routes builds without error and branches
-    on the merged output_mapping field, same as switch/llm_structured."""
+    on the merged output_mapping field, same as a switch step."""
     runner = _make_agent_route_runner(verdict)
 
     with patch(
