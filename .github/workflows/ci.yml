@@ -106,7 +106,7 @@ jobs:
           git push origin main
 
   publish:
-    name: Build & push Docker image
+    name: Build & push Docker images
     runs-on: ubuntu-latest
     needs: release
     permissions:
@@ -126,13 +126,30 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push
+      # slim — the backend alone. Keeps the unsuffixed tags, so every existing
+      # deployment keeps resolving to the same image it always did.
+      - name: Build and push (slim)
         uses: docker/build-push-action@v6
         with:
           context: .
+          target: slim
           push: true
           tags: |
             ghcr.io/comtihon/ai-agents-carrier:latest
             ghcr.io/comtihon/ai-agents-carrier:v${{ needs.release.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # full — the same backend with pi-cloud-agent baked in, for the `local`
+      # agent runtime. Suffixed tags: opting in is a deliberate image change.
+      - name: Build and push (full)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: full
+          push: true
+          tags: |
+            ghcr.io/comtihon/ai-agents-carrier:latest-full
+            ghcr.io/comtihon/ai-agents-carrier:v${{ needs.release.outputs.version }}-full
           cache-from: type=gha
           cache-to: type=gha,mode=max
