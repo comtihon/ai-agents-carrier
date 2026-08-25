@@ -57,7 +57,7 @@ API at `http://localhost:8000`. Health check: `GET /health`.
 | `STATE_DIVERGENCE_PROBE` | `false` | Log every key where the runner's hand-merged run state disagrees with the LangGraph checkpoint. Diagnostic only — never writes — and costs one extra checkpoint read per node |
 | `DOCKER_REGISTRY_USERNAME` | — | Registry username for pulling private images (DockerRuntime) |
 | `DOCKER_REGISTRY_PASSWORD` | — | Registry password / token for pulling private images |
-| `LOCAL_AGENT_DIR` | — | Path to a [pi-cloud-agent](https://github.com/comtihon/pi-cloud-agent) checkout. Required for the `local` agent runtime |
+| `LOCAL_AGENT_DIR` | — (`/opt/pi-cloud-agent` in the `-full` image) | Path to a [pi-cloud-agent](https://github.com/comtihon/pi-cloud-agent) checkout. Required for the `local` agent runtime |
 | `LOCAL_AGENT_COMMAND` | `node src/server.js` | Command that starts the local agent's HTTP server, run with `LOCAL_AGENT_DIR` as cwd |
 | `META_LLM_PROVIDER` | — | LLM provider for post-agent analysis (`anthropic` or `openai`; defaults to `LLM_PROVIDER`) |
 | `META_LLM_MODEL` | `claude-haiku-4-5-20251001` | Model for post-agent meta-analysis (haiku recommended for cost/speed) |
@@ -685,7 +685,43 @@ Agents are registered persistent definitions that `langgraph-agent` / `claude-ag
 | `docker` | container, random host port | `image` on the definition, `DOCKER_REGISTRY_*` for private registries |
 | `k8s`    | Helm release in `AGENT_NAMESPACE` | `helm_chart` / `helm_values`, `AGENT_SERVICE_ACCOUNT` |
 
-`local` needs `LOCAL_AGENT_DIR` set — there is no in-process agent to fall back on, and a step whose runtime resolves to `local` without it fails with a configuration error rather than running something different from production. The backend image does not ship the agent, so in a cluster agents belong on `k8s` (or `docker`); `local` is for a laptop with a checkout beside the backend. Definitions written before this — `default_runtime: local` was the old inline LangGraph agent — need switching to `k8s`.
+`local` needs `LOCAL_AGENT_DIR` set — there is no in-process agent to fall back on, and a step whose runtime resolves to `local` without it fails with a configuration error rather than running something different from production. Definitions written before this — `default_runtime: local` was the old inline LangGraph agent — need switching to `k8s`.
+
+### Two images: `slim` and `full`
+
+The backend ships as two images built from the same `Dockerfile`:
+
+| tag | contains | `local` runtime |
+|---|---|---|
+| `ghcr.io/comtihon/ai-agents-carrier:latest` / `:vX.Y.Z` | the backend alone | unavailable |
+| `ghcr.io/comtihon/ai-agents-carrier:latest-full` / `:vX.Y.Z-full` | the backend plus [pi-cloud-agent](https://github.com/comtihon/pi-cloud-agent) and a Node runtime | ready — `LOCAL_AGENT_DIR` is preset to `/opt/pi-cloud-agent` |
+
+The unsuffixed tags stay slim, so an existing deployment keeps resolving to the
+image it always did; moving to `full` is a deliberate change of tag.
+
+`full` copies the agent out of the published `ghcr.io/comtihon/pi-cloud-agent`
+image rather than rebuilding it, so the two cannot drift: one image remains the
+single definition of what the agent is. Pin a different one with
+`--build-arg PI_AGENT_IMAGE=ghcr.io/comtihon/pi-cloud-agent:v0.1.5`.
+
+```bash
+docker build -t carrier:slim .                  # slim is the default target
+docker build -t carrier:full --target full .
+```
+
+**What `full` costs you.** The agent stops being isolated. On `docker` and `k8s`
+it gets its own container, its own service account and its own filesystem; run
+as `local` it is a child process of the backend, sharing the backend's pod,
+filesystem, environment and service-account token. Agents run model-authored
+code, so that is a real reduction in blast-radius containment — the separate
+`langgraph-agent` identity exists precisely to avoid it. Use `full` where that
+trade is worth not needing a registry, a chart, or cluster permissions at run
+time; prefer `k8s` or `docker` otherwise.
+
+`full` carries Node, the agent and its `git` / `ripgrep` / `jq` helpers. It does
+not carry the agent image's heavier tooling (`gcloud`, `kubectl`, `gh`, `uv`,
+`semble`, `graphify`), so an agent granted one of those through `AGENT_TOOLS`
+needs the `docker` or `k8s` runtime.
 
 ```yaml
 # Example agent definition (managed via API or copilot_ui)
