@@ -148,14 +148,20 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
         # execute steps persist their OpenHands conversation ID for restart resumption
         if step.get("type") == "execute":
             fields[f"_openhands_conv_{step['id']}"] = Any  # type: ignore[assignment]
-        # agent steps (langgraph-agent / claude-agent) store their output under output_key
-        # when output_mapping is absent; the output_key field is already captured by the
-        # generic "output_key" check above, but we also ensure it exists for typing.
+        # agent steps (langgraph-agent / claude-agent) store their output under
+        # output_key; output_mapping additionally lifts individual agent keys
+        # into state under names of their own. The two are independent, and a
+        # step may declare both — output_key for the whole payload,
+        # output_mapping for the fields the rest of the graph routes on. Every
+        # mapped name must be declared here regardless, or LangGraph's state
+        # merge drops it: the step reports "finished" and its outputs silently
+        # never arrive. Gating this on `output_key` being absent made declaring
+        # both the one combination that quietly lost the mapped fields.
         if step.get("type") in ("langgraph-agent", "claude-agent"):
-            if "output_key" not in step and step.get("output_mapping"):
+            if step.get("output_mapping"):
                 for wf_key in step["output_mapping"].values():
                     fields[wf_key] = Any  # type: ignore[assignment]
-            elif "output_key" not in step and not step.get("output_mapping"):
+            if "output_key" not in step and not step.get("output_mapping"):
                 # No output declaration — agent output keys will be silently
                 # dropped by LangGraph's state reducer. Log a warning so this
                 # is caught during development rather than at runtime.
