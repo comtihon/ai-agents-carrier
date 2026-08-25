@@ -313,3 +313,25 @@ def test_apply_thread_context_threads_without_an_approver():
     payload = {"channel": "C1", "text": "approved"}
     apply_thread_context(payload, "170.1", "")
     assert payload == {"channel": "C1", "text": "approved", "thread_ts": "170.1"}
+
+
+def test_registering_a_provider_first_does_not_hide_the_builtins():
+    """The bundled providers are registered explicitly, not by import side
+    effect — the module is cached after the first import, so a caller that
+    registered its own provider first would otherwise never see slack again."""
+    from app.infrastructure.messaging import registry
+
+    saved_providers = dict(registry._PROVIDERS)
+    registry._PROVIDERS.clear()
+    reset_providers()
+    try:
+        @register_provider
+        class _First(SlackProvider):
+            name = "first-in"
+
+        assert get_provider("slack").name == "slack"
+        assert get_provider("first-in").name == "first-in"
+    finally:
+        registry._PROVIDERS.clear()
+        registry._PROVIDERS.update(saved_providers)
+        reset_providers()
