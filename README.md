@@ -54,6 +54,7 @@ API at `http://localhost:8000`. Health check: `GET /health`.
 | `OPENHANDS_BASE_URL` | `http://openhands:3000` | OpenHands service URL |
 | `OPENHANDS_API_KEY` | — | OpenHands auth token |
 | `OPENHANDS_MOCK_MODE` | `true` | Return stub results instead of calling OpenHands |
+| `STATE_DIVERGENCE_PROBE` | `false` | Log every key where the runner's hand-merged run state disagrees with the LangGraph checkpoint. Diagnostic only — never writes — and costs one extra checkpoint read per node |
 | `DOCKER_REGISTRY_USERNAME` | — | Registry username for pulling private images (DockerRuntime) |
 | `DOCKER_REGISTRY_PASSWORD` | — | Registry password / token for pulling private images |
 | `LOCAL_AGENT_DIR` | — | Path to a [pi-cloud-agent](https://github.com/comtihon/pi-cloud-agent) checkout. Required for the `local` agent runtime |

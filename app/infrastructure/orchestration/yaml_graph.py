@@ -283,6 +283,69 @@ def _parse_questions_string(raw: str) -> list[str]:
     return lines
 
 
+_PROBE_IGNORED_KEYS = frozenset({"__failed_step__"})
+
+
+def _probe_repr(value: Any) -> str:
+    """Short, never-raising repr for probe logging."""
+    try:
+        text = repr(value)
+    except Exception:
+        return f"<unreprable {type(value).__name__}>"
+    return text if len(text) <= 200 else text[:197] + "..."
+
+
+async def _probe_state_divergence(runner: Any, run_id: str, node_name: str,
+                                  current_state: dict, config: dict) -> None:
+    """Log every key where the runner's hand-merged state disagrees with the
+    checkpoint's own reducer-applied values.
+
+    Phase 1 of collapsing the dual state: `stream_graph_to_pause` rebuilds
+    state by `dict.update()`-ing each chunk's output, which silently
+    reimplements LangGraph's reducers. Any field with a non-last-wins reducer
+    (``_sum_usage``, ``_merge_dicts``) can therefore drift. This measures the
+    drift instead of guessing at it.
+
+    Purely diagnostic and best-effort: it must never raise, and never writes.
+    """
+    try:
+        snap = await runner.graph.aget_state(config)
+    except Exception as exc:
+        logger.debug("state probe: run %s: aget_state failed: %s", run_id, exc)
+        return
+    checkpoint = dict(snap.values) if snap and snap.values else {}
+    for key in sorted(set(checkpoint) | set(current_state)):
+        if key in _PROBE_IGNORED_KEYS:
+            continue
+        in_ckpt = key in checkpoint
+        in_local = key in current_state
+        try:
+            same = in_ckpt and in_local and checkpoint[key] == current_state[key]
+        except Exception:
+            # Values that refuse comparison are not evidence of drift.
+            continue
+        if same:
+            continue
+        if not in_local:
+            # The checkpoint knows a key the runner never saw — the reducer
+            # produced it, or another writer did.
+            logger.warning(
+                "state probe: run %s node %s key %r MISSING-LOCALLY checkpoint=%s",
+                run_id, node_name, key, _probe_repr(checkpoint[key]),
+            )
+        elif not in_ckpt:
+            logger.warning(
+                "state probe: run %s node %s key %r MISSING-IN-CHECKPOINT local=%s",
+                run_id, node_name, key, _probe_repr(current_state[key]),
+            )
+        else:
+            logger.warning(
+                "state probe: run %s node %s key %r DIVERGED local=%s checkpoint=%s",
+                run_id, node_name, key,
+                _probe_repr(current_state[key]), _probe_repr(checkpoint[key]),
+            )
+
+
 async def stream_graph_to_pause(
     runner: YamlGraphRunner,
     run: GraphRun,
@@ -333,6 +396,11 @@ async def stream_graph_to_pause(
     last_processed: str | None = None
     _stream_interrupt_output: list | None = None  # payload from __interrupt__ chunk if seen
     try:
+        from app.core.config import get_settings as _get_settings_for_probe
+        _probe_enabled = bool(_get_settings_for_probe().state_divergence_probe)
+    except Exception:
+        _probe_enabled = False
+    try:
         async for chunk in runner.graph.astream(input_value, config, stream_mode="updates"):
             for node_name, output in chunk.items():
                 if node_name in ("__start__", "__end__"):
@@ -360,6 +428,10 @@ async def stream_graph_to_pause(
                 last_processed = node_name
                 run.touch()
                 await run_repository.update(run)
+                if _probe_enabled:
+                    await _probe_state_divergence(
+                        runner, run.id, node_name, current_state, config,
+                    )
     except Exception as exc:
         logger.exception("run %s: graph execution failed", run.id)
         # Attribute the failure to a specific step only when we can identify
