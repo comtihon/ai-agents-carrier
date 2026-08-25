@@ -637,7 +637,7 @@ class YamlGraphRunner:
         description: "..."
         steps:
           - id: <node-id>
-            type: llm_structured | llm | mcp | human_approval | execute | workflow | cron | http | http_call | python | data_source | parallel | join | proceed_or | switch | storage
+            type: llm_structured | llm | mcp | human_approval | execute | workflow | cron | http | http_call | python | data_source | parallel | join | proceed_or | switch | storage | slack
             when: <state-key>          # skip node if state[key] is falsy
             system_prompt: "..."       # llm / llm_structured
             user_template: "..."       # {key} placeholders resolved from state
@@ -687,6 +687,21 @@ class YamlGraphRunner:
             action: get                # storage only -- get | set | delete | keys
             key: "alert-state"         # storage only -- entry name; {state} templated
             value: {}                  # storage only (set) -- any JSON; {state} templated
+            action: post               # slack only -- post | reply | history | thread | dm | delete
+            provider: slack            # slack only -- messaging provider name (default slack)
+            channel: "C0BLDDSEB1D"     # slack only -- channel id; {state} templated
+            text: "{digest}"           # slack only (post|reply|dm) -- message body
+            thread_id: "{ts}"          # slack only (reply|thread) -- root message id
+            user_id: "{owner}"         # slack only (dm) -- DM recipient
+            message_id: "{ts}"         # slack only (delete) -- message to delete
+            oldest: "1787600000"       # slack only (history) -- lower time bound
+            limit: 200                 # slack only (history) -- max messages
+            items: overrides.confirmations   # slack only (reply) -- state path to a
+                                       #   list of {thread_id, text} to post in one go
+            skip_if_replied: true      # slack only (reply) -- do not post a reply whose
+                                       #   text is already in the thread (idempotency)
+            ignore_errors: true        # slack only -- capture provider errors under
+                                       #   output_key instead of failing the run
             source: github             # data_source only — DataSourceDefinition id
             operation: list_repos      # data_source only — operation to invoke
             params:                    # data_source only — operation inputs;
@@ -989,6 +1004,8 @@ class YamlGraphRunner:
             fn = self._proceed_or_node(step)
         elif t == "storage":
             fn = self._storage_node(step)
+        elif t == "slack":
+            fn = self._messaging_node(step)
         elif t == "switch":
             fn = self._switch_node(step)
         else:
@@ -2214,6 +2231,220 @@ class YamlGraphRunner:
             return END
 
         return _select
+
+    _MESSAGING_ACTIONS = ("post", "reply", "history", "thread", "dm", "delete")
+
+    @staticmethod
+    def _state_path(state: dict, path: str) -> Any:
+        """Walk a dotted/bracketed state path, returning None when it breaks.
+
+        ``items: overrides.confirmations`` has to reach a *list*, and {key}
+        templating renders to a string — so list-valued config is addressed by
+        path instead of by template.
+        """
+        current: Any = state
+        for part in path.replace("]", "").replace("[", ".").split("."):
+            part = part.strip()
+            if not part:
+                continue
+            if isinstance(current, dict):
+                current = current.get(part)
+            elif isinstance(current, list) and part.lstrip("-").isdigit():
+                try:
+                    current = current[int(part)]
+                except IndexError:
+                    return None
+            else:
+                return None
+            if current is None:
+                return None
+        return current
+
+    def _messaging_node(self, step: dict[str, Any]):
+        """Post to, read from, or clean up a chat provider.
+
+        One step type covers every provider: ``provider`` names an
+        implementation registered in ``app.infrastructure.messaging`` (``slack``
+        today), so adding WhatsApp or Teams later is a new provider class, not a
+        new step type.  Config:
+
+        ``action``   post | reply | history | thread | dm | delete
+        ``channel``  target channel id (post/reply/history/thread/delete)
+        ``text``     message body (post/reply/dm)
+        ``thread_id``root message id (reply/thread)
+        ``user_id``  DM recipient (dm) — the channel is opened on the fly
+        ``message_id`` message to delete (delete)
+        ``oldest`` / ``limit``  history window
+        ``items``    state path to a list of ``{thread_id, text}`` (reply), so one
+                     step can confirm N things without a loop construct
+        ``skip_if_replied``  do not post a reply whose exact text is already in
+                     the thread — the idempotency guard
+        ``ignore_errors``  capture a provider error under ``output_key`` instead
+                     of failing the run
+
+        Every string field is ``{state}``-templated like the other steps.  The
+        credential is never part of this config: the provider reads
+        ``SLACK_BOT_TOKEN`` from settings itself, and provider errors are
+        scrubbed of it before they can reach run state.
+        """
+        graph_id = self.id
+
+        async def node(state: dict) -> dict:
+            step_id = step["id"]
+            action = (step.get("action") or "post").lower()
+            provider_name = (step.get("provider") or "").strip() or None
+            output_key = step.get("output_key") or step_id
+            list_action = action in ("history", "thread")
+            try:
+                from app.infrastructure.messaging import MessagingError, get_provider
+
+                if action not in self._MESSAGING_ACTIONS:
+                    raise ValueError(
+                        f"step '{step_id}' has unknown messaging action '{action}' "
+                        f"(expected {' | '.join(self._MESSAGING_ACTIONS)})"
+                    )
+                provider = get_provider(provider_name)
+                channel = self._render(str(step.get("channel") or ""), state).strip()
+                text = self._render(str(step.get("text") or ""), state)
+                thread_id = self._render(str(step.get("thread_id") or ""), state).strip()
+
+                logger.info(
+                    "[%s] step '%s' running (%s %s channel=%s)",
+                    graph_id, step_id, provider.name, action, channel or "-",
+                )
+
+                if action == "post":
+                    self._need(step_id, "channel", channel)
+                    posted = await provider.post_message(channel, text)
+                    result: Any = posted.as_dict()
+
+                elif action == "reply":
+                    self._need(step_id, "channel", channel)
+                    result = await self._post_replies(step, state, provider, channel,
+                                                      thread_id, text)
+
+                elif action == "history":
+                    self._need(step_id, "channel", channel)
+                    oldest = self._render(str(step.get("oldest") or ""), state).strip()
+                    limit = self._render(str(step.get("limit") or ""), state).strip()
+                    messages = await provider.read_history(
+                        channel,
+                        oldest=oldest or None,
+                        limit=int(limit) if limit.isdigit() else None,
+                    )
+                    result = [m.as_dict() for m in messages]
+
+                elif action == "thread":
+                    self._need(step_id, "channel", channel)
+                    self._need(step_id, "thread_id", thread_id)
+                    messages = await provider.read_thread(channel, thread_id)
+                    result = [m.as_dict() for m in messages]
+
+                elif action == "dm":
+                    user_id = self._render(str(step.get("user_id") or ""), state).strip()
+                    self._need(step_id, "user_id", user_id)
+                    dm_channel = await provider.open_dm(user_id)
+                    posted = await provider.post_message(dm_channel, text)
+                    result = {**posted.as_dict(), "user_id": user_id}
+
+                else:  # delete
+                    self._need(step_id, "channel", channel)
+                    message_id = self._render(
+                        str(step.get("message_id") or ""), state
+                    ).strip()
+                    self._need(step_id, "message_id", message_id)
+                    await provider.delete_message(channel, message_id)
+                    result = {"deleted": True, "message_id": message_id,
+                              "channel": channel}
+
+                logger.info("[%s] step '%s' finished (%s)", graph_id, step_id, action)
+                return {output_key: result}
+            except Exception as exc:
+                logger.exception("[%s] step '%s' messaging failed", graph_id, step_id)
+                if step.get("ignore_errors"):
+                    # A provider being unreachable must not be able to take the
+                    # whole run down when the caller said so — the CSM watcher
+                    # reads its override channel this way, because refusing to
+                    # compute deadlines because Slack is down would trade a real
+                    # alarm for a missing one.
+                    return {output_key: [] if list_action else {"error": str(exc)}}
+                return {output_key: {"error": str(exc)}, "__failed_step__": step_id}
+
+        return node
+
+    @staticmethod
+    def _need(step_id: str, field: str, value: str) -> None:
+        if not value:
+            raise ValueError(f"step '{step_id}' needs a non-empty '{field}'")
+
+    @classmethod
+    async def _post_replies(
+        cls,
+        step: dict[str, Any],
+        state: dict,
+        provider: Any,
+        channel: str,
+        thread_id: str,
+        text: str,
+    ) -> dict[str, Any]:
+        """Post one thread reply, or a batch of them, skipping duplicates.
+
+        ``items`` names a state path holding a list of ``{thread_id, text}``
+        (``thread_ts`` is accepted as well, since that is what Slack calls it).
+        With ``skip_if_replied`` the thread is read first and a reply whose text
+        is already present is not posted again — that is what makes "confirm
+        each accepted override" safe to re-run, which the CSM watcher does every
+        morning over an overlapping 26-hour window.
+        """
+        raw_items = step.get("items")
+        if isinstance(raw_items, str) and raw_items.strip():
+            items = cls._state_path(state, raw_items.strip())
+        elif isinstance(raw_items, list):
+            items = cls._render_deep(raw_items, state)
+        else:
+            items = None
+
+        if items is None:
+            cls._need(step["id"], "thread_id", thread_id)
+            entries = [{"thread_id": thread_id, "text": text}]
+            batch = False
+        else:
+            if not isinstance(items, list):
+                raise ValueError(
+                    f"step '{step['id']}' items path '{raw_items}' is not a list"
+                )
+            entries = items
+            batch = True
+
+        skip_if_replied = bool(step.get("skip_if_replied"))
+        posted: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            entry_thread = str(entry.get("thread_id") or entry.get("thread_ts") or "")
+            entry_text = str(entry.get("text") or "")
+            if not entry_thread or not entry_text:
+                skipped.append({"thread_id": entry_thread, "reason": "incomplete"})
+                continue
+            if skip_if_replied:
+                existing = await provider.read_thread(channel, entry_thread)
+                # The root message is in the reply list too; comparing text
+                # rather than authorship keeps the check provider-neutral and
+                # deterministic, which is what makes it testable.
+                if any(m.text == entry_text and m.id != entry_thread for m in existing):
+                    skipped.append({"thread_id": entry_thread, "reason": "already_replied"})
+                    continue
+            sent = await provider.reply_in_thread(channel, entry_thread, entry_text)
+            posted.append({**sent.as_dict(), "thread_id": entry_thread})
+
+        if not batch:
+            if skipped:
+                return {"skipped": True, "reason": skipped[0]["reason"],
+                        "thread_id": thread_id}
+            return {**posted[0], "thread_id": thread_id}
+        return {"posted": posted, "skipped": skipped,
+                "posted_count": len(posted), "skipped_count": len(skipped)}
 
     def _storage_node(self, step: dict[str, Any]):
         """Read or write this workflow's own key/value storage.

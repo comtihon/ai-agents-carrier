@@ -122,6 +122,13 @@ EXPECTED_TOOL_PERMISSIONS: dict[str, Permission] = {
     "restart_from_step": Permission.WRITE,
     "approve_run": Permission.WRITE,
     "reject_run": Permission.WRITE,
+    # messaging — one shared provider abstraction behind both surfaces.  A
+    # delete is a delete even when the thing deleted lives in Slack.
+    "post_message": Permission.WRITE,
+    "read_messages": Permission.READ,
+    "read_thread": Permission.READ,
+    "send_direct_message": Permission.WRITE,
+    "delete_message": Permission.DELETE,
 }
 
 _RUN_CONTROL_TOOLS = {

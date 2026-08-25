@@ -31,6 +31,8 @@ _EXPECTED_TOOLS = {
     "delete_datasource", "import_datasource_schema",
     "create_datasource_from_schema", "add_datasource_operations_from_schema",
     "terminate_run", "retry_run", "restart_from_step", "approve_run", "reject_run",
+    "post_message", "read_messages", "read_thread", "send_direct_message",
+    "delete_message",
 }
 
 
@@ -98,7 +100,7 @@ async def test_registers_the_full_tool_set(mcp):
     _register(mcp, _Container())
     tools = await mcp.list_tools()
     assert {t.name for t in tools} == _EXPECTED_TOOLS
-    assert len(tools) == 37
+    assert len(tools) == 42
 
 
 async def test_ask_user_is_not_exposed_over_mcp(mcp):

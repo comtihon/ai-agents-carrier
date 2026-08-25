@@ -1469,3 +1469,114 @@ async def delete_datasource(deps: ManagementDeps, source_id: str) -> str:
     await deps.data_source_backend.delete(resolved)
     await _publish_datasources(deps)
     return f"Data source '{resolved}' deleted."
+
+
+# ---------------------------------------------------------------------------
+# Messaging tools
+#
+# The same provider abstraction the `slack` workflow step uses
+# (app.infrastructure.messaging), so a message posted by an operator over MCP
+# and one posted by a workflow step travel the identical code path.  The
+# credential is never a parameter: providers read it from settings, which is why
+# none of these take a token and none of them can be talked into using one.
+# ---------------------------------------------------------------------------
+
+_MESSAGING_PREVIEW_CHARS = 300
+
+
+def _messaging(provider: str = ""):
+    from app.infrastructure.messaging import get_provider
+
+    return get_provider(provider or None)
+
+
+def _render_messages(messages: list[Any]) -> str:
+    if not messages:
+        return "No messages."
+    lines = []
+    for message in messages:
+        text = (message.text or "").replace("\n", " ⏎ ")
+        if len(text) > _MESSAGING_PREVIEW_CHARS:
+            text = text[:_MESSAGING_PREVIEW_CHARS] + "…"
+        thread = f" [thread {message.thread_id}]" if message.thread_id else ""
+        lines.append(f"- {message.id} {message.author or 'unknown'}{thread}: {text}")
+    return "\n".join(lines)
+
+
+@requires(Permission.WRITE)
+async def post_message(
+    deps: ManagementDeps,
+    channel: str,
+    text: str,
+    thread_id: str = "",
+    provider: str = "slack",
+) -> str:
+    try:
+        posted = await _messaging(provider).post_message(
+            channel, text, thread_id=thread_id or None
+        )
+    except Exception as exc:  # noqa: BLE001 — a tool reports, it does not raise
+        return f"Could not post the message: {exc}"
+    where = f" in thread {thread_id}" if thread_id else ""
+    return f"Posted to {posted.channel}{where} as message {posted.id}."
+
+
+@requires(Permission.READ)
+async def read_messages(
+    deps: ManagementDeps,
+    channel: str,
+    limit: int = 20,
+    oldest: str = "",
+    provider: str = "slack",
+) -> str:
+    try:
+        messages = await _messaging(provider).read_history(
+            channel, oldest=oldest or None, limit=limit
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"Could not read the channel: {exc}"
+    return _render_messages(messages)
+
+
+@requires(Permission.READ)
+async def read_thread(
+    deps: ManagementDeps,
+    channel: str,
+    thread_id: str,
+    provider: str = "slack",
+) -> str:
+    try:
+        messages = await _messaging(provider).read_thread(channel, thread_id)
+    except Exception as exc:  # noqa: BLE001
+        return f"Could not read the thread: {exc}"
+    return _render_messages(messages)
+
+
+@requires(Permission.WRITE)
+async def send_direct_message(
+    deps: ManagementDeps,
+    user_id: str,
+    text: str,
+    provider: str = "slack",
+) -> str:
+    try:
+        messaging = _messaging(provider)
+        channel = await messaging.open_dm(user_id)
+        posted = await messaging.post_message(channel, text)
+    except Exception as exc:  # noqa: BLE001
+        return f"Could not send the direct message: {exc}"
+    return f"Direct message sent to {user_id} (channel {channel}, message {posted.id})."
+
+
+@requires(Permission.DELETE)
+async def delete_message(
+    deps: ManagementDeps,
+    channel: str,
+    message_id: str,
+    provider: str = "slack",
+) -> str:
+    try:
+        await _messaging(provider).delete_message(channel, message_id)
+    except Exception as exc:  # noqa: BLE001
+        return f"Could not delete the message: {exc}"
+    return f"Message {message_id} deleted from {channel}."
