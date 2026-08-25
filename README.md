@@ -431,6 +431,52 @@ POST /api/v1/callbacks/{run_id}/reject   body: {"reason": "..."}
   output_key: ticket
 ```
 
+### `slack` — post to / read from a chat provider
+
+One step type for every chat provider: `provider` names an implementation
+registered in `app.infrastructure.messaging` (`slack` today), so a second
+provider is a new `MessagingProvider` subclass plus a registry entry rather
+than a new step type.
+
+```yaml
+- id: read_commands            # action: post | reply | history | thread | dm | delete
+  type: slack
+  action: history
+  channel: "C0BLDDSEB1D"
+  oldest: "{window_start_ts}"  # history only — lower time bound
+  limit: 200                   # history only
+  output_key: slack_messages
+  ignore_errors: true          # capture the error under output_key instead
+                               #   of failing the run
+
+- id: confirm
+  type: slack
+  action: reply
+  channel: "C0BLDDSEB1D"
+  items: overrides.confirmations   # state path to a list of {thread_id, text}
+  skip_if_replied: true            # read the thread first; do not post a reply
+                                   #   whose text is already there
+  output_key: confirmed
+
+- id: warn_owner
+  type: slack
+  action: dm
+  user_id: "{owner_slack_id}"      # the DM channel is opened for you
+  text: "{board_warning}"
+  output_key: dm
+```
+
+There is **no token field**. The provider reads `SLACK_BOT_TOKEN` from the
+deployment's settings, so a credential never lives in a workflow definition, a
+data source or step config — and provider errors are scrubbed of it before they
+can reach run state.
+
+`post`/`reply`/`dm`/`delete` write `{message_id, channel}` (a batch `reply`
+writes `{posted, skipped, posted_count, skipped_count}`); `history`/`thread`
+write a list of `{id, channel, text, author, thread_id}`, which the Slack
+provider augments with its own `ts`/`user`/`thread_ts` names so scripts written
+against the Slack Web API keep working.
+
 ### `workflow` — spawn a child workflow
 
 ```yaml

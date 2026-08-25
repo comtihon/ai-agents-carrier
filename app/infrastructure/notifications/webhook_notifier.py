@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import re
 import string
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -29,9 +29,7 @@ def _slack(bot_token: str | None = None) -> SlackProvider:
 
     if bot_token:
         return SlackProvider(bot_token)
-    provider = get_provider("slack")
-    assert isinstance(provider, SlackProvider)
-    return provider
+    return cast(SlackProvider, get_provider("slack"))
 
 
 def _md_to_slack(text: str) -> str:
