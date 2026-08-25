@@ -162,7 +162,8 @@ def register_management_tools(
                 http_call (outbound HTTP), langgraph-agent, claude-agent,
                 data_source (invoke a DataSourceDefinition operation).
                 Example: [{"id": "trigger", "type": "http"}, {"id": "research", "type": "llm_structured", "system_prompt": "...", "output": [{"name": "summary", "type": "str", "description": "..."}]}]
-                Also available: storage (this workflow's own key/value state).
+                Also available: storage (this workflow's own key/value state),
+                slack (post/reply/read/DM/delete via a messaging provider).
             use_storage: Turn on this workflow's private key/value storage. Off by
                 default, and a `storage` step in a workflow that has it off fails
                 loudly rather than quietly not persisting -- so set it while
@@ -733,6 +734,81 @@ def register_management_tools(
         )
         return f"Run {run.id} rejected."
 
+    # ── messaging ───────────────────────────────────────────────────────────
+    #
+    # Same provider abstraction as the `slack` workflow step, so an operator
+    # posting from here and a workflow step posting from a run share one
+    # implementation.  No tool takes a credential: providers read theirs from
+    # settings.
+
+    async def post_message(channel: str, text: str, thread_id: str = "", provider: str = "slack") -> str:
+        """Post a message to a chat channel.
+
+        Call read_messages first when you need the channel's recent context.
+        The provider's credential comes from this deployment's settings, so
+        there is no token to pass and none is accepted.
+
+        Args:
+            channel: Channel id to post into (e.g. a Slack channel id).
+            text: Message body. The slack provider renders Slack mrkdwn.
+            thread_id: Post as a reply inside this thread instead of as a new
+                top-level message.
+            provider: Messaging provider name (default "slack").
+        """
+        return await core.post_message(deps(), channel, text, thread_id, provider)
+
+    async def read_messages(channel: str, limit: int = 20, oldest: str = "", provider: str = "slack") -> str:
+        """Read a chat channel's recent messages, newest first.
+
+        Args:
+            channel: Channel id to read.
+            limit: Maximum number of messages to return (default 20).
+            oldest: Only messages at or after this provider timestamp.
+            provider: Messaging provider name (default "slack").
+        """
+        return await core.read_messages(deps(), channel, limit, oldest, provider)
+
+    async def read_thread(channel: str, thread_id: str, provider: str = "slack") -> str:
+        """Read every message in one chat thread, the root message first.
+
+        Use this before replying to check whether the reply is already there,
+        so a re-run does not post it twice.
+
+        Args:
+            channel: Channel id the thread lives in.
+            thread_id: Id of the thread's root message.
+            provider: Messaging provider name (default "slack").
+        """
+        return await core.read_thread(deps(), channel, thread_id, provider)
+
+    async def send_direct_message(user_id: str, text: str, provider: str = "slack") -> str:
+        """Send a direct message to one user.
+
+        Opens (or reuses) the DM channel and posts there, so nothing reaches a
+        shared channel. This is the path for an alert that must not be
+        broadcast — a false all-clear in a shared channel is worse than a DM
+        nobody expected.
+
+        Args:
+            user_id: The provider's user id to send the DM to.
+            text: Message body.
+            provider: Messaging provider name (default "slack").
+        """
+        return await core.send_direct_message(deps(), user_id, text, provider)
+
+    async def delete_message(channel: str, message_id: str, provider: str = "slack") -> str:
+        """Permanently delete a message this platform posted.
+
+        Irreversible, and only works for messages the platform's own bot
+        created.
+
+        Args:
+            channel: Channel id the message is in.
+            message_id: Id of the message to delete.
+            provider: Messaging provider name (default "slack").
+        """
+        return await core.delete_message(deps(), channel, message_id, provider)
+
     handlers = [
         list_workflows, run_workflow, list_runs, get_run,
         create_workflow, update_workflow, delete_workflow,
@@ -744,6 +820,8 @@ def register_management_tools(
         list_events, get_event, create_event, update_event, delete_event,
         create_datasource_from_schema, add_datasource_operations_from_schema,
         terminate_run, retry_run, restart_from_step, approve_run, reject_run,
+        post_message, read_messages, read_thread, send_direct_message,
+        delete_message,
     ]
     for handler in handlers:
         mcp.add_tool(handler, name=handler.__name__)

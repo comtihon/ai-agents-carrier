@@ -7,7 +7,31 @@ from typing import Any
 
 import httpx
 
+from app.infrastructure.messaging.base import MessagingError
+from app.infrastructure.messaging.slack import (
+    SLACK_BLOCK_TEXT_LIMIT as _SLACK_BLOCK_TEXT_LIMIT,
+)
+from app.infrastructure.messaging.slack import SlackProvider, apply_thread_context
+
 logger = logging.getLogger(__name__)
+
+
+def _slack(bot_token: str | None = None) -> SlackProvider:
+    """The one Slack client in the backend.
+
+    ``bot_token`` is what the call sites already carry (a step-level override, or
+    ``settings.slack_bot_token``); passing ``None`` lets the provider resolve the
+    token from settings/env itself.  Either way the HTTP work, the error
+    handling and the token scrubbing live in
+    ``app.infrastructure.messaging.slack`` and nowhere else.
+    """
+    from app.infrastructure.messaging.registry import get_provider
+
+    if bot_token:
+        return SlackProvider(bot_token)
+    provider = get_provider("slack")
+    assert isinstance(provider, SlackProvider)
+    return provider
 
 
 def _md_to_slack(text: str) -> str:
@@ -23,10 +47,6 @@ def _render(template: str, ctx: dict) -> str:
         return string.Formatter().vformat(template, [], _DefaultDict(ctx))  # type: ignore[arg-type]
     except ValueError:
         return template
-
-
-# Slack section/input block text elements are capped at 3000 chars.
-_SLACK_BLOCK_TEXT_LIMIT = 2900
 
 
 def _truncate(value: str, limit: int = _SLACK_BLOCK_TEXT_LIMIT) -> str:
@@ -166,20 +186,15 @@ async def send_approval_notification(
     payload = await _render_value(notify.get("payload", {}), ctx, settings)
 
     # For Slack chat.postMessage: if a previous approval already created a thread,
-    # reply in that thread and tag whoever approved it.
+    # reply in that thread and tag whoever approved it.  The payload surgery is
+    # Slack knowledge, so it lives with the Slack provider — this stays the
+    # generic webhook sender it has always been (any url, method, auth).
     if "slack.com/api/chat.postMessage" in url:
-        thread_ts = state.get("_slack_thread_ts")
-        approver_id = state.get("_slack_approver_id") or ""
-        if thread_ts:
-            payload["thread_ts"] = thread_ts
-            if approver_id:
-                mention = f"<@{approver_id}> "
-                payload["text"] = mention + payload.get("text", "")
-                # Also prepend to the first mrkdwn section block so rich formatting includes it
-                for block in payload.get("blocks", []):
-                    if block.get("type") == "section" and isinstance(block.get("text"), dict):
-                        block["text"]["text"] = mention + block["text"].get("text", "")
-                        break
+        apply_thread_context(
+            payload,
+            state.get("_slack_thread_ts"),
+            state.get("_slack_approver_id") or "",
+        )
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -225,15 +240,9 @@ async def post_slack_thread_reply(
 ) -> None:
     """Post a plain text reply in an existing Slack thread."""
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                "https://slack.com/api/chat.postMessage",
-                headers={"Authorization": f"Bearer {bot_token}"},
-                json={"channel": channel, "thread_ts": thread_ts, "text": text},
-            )
-            data = response.json()
-            if not data.get("ok"):
-                logger.warning("Slack thread reply failed: %s", data.get("error"))
+        await _slack(bot_token).reply_in_thread(channel, thread_ts, text)
+    except MessagingError as exc:
+        logger.warning("Slack thread reply failed: %s", exc)
     except Exception:
         logger.exception("Failed to post Slack thread reply")
 
@@ -249,15 +258,9 @@ async def post_slack_thread_questions(
         return
     text = f"I need a bit more information to proceed:\n\n{_format_questions(questions)}"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                "https://slack.com/api/chat.postMessage",
-                headers={"Authorization": f"Bearer {bot_token}"},
-                json={"channel": channel, "thread_ts": thread_ts, "text": text},
-            )
-            data = response.json()
-            if not data.get("ok"):
-                logger.warning("Slack thread post failed: %s", data.get("error"))
+        await _slack(bot_token).reply_in_thread(channel, thread_ts, text)
+    except MessagingError as exc:
+        logger.warning("Slack thread post failed: %s", exc)
     except Exception:
         logger.exception("Failed to post ask_context questions to Slack thread")
 
@@ -281,23 +284,14 @@ async def post_slack_ask_context(
         f"Reply in this thread with {n} numbered answers, one per line."
     text = f"*Context needed for `{ticket_id}`*\n\n{_format_questions(questions)}\n\n_{hint}_"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                "https://slack.com/api/chat.postMessage",
-                headers={"Authorization": f"Bearer {bot_token}"},
-                json={"channel": channel, "text": text},
-            )
-            data = response.json()
-            if not data.get("ok"):
-                logger.warning("Slack ask_context post failed: %s", data.get("error"))
-                return None
-            return data
+        posted = await _slack(bot_token).post_message(channel, text)
+        return posted.raw
+    except MessagingError as exc:
+        logger.warning("Slack ask_context post failed: %s", exc)
+        return None
     except Exception:
         logger.exception("Failed to post ask_context questions to Slack")
         return None
-
-
-_SLACK_POSTMESSAGE_URL = "https://slack.com/api/chat.postMessage"
 
 
 async def post_slack_addon_notification(
@@ -314,7 +308,7 @@ async def post_slack_addon_notification(
       {request}      — user request from state
       {questions}    — formatted clarification questions (if any)
       Any other state key.
-    The URL is always ``https://slack.com/api/chat.postMessage``.
+    The message always goes out as ``chat.postMessage``.
     """
     import json as _json
     from app.core.config import get_settings
@@ -339,14 +333,8 @@ async def post_slack_addon_notification(
     payload = await _render_value(payload, ctx, settings)
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                _SLACK_POSTMESSAGE_URL,
-                headers={"Authorization": f"Bearer {bot_token}"},
-                json=payload,
-            )
-            data = response.json()
-            if not data.get("ok"):
-                logger.warning("run %s: slack addon notification failed: %s", run_id, data.get("error"))
+        await _slack(bot_token).post_payload(payload)
+    except MessagingError as exc:
+        logger.warning("run %s: slack addon notification failed: %s", run_id, exc)
     except Exception:
         logger.exception("run %s: failed to send slack addon notification", run_id)
