@@ -49,7 +49,7 @@ API at `http://localhost:8000`. Health check: `GET /health`.
 | `AUTH_READ_ROLES` | `[]` | Roles granted READ (`GET`/`HEAD`/`OPTIONS`, and the `list_*` / `get_*` tools) |
 | `AUTH_WRITE_ROLES` | `[]` | Roles granted WRITE (`POST`/`PUT`/`PATCH`, creates, updates, run control) |
 | `AUTH_DELETE_ROLES` | `[]` | Roles granted DELETE (`DELETE`, and the `delete_*` tools) |
-| `AUTH_ADMIN_ROLES` | `[]` | Roles granted ADMIN — python steps that run on the backend pod. Keep this narrowest |
+| `AUTH_ADMIN_ROLES` | `[]` | Roles granted ADMIN — `python` steps with `sandbox: false`, which run inside the backend process. Keep this narrowest |
 | `MANAGEMENT_MCP_API_KEY` | — | Static key for `/mcp/management`. Capped below ADMIN: a shared secret cannot be attributed to a person |
 | `OPENHANDS_BASE_URL` | `http://openhands:3000` | OpenHands service URL |
 | `OPENHANDS_API_KEY` | — | OpenHands auth token |
@@ -74,7 +74,7 @@ entirely configuration, so no deployment's role names live in this repository:
 | READ | read workflows, runs, definitions, data sources, traces |
 | WRITE | create, edit and run workflows; control runs |
 | DELETE | delete workflows, runs, agents, data sources |
-| ADMIN | python steps that execute on the backend pod (see [`python`](#python--python-script)) |
+| ADMIN | `python` steps with `sandbox: false`, which execute inside the backend process (see [`python`](#python--python-script)). Sandboxed steps, `local` included, need only WRITE |
 
 ADMIN is not "WRITE plus a bit": its blast radius is the backend process and
 every credential it holds, not the data.
@@ -572,9 +572,26 @@ returned the same way, so both must be JSON-serialisable.
 
 | runtime  | isolation |
 |----------|-----------|
-| `local`  | child `python -I -S` process: empty environment, no site-packages, throw-away cwd, CPU/memory rlimits, wall-clock timeout. Process-level only — no kernel namespaces. |
+| `local`  | child `python -I -S` process under a **seccomp-bpf allow-list**: the kernel refuses `openat`, `socket`, `execve`, `clone` and everything outside a compute-only syscall set. Plus empty environment, no site-packages, throw-away cwd, CPU/memory rlimits, wall-clock timeout. |
 | `docker` | throw-away container: networking disabled, read-only rootfs, no inherited env, memory limit, all capabilities dropped. |
 | `k8s`    | one-shot `Never`-restart pod: service-account token unmounted, read-only rootfs, resource limits, deleted after the run. |
+
+**Why the allow-list, and why `openat` is on the wrong side of it.** The
+in-interpreter controls (cleared `sys.meta_path`, a blocked-module list, a
+guarded `__import__`) live in the same interpreter as the code they filter, and
+reflection reaches around them — `().__class__.__mro__[1].__subclasses__()` is
+enough. The kernel filter is the actual boundary, and it goes up after every
+permitted stdlib module is resident, so nothing can be loaded from disk
+afterwards. A syscall filter cannot inspect a path, so the only way to stop a
+script reading the pod's service-account token is to refuse it every file: a
+script that reflects its way to `open` gets `PermissionError` from the kernel.
+
+The filter is mandatory. If it cannot be installed — a non-x86_64 host, a kernel
+without `CONFIG_SECCOMP_FILTER` — the sandbox refuses to run the script rather
+than running it unprotected.
+
+Because of this, a sandboxed `python` step needs only WRITE, on any runtime
+including `local`. Only `sandbox: false` still requires ADMIN.
 
 Set `sandbox: false` to keep the legacy behaviour — `exec` inside the backend
 process, with full access to its environment and libraries. Use it only for

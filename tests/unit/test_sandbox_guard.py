@@ -121,24 +121,42 @@ def test_writer_may_submit_an_isolated_step() -> None:
     )
 
 
-def test_writer_may_not_submit_a_step_that_runs_on_the_backend_pod() -> None:
-    """`local` — including the default — is a convenience guard, not a boundary:
-    the script shares the pod filesystem, so it can read the service-account
-    token with a plain `open()`. Letting WRITE have it would make ADMIN a
-    formality that any author walks around by leaving one field unset."""
+def test_writer_may_submit_a_sandboxed_step_on_any_known_runtime() -> None:
+    """`local` is a boundary now: the sandbox installs a seccomp allow-list
+    before the script runs, and the kernel refuses openat/socket/execve whatever
+    the interpreter is talked into. It no longer needs ADMIN — which is the
+    point, since a WRITE holder that can read a workflow in full could not
+    previously edit it at all."""
     for step in (
         {"id": "s", "type": "python"},
         {"id": "s", "type": "python", "sandbox": True},
         {"id": "s", "type": "python", "sandbox_runtime": "local"},
         {"id": "s", "type": "python", "sandbox_runtime": "LOCAL"},
-        {"id": "s", "type": "python", "sandbox_runtime": "nonsense"},
+        {"id": "s", "type": "python", "sandbox_runtime": "k8s"},
     ):
-        with pytest.raises(SandboxNotPermittedError):
-            assert_sandbox_allowed([step], WRITER)
+        assert_sandbox_allowed([step], WRITER)
+
+
+def test_writer_may_not_submit_an_unknown_runtime() -> None:
+    """Only runtimes whose isolation is known count. A typo must not read as
+    'isolated' merely because it is not the string 'false'."""
+    with pytest.raises(SandboxNotPermittedError):
+        assert_sandbox_allowed(
+            [{"id": "s", "type": "python", "sandbox_runtime": "nonsense"}], WRITER
+        )
+
+
+def test_sandbox_false_still_requires_admin() -> None:
+    """The one case left: exec inside the backend process, where there is no
+    boundary at all to put a filter behind."""
+    with pytest.raises(SandboxNotPermittedError):
+        assert_sandbox_allowed(
+            [{"id": "s", "type": "python", "sandbox": False}], WRITER
+        )
 
 
 def test_admin_may_submit_a_step_on_the_backend_pod() -> None:
-    assert_sandbox_allowed([{"id": "s", "type": "python"}], ADMIN)
+    assert_sandbox_allowed([{"id": "s", "type": "python", "sandbox": False}], ADMIN)
 
 
 def test_non_python_steps_are_never_gated() -> None:

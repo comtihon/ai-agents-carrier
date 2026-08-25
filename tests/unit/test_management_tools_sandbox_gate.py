@@ -127,15 +127,17 @@ async def test_refusal_is_returned_as_text_not_raised(deps) -> None:
 
 
 @pytest.mark.asyncio
-async def test_api_key_principal_cannot_create_a_step_on_the_default_runtime(
+async def test_api_key_principal_may_create_a_step_on_the_default_runtime(
     deps, backend
 ) -> None:
-    """A python step that names no runtime gets `local`, i.e. the backend pod."""
+    """A python step that names no runtime gets `local`, which the seccomp
+    allow-list makes a real boundary — so the MCP key can now author and edit
+    these workflows instead of being locked out of them."""
     set_current_permissions(API_KEY_PERMISSIONS)
 
     result = await management_tools.create_workflow(
         deps, "wf", "WF", "desc", json.dumps(DEFAULT_RUNTIME)
     )
 
-    assert "admin" in result.lower()
-    assert backend.created == []
+    assert "admin" not in result.lower()
+    assert [w.id for w in backend.created] == ["wf"]

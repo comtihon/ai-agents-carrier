@@ -94,10 +94,133 @@ _SANDBOX_STDLIB = (
     "_strptime", "_pydatetime", "_pydecimal", "_compat_pickle", "encodings.idna",
 )
 
+# ---------------------------------------------------------------------------
+# seccomp-bpf allow-list (x86_64)
+# ---------------------------------------------------------------------------
+# The in-interpreter deny-list below keeps an honest script from wandering off.
+# It is not a boundary: a deny-list lives in the same interpreter as the code it
+# filters, and reflection reaches around it (a str.format() chain is enough).
+# This is the boundary — the kernel refusing the syscall, whatever the
+# interpreter thinks.
+#
+# An ALLOW-list, so a syscall nobody thought about is denied rather than
+# forgotten. The set is what CPython needs to compute and to write its result to
+# stdout, and nothing else. Absent, and therefore refused:
+#
+#   openat/open/openat2   no filesystem at all — this is what stops a script
+#                         reading the pod's service-account token, which no
+#                         path-blind syscall filter could otherwise prevent
+#   socket/connect/…      no network
+#   execve/fork/clone     no processes
+#   ptrace/process_vm_*   no reaching into other processes
+#
+# Denial is EPERM rather than SIGSYS: a script that trips it gets a
+# PermissionError it can be debugged from, instead of dying without a word.
+_SECCOMP_ALLOWED_SYSCALLS = (
+    0,    # read
+    1,    # write
+    3,    # close
+    5,    # fstat
+    8,    # lseek
+    9,    # mmap
+    10,   # mprotect
+    11,   # munmap
+    12,   # brk
+    13,   # rt_sigaction
+    14,   # rt_sigprocmask
+    15,   # rt_sigreturn
+    16,   # ioctl        (isatty on the inherited fds)
+    24,   # sched_yield
+    25,   # mremap
+    28,   # madvise
+    32,   # dup
+    35,   # nanosleep
+    39,   # getpid
+    60,   # exit
+    63,   # uname
+    72,   # fcntl
+    79,   # getcwd
+    96,   # gettimeofday
+    131,  # sigaltstack
+    202,  # futex
+    219,  # restart_syscall
+    228,  # clock_gettime
+    229,  # clock_getres
+    230,  # clock_nanosleep   (time.sleep)
+    231,  # exit_group
+    262,  # newfstatat        (metadata on an already-open fd; opens nothing)
+    273,  # set_robust_list
+    302,  # prlimit64
+    318,  # getrandom         (random, secrets, hash seeding)
+    334,  # rseq
+)
+
+# Installed by the bootstrap once the interpreter is warm. Kept as source text
+# because the sandboxed interpreter runs with -S: it cannot import a helper from
+# site-packages, so the filter is built with ctypes from the stdlib instead of
+# libseccomp. ctypes itself is torn out of sys.modules immediately afterwards.
+_SECCOMP_INSTALL = f'''
+def _install_seccomp():
+    """Return None on success, or a string explaining why it could not install.
+
+    Imports nothing: it runs after the import machinery has been dismantled, so
+    it uses the ctypes/struct bound at the top of this bootstrap. os.uname()
+    rather than platform, to avoid needing one more module resident.
+    """
+    if os.uname().machine != "x86_64":
+        return "unsupported architecture %r" % os.uname().machine
+
+    AUDIT_ARCH_X86_64 = 0xC000003E
+    LD_W_ABS, JEQ_K, RET_K = 0x20, 0x15, 0x06
+    RET_ALLOW, RET_ERRNO, RET_KILL = 0x7FFF0000, 0x00050000, 0x80000000
+    EPERM = 1
+
+    allowed = {tuple(_SECCOMP_ALLOWED_SYSCALLS)!r}
+    n = len(allowed)
+
+    # arch guard first: syscall numbers are meaningless without it, so a
+    # mismatched personality is killed rather than filtered by the wrong table.
+    ins = [
+        (LD_W_ABS, 0, 0, 4),                     # load arch
+        (JEQ_K, 0, n + 3, AUDIT_ARCH_X86_64),    # wrong arch -> KILL
+        (LD_W_ABS, 0, 0, 0),                     # load syscall nr
+    ]
+    for i, nr in enumerate(allowed):
+        ins.append((JEQ_K, n - i, 0, nr))        # match -> ALLOW
+    ins.append((RET_K, 0, 0, RET_ERRNO | EPERM))  # fall-through -> EPERM
+    ins.append((RET_K, 0, 0, RET_ALLOW))
+    ins.append((RET_K, 0, 0, RET_KILL))
+
+    blob = b"".join(struct.pack("HBBI", *x) for x in ins)
+    # Both buffers must outlive the prctl call; keep them referenced until it
+    # returns, or the kernel reads freed memory.
+    buf = ctypes.create_string_buffer(blob, len(blob))
+    prog = struct.pack("HxxxxxxP", len(ins), ctypes.addressof(buf))
+
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    except OSError as exc:
+        return "libc not loadable: %s" % exc
+
+    # no_new_privs is what lets an unprivileged process install a filter at all.
+    if libc.prctl(38, 1, 0, 0, 0) != 0:
+        return "PR_SET_NO_NEW_PRIVS failed (errno %d)" % ctypes.get_errno()
+    if libc.prctl(22, 2, ctypes.c_char_p(prog), 0, 0) != 0:
+        return "PR_SET_SECCOMP failed (errno %d)" % ctypes.get_errno()
+    return None
+'''
+
+
 # Executed by the sandboxed interpreter.  argv[1] is "-" (read payload from
 # stdin) or a path to a JSON payload file.
 _BOOTSTRAP = f'''
-import base64, builtins, json, os, sys
+# ctypes is imported here, at the top, because the seccomp filter is built with
+# it *after* the import machinery has been torn down -- by then nothing new can
+# be loaded. It is dropped from sys.modules again once the filter is up, and it
+# never reaches the script's namespace.
+import base64, builtins, ctypes, json, os, struct, sys
+
+{_SECCOMP_INSTALL}
 
 _arg = sys.argv[1] if len(sys.argv) > 1 else "-"
 _raw = sys.stdin.read() if _arg == "-" else open(_arg, "r", encoding="utf-8").read()
@@ -147,6 +270,23 @@ def _guarded_import(name, *args, **kwargs):
 
 
 builtins.__import__ = _guarded_import
+
+# The kernel boundary goes up last, once every module the script may use is
+# resident: the filter denies openat, so nothing can be loaded from disk after
+# this point -- including the .py files of a stdlib module imported lazily.
+#
+# Refusing to run is the only honest failure here. A script that ran unfiltered
+# because the filter would not install is exactly the situation the caller was
+# told could not happen, and `local` is only a WRITE-level runtime because this
+# succeeds.
+_seccomp_error = _install_seccomp()
+if _seccomp_error is not None:
+    sys.stderr.write("sandbox: refusing to run, seccomp unavailable: %s\\n" % _seccomp_error)
+    raise SystemExit(3)
+
+# ctypes was the means of installing the filter; it is not for the script.
+sys.modules.pop("ctypes", None)
+sys.modules.pop("_ctypes", None)
 
 # One namespace for globals AND locals. Passing two made every top-level `def`
 # bind into locals while its body resolved names against globals, so any script

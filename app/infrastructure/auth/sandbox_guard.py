@@ -1,22 +1,26 @@
-"""Authorization gate for `python` workflow steps that are not isolated.
+"""Authorization gate for `python` workflow steps that run unsandboxed.
 
 A `python` step with ``sandbox: false`` is ``exec``'d inside the backend process,
 next to the Mongo URI, every LLM key, the service-auth private key and the pod's
 cloud identity. It is not a data-level privilege — it is code execution in the
-backend, so it needs ADMIN rather than WRITE.
+backend, so it needs ADMIN rather than WRITE. That is the whole of what this
+gate now covers.
 
-``sandbox_runtime: local`` — which is also what a step gets when it names no
-runtime — is the same privilege wearing a different hat. It runs the script in a
-child ``python -I -S`` process of the backend pod: the environment is cleared and
-imports are filtered, but the process shares the pod's filesystem, so the script
-can simply ``open()`` the mounted Kubernetes service-account token, and the import
-filter is a deny-list in the same interpreter as the code it filters (a script
-that loads a module through the loader machinery instead of ``import`` is outside
-it). It keeps an honest script from touching the backend by accident; it does not
-keep a hostile one out. Only the ``docker`` and ``k8s`` runtimes put a kernel
-boundary in the way, so those are what WRITE may submit, and anything else needs
-ADMIN — otherwise the ADMIN tier would be a formality that any WRITE holder walks
-around by leaving one field unset.
+``sandbox_runtime: local`` used to need ADMIN too, and no longer does. It once
+shared the backend pod with nothing but an in-interpreter deny-list in the way,
+which reflection walks around — a ``str.format()`` chain is enough to reach a
+class the deny-list never removed. The sandbox now installs a seccomp-bpf
+allow-list before any script runs (see ``script_sandbox._SECCOMP_INSTALL``), and
+the kernel refuses ``openat``, ``socket``, ``execve``, ``clone`` and everything
+else outside a compute-only set, whatever the interpreter thinks. Denying
+``openat`` outright is what closes the case a syscall filter cannot otherwise
+reach: a filter cannot inspect a path, so the only way to stop a script reading
+the pod's service-account token is to refuse it every file. A script that
+reflects its way to ``open`` now gets ``PermissionError`` from the kernel.
+
+The filter is mandatory: if it cannot be installed the sandbox refuses to run
+the script at all, so ``local`` cannot silently degrade to the old behaviour.
+That is what makes it safe for WRITE.
 
 The check lives here, apart from any transport, because there is more than one way
 to write a workflow definition (the REST API and the management MCP today). A gate
@@ -28,9 +32,10 @@ from typing import Any, Iterable
 
 from app.infrastructure.auth.authorization import Permission
 
-# Sandbox runtimes that isolate the script with something the script itself cannot
-# reach around: a container, or a pod with the service-account token unmounted.
-ISOLATED_RUNTIMES = frozenset({"docker", "k8s"})
+# Sandbox runtimes that isolate the script with something it cannot reach around:
+# a container, a pod with the service-account token unmounted, or -- since the
+# seccomp allow-list -- the kernel refusing the syscalls in-process.
+ISOLATED_RUNTIMES = frozenset({"local", "docker", "k8s"})
 
 
 class SandboxNotPermittedError(PermissionError):
@@ -44,10 +49,11 @@ class SandboxNotPermittedError(PermissionError):
         super().__init__(
             f"Python steps that are not isolated require admin permission "
             f"(steps: {listed}). " + (f"{detail}. " if detail else "")
-            + "Such a step runs on the backend pod, with access to its credentials "
-            "and its service-account token. Set 'sandbox_runtime: k8s' (or 'docker') "
-            "and leave 'sandbox' unset to run isolated, or have an administrator "
-            "submit this workflow."
+            + "Such a step runs inside the backend process, with access to its "
+            "credentials and its service-account token. Leave 'sandbox' unset to "
+            "run isolated -- every sandbox runtime, 'local' included, is enforced "
+            "by a seccomp allow-list -- or have an administrator submit this "
+            "workflow."
         )
 
 
@@ -111,9 +117,9 @@ def find_unsandboxed_python_steps(definition: Any) -> list[str]:
 def find_admin_only_python_steps(definition: Any) -> dict[str, str]:
     """``{step_id: reason}`` for python steps that WRITE alone may not submit.
 
-    Two cases, one privilege: the step opts out of the sandbox entirely, or it
-    asks for (or defaults to) the ``local`` runtime, which shares the backend
-    pod. See the module docstring for why the second is not a lesser case.
+    One case now: the step opts out of the sandbox entirely. Every sandbox
+    runtime — including ``local``, and including the ``local`` a step gets by
+    naming no runtime — is a real boundary; see the module docstring.
     """
     offending: dict[str, str] = {}
     for step in _steps_of(definition):
@@ -126,10 +132,9 @@ def find_admin_only_python_steps(definition: Any) -> dict[str, str]:
             continue
         runtime = str(step.get("sandbox_runtime") or "local").strip().lower()
         if runtime not in ISOLATED_RUNTIMES:
-            named = "sandbox_runtime" if step.get("sandbox_runtime") else "no runtime"
             offending[_step_id(step)] = (
-                f"{named} '{runtime}' runs the code on the backend pod, which is not "
-                "an isolation boundary"
+                f"sandbox_runtime '{runtime}' is not a known isolated runtime "
+                f"(expected one of: {', '.join(sorted(ISOLATED_RUNTIMES))})"
             )
     return offending
 
