@@ -80,10 +80,16 @@ class WorkflowDefinitionUpdateRequest(BaseModel):
     description: str = ""
     steps: list[dict[str, Any]] = []
     ui: dict[str, Any] = Field(default_factory=dict)
-    use_meta_llm: bool = True
-    use_storage: bool = False
-    # None (field omitted) keeps the stored value, so a client that predates the
-    # flag cannot silently re-enable a workflow by PUTting a full definition.
+    # None (field omitted) keeps the stored value for every flag below, so a
+    # client that predates a flag cannot silently reset it by PUTting a full
+    # definition. There is no partial-update route — PUT replaces the whole
+    # definition — so a hand-assembled payload that forgets one field would
+    # otherwise turn that feature off behind the user's back. That is not
+    # hypothetical: the UI's update call omitted `use_storage`, so every save
+    # from the editor switched a workflow's storage back off, and the checkbox
+    # appeared not to stick.
+    use_meta_llm: bool | None = None
+    use_storage: bool | None = None
     enabled: bool | None = None
 
 
@@ -897,8 +903,12 @@ async def update_workflow(
         description=body.description,
         steps=body.steps,
         ui=body.ui,
-        use_meta_llm=body.use_meta_llm,
-        use_storage=body.use_storage,
+        use_meta_llm=(
+            existing.use_meta_llm if body.use_meta_llm is None else body.use_meta_llm
+        ),
+        use_storage=(
+            existing.use_storage if body.use_storage is None else body.use_storage
+        ),
         enabled=existing.enabled if body.enabled is None else body.enabled,
         created_at=existing.created_at,
     )
