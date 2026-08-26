@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from datetime import timedelta
-from typing import Any
+from typing import Any, Literal
 
 import anyio
 from fastapi import APIRouter, Depends, HTTPException
@@ -112,12 +112,28 @@ async def list_mcp_integrations():
 
 @router.get("")
 async def list_agents(
+    view: Literal["full", "summary"] = "full",
     container: ApplicationContainer = Depends(get_container),
 ):
-    """List all registered agent definitions."""
+    """List all registered agent definitions.
+
+    ``view=summary`` leaves out ``agent_input`` (which carries the system
+    prompt), ``helm_values`` and ``addons`` -- everything a list of agents does
+    not draw.  Default stays ``full``.
+    """
     _require_backend(container)
     assert container.agent_backend is not None
     agents = await container.agent_backend.list()
+    if view == "summary":
+        return [
+            {
+                "id": a.id,
+                "name": a.name,
+                "description": a.description,
+                "default_runtime": a.default_runtime,
+            }
+            for a in agents
+        ]
     return [a.model_dump(mode="json") for a in agents]
 
 

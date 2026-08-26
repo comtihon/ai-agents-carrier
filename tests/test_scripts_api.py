@@ -108,6 +108,25 @@ async def test_create_get_list_update_delete_roundtrip(client):
     assert await backend.get("sum-items") is None
 
 
+async def test_summary_view_omits_the_code(client):
+    """The library panel and the node picker draw a list from name/description.
+
+    Sending every Python body along with it was the largest response this API
+    served, so ``view=summary`` drops ``code`` -- the editor fetches it from
+    ``GET /scripts/{id}`` when a script is actually opened.
+    """
+    c, _ = client
+    await c.post("/api/v1/scripts", json={
+        "name": "Sum Items", "description": "adds them up", "code": "output = 1",
+    })
+
+    summary = (await c.get("/api/v1/scripts", params={"view": "summary"})).json()
+
+    assert summary == [{"id": "sum-items", "name": "Sum Items", "description": "adds them up"}]
+    # The default is unchanged, so nothing that relied on the full list breaks.
+    assert (await c.get("/api/v1/scripts")).json()[0]["code"] == "output = 1"
+
+
 async def test_create_with_existing_name_conflicts_until_overwrite(client):
     c, backend = client
 

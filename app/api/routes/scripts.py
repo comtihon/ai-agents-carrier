@@ -8,6 +8,7 @@ overwrite, and the retry carries ``overwrite: true``.
 from __future__ import annotations
 
 import logging
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -54,13 +55,26 @@ def _require_backend(container: ApplicationContainer) -> None:
 
 @router.get("")
 async def list_scripts(
+    view: Literal["full", "summary"] = "full",
     container: ApplicationContainer = Depends(get_container),
 ):
-    """List every script in the library."""
+    """List every script in the library.
+
+    ``view=summary`` leaves out ``code``, which is the whole weight of a script.
+    Both callers that render a list of scripts -- the library panel and the
+    python-node picker -- show nothing but id/name/description, so the full view
+    was shipping every Python body in the library to draw a dropdown.  Default
+    stays ``full`` so existing clients are unaffected.
+    """
     _require_backend(container)
     assert container.script_backend is not None
     scripts = await container.script_backend.list()
     scripts.sort(key=lambda s: (s.name or s.id).lower())
+    if view == "summary":
+        return [
+            {"id": s.id, "name": s.name, "description": s.description}
+            for s in scripts
+        ]
     return [s.model_dump(mode="json") for s in scripts]
 
 

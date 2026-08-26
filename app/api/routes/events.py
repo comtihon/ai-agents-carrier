@@ -14,7 +14,7 @@ event instead.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ValidationError
@@ -86,12 +86,28 @@ async def _reject_duplicate_name(
 
 @router.get("")
 async def list_events(
+    view: Literal["full", "summary"] = "full",
     container: ApplicationContainer = Depends(get_container),
 ):
-    """List all registered events."""
+    """List all registered events.
+
+    ``view=summary`` leaves out ``event_schema``, which dominates the payload --
+    a list of events is drawn from name/topic alone, and the schema is only
+    needed once one event is opened.  Default stays ``full``.
+    """
     _require_backend(container)
     assert container.event_backend is not None
     events = await container.event_backend.list()
+    if view == "summary":
+        return [
+            {
+                "id": e.id,
+                "name": e.name,
+                "description": e.description,
+                "topic": e.topic,
+            }
+            for e in events
+        ]
     return [e.model_dump(mode="json") for e in events]
 
 

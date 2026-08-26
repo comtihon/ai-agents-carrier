@@ -121,6 +121,27 @@ async def test_listing_returns_every_event(client):
     assert {e["id"] for e in listed.json()} == {"orders-events", "shipments"}
 
 
+async def test_summary_view_omits_the_event_schema(client):
+    """A list of events is drawn from name and topic; the schema is not read
+    until one is opened, and it is the bulk of the definition."""
+    c, _ = client
+    await c.post("/api/v1/events", json=_payload())
+
+    summary = (await c.get("/api/v1/events", params={"view": "summary"})).json()
+
+    assert summary == [{
+        "id": "orders-events",
+        "name": summary[0]["name"],
+        "description": summary[0]["description"],
+        "topic": "orders",
+    }]
+    assert "event_schema" not in summary[0]
+    # Default view is unchanged.
+    assert (await c.get("/api/v1/events")).json()[0]["event_schema"] == {
+        "type": "object", "required": ["order_id"],
+    }
+
+
 async def test_getting_an_unknown_event_is_a_404(client):
     c, _ = client
     assert (await c.get("/api/v1/events/nope")).status_code == 404
