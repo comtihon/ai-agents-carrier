@@ -199,7 +199,7 @@ def build_default_workflow(
     @tool
     async def create_workflow(
         workflow_id: str, name: str, description: str, steps_json: str,
-        use_storage: bool = False, enabled: bool = True,
+        use_storage: bool = False, enabled: bool = True, use_meta_llm: bool = True,
     ) -> str:
         """Create a new workflow definition and register it immediately.
 
@@ -221,6 +221,10 @@ def build_default_workflow(
                 default, and a `storage` step in a workflow that has it off fails
                 loudly rather than quietly not persisting -- so set it while
                 creating, not afterwards.
+            use_meta_llm: Whether the workflow may use the meta-LLM. On by
+                default. Turn it off for a workflow that must stay fully
+                deterministic -- a scheduled watchdog whose verdict is computed
+                in `python` steps has no use for it.
             enabled: Pass False to create the workflow already disabled. A
                 workflow carrying a `cron` or `pubsub` trigger is eligible to fire
                 as soon as it is registered, so one that is not ready yet must be
@@ -228,7 +232,7 @@ def build_default_workflow(
         """
         return await core.create_workflow(
             deps, workflow_id, name, description, steps_json,
-            use_storage=use_storage, enabled=enabled,
+            use_storage=use_storage, enabled=enabled, use_meta_llm=use_meta_llm,
         )
 
     @tool
@@ -239,6 +243,7 @@ def build_default_workflow(
         steps_json: str = "",
         enabled: bool | None = None,
         use_storage: bool | None = None,
+        use_meta_llm: bool | None = None,
     ) -> str:
         """Update an existing workflow definition (name, description, steps, enabled).
 
@@ -249,6 +254,10 @@ def build_default_workflow(
             steps_json: JSON array replacing ALL steps (omit to keep current).
             enabled: False disables the workflow — every trigger and every manual
                 start is refused until it is set back to True. Omit to keep current.
+            use_storage: Turn this workflow's private key/value storage on or off.
+                Omit to keep current. A `storage` step in a workflow that has it
+                off fails loudly rather than quietly not persisting.
+            use_meta_llm: Turn the meta-LLM on or off. Omit to keep current.
         """
         # Annotated `str`, not `str | None`, to stay identical to the MCP tool
         # of the same name (the surfaces are asserted to match): FastMCP
@@ -257,7 +266,7 @@ def build_default_workflow(
         # Empty string means "omitted".
         return await core.update_workflow(
             deps, workflow_id, name, description, steps_json or None, enabled,
-            use_storage,
+            use_storage, use_meta_llm,
         )
 
     @tool
