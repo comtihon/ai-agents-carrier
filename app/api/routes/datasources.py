@@ -25,7 +25,7 @@ time and stored like any other secret, so the caller never handles it.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
@@ -261,12 +261,36 @@ async def _refresh_datasource_tools(container: ApplicationContainer) -> None:
 
 @router.get("")
 async def list_datasources(
+    view: Literal["full", "summary"] = "full",
     container: ApplicationContainer = Depends(get_container),
 ):
-    """List all registered data source definitions (auth secrets redacted)."""
+    """List all registered data source definitions (auth secrets redacted).
+
+    ``view=summary`` keeps each operation's name and method -- the list view
+    needs the methods to aggregate a risk badge -- and drops the rest of the
+    operation: path, query, params, response_schema, pagination.  Those schemas
+    are the bulk of a source (one imported OpenAPI spec can carry dozens of
+    operations), and none of them is read until a source is opened.  ``auth`` is
+    dropped too rather than redacted, so a summary carries no secret shape at
+    all.  Default stays ``full``.
+    """
     _require_backend(container)
     assert container.data_source_backend is not None
     sources = await container.data_source_backend.list()
+    if view == "summary":
+        return [
+            {
+                "id": s.id,
+                "name": s.name,
+                "description": s.description,
+                "kind": s.kind,
+                "base_url": s.base_url,
+                "operations": [
+                    {"name": op.name, "method": op.method} for op in s.operations
+                ],
+            }
+            for s in sources
+        ]
     return [_redact_secrets(s.model_dump(mode="json")) for s in sources]
 
 

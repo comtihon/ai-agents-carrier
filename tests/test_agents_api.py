@@ -107,6 +107,27 @@ async def test_put_without_addons_preserves_existing_addons(client):
 
 
 @pytest.mark.asyncio
+async def test_summary_view_omits_agent_input_and_addons(client):
+    """A list of agents shows name/description/runtime.  ``agent_input`` carries
+    the system prompt and ``addons`` the tool wiring; neither is drawn, so
+    ``view=summary`` leaves them out and the editor fetches the full agent."""
+    c, _ = client
+
+    summary = (await c.get("/api/v1/agents", params={"view": "summary"})).json()
+
+    assert summary == [{
+        "id": "researcher",
+        "name": "Researcher",
+        "description": None,
+        "default_runtime": "local",
+    }]
+    # Default view is unchanged.
+    full = (await c.get("/api/v1/agents")).json()[0]
+    assert full["agent_input"]["system_prompt"] == "old prompt"
+    assert len(full["addons"]) == 2
+
+
+@pytest.mark.asyncio
 async def test_put_with_explicit_empty_addons_clears_them(client):
     c, backend = client
     resp = await c.put(

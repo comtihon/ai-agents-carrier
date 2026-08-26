@@ -140,6 +140,30 @@ async def test_list_and_get_redact_auth_secrets(client):
     assert fetched["auth"] == {"type": "bearer", "token": "********"}
 
 
+async def test_summary_view_keeps_operation_methods_and_drops_the_rest(client):
+    """The list view aggregates a risk badge over every operation's method, so a
+    summary has to keep name+method -- but not the paths, params or response
+    schemas, which are what make an imported OpenAPI source large.  ``auth`` is
+    dropped outright rather than redacted: a summary carries no secret shape."""
+    c, _ = client
+    await c.post("/api/v1/datasources", json=_payload())
+
+    summary = (await c.get("/api/v1/datasources", params={"view": "summary"})).json()
+
+    assert summary == [{
+        "id": "github",
+        "name": "GitHub",
+        "description": None,
+        "kind": "http",
+        "base_url": "https://api.github.com",
+        "operations": [{"name": "list_repos", "method": "GET"}],
+    }]
+    # Default view is unchanged, secrets still redacted.
+    full = (await c.get("/api/v1/datasources")).json()[0]
+    assert full["auth"] == {"type": "bearer", "token": "********"}
+    assert full["operations"][0]["path"] == "/users/{params.owner}/repos"
+
+
 async def test_update_with_redacted_secret_preserves_stored_value(client):
     c, backend = client
     await c.post("/api/v1/datasources", json=_payload())
