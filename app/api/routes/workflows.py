@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from app.api.dependencies import get_container
 from app.application.script_capture import capture_inline_scripts
+from app.application.step_normalization import declared_edges, implicit_edges, normalize_edges
 from app.application import run_control
 # _config is defined in run_control (the shared run-control layer); imported here
 # rather than duplicated. The dependency direction is workflows -> run_control.
@@ -578,7 +579,7 @@ async def create_workflow(
         id=body.id,
         name=body.name,
         description=body.description,
-        steps=body.steps,
+        steps=normalize_edges(body.steps),
         ui=body.ui,
         use_meta_llm=body.use_meta_llm,
         use_storage=body.use_storage,
@@ -872,6 +873,47 @@ async def get_workflow(
     return defn.model_dump(mode="json")
 
 
+@router.get("/{workflow_id}/graph")
+async def get_workflow_graph(
+    workflow_id: str,
+    container: ApplicationContainer = Depends(get_container),
+):
+    """The workflow as a graph: nodes, edges, and which edges nobody declared.
+
+    One authority on what a definition means. Reading the edges off a step list
+    means applying the fall-through rule, and every place that did so was a
+    place it could be applied differently — which is how the canvas came to draw
+    a graph the engine did not run. Definitions saved since normalisation state
+    every edge outright, so for those this is simply what is stored; for one
+    written earlier, `implicit_edges` names what step order is contributing.
+    """
+    _require_backend(container)
+    assert container.workflow_backend is not None
+
+    defn = await container.workflow_backend.get(workflow_id)
+    if defn is None:
+        raise HTTPException(status_code=404, detail=f"Workflow '{workflow_id}' not found")
+
+    stored = defn.steps or []
+    normalized = normalize_edges(stored)
+    return {
+        "id": workflow_id,
+        "nodes": [
+            {"id": s.get("id"), "type": s.get("type"), "name": s.get("name") or s.get("id")}
+            for s in normalized
+            if isinstance(s, dict) and s.get("id")
+        ],
+        "edges": [
+            {"source": src, "target": dst}
+            for src, dst in sorted(declared_edges(normalized))
+        ],
+        "implicit_edges": [
+            {"source": src, "target": dst}
+            for src, dst in implicit_edges(stored)
+        ],
+    }
+
+
 @router.put("/{workflow_id}")
 async def update_workflow(
     workflow_id: str,
@@ -901,7 +943,7 @@ async def update_workflow(
         id=workflow_id,
         name=body.name,
         description=body.description,
-        steps=body.steps,
+        steps=normalize_edges(body.steps),
         ui=body.ui,
         use_meta_llm=(
             existing.use_meta_llm if body.use_meta_llm is None else body.use_meta_llm

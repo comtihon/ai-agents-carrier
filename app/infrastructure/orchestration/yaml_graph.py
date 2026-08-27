@@ -24,6 +24,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
+from app.application.step_normalization import normalize_edges
 from app.domain.models.graph_run import GraphRun
 from app.infrastructure.tools.mcp_client import McpToolsProvider
 
@@ -886,7 +887,14 @@ class YamlGraphRunner:
         # Read off the definition (not post-construction like readonly) so runners
         # built straight from a YAML dict carry the flag too. Absent means enabled.
         self.enabled: bool = bool(definition.get("enabled", True))
-        self._steps: list[dict[str, Any]] = definition["steps"]
+        # Resolve implicit fall-through into an explicit `next`/`targets` up
+        # front, so array position stops being load-bearing below this line.
+        # Every construction path — stored definition, on-disk YAML, a raw dict
+        # in a test — arrives here, so this is the one place that has to do it.
+        # Behaviour is unchanged: normalisation writes down the destination the
+        # edge builder would have picked anyway, which is why the positional
+        # branches further down survive as an unreachable belt-and-braces.
+        self._steps: list[dict[str, Any]] = normalize_edges(definition["steps"])
         self._llm = llm
         self._llm_factory = llm_factory
         self._mcp = mcp_tools_provider
