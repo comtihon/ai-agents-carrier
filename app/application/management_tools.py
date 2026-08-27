@@ -498,6 +498,25 @@ def _sandbox_denial(steps: Any) -> str | None:
     return None
 
 
+def _implicit_edge_note(edges: list[tuple[str, str]]) -> str:
+    """Name the edges that came from step order rather than from a `next`.
+
+    A step that declares no destination falls through to the next one in the
+    array, so a step list can mean more than it says. Writing those edges out is
+    normalisation's job; saying so is this note's, because an author who did not
+    intend one has no other way to notice — that silence is what let a workflow
+    wire its own tail into a branch and post the same digest eleven times.
+    """
+    if not edges:
+        return ""
+    return (
+        " Note: step order implied "
+        + ", ".join(f"{src} → {dst}" for src, dst in edges)
+        + ". These are now explicit `next` values; set `next: END` on a step that"
+        " should terminate instead."
+    )
+
+
 def _captured_note(captured: list[str]) -> str:
     """Tell the model which python bodies became library scripts.
 
@@ -587,8 +606,11 @@ async def create_workflow(
         return f"Workflow '{workflow_id}' already exists. Use update_workflow to modify it."
 
     from app.application.script_capture import capture_inline_scripts
+    from app.application.step_normalization import implicit_edges, normalize_edges
     from app.domain.models.workflow_definition import WorkflowDefinition
     captured = await capture_inline_scripts(workflow_id, steps, deps.script_backend)
+    implied = implicit_edges(steps)
+    steps = normalize_edges(steps)
     defn = WorkflowDefinition(
         id=workflow_id, name=name, description=description, steps=steps,
         use_storage=use_storage, enabled=enabled, use_meta_llm=use_meta_llm,
@@ -603,6 +625,7 @@ async def create_workflow(
     return (
         f"Workflow '{workflow_id}' created with {len(steps)} step(s)."
         + state_note + storage_note + _captured_note(captured)
+        + _implicit_edge_note(implied)
     )
 
 
@@ -631,6 +654,7 @@ async def update_workflow(
         return f"Workflow '{workflow_id}' is read-only and cannot be modified."
 
     captured: list[str] = []
+    implied: list[tuple[str, str]] = []
     if name is not None:
         defn.name = name
     if description is not None:
@@ -652,14 +676,19 @@ async def update_workflow(
         if denied:
             return denied
         from app.application.script_capture import capture_inline_scripts
+        from app.application.step_normalization import implicit_edges, normalize_edges
         captured = await capture_inline_scripts(workflow_id, steps, deps.script_backend)
-        defn.steps = steps
+        implied = implicit_edges(steps)
+        defn.steps = normalize_edges(steps)
 
     await deps.workflow_backend.update(workflow_id, defn)
     if deps.refresh_runner is not None:
         await deps.refresh_runner(workflow_id)
     state_note = "" if defn.enabled else " It is disabled and will not start."
-    return f"Workflow '{workflow_id}' updated." + state_note + _captured_note(captured)
+    return (
+        f"Workflow '{workflow_id}' updated." + state_note + _captured_note(captured)
+        + _implicit_edge_note(implied)
+    )
 
 
 @requires(Permission.DELETE)
