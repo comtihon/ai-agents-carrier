@@ -190,6 +190,15 @@ def register_management_tools(
                 workflow carrying a `cron` or `pubsub` trigger is eligible to fire
                 as soon as it is registered, so one that is not ready yet must be
                 created disabled rather than disabled in a second call.
+
+        Canvas positions are computed from the graph -- a layered left-to-right
+        layout where a `parallel` sits centred against its branches and a `join`
+        against the branches arriving at it. Do not try to place nodes by hand;
+        there is no parameter for it, and step order in the array is not a layout
+        hint. Order the array for reading (trigger first, then the flow), and
+        write the wiring explicitly with `next` / `routes` / `targets` -- a step
+        that declares nothing falls through to the next array entry, and a graph
+        laid out from edges shows exactly what that produced.
         """
         return await core.create_workflow(
             deps(), workflow_id, name, description, steps_json,
@@ -204,6 +213,7 @@ def register_management_tools(
         enabled: bool | None = None,
         use_storage: bool | None = None,
         use_meta_llm: bool | None = None,
+        relayout: bool = False,
     ) -> str:
         """Update an existing workflow definition (name, description, steps, enabled).
 
@@ -218,6 +228,12 @@ def register_management_tools(
                 Omit to keep current. A `storage` step in a workflow that has it
                 off fails loudly rather than quietly not persisting.
             use_meta_llm: Turn the meta-LLM on or off. Omit to keep current.
+            relayout: Recompute every canvas position from the graph. Off by
+                default, because a stored position may be where a person dragged
+                the node on the canvas and replacing their arrangement is not an
+                improvement -- new steps are placed automatically either way.
+                Pass True when the rewiring was large enough that the old
+                arrangement no longer describes the graph.
         """
         # NOTE: JSON-carrying params are annotated `str`, never `str | None`.
         # FastMCP pre-parses a string argument whenever the annotation is not
@@ -228,7 +244,7 @@ def register_management_tools(
         # the core function's "None keeps the stored value" contract.
         return await core.update_workflow(
             deps(), workflow_id, name, description, steps_json or None, enabled,
-            use_storage, use_meta_llm,
+            use_storage, use_meta_llm, relayout=relayout,
         )
 
     async def delete_workflow(workflow_id: str) -> str:

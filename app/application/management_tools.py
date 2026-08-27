@@ -605,15 +605,20 @@ async def create_workflow(
     if existing is not None:
         return f"Workflow '{workflow_id}' already exists. Use update_workflow to modify it."
 
+    from app.application.graph_layout import apply_layout
     from app.application.script_capture import capture_inline_scripts
     from app.application.step_normalization import implicit_edges, normalize_edges
     from app.domain.models.workflow_definition import WorkflowDefinition
     captured = await capture_inline_scripts(workflow_id, steps, deps.script_backend)
     implied = implicit_edges(steps)
     steps = normalize_edges(steps)
+    # Nothing coming through this tool carries coordinates, and the canvas's
+    # fallback for a step without one ignores the graph -- so the graph is what
+    # places them here, once, at the point the definition is written.
     defn = WorkflowDefinition(
         id=workflow_id, name=name, description=description, steps=steps,
         use_storage=use_storage, enabled=enabled, use_meta_llm=use_meta_llm,
+        ui=apply_layout(None, steps),
     )
     await deps.workflow_backend.create(defn)
     if deps.refresh_runner is not None:
@@ -639,6 +644,7 @@ async def update_workflow(
     enabled: bool | None = None,
     use_storage: bool | None = None,
     use_meta_llm: bool | None = None,
+    relayout: bool = False,
 ) -> str:
     if deps.workflow_backend is None:
         return "Workflow updates unavailable: no persistent backend configured."
@@ -675,11 +681,18 @@ async def update_workflow(
         denied = _sandbox_denial(steps)
         if denied:
             return denied
+        from app.application.graph_layout import apply_layout
         from app.application.script_capture import capture_inline_scripts
         from app.application.step_normalization import implicit_edges, normalize_edges
         captured = await capture_inline_scripts(workflow_id, steps, deps.script_backend)
         implied = implicit_edges(steps)
         defn.steps = normalize_edges(steps)
+        # A position already stored was put there by whoever arranged the canvas,
+        # so only the new steps are placed unless a relayout was asked for.
+        defn.ui = apply_layout(defn.ui, defn.steps, relayout=relayout)
+    elif relayout:
+        from app.application.graph_layout import apply_layout
+        defn.ui = apply_layout(defn.ui, defn.steps, relayout=True)
 
     await deps.workflow_backend.update(workflow_id, defn)
     if deps.refresh_runner is not None:
