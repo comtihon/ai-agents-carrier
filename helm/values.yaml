@@ -23,6 +23,17 @@ service:
 
 # All non-secret env vars passed to the container as a ConfigMap.
 # Keys become env var names; values become env var values.
+#
+# Data-source deletion approvals (defaults in app/core/config.py):
+#   APPROVALS_ENABLED: "true"            # off restores unattended deletes
+#   APPROVAL_AUTO_DECIDE_THRESHOLD: "10" # identical human decisions before the
+#                                        #   meta-LLM decides the next one alone
+#   APPROVAL_VETO_WINDOW_SECONDS: "60"   # how long such a decision stays
+#                                        #   cancellable; 0 disables the window
+#   APPROVAL_WAIT_TIMEOUT_SECONDS: "3600"  # how long a blocked agent tool call
+#                                        #   waits before the case expires
+# Set SLACK_APPROVALS_CHANNEL for the Slack side; without it the gate still
+# holds every deletion, and copilot_ui is the only place to answer.
 config: {}
 
 # Secrets injected as individual env vars.

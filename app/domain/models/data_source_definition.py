@@ -125,6 +125,13 @@ class OperationDefinition(BaseModel):
     query: str | None = None
     variables: dict[str, Any] | None = None
     params: list[ParamSpec] = Field(default_factory=list)
+    # Tri-state override of the "is this call destructive?" verdict that
+    # otherwise comes from ``method`` (see
+    # ``app.infrastructure.datasources.destructive``).  ``True`` puts a POST
+    # /purge behind the approval gate; ``False`` lets a DELETE that only clears
+    # a cache run unstopped.  ``None`` — the default — means "not stated", so
+    # the verb decides.
+    destructive: bool | None = None
     response_schema: dict[str, Any] | None = None
     # JMESPath expression applied to the response payload.
     mapping: str | None = None

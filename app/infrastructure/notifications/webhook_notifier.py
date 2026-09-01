@@ -336,3 +336,171 @@ async def post_slack_addon_notification(
         logger.warning("run %s: slack addon notification failed: %s", run_id, exc)
     except Exception:
         logger.exception("run %s: failed to send slack addon notification", run_id)
+
+
+# ── Data-source approval cases ────────────────────────────────────────────────
+
+# Slack action ids for the approval-case buttons. Distinct from the plain
+# "approve"/"reject" pair the human_approval gate uses, because those carry a
+# run id in ``value`` and these carry a case id — one handler must be able to
+# tell them apart without guessing at the shape of the value.
+APPROVAL_APPROVE_ACTION = "ds_approval_approve"
+APPROVAL_REJECT_ACTION = "ds_approval_reject"
+APPROVAL_VETO_ACTION = "ds_approval_veto"
+
+_APPROVAL_SAMPLE_LINES = 10
+
+
+def _approval_blocks(case: Any, *, mode: str = "request") -> list[dict[str, Any]]:
+    """The message body an approver reads before answering.
+
+    Ordered by what decides the answer: the blast radius first (it is the whole
+    reason this message exists), then what is being hit, then the meta-LLM's
+    recommendation — last, and clearly labelled as advice, so it informs the
+    decision instead of standing in for it.
+
+    ``mode`` picks which of three messages this is: ``request`` (Approve /
+    Reject), ``veto`` (the meta-LLM decided; one Cancel button and a deadline),
+    or ``notice`` (already done, no buttons — offering an action on a closed
+    case would be a lie).
+    """
+    rows = "1 row" if case.affected_rows == 1 else f"{case.affected_rows} rows"
+    headline = {
+        "request": f"*Data deletion awaiting approval* — `{rows}`",
+        "veto": f"*Data deletion auto-approved* — `{rows}`",
+        "notice": f"*Data deletion confirmed* — `{rows}`",
+    }.get(mode, f"*Data deletion* — `{rows}`")
+    fields = [
+        {"type": "mrkdwn", "text": f"*Data source*\n{case.datasource_name or case.datasource_id}"},
+        {"type": "mrkdwn", "text": f"*Operation*\n`{case.operation}` [{case.method}]"},
+        {"type": "mrkdwn", "text": f"*Workflow*\n{case.workflow_name or case.workflow_id or '—'}"},
+        {"type": "mrkdwn", "text": f"*Run*\n`{case.run_id or '—'}`"},
+    ]
+    blocks: list[dict[str, Any]] = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": headline}},
+        {"type": "section", "fields": fields},
+    ]
+
+    if case.endpoint:
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*Endpoint*\n`{_truncate(case.endpoint, 400)}`"},
+        })
+    if case.params:
+        import json as _json
+        body = _json.dumps(case.params, default=str, indent=2)
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*Input*\n```{_truncate(body, 1200)}```"},
+        })
+    if case.affected_sample:
+        shown = case.affected_sample[:_APPROVAL_SAMPLE_LINES]
+        more = case.affected_rows - len(shown)
+        listing = "\n".join(f"• {s}" for s in shown)
+        if more > 0:
+            listing += f"\n• …and {more} more"
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*Targets*\n{_truncate(listing, 1200)}"},
+        })
+
+    verdict = case.meta_llm
+    if verdict is not None and verdict.decision != "abstain":
+        label = "would approve" if verdict.decision == "approve" else "would reject"
+        note = (
+            f"*Meta-LLM {label}* — {verdict.reason or 'no reason given'}\n"
+            f"_Based on {verdict.history_size} prior decision(s) on this operation. "
+            + ("This is the decision; cancel below to stop it._"
+               if verdict.autonomous else "Advisory only — you decide._")
+        )
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": _truncate(note, 2800)}})
+
+    if mode == "notice":
+        who = case.decided_by_name or "someone"
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"Confirmed by {who} in the data source editor."},
+        })
+    elif mode == "veto":
+        blocks.append({
+            "type": "actions",
+            "elements": [{
+                "type": "button",
+                "style": "danger",
+                "text": {"type": "plain_text", "text": "Cancel this deletion"},
+                "action_id": APPROVAL_VETO_ACTION,
+                "value": case.id,
+            }],
+        })
+    else:
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "text": {"type": "plain_text", "text": "Approve"},
+                    "action_id": APPROVAL_APPROVE_ACTION,
+                    "value": case.id,
+                },
+                {
+                    "type": "button",
+                    "style": "danger",
+                    "text": {"type": "plain_text", "text": "Reject"},
+                    "action_id": APPROVAL_REJECT_ACTION,
+                    "value": case.id,
+                },
+            ],
+        })
+    blocks.append({
+        "type": "context",
+        "elements": [{"type": "mrkdwn", "text": f"case `{case.id}`"}],
+    })
+    return blocks
+
+
+async def post_slack_approval_case(
+    bot_token: str,
+    channel: str,
+    case: Any,
+    *,
+    mode: str = "request",
+) -> dict[str, Any] | None:
+    """Announce an approval case in Slack; returns the raw API response.
+
+    See :func:`_approval_blocks` for what ``mode`` selects.
+    """
+    rows = "1 row" if case.affected_rows == 1 else f"{case.affected_rows} rows"
+    prefix = {
+        "request": "Approval needed",
+        "veto": "Auto-approved",
+        "notice": "Deletion confirmed",
+    }.get(mode, "Deletion")
+    fallback = (
+        f"{prefix}: "
+        f"{case.datasource_name or case.datasource_id}.{case.operation} "
+        f"[{case.method}] affecting {rows}"
+    )
+    try:
+        posted = await _slack(bot_token).post_message(
+            channel, fallback, blocks=_approval_blocks(case, mode=mode)
+        )
+        return posted.raw
+    except MessagingError as exc:
+        logger.warning("approval case %s: Slack post failed: %s", case.id, exc)
+        return None
+    except Exception:
+        logger.exception("approval case %s: failed to post to Slack", case.id)
+        return None
+
+
+async def post_slack_approval_outcome(
+    bot_token: str,
+    channel: str,
+    thread_ts: str,
+    text: str,
+) -> None:
+    """Close the loop in the case's own thread once it has been decided."""
+    if not (channel and thread_ts):
+        return
+    await post_slack_thread_reply(bot_token, channel, thread_ts, text)

@@ -22,6 +22,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.errors import GraphBubbleUp
 from langgraph.types import interrupt
 
 from app.application.step_normalization import normalize_edges
@@ -116,6 +117,10 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
         # silently drops them from the update stream before step_outputs is written.
         "_meta_llm_rejection":        Annotated[Any, _last_wins],    # type: ignore[assignment]
         "_meta_llm_result":           Annotated[Any, _last_wins],    # type: ignore[assignment]
+        # Id of the approval case the last destructive data_source step went
+        # through. Declared or LangGraph drops it, and the run would then carry
+        # no trace of which case let the deletion happen.
+        "_approval_case_id":          Annotated[Any, _last_wins],    # type: ignore[assignment]
         "error":                      Annotated[Any, _last_wins],    # type: ignore[assignment]
         # Backend judge (meta-LLM) token usage, summed across the whole workflow
         # run — a single global bucket, kept separate from per-step agent/meta usage.
@@ -562,6 +567,13 @@ async def stream_graph_to_pause(
             run.status = "waiting_agent"
         else:
             run.status = "waiting_approval"
+            # A data_source step pauses only to have a deletion approved, and
+            # unlike human_approval — whose node *is* the gate — it is a
+            # working step that will go on to run. Mark it waiting_approval so
+            # the canvas shows the halted node in amber rather than leaving it
+            # "running" while nothing happens.
+            if step_type == "data_source" and current_step_id in run.step_statuses:
+                run.step_statuses[current_step_id] = "waiting_approval"
     else:
         run.status = "completed"
     run.current_step = _effective_next
@@ -694,6 +706,31 @@ async def stream_graph_to_pause(
                     run.state = {**run.state, "_slack_thread_ts": ts, "_slack_channel": channel}
                     run.touch()
                     await run_repository.update(run)
+
+
+def _approval_interrupt_payload(case: Any) -> dict[str, Any]:
+    """What copilot_ui and the Slack message read off a paused deletion.
+
+    Deliberately flat and self-contained: the panel that renders it must not
+    have to fetch the case to know what is about to be deleted, because the
+    number in ``affected_rows`` is the one thing the reviewer has to see before
+    the buttons.
+    """
+    verdict = case.meta_llm
+    return {
+        "type": "datasource_approval",
+        "case_id": case.id,
+        "datasource_id": case.datasource_id,
+        "datasource_name": case.datasource_name,
+        "operation": case.operation,
+        "method": case.method,
+        "endpoint": case.endpoint,
+        "affected_rows": case.affected_rows,
+        "affected_sample": case.affected_sample,
+        "targets": case.targets,
+        "params": case.params,
+        "meta_llm": verdict.model_dump(mode="json") if verdict is not None else None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -922,6 +959,11 @@ class YamlGraphRunner:
         # Injected post-construction for `data_source` steps (optional)
         self._data_source_backend: Any = None
         self._data_source_executor: Any = None
+        # Injected post-construction: the privilege gate that holds a
+        # destructive data-source operation until somebody approves it.
+        # Optional — without it a `data_source` step runs a DELETE unattended,
+        # which is the pre-gate behaviour.
+        self._approval_service: Any = None
         # Injected post-construction for `python` steps that reference a
         # library script via `script_id` (optional — inline `code` still works
         # without it).
@@ -1911,6 +1953,15 @@ class YamlGraphRunner:
         ``output_key``.  The executor resolves any upstream operations the
         operation depends on, so ``params`` only carries the operation's own
         declared inputs.
+
+        An operation that *destroys* — a DELETE, or one flagged ``destructive``
+        — does not simply run.  The step first resolves what the call would hit
+        without making it, opens an approval case naming the row count, and
+        raises a ``datasource_approval`` interrupt.  The run parks at
+        ``waiting_approval`` exactly as it does for a ``human_approval`` step,
+        so every surface that already resumes an approval — the REST routes,
+        the Slack buttons, copilot_ui — resumes this one too, and the deletion
+        happens only on the way back.
         """
         graph_id = self.id
 
@@ -1931,14 +1982,125 @@ class YamlGraphRunner:
                 source = await self._data_source_backend.get(source_id)
                 if source is None:
                     raise ValueError(f"Data source '{source_id}' not found")
+
+                gate = await self._gate_destructive(step, source, operation, params)
+                if gate is not None and not gate["approved"]:
+                    logger.info(
+                        "[%s] step '%s' data_source deletion refused (case %s): %s",
+                        graph_id, step_id, gate["case_id"], gate["reason"],
+                    )
+                    return {output_key: {
+                        "skipped": True,
+                        "reason": gate["reason"],
+                        "approval_case_id": gate["case_id"],
+                        "affected_rows": gate["affected_rows"],
+                    }}
+
                 result = await self._data_source_executor.execute(source, operation, params)
                 logger.info("[%s] step '%s' finished", graph_id, step_id)
+                if gate is not None:
+                    return {output_key: result, "_approval_case_id": gate["case_id"]}
                 return {output_key: result}
+            except GraphBubbleUp:
+                # The approval gate suspends the node by raising, and LangGraph
+                # needs that exception to reach it. Swallowing it into
+                # ``{"error": ...}`` would turn every paused deletion into a
+                # step that "failed" and a run that carried on.
+                raise
             except Exception as exc:
                 logger.exception("[%s] step '%s' data_source failed", graph_id, step_id)
                 return {output_key: {"error": str(exc)}}
 
         return node
+
+    async def _gate_destructive(
+        self,
+        step: dict[str, Any],
+        source: Any,
+        operation: str,
+        params: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Hold a destructive operation until it is approved.
+
+        Returns ``None`` when the call needs no approval at all — not a
+        destructive operation, no gate configured, the gate switched off, or a
+        preview that found nothing to delete.  Otherwise returns the verdict:
+        ``{"approved": bool, "reason": str, "case_id": str, "affected_rows": int}``.
+
+        The node re-runs from the top every time it resumes from the interrupt,
+        so the first thing this does is look for the case it already opened.
+        Without that, one paused deletion would write a new case — and re-read
+        the whole upstream list — on every resume.
+        """
+        service = self._approval_service
+        if service is None:
+            return None
+        from app.core.config import get_settings
+        if not getattr(get_settings(), "approvals_enabled", True):
+            return None
+
+        op = source.get_operation(operation)
+        if op is None:
+            return None
+        from app.infrastructure.datasources.destructive import is_destructive
+        if not is_destructive(op, source):
+            return None
+
+        step_id = step["id"]
+        run = self._current_run
+        run_id = run.id if run is not None else ""
+
+        case = await service.find_open_case(run_id, step_id)
+        if case is None:
+            plan = await self._data_source_executor.preview(source, operation, params)
+            # Nothing matched upstream, so nothing is destroyed. Asking a human
+            # to approve a no-op only teaches them to click Approve.
+            if plan.affected_rows < 1:
+                return None
+            case = await service.open_case(
+                source=source,
+                operation=operation,
+                method=(op.method or "").upper(),
+                params=params,
+                affected_rows=plan.affected_rows,
+                targets=plan.targets,
+                sample=plan.sample,
+                workflow_id=self.id,
+                run_id=run_id,
+                step_id=step_id,
+                surface="workflow",
+            )
+
+        if case.status == "pending":
+            decision: dict = interrupt(_approval_interrupt_payload(case))
+            approved = bool(decision.get("approved", False))
+            decided = await service.decide(
+                case.id,
+                approved=approved,
+                source=decision.get("approver_source") or "ui",
+                decided_by_name=decision.get("approver_name") or "",
+                decided_by_id=decision.get("approver_id") or "",
+                reason=decision.get("reason") or "",
+            )
+            # A None here means somebody else closed the case first (the Slack
+            # button and the UI button racing). Their answer stands.
+            if decided is not None:
+                case = decided
+            else:
+                case = await service._backend.get(case.id) or case
+        elif case.veto_deadline is not None:
+            # The meta-LLM decided on its own. Announced, not silent: the run
+            # holds for the veto window so a person can still stop it.
+            case = await service.wait_out_veto(case)
+
+        approved = case.status == "approved"
+        reason = case.reason or ("approved" if approved else "rejected")
+        return {
+            "approved": approved,
+            "reason": reason,
+            "case_id": case.id,
+            "affected_rows": case.affected_rows,
+        }
 
     async def _resolve_script_code(self, step: dict[str, Any]) -> str:
         """Return the code a ``python`` step should run.

@@ -351,6 +351,30 @@ class Settings(BaseSettings):
     slack_bot_token: str = Field(default="", alias="SLACK_BOT_TOKEN")
     slack_approvals_channel: str = Field(default="", alias="SLACK_APPROVALS_CHANNEL")
 
+    # --- Data-source deletion approvals ---
+    # A workflow that reaches a destructive data-source operation (DELETE, or
+    # one flagged ``destructive``) opens an approval case and waits. Turning
+    # this off restores the pre-feature behaviour: deletes run unattended.
+    approvals_enabled: bool = Field(default=True, alias="APPROVALS_ENABLED")
+    # Unbroken identical *human* decisions on one workflow+source+operation
+    # after which the meta-LLM decides the next case itself.
+    approval_auto_decide_threshold: int = Field(
+        default=10, alias="APPROVAL_AUTO_DECIDE_THRESHOLD"
+    )
+    # How long an autonomous decision stays cancellable before it takes effect.
+    # Zero disables the window (the decision applies immediately).
+    approval_veto_window_seconds: int = Field(
+        default=60, alias="APPROVAL_VETO_WINDOW_SECONDS"
+    )
+    # How long a surface that cannot suspend (an agent's MCP tool call) blocks
+    # waiting for a person before the case expires unapproved.
+    approval_wait_timeout_seconds: float = Field(
+        default=3600.0, alias="APPROVAL_WAIT_TIMEOUT_SECONDS"
+    )
+    approval_poll_interval_seconds: float = Field(
+        default=3.0, alias="APPROVAL_POLL_INTERVAL_SECONDS"
+    )
+
     # --- OpenHands ---
     openhands_base_url: str = Field(default="http://openhands:3000", alias="OPENHANDS_BASE_URL")
     openhands_api_key: str | None = Field(default=None, alias="OPENHANDS_API_KEY")

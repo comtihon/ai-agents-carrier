@@ -23,6 +23,7 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote
 
@@ -46,6 +47,25 @@ _JSON_TYPES: dict[str, tuple[type, ...]] = {
     "array": (list,),
     "object": (dict,),
 }
+
+
+# How many rendered request lines / sample values a preview carries. An
+# approval message that lists ten thousand URLs is unreadable, and the number
+# that matters (``affected_rows``) is exact regardless of the cap.
+_PREVIEW_TARGET_CAP = 20
+_PREVIEW_SAMPLE_CAP = 20
+
+
+@dataclass
+class DestructivePlan:
+    """What a destructive operation is about to do, before it does it."""
+
+    affected_rows: int
+    # Rendered "METHOD url" lines, capped at ``_PREVIEW_TARGET_CAP``.
+    targets: list[str] = field(default_factory=list)
+    # The values bound from the upstream array (ids, names) — what an approver
+    # reads to recognise what is being removed. Capped the same way.
+    sample: list[Any] = field(default_factory=list)
 
 
 class DataSourceExecutor:
@@ -110,6 +130,110 @@ class DataSourceExecutor:
                 for name, result in zip(level, results):
                     memo[name] = result
         return memo[operation]
+
+    async def preview(
+        self,
+        source: DataSourceDefinition,
+        operation: str,
+        params: dict[str, Any],
+    ) -> "DestructivePlan":
+        """Resolve everything *around* a call without making the call itself.
+
+        Used before a destructive operation runs, to answer the one question an
+        approver actually needs: how many rows is this about to remove, and
+        which ones. The dependency closure is executed for real — those are the
+        reads that name the targets — and the target operation alone is held
+        back, its request URL rendered but never sent.
+
+        The upstream reads run a second time when the approved call finally
+        goes out. That is deliberate: re-reading is how an approval that sat in
+        Slack for an hour does not act on an hour-old list. Set a
+        ``cache.ttl_seconds`` on the source when the extra read is not wanted.
+        """
+        op = source.get_operation(operation)
+        if op is None:
+            raise ValueError(
+                f"Data source '{source.id}' has no operation '{operation}'"
+            )
+        levels = self._plan(source, operation)
+        closure = [
+            declared
+            for level in levels
+            for name in level
+            if (declared := source.get_operation(name)) is not None
+        ]
+        params = _coerce_params(closure, params)
+        for op_in_closure in closure:
+            self._check_required_params(op_in_closure, params)
+
+        memo: dict[str, Any] = {}
+        async with httpx.AsyncClient(timeout=source.timeout_seconds) as client:
+            for level in levels:
+                ops = [
+                    o for name in level
+                    if name != operation and (o := source.get_operation(name)) is not None
+                ]
+                if not ops:
+                    continue
+                results = await asyncio.gather(
+                    *(self._execute_operation(source, o, params, memo, client) for o in ops)
+                )
+                for o, result in zip(ops, results):
+                    memo[o.name] = result
+
+        # Same fan-out rule the real invocation follows: one array upstream
+        # binds one request per element, and that element count *is* the number
+        # of affected rows.
+        array_refs = {
+            (head, path)
+            for head, path in operation_refs(op)
+            if head != "params" and isinstance(memo.get(head), list)
+        }
+        array_heads = {head for head, _ in array_refs}
+        if len(array_heads) > 1:
+            raise ValueError(
+                f"Operation '{op.name}' binds more than one array upstream "
+                f"({', '.join(sorted(array_heads))}); only one fan-out source "
+                f"is supported"
+            )
+
+        if not array_heads:
+            return DestructivePlan(
+                affected_rows=1,
+                targets=[self._describe_target(source, op, params, memo, {})],
+                sample=[params] if params else [],
+            )
+
+        head = next(iter(array_heads))
+        binding_path = sorted(path for h, path in array_refs if h == head)[0]
+        elements = memo[head]
+        targets = [
+            self._describe_target(source, op, params, memo, {head: element})
+            for element in elements[:_PREVIEW_TARGET_CAP]
+        ]
+        sample = [_search(binding_path, element) for element in elements[:_PREVIEW_SAMPLE_CAP]]
+        return DestructivePlan(
+            affected_rows=len(elements),
+            targets=targets,
+            sample=sample,
+        )
+
+    def _describe_target(
+        self,
+        source: DataSourceDefinition,
+        op: OperationDefinition,
+        params: dict[str, Any],
+        memo: dict[str, Any],
+        bound: dict[str, Any],
+    ) -> str:
+        """The request line a call would produce, rendered but not sent."""
+        method = (op.method or "GET").upper()
+        if source.kind == "graphql":
+            return f"{method} {source.base_url} ({op.name})"
+        path = self._render_path(op, params, memo, bound)
+        base = source.base_url.rstrip("/")
+        url = f"{base}/{path.lstrip('/')}" if path else base
+        return f"{method} {url}"
 
     # ------------------------------------------------------------------
     # Planning
