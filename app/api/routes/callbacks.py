@@ -17,7 +17,12 @@ from pydantic import BaseModel
 from app.api.dependencies import get_container
 from app.core.config import get_settings
 from app.core.container import ApplicationContainer
-from app.infrastructure.notifications.webhook_notifier import post_slack_thread_reply
+from app.infrastructure.notifications.webhook_notifier import (
+    APPROVAL_APPROVE_ACTION,
+    APPROVAL_REJECT_ACTION,
+    APPROVAL_VETO_ACTION,
+    post_slack_thread_reply,
+)
 from app.infrastructure.orchestration.yaml_graph import stream_graph_to_pause
 
 logger = logging.getLogger(__name__)
@@ -165,6 +170,64 @@ async def _do_reject(
     return run.status
 
 
+# ── Data-source approval cases ────────────────────────────────────────────────
+
+async def _decide_approval_case(
+    case_id: str,
+    approved: bool,
+    container: ApplicationContainer,
+    user_name: str = "",
+    user_id: str = "",
+    reason: str = "",
+) -> None:
+    """Answer one approval case from Slack, and unblock whatever is waiting.
+
+    Two shapes of waiting, one entry point. A case a workflow step opened has a
+    run parked at ``waiting_approval`` with the node suspended inside
+    ``interrupt()``: resuming the run is what records the decision, because the
+    node itself calls ``ApprovalService.decide`` with the approver carried in
+    the resume payload. A case an agent's MCP tool call opened has no run to
+    resume — the tool is blocked on a poll — so the decision is written here and
+    the poll picks it up.
+    """
+    service = getattr(container, "approval_service", None)
+    backend = getattr(container, "approval_backend", None)
+    if service is None or backend is None:
+        logger.warning("slack: approval case %s arrived with no approvals backend", case_id)
+        return
+    case = await backend.get(case_id)
+    if case is None:
+        logger.warning("slack: approval case %s not found", case_id)
+        return
+    if case.decided:
+        logger.info("slack: approval case %s already %s", case_id, case.status)
+        return
+
+    if case.surface == "workflow" and case.run_id:
+        if approved:
+            await _do_approve(
+                case.run_id, container,
+                approver_slack_id=user_id, approver_name=user_name,
+                approver_id=user_id, approver_source="slack",
+            )
+        else:
+            await _do_reject(
+                case.run_id, reason or None, container,
+                approver_name=user_name, approver_id=user_id,
+                approver_source="slack",
+            )
+        return
+
+    await service.decide(
+        case_id,
+        approved=approved,
+        source="slack",
+        decided_by_name=user_name,
+        decided_by_id=user_id,
+        reason=reason,
+    )
+
+
 # ── POST endpoints (called by machines / API clients) ─────────────────────────
 
 @router.post("/{run_id}/approve")
@@ -274,7 +337,16 @@ async def slack_interactive(
     )
 
     if not run_id:
-        raise HTTPException(status_code=400, detail="Missing run_id in action value")
+        raise HTTPException(status_code=400, detail="Missing run/case id in action value")
+
+    # Approval-case buttons carry a case id, not a run id, and are handled on
+    # their own path: one case can gate an agent's tool call with no run to
+    # resume at all.
+    if action_id in (APPROVAL_APPROVE_ACTION, APPROVAL_REJECT_ACTION, APPROVAL_VETO_ACTION):
+        return await _slack_approval_action(
+            action_id, run_id, user_name, user_id,
+            channel_id, message_ts, background_tasks, container,
+        )
 
     if action_id == "approve":
         update_text = f"✅ Approved by {user_name}"
@@ -312,6 +384,58 @@ async def slack_interactive(
             approver_name=user_name,
             approver_id=user_id,
             approver_source="slack",
+        )
+
+    return JSONResponse(content={
+        "replace_original": True,
+        "text": update_text,
+        "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": update_text}}],
+    })
+
+
+async def _slack_approval_action(
+    action_id: str,
+    case_id: str,
+    user_name: str,
+    user_id: str,
+    channel_id: str,
+    message_ts: str,
+    background_tasks: BackgroundTasks,
+    container: ApplicationContainer,
+) -> JSONResponse:
+    """Handle an Approve / Reject / Cancel click on an approval-case message.
+
+    The work is queued rather than awaited for the same reason the approval
+    buttons queue theirs: approving resumes a graph, and Slack gives an
+    interactive endpoint three seconds before it shows the user a timeout.
+    """
+    if action_id == APPROVAL_VETO_ACTION:
+        update_text = f"🛑 Cancelled by {user_name}"
+    elif action_id == APPROVAL_APPROVE_ACTION:
+        update_text = f"✅ Deletion approved by {user_name}"
+    else:
+        update_text = f"🚫 Deletion rejected by {user_name}"
+
+    settings = get_settings()
+    if settings.slack_bot_token and channel_id and message_ts:
+        background_tasks.add_task(
+            post_slack_thread_reply,
+            settings.slack_bot_token, channel_id, message_ts, update_text,
+        )
+
+    if action_id == APPROVAL_VETO_ACTION:
+        service = getattr(container, "approval_service", None)
+        if service is not None:
+            background_tasks.add_task(service.veto, case_id, by=user_name)
+    else:
+        background_tasks.add_task(
+            _decide_approval_case,
+            case_id,
+            action_id == APPROVAL_APPROVE_ACTION,
+            container,
+            user_name,
+            user_id,
+            "",
         )
 
     return JSONResponse(content={

@@ -245,6 +245,91 @@ def _tool_description(defn: Any, op: OperationDefinition) -> str:
     ).strip()
 
 
+async def _await_approval(
+    container: Any, source: Any, operation: str, params: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Hold a destructive tool call until a person approves it.
+
+    The agent surface cannot suspend the way a workflow step can: an MCP tool
+    call is one HTTP request with an agent blocked on the other end of it, and
+    there is no checkpoint to interrupt into. So this blocks — opens the same
+    approval case the ``data_source`` step opens, announces it the same way,
+    and polls until somebody answers or ``APPROVAL_WAIT_TIMEOUT_SECONDS``
+    elapses. To the agent it simply looks like a slow tool.
+
+    Returns ``None`` when the call may proceed, or the error dict the agent
+    should see when it may not.
+    """
+    service = getattr(container, "approval_service", None)
+    executor = getattr(container, "data_source_executor", None)
+    if service is None or executor is None:
+        return None
+    settings = getattr(container, "settings", None)
+    if settings is not None and not getattr(settings, "approvals_enabled", True):
+        return None
+
+    op = source.get_operation(operation)
+    if op is None:
+        return None
+    from app.infrastructure.datasources.destructive import is_destructive
+    if not is_destructive(op, source):
+        return None
+
+    grant = current_grant()
+    run_id = grant.run_id if grant is not None else ""
+    agent_id = grant.agent_id if grant is not None else ""
+    # The grant names the run, and the run names the workflow — which is what
+    # scopes the decision history and decides whether the meta-LLM is allowed
+    # to weigh in at all.
+    workflow_id = ""
+    repository = getattr(container, "run_repository", None)
+    if run_id and repository is not None:
+        try:
+            run = await repository.get(run_id)
+            workflow_id = getattr(run, "graph_id", "") if run is not None else ""
+        except Exception:
+            logger.debug("approval gate: run lookup failed for %s", run_id, exc_info=True)
+
+    plan = await executor.preview(source, operation, params)
+    if plan.affected_rows < 1:
+        return None
+
+    case = await service.open_case(
+        source=source,
+        operation=operation,
+        method=(op.method or "").upper(),
+        params=params,
+        affected_rows=plan.affected_rows,
+        targets=plan.targets,
+        sample=plan.sample,
+        workflow_id=workflow_id,
+        run_id=run_id,
+        agent_id=agent_id,
+        surface="mcp",
+    )
+    logger.info(
+        "data source '%s' operation '%s': %d row(s) held for approval (case %s)",
+        source.id, operation, plan.affected_rows, case.id,
+    )
+
+    if case.status == "pending":
+        case = await service.wait_for_decision(case.id) or case
+    elif case.veto_deadline is not None:
+        case = await service.wait_out_veto(case)
+
+    if case.status == "approved":
+        return None
+    return {
+        "error": (
+            f"Refused: deleting {case.affected_rows} row(s) via "
+            f"'{source.id}.{operation}' was not approved ({case.status})."
+        ),
+        "approval_case_id": case.id,
+        "approval_status": case.status,
+        "reason": case.reason,
+    }
+
+
 def _make_handler(
     source_id: str,
     operation: str,
@@ -263,6 +348,9 @@ def _make_handler(
         if source is None:
             return {"error": f"Data source '{source_id}' not found"}
         try:
+            refusal = await _await_approval(container, source, operation, kwargs)
+            if refusal is not None:
+                return refusal
             return await executor.execute(source, operation, kwargs)
         except Exception as exc:  # noqa: BLE001 — surfaced to the MCP caller
             logger.exception(

@@ -13,6 +13,7 @@ from uuid import uuid4
 from langchain_core.language_models import BaseChatModel
 from pymongo import MongoClient
 
+from app.application.approval_service import ApprovalService
 from app.application.run_control import WorkflowDisabledError, ensure_workflow_enabled
 from app.core.config import Settings
 from app.domain.models.event_definition import EventDefinition
@@ -53,6 +54,10 @@ from app.infrastructure.persistence.workflow_backend import (
 )
 from app.infrastructure.auth.service_token_provider import ServiceTokenProvider
 from app.infrastructure.datasources.executor import DataSourceExecutor
+from app.infrastructure.persistence.approval_backend import (
+    ApprovalCaseBackend,
+    MongoApprovalBackend,
+)
 from app.infrastructure.tools.mcp_client import McpToolsProvider
 from app.infrastructure.triggers.cron_scheduler import CronScheduler
 from app.infrastructure.triggers.pubsub_subscriber import (
@@ -84,6 +89,12 @@ class ApplicationContainer:
     # steps and for the /mcp/datasources tools.
     data_source_backend: DataSourceDefinitionBackend | None = None
     data_source_executor: DataSourceExecutor | None = None
+    # Privilege gate in front of destructive data-source operations: the store
+    # of approval cases and the service that opens, decides and remembers them.
+    # None in legacy test setups, which then run deletes ungated exactly as
+    # before this feature existed.
+    approval_backend: ApprovalCaseBackend | None = None
+    approval_service: Any = None
     # Event definition backend — None when MongoDB is not configured or in
     # legacy test setups.  Required for `pubsub` trigger steps that name an
     # event, and for the subscription write-back.
@@ -190,6 +201,8 @@ class ApplicationContainer:
             runner._data_source_backend = self.data_source_backend
         if self.data_source_executor is not None:
             runner._data_source_executor = self.data_source_executor
+        if self.approval_service is not None:
+            runner._approval_service = self.approval_service
         if self.script_backend is not None:
             runner._script_backend = self.script_backend
         if self.service_token_provider is not None:
@@ -898,6 +911,8 @@ class ApplicationContainer:
             await self.agent_backend.close()
         if isinstance(self.data_source_backend, MongoDataSourceBackend):
             await self.data_source_backend.close()
+        if isinstance(self.approval_backend, MongoApprovalBackend):
+            await self.approval_backend.close()
         if isinstance(self.event_backend, MongoEventBackend):
             await self.event_backend.close()
 
@@ -1032,6 +1047,13 @@ def build_container(settings: Settings) -> ApplicationContainer:
     workflow_storage = MongoWorkflowStorageBackend(settings.mongodb_uri, settings.mongodb_database)
     service_token_provider = ServiceTokenProvider(settings)
     data_source_executor = DataSourceExecutor(token_provider=service_token_provider)
+    approval_backend = MongoApprovalBackend(settings.mongodb_uri, settings.mongodb_database)
+    approval_service = ApprovalService(
+        approval_backend,
+        settings,
+        workflow_backend=workflow_backend,
+        run_repository=run_repository,
+    )
     checkpointer = MongoDBCheckpointSaver(
         MongoClient(settings.mongodb_uri),
         db_name=settings.mongodb_database,
@@ -1050,6 +1072,8 @@ def build_container(settings: Settings) -> ApplicationContainer:
         agent_backend=agent_backend,
         data_source_backend=data_source_backend,
         data_source_executor=data_source_executor,
+        approval_backend=approval_backend,
+        approval_service=approval_service,
         event_backend=event_backend,
         script_backend=script_backend,
         workflow_storage=workflow_storage,

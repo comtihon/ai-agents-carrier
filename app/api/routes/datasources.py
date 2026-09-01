@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from app.api.dependencies import get_container
@@ -47,6 +47,7 @@ from app.infrastructure.datasources.discovery import (
     parse_spec,
     probe_and_discover,
 )
+from app.infrastructure.datasources.destructive import is_destructive
 from app.infrastructure.datasources.try_run import try_operation
 
 logger = logging.getLogger(__name__)
@@ -122,6 +123,10 @@ class TryOperationRequest(BaseModel):
     operation: str
     params: dict[str, Any] = Field(default_factory=dict)
     timeout_seconds: float = 30
+    # Set by the client after the user read the row count and clicked through
+    # the confirmation. Without it a destructive operation is previewed and
+    # refused — see ``try_datasource_operation``.
+    confirm_destructive: bool = False
 
 
 # ─── Secret redaction ─────────────────────────────────────────────────────────
@@ -415,6 +420,7 @@ async def upload_datasource_schema(
 @router.post("/try-operation")
 async def try_datasource_operation(
     body: TryOperationRequest,
+    request: Request,
     container: ApplicationContainer = Depends(get_container),
 ):
     """Execute one operation of a draft definition and sample its output.
@@ -448,9 +454,94 @@ async def try_datasource_operation(
     if defn.get_operation(body.operation) is None:
         raise HTTPException(status_code=422, detail=f"Unknown operation '{body.operation}'")
 
+    gate = await _gate_try_run(request, body, defn, container)
+    if gate is not None:
+        return gate
+
     return await try_operation(
         defn, body.operation, body.params, container.settings, container.data_source_executor
     )
+
+
+async def _gate_try_run(
+    request: Request,
+    body: TryOperationRequest,
+    defn: DataSourceDefinition,
+    container: ApplicationContainer,
+) -> dict[str, Any] | None:
+    """Stop a try run of a destructive operation until it is confirmed.
+
+    Try run is the one surface where the approver is already present: a person
+    in the editor, one click from deleting whatever the operation points at.
+    Blocking on Slack would make a delete endpoint untestable, so the gate is
+    a two-step instead — the first call previews and refuses, returning the row
+    count and the targets for the UI to put in front of them; the second call
+    carries ``confirm_destructive`` and runs.
+
+    That is a self-approval, and it is recorded as one: the case is written
+    with ``surface="try_run"``, which keeps it in the audit trail and out of
+    the history that grants the meta-LLM autonomy.
+
+    Returns the response to send instead of running, or ``None`` to proceed.
+    """
+    if not getattr(container.settings, "approvals_enabled", True):
+        return None
+    executor = container.data_source_executor
+    service = getattr(container, "approval_service", None)
+    if executor is None or service is None:
+        return None
+
+    op = defn.get_operation(body.operation)
+    if op is None or not is_destructive(op, defn):
+        return None
+
+    try:
+        plan = await executor.preview(defn, body.operation, body.params)
+    except Exception as exc:
+        # The preview is real traffic against the target API, and a try run
+        # reports failures rather than raising them.
+        logger.info("try-operation '%s' preview failed: %s", body.operation, exc)
+        return {
+            "status": "error",
+            "error": f"Could not work out what this would delete: {exc}",
+            "api_output": None,
+            "suggested_mapping": None,
+        }
+
+    if plan.affected_rows < 1:
+        return None
+
+    if not body.confirm_destructive:
+        return {
+            "status": "confirmation_required",
+            "error": None,
+            "api_output": None,
+            "suggested_mapping": None,
+            "destructive": {
+                "operation": body.operation,
+                "method": (op.method or "").upper(),
+                "affected_rows": plan.affected_rows,
+                "targets": plan.targets,
+                "affected_sample": [str(item) for item in plan.sample],
+            },
+        }
+
+    claims = getattr(request.state, "jwt_claims", None) or {}
+    await service.record_confirmed(
+        source=defn,
+        operation=body.operation,
+        method=(op.method or "").upper(),
+        params=body.params,
+        affected_rows=plan.affected_rows,
+        targets=plan.targets,
+        sample=plan.sample,
+        decided_by_name=str(
+            claims.get("name") or claims.get("preferred_username")
+            or claims.get("email") or claims.get("sub") or ""
+        ),
+        decided_by_id=str(claims.get("sub") or ""),
+    )
+    return None
 
 
 # ─── Item routes (parameterised — must come AFTER literal-segment routes) ─────

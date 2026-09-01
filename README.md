@@ -812,6 +812,10 @@ operations:
   - name: repo_languages
     method: GET
     path: /repos/{list_repos.full_name}/languages      # DAG reference → fan-out
+  - name: delete_repo
+    method: DELETE                                     # gated: needs approval at run time
+    path: /repos/{list_repos.full_name}
+    destructive: true                                  # optional override; omit to let the verb decide
 ```
 
 **DAG references.** Templates resolve `{params.<name>}` from the caller's inputs and `{<operation>.<field.path>}` from another operation of the same source. Field paths are JMESPath. The referenced operations form the dependency closure of the call: they run level by level with `asyncio.gather` and are memoised per request, so a diamond DAG calls each upstream exactly once. Unknown references, self-references and cycles are rejected at save time with HTTP 422.
@@ -837,6 +841,34 @@ operations:
 ```
 
 Errors are captured as `{"error": "..."}` under `output_key` so the next step can react.
+
+### Deletion approvals
+
+A workflow author writes a delete operation by hand; a workflow *run* executes it against real data, sometimes against a row count nobody predicted. Every destructive data-source call is therefore held until somebody approves it.
+
+**What counts as destructive.** `DELETE` by default — the same verb the UI already paints red on the risk badge. An operation may override that with `destructive: true` (gates a `POST /purge`) or `destructive: false` (frees a `DELETE` that only clears a cache). GraphQL operations carry no method and are gated only when they say so.
+
+**What happens.** The call is *previewed* instead of made: the dependency closure runs for real — those reads are what name the targets — and the destructive operation alone is held back, its request URLs rendered but never sent. That yields the number the whole feature turns on, `affected_rows`. A row is written to the `approvals` collection carrying the data source, the operation, the endpoint, the caller's inputs, the row count and a sample of the targets.
+
+A preview that matches nothing (`affected_rows == 0`) runs unattended: asking someone to approve a no-op only teaches them to click Approve.
+
+**Where it waits.** A `data_source` step raises a `datasource_approval` interrupt, so the run parks at `waiting_approval` and leaves memory — every surface that already resumes an approval resumes this one. An agent's MCP tool call has no checkpoint to interrupt into, so it blocks and polls (`APPROVAL_WAIT_TIMEOUT_SECONDS`); to the agent it looks like a slow tool. Either way the case is announced in `SLACK_APPROVALS_CHANNEL` with Approve / Reject buttons, and always appears in copilot_ui's Approvals panel. Without a Slack channel configured the gate still holds — copilot_ui is simply the only place to answer.
+
+**Try run** is the one surface where the approver is already present: a person in the data-source editor, one click from deleting whatever the operation points at. Blocking that on a Slack round trip would make a delete endpoint untestable, so the gate is a two-step instead. The first `POST /datasources/try-operation` previews and refuses, answering `status: "confirmation_required"` with the row count and a sample of the targets; the editor puts that in front of the operator, and the retry carries `confirm_destructive: true` and runs.
+
+That is a self-approval, and it is recorded as one — `surface: "try_run"`, decided by whoever clicked. Such cases stay in the audit trail and are **excluded from the decision history**, so an author cannot assemble the streak that grants the meta-LLM autonomy over their own delete by clicking Try run ten times.
+
+**The meta-LLM.** Once a workflow has decided this operation before, and the workflow has `use_meta_llm` on, the meta-LLM reads that history and says what it would do. The recommendation rides on the Slack message and the approval panel; it does not decide, and it is stored on the case next to the human answer.
+
+When the last `APPROVAL_AUTO_DECIDE_THRESHOLD` (default 10) decided cases on the same **workflow + data source + operation** all went the same way, the meta-LLM decides the next one itself — at that point asking again is asking a question whose answer is on record ten times over. Three limits keep that honest:
+
+- Only decisions a *person* made extend a streak. The model reading its own output back as evidence would ratchet one early mistake into standing policy.
+- A model that disagrees with the streak hands the case back to a human rather than either answer winning by default.
+- An autonomous decision is announced with a countdown, not silently: until `APPROVAL_VETO_WINDOW_SECONDS` elapses anyone can cancel it from Slack or the UI.
+
+Trust is scoped per workflow. Ten approvals earned in a nightly-cleanup workflow grant nothing to a delete operation in a workflow somebody wrote this morning.
+
+**API.** `GET /api/v1/approvals` (the queue and the history), `GET /api/v1/approvals/pending/count`, `GET /api/v1/approvals/history?workflow_id=&datasource_id=&operation=` (past decisions plus the streak), `POST /api/v1/approvals/{id}/decide`, `POST /api/v1/approvals/{id}/veto`. Set `APPROVALS_ENABLED=false` to restore unattended deletes.
 
 ---
 
@@ -909,6 +941,16 @@ GET    /api/v1/events/{id}                    get event definition
 PUT    /api/v1/events/{id}                    update event definition
 DELETE /api/v1/events/{id}                    delete event definition
 ALL    /mcp/datasources                       MCP (streamable-http) tools for all operations
+
+# Data-source deletion approvals
+GET    /api/v1/approvals                      list cases (status / workflow / datasource / run filters)
+GET    /api/v1/approvals/pending/count        badge count for the dock rail
+GET    /api/v1/approvals/history              past decisions on one workflow+source+operation, plus the streak
+GET    /api/v1/approvals/{id}                 one case
+POST   /api/v1/approvals/{id}/decide          approve or reject; resumes the run waiting on it
+POST   /api/v1/approvals/{id}/veto            cancel an autonomous decision inside its veto window
+POST   /api/v1/datasources/try-operation      dry-run one operation; a destructive one previews and refuses
+                                              until the retry carries confirm_destructive
 
 # Agent callbacks (called by running agent containers)
 POST   /api/v1/runs/{id}/agent/output         deliver result, resume run

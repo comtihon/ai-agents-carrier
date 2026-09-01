@@ -31,6 +31,7 @@ from app.infrastructure.auth.authorization import (
 )
 from app.api.routes.agent_callbacks import router as agent_callbacks_router
 from app.api.routes.agents import router as agents_router
+from app.api.routes.approvals import router as approvals_router
 from app.api.routes.callbacks import router as callbacks_router
 from app.api.routes.chat import router as chat_router
 from app.api.routes.datasources import router as datasources_router
@@ -599,6 +600,7 @@ def create_app() -> FastAPI:
     app.include_router(workflows_router, prefix=settings.api_prefix)
     app.include_router(agents_router, prefix=settings.api_prefix)
     app.include_router(datasources_router, prefix=settings.api_prefix)
+    app.include_router(approvals_router, prefix=settings.api_prefix)
     app.include_router(events_router, prefix=settings.api_prefix)
     app.include_router(scripts_router, prefix=settings.api_prefix)
     app.include_router(llm_router, prefix=settings.api_prefix)
