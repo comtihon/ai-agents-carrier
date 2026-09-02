@@ -260,7 +260,7 @@ async def test_list_runs_no_filter(client):
     assert data["runs"] == []
     assert data["total"] == 0
     container.run_repository.list_recent.assert_called_once_with(
-        limit=50, offset=0, workflow_id=None, status=None, search=None, exclude_workflow_ids=None
+        limit=50, offset=0, workflow_id=None, status=None, search=None, exclude_workflow_ids=None, summary=True
     )
 
 
@@ -273,7 +273,7 @@ async def test_list_runs_status_filter(client):
     resp = await c.get("/api/v1/workflows/runs?status=running")
     assert resp.status_code == 200
     container.run_repository.list_recent.assert_called_once_with(
-        limit=50, offset=0, workflow_id=None, status="running", search=None, exclude_workflow_ids=None
+        limit=50, offset=0, workflow_id=None, status="running", search=None, exclude_workflow_ids=None, summary=True
     )
     data = resp.json()
     assert data["total"] == 1
@@ -292,7 +292,7 @@ async def test_list_runs_search_filter(client):
     assert data["runs"] == []
     assert data["total"] == 0
     container.run_repository.list_recent.assert_called_once_with(
-        limit=50, offset=0, workflow_id=None, status=None, search="dark mode", exclude_workflow_ids=None
+        limit=50, offset=0, workflow_id=None, status=None, search="dark mode", exclude_workflow_ids=None, summary=True
     )
 
 
@@ -307,11 +307,91 @@ async def test_list_runs_combined_filters(client):
     )
     assert resp.status_code == 200
     container.run_repository.list_recent.assert_called_once_with(
-        limit=10, offset=0, workflow_id="simple", status="completed", search="build", exclude_workflow_ids=None
+        limit=10, offset=0, workflow_id="simple", status="completed", search="build", exclude_workflow_ids=None, summary=True
     )
     data = resp.json()
     assert data["total"] == 1
     assert len(data["runs"]) == 1
+
+
+# ─── The list endpoint answers with rows, not whole runs ──────────────────────
+# `graph_runs` documents are large (step_inputs averaged 471 KB of a 611 KB
+# document in production), so the list reads them projected and says so. The
+# exception is a paused run: its interrupt payload lives in step_outputs and
+# the approval panel needs it, so those few are read back in full.
+
+@pytest.mark.asyncio
+async def test_listed_rows_are_marked_partial(client):
+    c, container = client
+    run = GraphRun(id="r1", graph_id="simple", user_request="build", status="completed")
+    container.run_repository.list_recent = AsyncMock(return_value=[run])
+    container.run_repository.count_recent = AsyncMock(return_value=1)
+
+    resp = await c.get("/api/v1/workflows/runs")
+
+    assert resp.status_code == 200
+    row = resp.json()["runs"][0]
+    assert row["partial"] is True
+    assert row["intermediate_outputs"] == {}
+
+
+@pytest.mark.asyncio
+async def test_single_run_is_never_partial(client):
+    c, container = client
+    container.run_repository.get = AsyncMock(
+        return_value=GraphRun(
+            id="r1", graph_id="simple", user_request="build", status="completed",
+            state={"answer": "42"},
+        )
+    )
+
+    resp = await c.get("/api/v1/workflows/runs/r1")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["partial"] is False
+    assert body["intermediate_outputs"] == {"answer": "42"}
+
+
+@pytest.mark.asyncio
+async def test_paused_row_is_read_back_in_full(client):
+    """A projected paused run would lose the payload the approval UI renders."""
+    c, container = client
+    projected = GraphRun(
+        id="tid1", graph_id="simple", user_request="build", status="waiting_approval",
+    )
+    full = GraphRun(
+        id="tid1", graph_id="simple", user_request="build", status="waiting_approval",
+        step_outputs={"__interrupt__": [{"value": {"question": "delete 1240 rows?"}}]},
+    )
+    container.run_repository.list_recent = AsyncMock(return_value=[projected])
+    container.run_repository.count_recent = AsyncMock(return_value=1)
+    container.run_repository.get = AsyncMock(return_value=full)
+
+    resp = await c.get("/api/v1/workflows/runs")
+
+    assert resp.status_code == 200
+    row = resp.json()["runs"][0]
+    container.run_repository.get.assert_awaited_once_with("tid1")
+    assert row["partial"] is False
+    assert row["interrupt_payload"] == {"question": "delete 1240 rows?"}
+
+
+@pytest.mark.asyncio
+async def test_completed_rows_cost_no_extra_reads(client):
+    c, container = client
+    runs = [
+        GraphRun(id=f"r{i}", graph_id="simple", user_request="build", status="completed")
+        for i in range(5)
+    ]
+    container.run_repository.list_recent = AsyncMock(return_value=runs)
+    container.run_repository.count_recent = AsyncMock(return_value=5)
+    container.run_repository.get = AsyncMock()
+
+    resp = await c.get("/api/v1/workflows/runs")
+
+    assert resp.status_code == 200
+    container.run_repository.get.assert_not_awaited()
 
 
 # ─── Approve handler claims atomically ────────────────────────────────────────
