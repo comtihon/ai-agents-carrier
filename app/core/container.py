@@ -130,6 +130,13 @@ class ApplicationContainer:
         # Fail fast on an enabled-but-incomplete outbound auth configuration.
         if self.service_token_provider is not None:
             self.service_token_provider.validate_configuration()
+        # Cheap and idempotent, but it decides whether the run list can be
+        # sorted at all: unindexed, Mongo sorts these large documents in
+        # memory and the query aborts past 32 MB.
+        try:
+            await self.run_repository.ensure_indexes()
+        except Exception:
+            logger.exception("failed to ensure graph_runs indexes; run list may be slow")
         await self.mcp_tools_provider.start()
         self.cron_scheduler.start()
         if self.settings.pubsub_enabled and self.pubsub_subscriber is None:

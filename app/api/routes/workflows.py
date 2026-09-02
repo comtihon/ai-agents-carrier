@@ -228,7 +228,16 @@ async def _get_interrupt_payload(runner: YamlGraphRunner | None, run: GraphRun) 
     return {}
 
 
-async def _run_response(run: GraphRun, runner: YamlGraphRunner | None = None) -> dict:
+async def _run_response(
+    run: GraphRun, runner: YamlGraphRunner | None = None, partial: bool = False
+) -> dict:
+    """Build the run payload the API answers with.
+
+    ``partial`` marks a row the list endpoint built from a projected document:
+    identity, status and per-step status are real, the per-step inputs,
+    outputs and state are empty because they were never read. Clients that
+    render a run in full re-read it by id.
+    """
     workflow_name, steps = await _steps_from_definition(run, runner)
     interrupt_payload = await _get_interrupt_payload(runner, run)
     return {
@@ -258,6 +267,7 @@ async def _run_response(run: GraphRun, runner: YamlGraphRunner | None = None) ->
         "metadata": {},
         "created_at": run.created_at.isoformat(),
         "updated_at": run.updated_at.isoformat(),
+        "partial": partial,
     }
 
 
@@ -616,15 +626,32 @@ async def list_runs(
         container.run_repository.list_recent(
             limit=limit, offset=offset, workflow_id=workflow_id,
             status=status, search=search, exclude_workflow_ids=exclude_workflow_ids,
+            summary=True,
         ),
         container.run_repository.count_recent(
             workflow_id=workflow_id, status=status, search=search,
             exclude_workflow_ids=exclude_workflow_ids,
         ),
     )
-    run_responses = await asyncio.gather(
-        *[_run_response(run, _get_runner_for_run(run, container)) for run in runs]
-    )
+    # A paused run is the one row that is also an action: the approval panel
+    # reads its interrupt payload, which lives in step_outputs. Those are read
+    # back in full — there are only ever a handful of them — while the rest of
+    # the page stays projected.
+    waiting = [r for r in runs if r.status in ("waiting_approval", "waiting_agent")]
+    if waiting:
+        full = await asyncio.gather(
+            *[container.run_repository.get(r.id) for r in waiting]
+        )
+        by_id = {r.id: r for r in full if r is not None}
+        runs = [by_id.get(r.id, r) for r in runs]
+    run_responses = await asyncio.gather(*[
+        _run_response(
+            run,
+            _get_runner_for_run(run, container),
+            partial=run.status not in ("waiting_approval", "waiting_agent"),
+        )
+        for run in runs
+    ])
     return {"runs": list(run_responses), "total": total}
 
 

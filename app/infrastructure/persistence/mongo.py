@@ -11,9 +11,34 @@ from app.core.config import Settings
 from app.domain.models.graph_run import GraphRun
 
 
+# Fields the run list never draws. This is where the weight sits: step_inputs
+# alone averages 471 KB per run against 611 KB for the whole document, so a
+# 13-row page was shipping — and sorting — megabytes to render a list of
+# statuses.
+_LIST_PROJECTION = {
+    "state": 0,
+    "step_inputs": 0,
+    "step_outputs": 0,
+    "routing_log": 0,
+    "trace_data": 0,
+}
+
+
 class MongoGraphRunRepository:
     def __init__(self, collection: AsyncIOMotorCollection) -> None:
         self._collection = collection
+
+    async def ensure_indexes(self) -> None:
+        """Index the key the run list sorts on.
+
+        Unindexed, Mongo sorts the whole matching set in memory, and these
+        documents are large: 90 runs made a 55 MB collection, past the 32 MB
+        sort limit, so `GET /workflows/runs` answered 500
+        (QueryExceededMemoryLimitNoDiskUseAllowed) rather than a page.
+        """
+        await self._collection.create_index([("created_at", -1)])
+        await self._collection.create_index([("graph_id", 1), ("created_at", -1)])
+        await self._collection.create_index([("status", 1), ("created_at", -1)])
 
     async def create(self, run: GraphRun) -> None:
         run.touch()
@@ -88,9 +113,22 @@ class MongoGraphRunRepository:
         status: str | None = None,
         search: str | None = None,
         exclude_workflow_ids: list[str] | None = None,
+        summary: bool = False,
     ) -> list[GraphRun]:
+        """Newest-first page of runs.
+
+        With ``summary`` the per-step payloads stay in the database and the
+        returned runs carry their model defaults for those fields. A caller
+        that renders one run in full asks for it by id instead.
+        """
         query = self._build_run_query(workflow_id, status, search, exclude_workflow_ids)
-        cursor = self._collection.find(query).sort("created_at", -1).skip(offset).limit(limit)
+        projection = _LIST_PROJECTION if summary else None
+        cursor = (
+            self._collection.find(query, projection)
+            .sort("created_at", -1)
+            .skip(offset)
+            .limit(limit)
+        )
         docs = await cursor.to_list(length=None)
         return [self._from_doc(doc) for doc in docs]
 
