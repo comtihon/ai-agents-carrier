@@ -55,6 +55,10 @@ from app.infrastructure.persistence.workflow_backend import (
 from app.infrastructure.auth.service_token_provider import ServiceTokenProvider
 from app.infrastructure.datasources.executor import DataSourceExecutor
 from app.infrastructure.datasources.datastream import LocalDiskStreamStore, DataStreamStore
+from app.infrastructure.persistence.data_artifact_backend import (
+    DataArtifactBackend,
+    MongoDataArtifactBackend,
+)
 from app.infrastructure.persistence.approval_backend import (
     ApprovalCaseBackend,
     MongoApprovalBackend,
@@ -93,6 +97,10 @@ class ApplicationContainer:
     # Reads back what the executor spilled; the `data_source`, `python` and
     # `llm` steps all go through it.
     stream_store: "DataStreamStore | None" = None
+    # Run download manifests written by `data` steps and read by
+    # GET /runs/{id}/data.  None in legacy test setups, which then run a `data`
+    # step as a no-op that records nothing.
+    data_artifact_backend: "DataArtifactBackend | None" = None
     # Privilege gate in front of destructive data-source operations: the store
     # of approval cases and the service that opens, decides and remembers them.
     # None in legacy test setups, which then run deletes ungated exactly as
@@ -160,7 +168,13 @@ class ApplicationContainer:
         # disk with results nothing will ever claim.
         if self.stream_store is not None:
             try:
-                await self.stream_store.purge_older_than(self.settings.stream_ttl_seconds)
+                # Pinned streams are the exception: a `data` step told somebody
+                # they could download those, so they are held to the much longer
+                # artifact window instead of being swept with the backlog.
+                await self.stream_store.purge_older_than(
+                    self.settings.stream_ttl_seconds,
+                    pinned_seconds=self.settings.data_artifact_ttl_seconds,
+                )
             except Exception:
                 logger.exception("failed to purge expired spilled results")
         self._recover_task = asyncio.create_task(self._recover_incomplete_runs())
@@ -223,6 +237,8 @@ class ApplicationContainer:
             runner._data_source_executor = self.data_source_executor
         if self.stream_store is not None:
             runner._stream_store = self.stream_store
+        if self.data_artifact_backend is not None:
+            runner._data_artifact_backend = self.data_artifact_backend
         if self.approval_service is not None:
             runner._approval_service = self.approval_service
         if self.script_backend is not None:
@@ -1046,6 +1062,38 @@ def _build_workflow_backend(settings: Settings) -> WorkflowDefinitionBackend:
     return LocalFilesWorkflowBackend(settings.graph_definitions_path, readonly=False)
 
 
+def _build_stream_store(settings: Settings) -> DataStreamStore:
+    """The store every data source result is written to.
+
+    Object storage is a second implementation of the same ABC, not a second
+    kind of storage bolted alongside it, so selecting it changes nothing about
+    how a result is produced or read — only where the bytes end up.  ``local``
+    stays the default: an unconfigured deployment must keep behaving exactly as
+    it did before this choice existed.
+    """
+    backend = (settings.stream_backend or "local").strip().lower()
+    if backend == "gcs":
+        from app.infrastructure.datasources.datastream_gcs import GcsStreamStore
+
+        logger.info(
+            "data stream store: gcs bucket '%s'%s",
+            settings.stream_gcs_bucket,
+            f" prefix '{settings.stream_gcs_prefix}'" if settings.stream_gcs_prefix else "",
+        )
+        return GcsStreamStore(
+            settings.stream_gcs_bucket, prefix=settings.stream_gcs_prefix
+        )
+    if backend != "local":
+        # Refused rather than silently defaulted: a typo in STREAM_BACKEND
+        # would otherwise put a deployment that meant to be durable back on
+        # ephemeral pod disk, and nothing would say so until a restart.
+        raise ValueError(
+            f"STREAM_BACKEND '{settings.stream_backend}' is not a known data "
+            f"stream store; use 'local' or 'gcs'"
+        )
+    return LocalDiskStreamStore(settings.stream_dir)
+
+
 def build_container(settings: Settings) -> ApplicationContainer:
     llm = build_llm(settings)
     llm_factory = _make_llm_factory(settings)
@@ -1071,7 +1119,7 @@ def build_container(settings: Settings) -> ApplicationContainer:
     # Where every data source result is written.
     # Required, not optional: results do not travel as values, so every
     # data source call needs somewhere to write its stream.
-    stream_store = LocalDiskStreamStore(settings.stream_dir)
+    stream_store = _build_stream_store(settings)
     data_source_executor = DataSourceExecutor(
         token_provider=service_token_provider, stream_store=stream_store
     )
@@ -1101,6 +1149,9 @@ def build_container(settings: Settings) -> ApplicationContainer:
         data_source_backend=data_source_backend,
         data_source_executor=data_source_executor,
         stream_store=stream_store,
+        data_artifact_backend=MongoDataArtifactBackend(
+            settings.mongodb_uri, settings.mongodb_database
+        ),
         approval_backend=approval_backend,
         approval_service=approval_service,
         event_backend=event_backend,

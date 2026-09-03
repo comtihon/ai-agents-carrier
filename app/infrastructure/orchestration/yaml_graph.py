@@ -26,6 +26,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.errors import GraphBubbleUp
 from langgraph.types import interrupt
 
+from app.application import data_artifacts
 from app.application.step_normalization import normalize_edges
 from app.domain.models.graph_run import GraphRun
 from app.infrastructure.tools.mcp_client import McpToolsProvider
@@ -254,15 +255,32 @@ async def _close_openhands_conversations(runner: YamlGraphRunner, state: dict) -
             logger.warning("Failed to close OpenHands conversation '%s' (%s)", name, oh_id)
 
 
-def step_status_from_output(node_name: str, output: Any) -> str:
+# Step types whose *successful* update is the empty dict. A `data` step records
+# what it names out of band and returns state byte-identical on purpose, so
+# inferring "skipped" from an empty update would show every working data node
+# as one that never ran.
+_EMPTY_UPDATE_IS_FINISHED: frozenset = frozenset({"data"})
+
+
+def step_status_from_output(
+    node_name: str, output: Any, *, step_type: str | None = None, ran: bool = False
+) -> str:
     """Infer step status from the dict a node returned.
 
-    Empty dict → ``skipped``. If the output carries a ``__failed_step__``
-    sentinel matching this node, it caught an internal exception and chose to
-    record the error in state — surface that as ``failed`` so the UI doesn't
-    show a green checkmark over a captured failure. Anything else → ``finished``.
+    Empty dict → ``skipped``, except for the types in
+    ``_EMPTY_UPDATE_IS_FINISHED`` that ran. A `when` guard also produces an
+    empty update, and that *is* a real skip; ``ran`` tells the two apart,
+    because the status hook publishes "running" only from inside the node,
+    inside the guard.
+
+    If the output carries a ``__failed_step__`` sentinel matching this node, it
+    caught an internal exception and chose to record the error in state —
+    surface that as ``failed`` so the UI doesn't show a green checkmark over a
+    captured failure. Anything else → ``finished``.
     """
     if not output:
+        if ran and step_type in _EMPTY_UPDATE_IS_FINISHED:
+            return "finished"
         return "skipped"
     if isinstance(output, dict) and output.get("__failed_step__") == node_name:
         return "failed"
@@ -429,7 +447,17 @@ async def stream_graph_to_pause(
                     run.touch()
                     await run_repository.update(run)
                     continue
-                status = step_status_from_output(node_name, output)
+                _node_def = next(
+                    (s for s in runner.steps if s["id"] == node_name), None
+                )
+                status = step_status_from_output(
+                    node_name, output,
+                    step_type=(_node_def or {}).get("type"),
+                    # Read before it is overwritten below: the status hook set
+                    # it from inside the node, so "running" is the evidence
+                    # that the node body actually executed.
+                    ran=run.step_statuses.get(node_name) == "running",
+                )
                 run.step_inputs[node_name] = dict(current_state)
                 run.step_statuses[node_name] = status
                 run.current_step = node_name
@@ -1108,6 +1136,10 @@ class YamlGraphRunner:
         # `data_source` step still runs, it just cannot spill, so an oversized
         # result fails the step instead.
         self._stream_store: Any = None
+        # Injected post-construction for `data` steps: the run download
+        # manifest.  Optional -- without it a `data` step still runs and still
+        # returns state unchanged, it simply records nothing (and says so).
+        self._data_artifact_backend: Any = None
         # Injected post-construction: the privilege gate that holds a
         # destructive data-source operation until somebody approves it.
         # Optional — without it a `data_source` step runs a DELETE unattended,
@@ -1267,6 +1299,8 @@ class YamlGraphRunner:
             fn = self._http_call_node(step)
         elif t == "data_source":
             fn = self._data_source_node(step)
+        elif t == "data":
+            fn = self._data_node(step)
         elif t == "python":
             fn = self._python_node(step)
         elif t == "parallel":
@@ -2332,6 +2366,106 @@ class YamlGraphRunner:
             "case_id": case.id,
             "affected_rows": case.affected_rows,
         }
+
+    def _data_node(self, step: dict[str, Any]):
+        """Name data mid-workflow so a person can download it afterwards.
+
+        Config: ``selections``, a list of ``{name, from, format}``.  ``from`` is
+        a state path (``state.projects``, or plain ``projects``) resolved with
+        the same walker every other step's path config uses; ``format`` is
+        ``jsonl`` (the stored form), ``json`` or ``csv``.
+
+        The step returns ``{}``.  Not "returns nothing much" -- exactly ``{}``:
+        no new keys, no mutation, no transform of the data it points at.  A
+        `data` node is an observation point, and one that changed the state it
+        observed would make a workflow behave differently depending on whether
+        somebody wanted to download something from it.  What it writes goes to
+        the run's download manifest, out of band, so state stays
+        checkpoint-sized however many selections a workflow exports.
+
+        Where a selection resolves to a ``DataRef`` nothing is copied: the bytes
+        are already in the stream store, so the stream is pinned (exempted from
+        the short spill TTL) and the manifest entry points at it.
+
+        Nothing here fails a run.  A missing path, an unusable selection, no
+        backend configured at all -- each is a logged warning and the node
+        carries on, because a run dying at the step that was only meant to
+        watch it would be the worst possible trade.
+        """
+        graph_id = self.id
+
+        async def node(state: dict) -> dict:
+            step_id = step["id"]
+            selections, problems = data_artifacts.parse_selections(step)
+            for problem in problems:
+                logger.warning(
+                    "[%s] step '%s' (data): %s -- nothing recorded for it",
+                    graph_id, step_id, problem,
+                )
+
+            run = self._current_run
+            run_id = run.id if run is not None else ""
+            store = self._stream_store
+            backend = self._data_artifact_backend
+            if not selections:
+                return {}
+            if store is None or backend is None or not run_id:
+                # Worth a warning rather than silence: the workflow author asked
+                # for a download and is not going to get one, and the reason is
+                # deployment configuration rather than anything in the YAML.
+                logger.warning(
+                    "[%s] step '%s' (data): no %s configured, so %d selection(s) "
+                    "were not recorded",
+                    graph_id, step_id,
+                    "run" if not run_id else
+                    "data stream store" if store is None else "data artifact backend",
+                    len(selections),
+                )
+                return {}
+
+            ttl = float(
+                getattr(self._stream_conf(), "data_artifact_ttl_seconds", 0.0) or 0.0
+            )
+            for selection in selections:
+                path = data_artifacts.strip_state_prefix(selection.path)
+                value = self._state_path(state, path)
+                if value is None:
+                    # Absent and present-but-null are one case here, and both
+                    # mean there is nothing to offer. Said out loud, since a
+                    # download the user expected will simply not be in the list.
+                    logger.warning(
+                        "[%s] step '%s' (data): selection '%s' path '%s' resolved "
+                        "to nothing -- skipped, no artifact recorded",
+                        graph_id, step_id, selection.name, selection.path,
+                    )
+                    continue
+                try:
+                    artifact = await data_artifacts.capture_selection(
+                        store=store,
+                        backend=backend,
+                        run_id=run_id,
+                        step_id=step_id,
+                        selection=selection,
+                        value=value,
+                        ttl_seconds=ttl,
+                    )
+                except Exception as exc:  # noqa: BLE001 — see the docstring
+                    logger.warning(
+                        "[%s] step '%s' (data): selection '%s' could not be "
+                        "recorded: %s",
+                        graph_id, step_id, selection.name, exc, exc_info=True,
+                    )
+                    continue
+                logger.info(
+                    "[%s] step '%s' (data): '%s' -> artifact %s (%s, %d item(s), "
+                    "%d bytes)%s",
+                    graph_id, step_id, selection.name, artifact.id,
+                    artifact.format, artifact.items, artifact.bytes,
+                    " TRUNCATED" if artifact.truncated else "",
+                )
+            return {}
+
+        return node
 
     async def _resolve_script_code(self, step: dict[str, Any]) -> str:
         """Return the code a ``python`` step should run.

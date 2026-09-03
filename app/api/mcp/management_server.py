@@ -144,6 +144,72 @@ def register_management_tools(
         """
         return await core.get_run(deps(), run_id)
 
+    async def list_run_data(run_id: str, include_datasource: bool = False) -> str:
+        """List the files a run made available for download.
+
+        A `data` step records the data it names in the run's download
+        manifest; this is that manifest. Each entry gives the artifact id, the
+        selection name, the format, the record count and a download URL for
+        the bytes. An entry marked INCOMPLETE is a truncated prefix of the
+        data, not the whole answer — never describe one as complete.
+
+        With include_datasource, the raw data source results this run fetched
+        are listed too, in the same shape and marked origin=datasource. Those
+        are not pinned: they are swept on the ordinary stream TTL at the expiry
+        each entry states, and the download then returns 410. Download either
+        kind with the URL in its entry, or inspect one with
+        get_run_data_artifact.
+
+        Args:
+            run_id: The run to list downloadable data for.
+            include_datasource: Also list the raw data source results in the
+                run's state (default false, curated exports only).
+        """
+        return await core.list_run_data(deps(), run_id, include_datasource)
+
+    async def get_run_data_artifact(run_id: str, artifact_id: str) -> str:
+        """Get one downloadable artifact's metadata and its download URL.
+
+        Returns the selection name, origin, format, filename, shape, record
+        count, stored size, whether the data is a truncated prefix, when it
+        expires, and the URL the bytes are fetched from. Works for a curated
+        `data` step export and for a raw data source result alike. The bytes
+        themselves are not returned here — download them from that URL.
+
+        Args:
+            run_id: The run the artifact belongs to.
+            artifact_id: The artifact id (from list_run_data).
+        """
+        return await core.get_run_data_artifact(deps(), run_id, artifact_id)
+
+    async def list_pending_approvals(limit: int = 20) -> str:
+        """List destructive operations waiting for approval, newest first.
+
+        Each entry gives the case id, the change kind, the data source and
+        operation, how many rows it would affect, the workflow and run it
+        belongs to, and the meta-LLM's verdict where it formed one. Read one in
+        full with get_approval before deciding it — a case can be a generated
+        write whose values were produced by a language model, and that is only
+        visible in the full case.
+
+        Args:
+            limit: Maximum cases to return (default 20, capped at 50).
+        """
+        return await core.list_pending_approvals(deps(), limit)
+
+    async def get_approval(case_id: str) -> str:
+        """Read one approval case in full, before approving or rejecting it.
+
+        Returns the operation and its blast radius, the `details` map (which
+        states whether generated code produced the values), the cell-level
+        sample of what would change, the resolved targets and params, the
+        meta-LLM verdict, and the veto deadline when it decided autonomously.
+
+        Args:
+            case_id: The approval case id (from list_pending_approvals).
+        """
+        return await core.get_approval(deps(), case_id)
+
     async def get_workflow(workflow_id: str, include_steps: bool = True) -> str:
         """Read one workflow in full: its flags and its complete step list.
 
@@ -177,7 +243,10 @@ def register_management_tools(
                 data_source (invoke a DataSourceDefinition operation).
                 Example: [{"id": "trigger", "type": "http"}, {"id": "classify", "type": "llm", "system_prompt": "...", "user_template": "...", "output_key": "verdict"}]
                 Also available: storage (this workflow's own key/value state),
-                slack (post/reply/read/DM/delete via a messaging provider).
+                slack (post/reply/read/DM/delete via a messaging provider),
+                data (name data mid-workflow so a user can download it
+                afterwards; `selections` is a list of {name, from, format},
+                format jsonl|json|csv — it returns state unchanged).
             use_storage: Turn on this workflow's private key/value storage. Off by
                 default, and a `storage` step in a workflow that has it off fails
                 loudly rather than quietly not persisting -- so set it while
@@ -1169,6 +1238,8 @@ def register_management_tools(
 
     handlers = [
         list_workflows, get_workflow, run_workflow, list_runs, get_run,
+        list_run_data, get_run_data_artifact,
+        list_pending_approvals, get_approval,
         create_workflow, update_workflow, delete_workflow,
         list_agents, get_agent, create_agent, update_agent, delete_agent,
         list_datasources, get_datasource, create_datasource, update_datasource,

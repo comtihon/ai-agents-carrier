@@ -39,6 +39,7 @@ from app.api.routes.events import router as events_router
 from app.api.routes.scripts import router as scripts_router
 from app.api.routes.health import router as health_router
 from app.api.routes.llm import router as llm_router
+from app.api.routes.run_data import router as run_data_router
 from app.api.routes.webhooks import router as webhooks_router
 from app.api.routes.workflows import router as workflows_router
 from app.core.config import get_settings
@@ -518,6 +519,7 @@ async def lifespan(app: FastAPI):
         agent_backend=container.agent_backend,
         data_source_backend=container.data_source_backend,
         event_backend=container.event_backend,
+        data_artifact_backend=container.data_artifact_backend,
         refresh_datasources=_make_datasources_refresher(container),
         # The chat agent is the platform's internal agent: it gets the same MCP
         # tools the workflow steps do, resolved per invocation.
@@ -610,6 +612,11 @@ def create_app() -> FastAPI:
     # Agent callback routes — registered after callbacks but the /runs prefix
     # means they don't conflict with the /{run_id} routes in workflows.
     app.include_router(agent_callbacks_router, prefix=settings.api_prefix)
+    # Run data downloads — same /runs prefix, literal /data segments, so no
+    # collision with the agent callbacks above or with workflows' /{run_id}.
+    # Authorised by OAuthMiddleware exactly as reading the run is; see the
+    # module docstring.
+    app.include_router(run_data_router, prefix=settings.api_prefix)
     # Data sources MCP server — the streamable-http endpoint lands exactly on
     # /mcp/datasources (streamable_http_path="/datasources" inside the mount).
     # OAuthMiddleware exempts this prefix (see _UNPROTECTED_PREFIXES); the

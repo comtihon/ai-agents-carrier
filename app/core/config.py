@@ -444,11 +444,29 @@ class Settings(BaseSettings):
     # Local disk is not durable across a pod restart, so keep this on a path
     # the node can spare and expect a run that outlives a restart to have to
     # re-fetch.
+    # Which store implementation holds them. "local" is the pod's own
+    # filesystem and stays the default, so an unconfigured deployment behaves
+    # exactly as it did before object storage existed. "gcs" is the same ABC
+    # over a bucket: durable across a restart, and the only sensible choice
+    # where a `data` step offers a download hours after the run.
+    stream_backend: str = Field(default="local", alias="STREAM_BACKEND")
+    stream_gcs_bucket: str = Field(default="", alias="STREAM_GCS_BUCKET")
+    # Optional key prefix inside the bucket, so one bucket can be shared with
+    # other things. Empty means objects sit at the root.
+    stream_gcs_prefix: str = Field(default="", alias="STREAM_GCS_PREFIX")
     stream_dir: str = Field(default="/tmp/carrier-streams", alias="STREAM_DIR")
     # Age at which an unreferenced stream file is swept, in seconds. A run that
     # outlives this and then reads its ref gets a clear "stream is gone" error
     # rather than a silently short result. Default 6 hours.
     stream_ttl_seconds: float = Field(default=21600.0, alias="STREAM_TTL_SECONDS")
+    # How long a stream a `data` step named stays downloadable. Pinned streams
+    # are held to this instead of the 6-hour sweep above: a person comes back
+    # for a file the next morning, and having the sweep delete exactly the data
+    # they were told they could download would be worse than keeping it a
+    # while. Default 7 days.
+    data_artifact_ttl_seconds: float = Field(
+        default=7 * 24 * 3600.0, alias="DATA_ARTIFACT_TTL_SECONDS"
+    )
     # Ceiling for `result_mode: ram` -- a step explicitly asking for a result
     # to be loaded whole. Well under the 16 MB BSON limit, because whatever is
     # loaded there also has to fit in the checkpoint.

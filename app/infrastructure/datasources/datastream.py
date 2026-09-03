@@ -58,8 +58,20 @@ Durability
 wrong across a pause, since a restart loses every file and a run parked at
 ``waiting_approval`` will come back to a ref pointing at nothing (it gets a
 clear error, never a short read).  The :class:`DataStreamStore` ABC is the seam
-for a durable backend — GridFS needs no new infrastructure, chunks at 255 KB
-and streams both ways.  ``persistent`` says which kind a store is.
+for a durable backend — ``GcsStreamStore`` in ``datastream_gcs`` is one, and
+GridFS would need no new infrastructure at all.  ``persistent`` says which kind
+a store is.
+
+Retention
+---------
+``purge_older_than`` sweeps on the short ``STREAM_TTL_SECONDS`` window, which
+is right for a stream that exists only to get from one step to the next.  A
+`data` step names data a person downloads later, so those streams are
+``pin``-ned: the sweep holds a pinned stream to the much longer
+``DATA_ARTIFACT_TTL_SECONDS`` instead, and deleting the download manifest entry
+``unpin``s it back into the ordinary window.  Pinning changes when a stream is
+swept, never whether the store is durable — a pin on a local-disk store still
+does not survive the pod.
 """
 from __future__ import annotations
 
@@ -183,8 +195,38 @@ class DataStreamStore(ABC):
     async def delete(self, ref: DataRef) -> None: ...
 
     @abstractmethod
-    async def purge_older_than(self, seconds: float) -> int:
-        """Drop streams older than *seconds*; returns how many were removed."""
+    async def pin(self, ref: DataRef) -> None:
+        """Exempt a stream from the ordinary retention sweep.
+
+        A `data` step names data a person will come back for, possibly hours
+        later; the 6-hour ``STREAM_TTL_SECONDS`` sweep would delete exactly the
+        file they came back for.  Pinning is what a download manifest entry
+        holds a stream by, so it is set when the entry is written and cleared
+        when the entry is deleted.
+
+        Idempotent, and pinning a stream that is already gone raises
+        :class:`StreamGone` — a manifest entry must never be written against a
+        stream that cannot be served.
+        """
+
+    @abstractmethod
+    async def unpin(self, ref: DataRef) -> None:
+        """Return a pinned stream to the ordinary sweep.  Idempotent."""
+
+    @abstractmethod
+    async def is_pinned(self, ref: DataRef) -> bool: ...
+
+    @abstractmethod
+    async def purge_older_than(
+        self, seconds: float, *, pinned_seconds: float | None = None
+    ) -> int:
+        """Drop streams older than *seconds*; returns how many were removed.
+
+        Pinned streams are held to *pinned_seconds* instead — the longer
+        ``DATA_ARTIFACT_TTL_SECONDS`` window a download is offered for. ``None``
+        keeps them indefinitely, which is what a caller sweeping only the
+        ordinary backlog wants.
+        """
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +317,19 @@ class LocalDiskStreamStore(DataStreamStore):
         if not stream_id or "/" in stream_id or stream_id.startswith("."):
             raise ValueError(f"invalid stream id {stream_id!r}")
         return self._dir / f"{stream_id}.jsonl"
+
+    def _pin_path_for(self, stream_id: str) -> Path:
+        """Sidecar marking a stream exempt from the ordinary sweep.
+
+        A separate empty file rather than a field inside the data file or an
+        index of its own: the data file is append-only JSONL that consumers
+        read as bytes, and an index would be a second thing to keep consistent
+        with the directory.  The ``.pin`` suffix keeps it out of the
+        ``ds_*.jsonl`` glob the sweep walks, so a marker is never mistaken for
+        a stream.  Goes through ``_path_for`` first, so a tampered id cannot
+        name a file outside the directory here either.
+        """
+        return self._path_for(stream_id).with_suffix(".pin")
 
     def _existing_path(self, ref: DataRef) -> Path:
         path = self._path_for(ref.id)
@@ -428,24 +483,69 @@ class LocalDiskStreamStore(DataStreamStore):
             path = self._path_for(ref.id)
         except ValueError:
             return
+        for target in (path, self._pin_path_for(ref.id)):
+            try:
+                await asyncio.to_thread(target.unlink)
+            except FileNotFoundError:
+                pass
+
+    async def pin(self, ref: DataRef) -> None:
+        # Existence is checked first: a manifest entry written against a
+        # stream that is already swept would offer a download that can only
+        # ever 410.
+        self._existing_path(ref)
+        marker = self._pin_path_for(ref.id)
+        await asyncio.to_thread(marker.touch)
+
+    async def unpin(self, ref: DataRef) -> None:
         try:
-            await asyncio.to_thread(path.unlink)
+            marker = self._pin_path_for(ref.id)
+        except ValueError:
+            return
+        try:
+            await asyncio.to_thread(marker.unlink)
         except FileNotFoundError:
             pass
 
-    async def purge_older_than(self, seconds: float) -> int:
+    async def is_pinned(self, ref: DataRef) -> bool:
+        try:
+            marker = self._pin_path_for(ref.id)
+        except ValueError:
+            return False
+        return await asyncio.to_thread(marker.exists)
+
+    async def purge_older_than(
+        self, seconds: float, *, pinned_seconds: float | None = None
+    ) -> int:
         def _purge() -> int:
             if not self._dir.exists():
                 return 0
-            cutoff = time.time() - seconds
+            now = time.time()
+            cutoff = now - seconds
+            pinned_cutoff = None if pinned_seconds is None else now - pinned_seconds
             removed = 0
             for path in self._dir.glob("ds_*.jsonl"):
+                marker = path.with_suffix(".pin")
+                pinned = marker.exists()
+                # A pinned stream is held to the longer artifact window, or
+                # kept outright when the caller named no window for it. The
+                # sweep must not be the reason a download offered to somebody
+                # stops working.
+                limit = pinned_cutoff if pinned else cutoff
+                if limit is None:
+                    continue
                 try:
-                    if path.stat().st_mtime < cutoff:
-                        path.unlink()
-                        removed += 1
+                    if path.stat().st_mtime >= limit:
+                        continue
+                    path.unlink()
+                    removed += 1
                 except FileNotFoundError:
                     continue
+                if pinned:
+                    try:
+                        marker.unlink()
+                    except FileNotFoundError:
+                        pass
             return removed
 
         removed = await asyncio.to_thread(_purge)

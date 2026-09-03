@@ -309,7 +309,7 @@ async def test_mounted_mcp_endpoints_answer_the_real_handshake(monkeypatch):
     assert _rpc_result(mg_init)["serverInfo"]["name"] == "management"
 
     names = {t["name"] for t in _rpc_result(mg_tools)["tools"]}
-    assert len(names) == 57
+    assert len(names) == 61
     assert "ask_user" not in names
 
     assert (ds_bad.status_code, mg_bad.status_code) == (401, 401)
