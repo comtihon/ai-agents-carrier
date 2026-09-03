@@ -496,9 +496,19 @@ class GcsStreamStore(DataStreamStore):
                     continue
             return removed
 
-        # Listing needs the client itself, not a bucket handle.
-        self._bucket()
-        removed = await asyncio.to_thread(_purge)
+        def _purge_with_client() -> int:
+            # Building the client is itself a blocking call -- credentials, and
+            # under Workload Identity a metadata round trip. It used to happen
+            # here on the event loop, one line outside the thread that was
+            # carefully created for the listing. That was enough to wedge the
+            # whole process whenever GCS was slow: the port stayed open while
+            # /health and /ready timed out, the kubelet pulled the pod, and
+            # nginx served 503. Nothing touching the network belongs on the
+            # loop, the client construction included.
+            self._bucket()  # listing needs the client itself, not a bucket handle
+            return _purge()
+
+        removed = await asyncio.to_thread(_purge_with_client)
         if removed:
             logger.info("data stream store (gcs): purged %d expired stream(s)", removed)
         return removed
