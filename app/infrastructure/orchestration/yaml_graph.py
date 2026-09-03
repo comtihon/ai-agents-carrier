@@ -15,6 +15,7 @@ from uuid import uuid4
 import httpx
 
 from langchain_core.language_models import BaseChatModel
+from app.domain.models.datastream import as_data_ref, find_data_refs
 from app.infrastructure.notifications.webhook_notifier import send_approval_notification
 
 logger = logging.getLogger(__name__)
@@ -737,6 +738,89 @@ def _approval_interrupt_payload(case: Any) -> dict[str, Any]:
 # YAML graph runner
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Spilled results in string templates
+# ---------------------------------------------------------------------------
+
+class _StreamRef:
+    """Stands in for a spilled result inside a ``{key}`` template.
+
+    A handle is a small dict, so interpolating it would not blow anything up
+    -- it would just paste ``{'__stream__': 1, 'id': 'sp_...'}`` into a prompt
+    or a URL, which is worse than useless because it looks like data. This
+    renders the handle's one-line summary instead, while still allowing
+    ``{result[items]}`` and ``{result.items}`` for a template that wants the
+    count, so a prompt can say "1.2M rows" without ever seeing a row.
+    """
+
+    __slots__ = ("_handle",)
+
+    def __init__(self, handle: Any) -> None:
+        self._handle = handle
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._handle, name)
+
+    def __getitem__(self, key: Any) -> Any:
+        try:
+            return getattr(self._handle, str(key))
+        except AttributeError as exc:
+            raise KeyError(key) from exc
+
+    def __format__(self, fmt: str) -> str:
+        return self._handle.summary()
+
+    def __str__(self) -> str:
+        return self._handle.summary()
+
+    def __repr__(self) -> str:
+        return f"_StreamRef({self._handle.id})"
+
+
+def _stream_sample_block(ref: Any, sample: list[Any]) -> str:
+    """The stated-sample text appended to a prompt for a streamed input.
+
+    The count comes first and the records second, and it says plainly that
+    they are a sample.  A model shown five records with no indication that
+    there are 400,000 answers as though five is the whole set -- the single
+    most dangerous way for this to go wrong.
+    """
+    import json as _json
+
+    body = _json.dumps(sample, indent=2, default=str)[:6000]
+    caveat = (
+        " The read was truncated, so even that count is a lower bound."
+        if ref.truncated
+        else ""
+    )
+    origin = f" from {ref.source_id}.{ref.operation}" if ref.source_id else ""
+    return (
+        f"DATA: {ref.items} records are available{origin}, totalling "
+        f"{ref.bytes} bytes. They are NOT included here -- far more than fits "
+        f"in this prompt.{caveat}\n"
+        f"Below are the first {len(sample)} records, as a sample of the shape "
+        f"only. Do not treat them as the whole set, do not count them, and do "
+        f"not draw totals from them; use the stated count of {ref.items} for "
+        f"anything quantitative.\n"
+        f"SAMPLE:\n{body}"
+    )
+
+
+def _stream_safe_state(state: dict) -> dict:
+    """*state* with every spill handle wrapped so templates cannot inline it.
+
+    Copies only when there is something to wrap, so the ordinary case pays
+    one dict scan and no allocation.
+    """
+    handles = find_data_refs(state)
+    if not handles:
+        return state
+    wrapped = dict(state)
+    for key, handle in handles.items():
+        wrapped[key] = _StreamRef(handle)
+    return wrapped
+
+
 class YamlGraphRunner:
     """
     Builds a compiled LangGraph from a plain dict parsed from a YAML file.
@@ -811,6 +895,24 @@ class YamlGraphRunner:
                                        #   output_key instead of failing the run
             source: github             # data_source only — DataSourceDefinition id
             operation: list_repos      # data_source only — operation to invoke
+            result_mode: auto          # data_source only — auto (default)
+                                       #   leaves the stream reference in
+                                       #   state; ram loads the records back
+                                       #   in, and fails if they will not fit
+            stream: contacts           # python | llm — the state key holding
+                                       #   the data_source result to read
+            sample_records: 5          # llm — how many records go in the prompt
+            stream_mode: sample        # llm — sample (default) states the count
+                                       #   and shows a few records; map_reduce
+                                       #   runs the prompt per chunk then once
+                                       #   over the answers
+            chunk_items: 5000          # llm + map_reduce — records per chunk
+            chunk_bytes: 524288        # llm + map_reduce — bytes per chunk
+            max_chunks: 200            # llm + map_reduce — stop after N chunks
+            chunk_template: ...        # llm + map_reduce — per-chunk prompt,
+                                       #   gets {chunk} {chunk_index} {total_items}
+            reduce_template: ...       # llm + map_reduce — combining prompt,
+                                       #   gets {parts} {total_items}
             params:                    # data_source only — operation inputs;
               owner: "{repo_owner}"    #   values support {key} templates
             routes:                    # switch / langgraph-agent /
@@ -865,7 +967,48 @@ class YamlGraphRunner:
     the ``trigger_info`` state key.  When the node executes it simply returns
     that metadata under ``output_key``.
 
-    ``data_source`` steps invoke one operation of a registered
+    Data source results
+    -------------------
+    A ``data_source`` step never puts its result in state.  The executor
+    writes every result -- one record or four million -- to the data stream
+    store and the step leaves a small ``DataRef`` behind (see
+    ``app.infrastructure.datasources.datastream``).  State, the LangGraph
+    checkpoint and the Mongo run document are therefore never functions of
+    result size.
+
+    One path, unconditionally, because the alternative -- inline when small,
+    a file when large -- means every consumer handles both shapes and every
+    workflow behaves differently in production than in test depending on how
+    much data happened to come back.
+
+    Consumers read the file:
+
+    * ``python`` with ``stream: <key>`` gets ``records()``, a generator over an
+      already-open descriptor, plus ``stream`` (the raw file object) and
+      ``stream_records`` (the count, known up front).  It can iterate twice;
+      it holds one record at a time.  The descriptor is opened for it before
+      the seccomp filter denies ``openat``, so the sandbox is no weaker --
+      the script still cannot open a path of its own, including that file.
+    * ``data_source`` fan-out streams a referenced upstream, one request per
+      record.  Nothing to configure.
+    * ``llm`` with ``stream: <key>`` is the one consumer that cannot read a
+      descriptor: bytes have to become tokens in a context window, so this
+      step reads the file on the model's behalf and puts a bounded selection
+      in the prompt (``stream_mode: sample`` or ``map_reduce``).  Reducing
+      first with a ``python`` step is cheaper and exact -- prefer it.
+    * Any ``{key}`` template renders a reference as a one-line summary, never
+      as data.  ``{key[items]}`` reads the count.
+    * ``result_mode: ram`` on the ``data_source`` step is the escape hatch for
+      a workflow that needs values inline -- a route condition on a field, an
+      ``http_call`` body built from the records.  It refuses past
+      ``STREAM_READ_ALL_MAX_BYTES`` rather than half-loading.
+
+    Where the sandbox runs decides how the file gets there: ``local`` and
+    ``docker`` are handed the path (docker bind-mounts it read-only), while
+    ``k8s`` is a different pod with no network and no shared filesystem, so
+    the backend streams the bytes into its stdin and it writes its own copy.
+
+    ``data_source`` steps invoke one operation of a registered    ``data_source`` steps invoke one operation of a registered
     ``DataSourceDefinition``.  Upstream operations of the source's DAG are
     resolved by the executor, so the step only supplies the operation's own
     ``params``.  The result is stored under ``output_key`` (defaults to the
@@ -959,6 +1102,12 @@ class YamlGraphRunner:
         # Injected post-construction for `data_source` steps (optional)
         self._data_source_backend: Any = None
         self._data_source_executor: Any = None
+        # Injected post-construction: reads back a data source result the
+        # executor spilled to disk because it was too large for state (see
+        # app.infrastructure.datasources.datastream).  Optional — without it a
+        # `data_source` step still runs, it just cannot spill, so an oversized
+        # result fails the step instead.
+        self._stream_store: Any = None
         # Injected post-construction: the privilege gate that holds a
         # destructive data-source operation until somebody approves it.
         # Optional — without it a `data_source` step runs a DELETE unattended,
@@ -1518,7 +1667,53 @@ class YamlGraphRunner:
             logger.info("[%s] step '%s' running (llm)", graph_id, step_id)
             try:
                 system_prompt = step.get("system_prompt", "")
+
+                # A data source result is a file. An LLM cannot read a file:
+                # bytes have to become tokens inside a context window, so
+                # something has to choose which bytes. This step reads the
+                # stream on the model's behalf and puts a bounded selection in
+                # the prompt. `stream:` names which result, `stream_mode` says
+                # how much:
+                #
+                #   sample (default) -- the record count and the first few
+                #       records, read from the file, labelled as a sample.
+                #   map_reduce -- the prompt once per chunk read off the file,
+                #       then once over the answers. Reads everything, at N+1
+                #       calls, and is lossy: the combining pass sees the
+                #       answers, never the records.
+                #
+                # Neither replaces reducing first. A `python` step reading the
+                # same file down to what actually needs judgement is cheaper
+                # and exact.
+                stream_key = step.get("stream") or step.get("over")
+                ref = self._ref_in(state, stream_key) if stream_key else None
+                if ref is not None:
+                    stream_mode = (
+                        step.get("stream_mode") or step.get("spill_mode") or "sample"
+                    ).lower()
+                    if stream_mode == "map_reduce":
+                        content = await self._llm_map_reduce(
+                            step, llm, system_prompt, state, ref, stream_key,
+                        )
+                        logger.info("[%s] step '%s' finished", graph_id, step_id)
+                        return {output_key: content}
+                    if stream_mode != "sample":
+                        raise ValueError(
+                            f"step '{step_id}': unknown stream_mode "
+                            f"'{stream_mode}'. Valid values are 'sample' and "
+                            f"'map_reduce'."
+                        )
+                    logger.info(
+                        "[%s] step '%s' reading '%s' (%d records) as a sample",
+                        graph_id, step_id, stream_key, ref.items,
+                    )
+
                 user_message = self._render(step.get("user_template", "{request}"), state)
+                if ref is not None:
+                    sample = await self._read_sample(ref, step_id, step)
+                    user_message = (
+                        f"{user_message}\n\n{_stream_sample_block(ref, sample)}"
+                    )
                 messages = [
                     SystemMessage(content=system_prompt),
                     HumanMessage(content=user_message),
@@ -1997,6 +2192,40 @@ class YamlGraphRunner:
                     }}
 
                 result = await self._data_source_executor.execute(source, operation, params)
+
+                # The executor always returns a reference, never the data.
+                # `result_mode` decides what this step leaves in state:
+                #
+                #   auto (default) -- the reference. Downstream steps read the
+                #       file; nothing large is ever checkpointed.
+                #   ram -- load the records back into state. The escape hatch
+                #       for a workflow that needs the value inline: a route
+                #       condition on one of its fields, an `http_call` body
+                #       built from it. Fails loudly past
+                #       stream_read_all_max_bytes rather than half-loading
+                #       into a checkpoint that cannot hold it.
+                result_mode = (step.get("result_mode") or "auto").lower()
+                ref = as_data_ref(result)
+                if ref is not None:
+                    if ref.truncated:
+                        logger.warning(
+                            "[%s] step '%s' result is TRUNCATED (%d records, "
+                            "%d bytes) -- downstream steps see a prefix, not "
+                            "the whole answer",
+                            graph_id, step_id, ref.items, ref.bytes,
+                        )
+                    if result_mode == "ram":
+                        result = await self._load_stream(ref, step_id)
+                        logger.info(
+                            "[%s] step '%s' loaded stream %s into state "
+                            "(result_mode: ram)", graph_id, step_id, ref.id,
+                        )
+                    else:
+                        logger.info(
+                            "[%s] step '%s' -> stream %s (%d records, %d bytes)",
+                            graph_id, step_id, ref.id, ref.items, ref.bytes,
+                        )
+
                 logger.info("[%s] step '%s' finished", graph_id, step_id)
                 if gate is not None:
                     return {output_key: result, "_approval_case_id": gate["case_id"]}
@@ -2158,11 +2387,24 @@ class YamlGraphRunner:
             try:
                 code = await self._resolve_script_code(step)
 
+                # A data source result is a file, so a script that needs
+                # one names it with `stream: <state key>` and reads it with
+                # records(). Nothing large ever passes through `state`.
+                stream_key = step.get("stream") or step.get("over")
+                ref = self._ref_in(state, stream_key) if stream_key else None
+                if stream_key and ref is None:
+                    raise ValueError(
+                        f"step '{step_id}' declares `stream: {stream_key}` but "
+                        f"state key '{stream_key}' does not hold a data source "
+                        f"result reference"
+                    )
+
                 if sandbox:
                     from app.core.config import get_settings
                     from app.infrastructure.orchestration.script_sandbox import run_script
 
                     settings = get_settings()
+                    delivery = await self._stream_delivery(ref, sandbox_runtime, step_id)
                     result = await run_script(
                         code,
                         dict(state),
@@ -2171,6 +2413,7 @@ class YamlGraphRunner:
                         image=step.get("sandbox_image") or settings.script_sandbox_image,
                         memory_mb=settings.script_sandbox_memory_mb,
                         namespace=settings.agent_namespace,
+                        **delivery,
                     )
                 else:
                     # Single namespace for globals and locals -- see the same
@@ -2180,6 +2423,11 @@ class YamlGraphRunner:
                     local_vars: dict[str, Any] = {
                         "__builtins__": __builtins__,
                         "state": dict(state),
+                        # Same contract as the sandbox: the data arrives as a
+                        # generator over the stream, never as a value.
+                        "records": self._records_callable(ref),
+                        "stream_records": ref.items if ref is not None else 0,
+                        "stream_truncated": bool(ref is not None and ref.truncated),
                         "output": None,
                     }
                     compiled = compile(code, f"<workflow:{graph_id}:{step_id}>", "exec")
@@ -2203,6 +2451,198 @@ class YamlGraphRunner:
                 return {output_key: {"error": detail}}
 
         return node
+
+    # ------------------------------------------------------------------
+    # Handing a data stream to a step
+    # ------------------------------------------------------------------
+
+    async def _stream_delivery(
+        self, ref: Any, runtime: str, step_id: str
+    ) -> dict[str, Any]:
+        """The ``run_script`` kwargs that get *ref* to a sandbox.
+
+        Two mechanisms, picked by where the sandbox runs:
+
+        * same pod (``local``, ``docker``) -- hand over the path. The bootstrap
+          opens it before seccomp denies ``openat``, and docker bind-mounts it
+          read-only. No copy at all.
+        * another pod (``k8s``) -- hand over a copy callable. The backend
+          pushes the bytes into that pod's stdin and it writes its own file.
+          There is no shared filesystem and the sandbox has no network, so a
+          transfer is the only option; it is chunked, so neither side holds the
+          whole stream.
+        """
+        if ref is None:
+            return {}
+        store = self._require_stream_store(step_id)
+        common = {
+            "stream_records": ref.items,
+            "stream_truncated": bool(ref.truncated),
+        }
+        if runtime == "k8s":
+            async def _copy(sink: Any) -> int:
+                return await store.copy_to(ref, sink)
+
+            return {"stream_copy": _copy, **common}
+
+        path = await store.local_path(ref)
+        if path is None:
+            # A store that keeps bytes off this filesystem (GridFS, object
+            # storage) has no path to hand over, so the same transfer the
+            # cross-pod case uses is used here too.
+            async def _copy_local(sink: Any) -> int:
+                return await store.copy_to(ref, sink)
+
+            return {"stream_copy": _copy_local, **common}
+        return {"stream_path": path, **common}
+
+    async def _llm_map_reduce(
+        self,
+        step: dict[str, Any],
+        llm: Any,
+        system_prompt: str,
+        state: dict,
+        ref: Any,
+        stream_key: str,
+    ) -> Any:
+        """Run the prompt per chunk read off the file, then over the answers.
+
+        The only way an ``llm`` step reads a whole result. Chunks come off the
+        stream, so the backend holds one chunk; but the model still never sees
+        the whole thing at once, and the combining pass sees the map answers
+        rather than the records, so this is lossy by construction. Opt-in,
+        bounded by ``max_chunks``, and logged with the call count so the bill
+        is not a surprise.
+
+        ``chunk_template`` is the per-chunk prompt and receives ``{chunk}``
+        (the records as JSON), ``{chunk_index}`` and ``{total_items}`` plus the
+        usual state keys; ``reduce_template`` receives ``{parts}``, the answers
+        joined. Both have defaults that state the job plainly -- a map-reduce
+        with a vague map prompt yields N vague summaries and one vaguer answer.
+        """
+        import json as _json
+
+        step_id = step["id"]
+        settings = self._stream_conf()
+        store = self._require_stream_store(step_id)
+
+        size = int(step.get("chunk_items") or settings.stream_chunk_items)
+        max_bytes = int(step.get("chunk_bytes") or settings.stream_chunk_bytes)
+        max_chunks = int(step.get("max_chunks") or settings.stream_max_chunks)
+
+        chunk_template = step.get("chunk_template") or (
+            "{request}\n\nBelow is part {chunk_index} of a larger set of "
+            "{total_items} records. Answer for these records only, and keep "
+            "the answer short enough to be combined with the others.\n"
+            "RECORDS:\n{chunk}"
+        )
+        reduce_template = step.get("reduce_template") or (
+            "{request}\n\nBelow are the answers for each part of a set of "
+            "{total_items} records, in order. Combine them into one answer. "
+            "Do not invent detail that is not in the parts.\n\nPARTS:\n{parts}"
+        )
+
+        parts: list[str] = []
+        index = 0
+        consumed = 0
+        async for chunk in store.chunks(ref, size=size, max_bytes=max_bytes):
+            if index >= max_chunks:
+                logger.warning(
+                    "[%s] step '%s' map_reduce stopped at max_chunks (%d) after "
+                    "%d record(s) of %d -- the answer covers a prefix only",
+                    self.id, step_id, max_chunks, consumed, ref.items,
+                )
+                break
+            chunk_state = dict(state)
+            chunk_state["chunk"] = _json.dumps(chunk, default=str)
+            chunk_state["chunk_index"] = index
+            chunk_state["total_items"] = ref.items
+            response = await llm.ainvoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=self._render(chunk_template, chunk_state)),
+            ])
+            parts.append(
+                response.content
+                if isinstance(response.content, str)
+                else str(response.content)
+            )
+            consumed += len(chunk)
+            index += 1
+
+        logger.info(
+            "[%s] step '%s' map_reduce: %d chunk call(s) over %d record(s), "
+            "plus 1 combining call",
+            self.id, step_id, index, consumed,
+        )
+        if not parts:
+            return ""
+        if len(parts) == 1:
+            # One chunk means the map answer *is* the answer; a combining call
+            # over a single part only costs money and adds a paraphrase.
+            return parts[0]
+
+        reduce_state = dict(state)
+        reduce_state["parts"] = "\n\n---\n\n".join(
+            f"[part {i}] {part}" for i, part in enumerate(parts)
+        )
+        reduce_state["total_items"] = ref.items
+        reduced = await llm.ainvoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=self._render(reduce_template, reduce_state)),
+        ])
+        return reduced.content
+
+    async def _read_sample(
+        self, ref: Any, step_id: str, step: dict[str, Any]
+    ) -> list[Any]:
+        """The first few records, read off the stream for a prompt.
+
+        Read from the file rather than taken from ``ref.preview`` so the
+        number of example records is the step's choice, not a constant fixed
+        when the stream was written.
+        """
+        if ref.shape != "list":
+            whole = await self._load_stream(ref, step_id)
+            return [whole]
+        store = self._require_stream_store(step_id)
+        count = max(1, int(step.get("sample_records") or 5))
+        return [item async for item in store.stream(ref, limit=count)]
+
+    def _records_callable(self, ref: Any) -> Any:
+        """A ``records()`` for an in-process (``sandbox: false``) script.
+
+        Synchronous, because the script it is handed to is synchronous: the
+        file is read on the calling thread, one line at a time, so an
+        unsandboxed script gets exactly the contract a sandboxed one gets.
+        """
+        if ref is None:
+            def _no_stream():
+                raise RuntimeError(
+                    "no data stream is attached to this step. Add "
+                    "`stream: <state key>` naming the data_source output this "
+                    "script should read."
+                )
+
+            return _no_stream
+
+        store = self._stream_store
+
+        def _records():
+            import json as _json
+
+            path = getattr(store, "_path_for", None)
+            if path is None:
+                raise RuntimeError(
+                    "this data stream store cannot be read from an unsandboxed "
+                    "script; use sandbox: true"
+                )
+            with open(path(ref.id), "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        yield _json.loads(line)
+
+        return _records
 
     @staticmethod
     def _parallel_node(step: dict[str, Any]) -> Callable:
@@ -2731,7 +3171,7 @@ class YamlGraphRunner:
             def __missing__(self, key: str) -> "_Safe":
                 return _Safe()
 
-        d = _DefaultDict(state)
+        d = _DefaultDict(_stream_safe_state(state))
         d["env"] = _EnvAccessor()
         try:
             return string.Formatter().vformat(template, [], d)  # type: ignore[arg-type]
@@ -2748,3 +3188,37 @@ class YamlGraphRunner:
         if isinstance(value, list):
             return [cls._render_deep(item, state) for item in value]
         return value
+
+    # ------------------------------------------------------------------
+    # Data source results (always a stream reference)
+    # ------------------------------------------------------------------
+
+    def _stream_conf(self) -> Any:
+        from app.core.config import get_settings
+
+        return get_settings()
+
+    def _ref_in(self, state: dict, key: str) -> Any:
+        """The ``DataRef`` at *key*, or ``None`` when it is not one."""
+        return as_data_ref(state.get(key))
+
+    def _require_stream_store(self, step_id: str) -> Any:
+        if self._stream_store is None:
+            raise ValueError(
+                f"step '{step_id}' reads a data source result but no data "
+                f"stream store is configured on this backend"
+            )
+        return self._stream_store
+
+    async def _load_stream(self, ref: Any, step_id: str) -> Any:
+        """Load a stream whole, for a step that asked for ``result_mode: ram``.
+
+        The escape hatch for a workflow that must have the value inline -- a
+        route condition on one of its fields, an ``http_call`` body built from
+        it.  Refuses past ``stream_read_all_max_bytes`` rather than degrading:
+        the value is about to go into a checkpoint, and a silent partial read
+        is the failure this design exists to remove.
+        """
+        store = self._require_stream_store(step_id)
+        limit = int(getattr(self._stream_conf(), "stream_read_all_max_bytes", 0) or 0)
+        return await store.read_all(ref, max_bytes=limit)

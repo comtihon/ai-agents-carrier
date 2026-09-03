@@ -29,6 +29,21 @@ from tests.test_datasources_api import InMemoryDataSourceBackend
 from tests.test_sheet_bindings_api import GRID, _read_binding, _write_binding
 
 
+def _executor(**kwargs):
+    """An executor with a throw-away stream store.
+
+    Every data source result is written to a stream and returned as a
+    reference, so an executor needs somewhere to write. Tests that assert on
+    records call ``execute_value``, which reads the stream back.
+    """
+    import tempfile
+
+    from app.infrastructure.datasources.datastream import LocalDiskStreamStore
+
+    kwargs.setdefault("stream_store", LocalDiskStreamStore(tempfile.mkdtemp()))
+    return DataSourceExecutor(**kwargs)
+
+
 class _RecordingExecutor(DataSourceExecutor):
     """A real executor with only the raw Sheets operations stubbed out.
 
@@ -40,6 +55,11 @@ class _RecordingExecutor(DataSourceExecutor):
         super().__init__()
         self.grid = GRID
         self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def execute_value(self, source, operation, params, *, max_bytes=0):
+        # The binding runtime asks for values; this double answers with
+        # the canned responses instead of going near a stream store.
+        return await self.execute(source, operation, params)
 
     async def execute(self, source, operation, params):
         if source.get_binding(operation) is None:
@@ -74,7 +94,7 @@ async def test_a_read_binding_is_executed_by_its_operation_name():
     source = _source(_read_binding())
     executor = _RecordingExecutor()
 
-    result = await executor.execute(source, "read_open_projects", {"assignee": "ann"})
+    result = await executor.execute_value(source, "read_open_projects", {"assignee": "ann"})
 
     assert result == [{"project_id": "P-1", "status": "open", "owner": "ann"}]
     # One read, and it carried the header row so the fingerprint could be
@@ -87,7 +107,7 @@ async def test_a_write_binding_runs_the_five_steps_in_order():
     source = _source(_write_binding())
     executor = _RecordingExecutor()
 
-    result = await executor.execute(source, "update_project", {
+    result = await executor.execute_value(source, "update_project", {
         "project_id": "P-1", "classification_status": "closed",
     })
 
@@ -111,7 +131,7 @@ async def test_a_write_stops_at_the_fingerprint_before_touching_anything():
 
     from app.infrastructure.datasources.sheet_binding_resolver import SheetBindingError
     with pytest.raises(SheetBindingError, match="header row has changed"):
-        await executor.execute(source, "update_project", {
+        await executor.execute_value(source, "update_project", {
             "project_id": "P-1", "classification_status": "closed",
         })
 
@@ -125,7 +145,7 @@ async def test_a_missing_param_is_named_rather_than_silently_blank():
 
     from app.infrastructure.datasources.sheet_binding_runtime import BindingRuntimeError
     with pytest.raises(BindingRuntimeError, match="classification_status"):
-        await executor.execute(source, "update_project", {"project_id": "P-1"})
+        await executor.execute_value(source, "update_project", {"project_id": "P-1"})
 
     assert executor.calls == []
 
@@ -182,7 +202,7 @@ async def test_a_write_whose_columns_all_skip_affects_no_rows():
 class _Container:
     def __init__(self, backend) -> None:
         self.data_source_backend = backend
-        self.data_source_executor = DataSourceExecutor()
+        self.data_source_executor = _executor()
 
 
 async def test_a_compiled_binding_is_published_as_an_mcp_tool():

@@ -439,6 +439,30 @@ class Settings(BaseSettings):
     # Memory cap for a sandboxed script, in MiB.
     script_sandbox_memory_mb: int = Field(default=512, alias="SCRIPT_SANDBOX_MEMORY_MB")
 
+    # --- Data source result streams (infrastructure/datasources/datastream.py) ---
+    # Every data source result is written here and passed on as a reference.
+    # Local disk is not durable across a pod restart, so keep this on a path
+    # the node can spare and expect a run that outlives a restart to have to
+    # re-fetch.
+    stream_dir: str = Field(default="/tmp/carrier-streams", alias="STREAM_DIR")
+    # Age at which an unreferenced stream file is swept, in seconds. A run that
+    # outlives this and then reads its ref gets a clear "stream is gone" error
+    # rather than a silently short result. Default 6 hours.
+    stream_ttl_seconds: float = Field(default=21600.0, alias="STREAM_TTL_SECONDS")
+    # Ceiling for `result_mode: ram` -- a step explicitly asking for a result
+    # to be loaded whole. Well under the 16 MB BSON limit, because whatever is
+    # loaded there also has to fit in the checkpoint.
+    stream_read_all_max_bytes: int = Field(
+        default=8 * 1024 * 1024, alias="STREAM_READ_ALL_MAX_BYTES"
+    )
+    # How much of a stream one `llm` map_reduce call receives. Both caps apply;
+    # whichever binds first wins.
+    stream_chunk_items: int = Field(default=5000, alias="STREAM_CHUNK_ITEMS")
+    stream_chunk_bytes: int = Field(default=512 * 1024, alias="STREAM_CHUNK_BYTES")
+    # Hard stop on how many chunks one map_reduce step will run: past some
+    # number that is a runaway LLM bill, not a workflow.
+    stream_max_chunks: int = Field(default=200, alias="STREAM_MAX_CHUNKS")
+
     # --- Run-state divergence probe (see stream_graph_to_pause) ---
     # Diagnostic for the dual-state cleanup: after every streamed chunk,
     # compare the hand-merged `current_state` the runner maintains against the

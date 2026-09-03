@@ -18,6 +18,21 @@ from app.domain.models.data_source_definition import DataSourceDefinition
 from app.infrastructure.datasources.executor import DataSourceExecutor
 
 
+def _executor(**kwargs):
+    """An executor with a throw-away stream store.
+
+    Every data source result is written to a stream and returned as a
+    reference, so an executor needs somewhere to write. Tests that assert on
+    records call ``execute_value``, which reads the stream back.
+    """
+    import tempfile
+
+    from app.infrastructure.datasources.datastream import LocalDiskStreamStore
+
+    kwargs.setdefault("stream_store", LocalDiskStreamStore(tempfile.mkdtemp()))
+    return DataSourceExecutor(**kwargs)
+
+
 def _source(paginate: dict | None = None, **op_extra) -> DataSourceDefinition:
     op: dict = {
         "name": "list_things",
@@ -59,7 +74,7 @@ def _drf_pages(pages: list[list[dict]], total: int) -> httpx.MockTransport:
 
 
 async def _run(source: DataSourceDefinition, transport: httpx.MockTransport):
-    executor = DataSourceExecutor()
+    executor = _executor()
     # The executor opens its own client, so hand it the mock transport.
     import app.infrastructure.datasources.executor as mod
 
@@ -71,7 +86,7 @@ async def _run(source: DataSourceDefinition, transport: httpx.MockTransport):
 
     mod.httpx.AsyncClient = _client  # type: ignore[assignment]
     try:
-        return await executor.execute(source, "list_things", {})
+        return await executor.execute_value(source, "list_things", {})
     finally:
         mod.httpx.AsyncClient = real_client  # type: ignore[assignment]
 

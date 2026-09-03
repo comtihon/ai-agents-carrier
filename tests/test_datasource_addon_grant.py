@@ -46,6 +46,21 @@ from app.infrastructure.datasources.executor import DataSourceExecutor
 from app.steps.agent_executor import _build_agent_config
 from tests.test_datasources_api import InMemoryDataSourceBackend
 
+
+def _executor(**kwargs):
+    """An executor with a throw-away stream store.
+
+    Every data source result is written to a stream and returned as a
+    reference, so an executor needs somewhere to write. Tests that assert on
+    records call ``execute_value``, which reads the stream back.
+    """
+    import tempfile
+
+    from app.infrastructure.datasources.datastream import LocalDiskStreamStore
+
+    kwargs.setdefault("stream_store", LocalDiskStreamStore(tempfile.mkdtemp()))
+    return DataSourceExecutor(**kwargs)
+
 SIGNING_KEY = "grant-signing-key"
 
 
@@ -102,7 +117,7 @@ def _crm_source() -> DataSourceDefinition:
 class _Container:
     def __init__(self, backend) -> None:
         self.data_source_backend = backend
-        self.data_source_executor = DataSourceExecutor()
+        self.data_source_executor = _executor()
 
 
 @pytest.fixture

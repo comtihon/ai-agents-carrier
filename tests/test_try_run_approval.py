@@ -28,6 +28,21 @@ from app.infrastructure.persistence.mongo import MongoGraphRunRepository
 from app.infrastructure.tools.mcp_client import McpToolsProvider
 
 
+def _executor(**kwargs):
+    """An executor with a throw-away stream store.
+
+    Every data source result is written to a stream and returned as a
+    reference, so an executor needs somewhere to write. Tests that assert on
+    records call ``execute_value``, which reads the stream back.
+    """
+    import tempfile
+
+    from app.infrastructure.datasources.datastream import LocalDiskStreamStore
+
+    kwargs.setdefault("stream_store", LocalDiskStreamStore(tempfile.mkdtemp()))
+    return DataSourceExecutor(**kwargs)
+
+
 # ── httpx stub (same shape as tests/test_data_source_executor.py) ─────────────
 
 class FakeResponse:
@@ -99,7 +114,7 @@ def _container(backend) -> ApplicationContainer:
         mongo_provider=mongo_provider,
         run_repository=AsyncMock(spec=MongoGraphRunRepository),
         openhands=MagicMock(spec=OpenHandsAdapter),
-        data_source_executor=DataSourceExecutor(),
+        data_source_executor=_executor(),
         approval_backend=backend,
         approval_service=ApprovalService(backend, settings),
     )

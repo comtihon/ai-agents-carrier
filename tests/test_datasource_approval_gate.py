@@ -20,6 +20,21 @@ from app.infrastructure.datasources.executor import DataSourceExecutor
 from app.infrastructure.persistence.approval_backend import InMemoryApprovalBackend
 
 
+def _executor(**kwargs):
+    """An executor with a throw-away stream store.
+
+    Every data source result is written to a stream and returned as a
+    reference, so an executor needs somewhere to write. Tests that assert on
+    records call ``execute_value``, which reads the stream back.
+    """
+    import tempfile
+
+    from app.infrastructure.datasources.datastream import LocalDiskStreamStore
+
+    kwargs.setdefault("stream_store", LocalDiskStreamStore(tempfile.mkdtemp()))
+    return DataSourceExecutor(**kwargs)
+
+
 # ---------------------------------------------------------------------------
 # httpx stub (same shape as tests/test_data_source_executor.py)
 # ---------------------------------------------------------------------------
@@ -157,7 +172,7 @@ async def test_preview_counts_fanout_rows_and_sends_no_delete(http):
     ])
     http.handler = lambda call: [{"id": "f1"}, {"id": "f2"}, {"id": "f3"}]
 
-    plan = await DataSourceExecutor().preview(source, "drop", {})
+    plan = await _executor().preview(source, "drop", {})
 
     assert plan.affected_rows == 3
     assert plan.sample == ["f1", "f2", "f3"]
@@ -171,7 +186,7 @@ async def test_preview_of_a_single_targeted_delete_counts_one_row(http):
         {"name": "drop", "method": "DELETE", "path": "/files/{params.id}",
          "params": [{"name": "id"}]},
     ])
-    plan = await DataSourceExecutor().preview(source, "drop", {"id": "f9"})
+    plan = await _executor().preview(source, "drop", {"id": "f9"})
 
     assert plan.affected_rows == 1
     assert plan.targets == ["DELETE https://api.test/files/f9"]
@@ -185,7 +200,7 @@ async def test_preview_of_an_empty_upstream_finds_nothing_to_delete(http):
     ])
     http.handler = lambda call: []
 
-    plan = await DataSourceExecutor().preview(source, "drop", {})
+    plan = await _executor().preview(source, "drop", {})
     assert plan.affected_rows == 0
 
 

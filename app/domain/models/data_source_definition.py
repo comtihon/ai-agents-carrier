@@ -137,6 +137,18 @@ class Paginate(BaseModel):
     items_path: str | None = None
     param: str
     max_pages: int = 10
+    # JMESPath expression pointing at the API's own total-record count in a
+    # raw page response ("total", "totalCount", "meta.total", …).  It is the
+    # only way to know the size of a paginated read *before* walking it: after
+    # page one, ``total x bytes-per-item`` projects the finished size, so a
+    # read that would blow the byte budget is refused (or spilled to disk) at
+    # page two instead of at page seven with the pod already at 900 MB.
+    #
+    # Optional because plenty of APIs do not report one -- cursor pagination
+    # typically cannot.  Without it the executor still enforces the budget,
+    # just reactively: it measures what has arrived rather than projecting
+    # what will.
+    total_path: str | None = None
 
 
 class CachePolicy(BaseModel):
@@ -244,6 +256,22 @@ class DataSourceDefinition(BaseModel):
     cache: CachePolicy = Field(default_factory=CachePolicy)
     timeout_seconds: float = 30
     retries: RetryPolicy = Field(default_factory=RetryPolicy)
+
+    # --- Result size ceiling ------------------------------------------------
+    # Every result is written to the data stream store and passed on as a
+    # DataRef, so neither memory nor the 16 MB checkpoint is a function of
+    # result size any more (see app.infrastructure.datasources.datastream).
+    # What is still finite is the node's disk, and nothing about a remote API
+    # bounds what it returns.
+    #
+    # Past this many *encoded* bytes the fetch stops and the ref is flagged
+    # ``truncated``, which every consumer can read -- a bounded, honest prefix
+    # beats filling the disk and getting the pod evicted. 0 disables the
+    # ceiling (not advised).
+    #
+    # Default 512 MiB: larger than any realistic business read, and a fraction
+    # of the 40 GB node disk even with several runs streaming at once.
+    max_result_bytes: int = 512 * 1024 * 1024
 
     # Timestamps
     created_at: datetime | None = None

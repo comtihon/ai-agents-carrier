@@ -42,6 +42,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
+from app.domain.models.datastream import as_data_ref
 from app.domain.models.data_source_definition import (
     OperationDefinition,
     ParamSpec,
@@ -362,7 +363,38 @@ def _make_handler(
             refusal = await _await_approval(container, source, operation, kwargs)
             if refusal is not None:
                 return refusal
-            return await executor.execute(source, operation, kwargs)
+            result = await executor.execute(source, operation, kwargs)
+
+            # The result was too large for memory and went to the spill store.
+            # An MCP caller is a language model: it has no way to read a
+            # spill file, and a context window that the data would not have
+            # fit in anyway. Return the shape and the count with an explicit
+            # instruction to narrow, which is the only useful answer here --
+            # and still strictly better than the OOM this replaced.
+            handle = as_data_ref(result)
+            if handle is None:
+                return result
+            logger.info(
+                "data source '%s' operation '%s': result spilled (%d items, "
+                "%d bytes); returning a summary to the MCP caller",
+                source_id, operation, handle.items, handle.bytes,
+            )
+            return {
+                "too_large": True,
+                "items": handle.items,
+                "bytes": handle.bytes,
+                "truncated": handle.truncated,
+                "sample": handle.preview,
+                "message": (
+                    f"This operation returned {handle.items} records "
+                    f"({handle.bytes} bytes) — far more than can be returned "
+                    f"here. Only a sample is included above. Narrow the "
+                    f"request (add a filter, ask for fewer fields, or request "
+                    f"a specific record), or run this operation from a "
+                    f"workflow `data_source` step, where the full result can "
+                    f"be folded over in chunks."
+                ),
+            }
         except Exception as exc:  # noqa: BLE001 — surfaced to the MCP caller
             logger.exception(
                 "data source '%s' operation '%s' failed", source_id, operation

@@ -20,6 +20,21 @@ from app.infrastructure.persistence.mongo import MongoGraphRunRepository
 from app.infrastructure.tools.mcp_client import McpToolsProvider
 
 
+def _executor(**kwargs):
+    """An executor with a throw-away stream store.
+
+    Every data source result is written to a stream and returned as a
+    reference, so an executor needs somewhere to write. Tests that assert on
+    records call ``execute_value``, which reads the stream back.
+    """
+    import tempfile
+
+    from app.infrastructure.datasources.datastream import LocalDiskStreamStore
+
+    kwargs.setdefault("stream_store", LocalDiskStreamStore(tempfile.mkdtemp()))
+    return DataSourceExecutor(**kwargs)
+
+
 class InMemoryDataSourceBackend(DataSourceDefinitionBackend):
     def __init__(self) -> None:
         self._store: dict[str, DataSourceDefinition] = {}
@@ -59,7 +74,7 @@ def _build_container(backend: DataSourceDefinitionBackend | None) -> Application
         run_repository=AsyncMock(spec=MongoGraphRunRepository),
         openhands=MagicMock(spec=OpenHandsAdapter),
         data_source_backend=backend,
-        data_source_executor=DataSourceExecutor() if backend else None,
+        data_source_executor=_executor() if backend else None,
     )
 
 
