@@ -18,6 +18,21 @@ from app.infrastructure.datasources import executor as executor_module
 from app.infrastructure.datasources.executor import DataSourceExecutor
 
 
+def _executor(**kwargs):
+    """An executor with a throw-away stream store.
+
+    Every data source result is written to a stream and returned as a
+    reference, so an executor needs somewhere to write. Tests that assert on
+    records call ``execute_value``, which reads the stream back.
+    """
+    import tempfile
+
+    from app.infrastructure.datasources.datastream import LocalDiskStreamStore
+
+    kwargs.setdefault("stream_store", LocalDiskStreamStore(tempfile.mkdtemp()))
+    return DataSourceExecutor(**kwargs)
+
+
 # ---------------------------------------------------------------------------
 # httpx stub
 # ---------------------------------------------------------------------------
@@ -111,7 +126,7 @@ async def test_linear_dag_passes_upstream_field_downstream(http):
         return {"bio": "hello"}
 
     http.handler = handler
-    result = await DataSourceExecutor().execute(source, "profile", {})
+    result = await _executor().execute_value(source, "profile", {})
     assert result == {"bio": "hello"}
     assert http.calls[-1]["url"] == "https://api.test/users/u7/profile"
 
@@ -134,7 +149,7 @@ async def test_diamond_dag_memoises_shared_upstream(http):
         return {"done": True}
 
     http.handler = handler
-    result = await DataSourceExecutor().execute(source, "merge", {})
+    result = await _executor().execute_value(source, "merge", {})
     assert result == {"done": True}
     assert http.count("/base") == 1
     assert http.calls[-1]["url"] == "https://api.test/merge/L/R"
@@ -152,7 +167,7 @@ async def test_fanout_over_array_upstream(http):
         return {"Python": 100}
 
     http.handler = handler
-    result = await DataSourceExecutor().execute(source, "languages", {})
+    result = await _executor().execute_value(source, "languages", {})
     assert result == [
         {"name": "a", "result": {"Python": 100}},
         {"name": "b", "result": {"Python": 100}},
@@ -169,12 +184,12 @@ async def test_fanout_rejects_two_array_upstreams(http):
     http.handler = lambda call: {"items": [{"name": "a"}]}
 
     with pytest.raises(ValueError, match="more than one array upstream"):
-        await DataSourceExecutor().execute(source, "combine", {})
+        await _executor().execute_value(source, "combine", {})
 
 
 async def test_unknown_operation_raises(http):
     with pytest.raises(ValueError, match="no operation 'nope'"):
-        await DataSourceExecutor().execute(_source(), "nope", {})
+        await _executor().execute_value(_source(), "nope", {})
 
 
 async def test_missing_required_param_raises(http):
@@ -182,7 +197,7 @@ async def test_missing_required_param_raises(http):
         {"name": "op", "path": "/x/{params.owner}", "params": [{"name": "owner"}]},
     ])
     with pytest.raises(ValueError, match="missing required param"):
-        await DataSourceExecutor().execute(source, "op", {})
+        await _executor().execute_value(source, "op", {})
 
 
 async def test_missing_required_param_on_upstream_op_raises_before_any_call(http):
@@ -194,7 +209,7 @@ async def test_missing_required_param_on_upstream_op_raises_before_any_call(http
         {"name": "down", "path": "/down/{up.id}"},
     ])
     with pytest.raises(ValueError, match="Operation 'up' is missing required param.*owner"):
-        await DataSourceExecutor().execute(source, "down", {})
+        await _executor().execute_value(source, "down", {})
     assert http.calls == []
 
 
@@ -206,7 +221,7 @@ async def test_loose_params_become_query_string(http):
         ]},
     ])
     http.handler = lambda call: {"ok": True}
-    await DataSourceExecutor().execute(source, "search", {"q": "cats", "limit": 5})
+    await _executor().execute_value(source, "search", {"q": "cats", "limit": 5})
     assert http.calls[0]["params"] == {"q": "cats", "limit": 5}
 
 
@@ -225,7 +240,7 @@ async def test_cursor_pagination_follows_cursor_path(http):
     ]
     http.handler = lambda call: pages[0] if "after" not in call["params"] else pages[1]
 
-    result = await DataSourceExecutor().execute(source, "items", {})
+    result = await _executor().execute_value(source, "items", {})
     assert result == [1, 2, 3]
     assert http.calls[1]["params"] == {"after": "c1"}
 
@@ -238,7 +253,7 @@ async def test_page_pagination_stops_on_empty_page(http):
     payloads = {1: {"items": ["a"]}, 2: {"items": ["b"]}, 3: {"items": []}}
     http.handler = lambda call: payloads[call["params"]["page"]]
 
-    result = await DataSourceExecutor().execute(source, "items", {})
+    result = await _executor().execute_value(source, "items", {})
     assert result == ["a", "b"]
     assert [c["params"]["page"] for c in http.calls] == [1, 2, 3]
 
@@ -251,7 +266,7 @@ async def test_offset_pagination_advances_by_item_count(http):
     payloads = {0: {"items": ["a", "b"]}, 2: {"items": ["c"]}, 3: {"items": []}}
     http.handler = lambda call: payloads[call["params"]["offset"]]
 
-    result = await DataSourceExecutor().execute(source, "items", {})
+    result = await _executor().execute_value(source, "items", {})
     assert result == ["a", "b", "c"]
     assert [c["params"]["offset"] for c in http.calls] == [0, 2, 3]
 
@@ -271,7 +286,7 @@ async def test_page_pagination_without_mapping_stops_via_items_path(http):
     }
     http.handler = lambda call: payloads[call["params"]["page"]]
 
-    result = await DataSourceExecutor().execute(source, "items", {})
+    result = await _executor().execute_value(source, "items", {})
     assert result == ["a", "b"]
     assert [c["params"]["page"] for c in http.calls] == [1, 2, 3]
 
@@ -282,7 +297,7 @@ async def test_pagination_respects_max_pages(http):
          "paginate": {"type": "page", "param": "page", "max_pages": 2}},
     ])
     http.handler = lambda call: {"items": ["x"]}
-    result = await DataSourceExecutor().execute(source, "items", {})
+    result = await _executor().execute_value(source, "items", {})
     assert result == ["x", "x"]
     assert len(http.calls) == 2
 
@@ -300,13 +315,13 @@ async def test_cache_hit_within_ttl_then_miss_after_expiry(http, monkeypatch):
     now = {"t": 1000.0}
     monkeypatch.setattr(executor_module.time, "monotonic", lambda: now["t"])
 
-    ex = DataSourceExecutor()
-    assert await ex.execute(source, "op", {}) == {"v": 1}
-    assert await ex.execute(source, "op", {}) == {"v": 1}
+    ex = _executor()
+    assert await ex.execute_value(source, "op", {}) == {"v": 1}
+    assert await ex.execute_value(source, "op", {}) == {"v": 1}
     assert len(http.calls) == 1  # served from cache
 
     now["t"] += 61
-    await ex.execute(source, "op", {})
+    await ex.execute_value(source, "op", {})
     assert len(http.calls) == 2  # TTL expired
 
 
@@ -330,18 +345,18 @@ async def test_cache_key_includes_resolved_upstream_value(http):
         return {"result": responses[upstream_value]}
 
     http.handler = handler
-    ex = DataSourceExecutor()
+    ex = _executor()
 
-    result_a = await ex.execute(source, "down", {"id": "A"})
+    result_a = await ex.execute_value(source, "down", {"id": "A"})
     assert result_a == {"result": "down-for-A"}
-    result_b = await ex.execute(source, "down", {"id": "B"})
+    result_b = await ex.execute_value(source, "down", {"id": "B"})
     assert result_b == {"result": "down-for-B"}
     # Both up() and down() must have been called twice — once per distinct id.
     assert http.count("/up/") == 2
     assert http.count("/down/") == 2
 
     # Re-running with the same id as before must still hit the cache.
-    await ex.execute(source, "down", {"id": "A"})
+    await ex.execute_value(source, "down", {"id": "A"})
     assert http.count("/up/") == 2
     assert http.count("/down/") == 2
 
@@ -349,9 +364,9 @@ async def test_cache_key_includes_resolved_upstream_value(http):
 async def test_cache_disabled_by_default(http):
     source = _source(operations=[{"name": "op", "path": "/x"}])
     http.handler = lambda call: {"v": 1}
-    ex = DataSourceExecutor()
-    await ex.execute(source, "op", {})
-    await ex.execute(source, "op", {})
+    ex = _executor()
+    await ex.execute_value(source, "op", {})
+    await ex.execute_value(source, "op", {})
     assert len(http.calls) == 2
 
 
@@ -373,7 +388,7 @@ async def test_retry_recovers_after_transient_failure(http, monkeypatch):
         return None
     monkeypatch.setattr(executor_module.asyncio, "sleep", _no_sleep)
 
-    assert await DataSourceExecutor().execute(source, "op", {}) == {"ok": True}
+    assert await _executor().execute_value(source, "op", {}) == {"ok": True}
     assert calls["n"] == 3
 
 
@@ -388,7 +403,7 @@ async def test_bearer_auth_uses_stored_token(http):
         operations=[{"name": "op", "path": "/x"}],
     )
     http.handler = lambda call: {}
-    await DataSourceExecutor().execute(source, "op", {})
+    await _executor().execute_value(source, "op", {})
     assert http.calls[0]["headers"] == {
         "Accept": "application/json",
         "Authorization": "Bearer sekret",
@@ -401,7 +416,7 @@ async def test_basic_auth_encodes_stored_credentials(http):
         operations=[{"name": "op", "path": "/x"}],
     )
     http.handler = lambda call: {}
-    await DataSourceExecutor().execute(source, "op", {})
+    await _executor().execute_value(source, "op", {})
     expected = base64.b64encode(b"alice:pw").decode()
     assert http.calls[0]["headers"]["Authorization"] == f"Basic {expected}"
 
@@ -412,7 +427,7 @@ async def test_header_auth_uses_configured_header(http):
         operations=[{"name": "op", "path": "/x"}],
     )
     http.handler = lambda call: {}
-    await DataSourceExecutor().execute(source, "op", {})
+    await _executor().execute_value(source, "op", {})
     assert http.calls[0]["headers"]["X-Api-Key"] == "k123"
 
 
@@ -437,7 +452,7 @@ async def test_service_identity_auth_injects_provider_token(http):
         operations=[{"name": "op", "path": "/x"}],
     )
     http.handler = lambda call: {}
-    await DataSourceExecutor(token_provider=provider).execute(source, "op", {})
+    await _executor(token_provider=provider).execute_value(source, "op", {})
     assert http.calls[0]["headers"]["Authorization"] == "Bearer svc-token"
     assert provider.calls == 1
 
@@ -453,7 +468,7 @@ async def test_service_identity_auth_error_propagates(http):
     )
     http.handler = lambda call: {}
     with pytest.raises(RuntimeError, match="service auth not configured"):
-        await DataSourceExecutor(token_provider=FailingProvider()).execute(source, "op", {})
+        await _executor(token_provider=FailingProvider()).execute_value(source, "op", {})
 
 
 # ---------------------------------------------------------------------------
@@ -474,7 +489,7 @@ async def test_graphql_posts_query_and_variables(http):
     )
     http.handler = lambda call: {"data": {"repo": {"name": "langgraph"}}}
 
-    result = await DataSourceExecutor().execute(source, "repo", {"owner": "acme"})
+    result = await _executor().execute_value(source, "repo", {"owner": "acme"})
     assert result == "langgraph"
     call = http.calls[0]
     assert call["url"] == "https://api.test/graphql"
@@ -486,7 +501,7 @@ async def test_mapping_extracts_with_jmespath(http):
         {"name": "op", "path": "/x", "mapping": "items[].name"},
     ])
     http.handler = lambda call: {"items": [{"name": "a"}, {"name": "b"}]}
-    assert await DataSourceExecutor().execute(source, "op", {}) == ["a", "b"]
+    assert await _executor().execute_value(source, "op", {}) == ["a", "b"]
 
 
 async def test_response_schema_missing_required_key_raises(http):
@@ -496,7 +511,7 @@ async def test_response_schema_missing_required_key_raises(http):
     ])
     http.handler = lambda call: {"other": 1}
     with pytest.raises(ValueError, match="missing required key 'id'"):
-        await DataSourceExecutor().execute(source, "op", {})
+        await _executor().execute_value(source, "op", {})
 
 
 async def test_response_schema_wrong_property_type_raises(http):
@@ -506,7 +521,7 @@ async def test_response_schema_wrong_property_type_raises(http):
     ])
     http.handler = lambda call: {"id": "not-a-number"}
     with pytest.raises(ValueError, match="expected number"):
-        await DataSourceExecutor().execute(source, "op", {})
+        await _executor().execute_value(source, "op", {})
 
 
 async def test_response_schema_accepts_valid_payload(http):
@@ -516,7 +531,7 @@ async def test_response_schema_accepts_valid_payload(http):
                              "properties": {"id": {"type": "string"}}}},
     ])
     http.handler = lambda call: {"id": "abc"}
-    assert await DataSourceExecutor().execute(source, "op", {}) == {"id": "abc"}
+    assert await _executor().execute_value(source, "op", {}) == {"id": "abc"}
 
 
 # ---------------------------------------------------------------------------
@@ -567,7 +582,7 @@ async def test_service_identity_auth_forwards_the_named_identity(http):
         operations=[{"name": "op", "path": "/x"}],
     )
     http.handler = lambda call: {}
-    await DataSourceExecutor(token_provider=provider).execute(source, "op", {})
+    await _executor(token_provider=provider).execute_value(source, "op", {})
     assert provider.identities == ["afp"]
 
 
@@ -578,7 +593,7 @@ async def test_service_identity_auth_without_identity_defers_to_the_default(http
         operations=[{"name": "op", "path": "/x"}],
     )
     http.handler = lambda call: {}
-    await DataSourceExecutor(token_provider=provider).execute(source, "op", {})
+    await _executor(token_provider=provider).execute_value(source, "op", {})
     assert provider.identities == [None]
 
 
@@ -603,7 +618,7 @@ async def test_path_traversal_is_rejected_not_encoded(http):
     """The exact escape: climb out of /projects and reach another endpoint."""
     source = _one_path_op()
     with pytest.raises(ValueError, match="path-traversal"):
-        await DataSourceExecutor().execute(
+        await _executor().execute_value(
             source, "get", {"id": "1/../../admin/users?role=all#"}
         )
     # Nothing was sent — the check happens while rendering, before the request.
@@ -622,14 +637,14 @@ async def test_every_traversal_shape_is_rejected(http):
         "a/./b",
     ):
         with pytest.raises(ValueError, match="path-traversal"):
-            await DataSourceExecutor().execute(source, "get", {"id": value})
+            await _executor().execute_value(source, "get", {"id": value})
     assert http.calls == []
 
 
 async def test_a_slash_in_a_path_param_cannot_add_a_segment(http):
     """No traversal, but still an escape: /projects/{id} must stay one segment."""
     http.handler = lambda call: {"ok": True}
-    await DataSourceExecutor().execute(source := _one_path_op(), "get", {"id": "1/deliver"})
+    await _executor().execute_value(source := _one_path_op(), "get", {"id": "1/deliver"})
     assert http.calls[0]["url"] == "https://api.test/projects/1%2Fdeliver"
     assert source is not None
 
@@ -637,7 +652,7 @@ async def test_a_slash_in_a_path_param_cannot_add_a_segment(http):
 async def test_query_and_fragment_characters_cannot_escape_the_path(http):
     """`?` would start a query string and `#` would truncate the path."""
     http.handler = lambda call: {"ok": True}
-    await DataSourceExecutor().execute(
+    await _executor().execute_value(
         _one_path_op(), "get", {"id": "1?role=admin#x"}
     )
     assert http.calls[0]["url"] == "https://api.test/projects/1%3Frole%3Dadmin%23x"
@@ -646,13 +661,13 @@ async def test_query_and_fragment_characters_cannot_escape_the_path(http):
 async def test_percent_encoded_traversal_is_double_encoded_not_decoded(http):
     """`%2e%2e%2f` must not become `../` once something normalises the URL."""
     http.handler = lambda call: {"ok": True}
-    await DataSourceExecutor().execute(_one_path_op(), "get", {"id": "%2e%2e%2fadmin"})
+    await _executor().execute_value(_one_path_op(), "get", {"id": "%2e%2e%2fadmin"})
     assert http.calls[0]["url"] == "https://api.test/projects/%252e%252e%252fadmin"
 
 
 async def test_an_ordinary_value_is_untouched_by_the_encoding(http):
     http.handler = lambda call: {"ok": True}
-    await DataSourceExecutor().execute(_one_path_op(), "get", {"id": "abc-123_4.json"})
+    await _executor().execute_value(_one_path_op(), "get", {"id": "abc-123_4.json"})
     assert http.calls[0]["url"] == "https://api.test/projects/abc-123_4.json"
 
 
@@ -664,7 +679,7 @@ async def test_literal_slashes_in_the_template_survive(http):
         "path": "/a/b/{params.id}/c/d",
         "params": [{"name": "id"}],
     }])
-    await DataSourceExecutor().execute(source, "get", {"id": "x y"})
+    await _executor().execute_value(source, "get", {"id": "x y"})
     assert http.calls[0]["url"] == "https://api.test/a/b/x%20y/c/d"
 
 
@@ -675,7 +690,7 @@ async def test_a_whole_path_placeholder_is_encoded_too(http):
     source = _source(operations=[{
         "name": "get", "path": "{params.p}", "params": [{"name": "p"}],
     }])
-    await DataSourceExecutor().execute(source, "get", {"p": "admin/users"})
+    await _executor().execute_value(source, "get", {"p": "admin/users"})
     assert http.calls[0]["url"] == "https://api.test/admin%2Fusers"
 
 
@@ -688,7 +703,7 @@ async def test_an_upstream_value_in_a_path_is_encoded_as_well(http):
     http.handler = lambda call: (
         {"id": "a b/c"} if call["url"].endswith("/me") else {"ok": True}
     )
-    await DataSourceExecutor().execute(source, "profile", {})
+    await _executor().execute_value(source, "profile", {})
     assert http.calls[-1]["url"] == "https://api.test/users/a%20b%2Fc/profile"
 
 
@@ -700,7 +715,7 @@ async def test_a_missing_path_value_still_renders_empty(http):
             {"name": "id", "required": False},
         ],
     }])
-    await DataSourceExecutor().execute(source, "get", {})
+    await _executor().execute_value(source, "get", {})
     assert http.calls[0]["url"] == "https://api.test/x/"
 
 
@@ -711,7 +726,7 @@ async def test_query_string_params_are_still_encoded_by_httpx_not_here(http):
     source = _source(operations=[
         {"name": "search", "path": "/search", "params": [{"name": "q"}]},
     ])
-    await DataSourceExecutor().execute(source, "search", {"q": "a&b=c/d"})
+    await _executor().execute_value(source, "search", {"q": "a&b=c/d"})
     assert http.calls[0]["params"] == {"q": "a&b=c/d"}
 
 
@@ -729,7 +744,7 @@ async def test_a_numeric_string_becomes_a_number(http):
             {"name": "ratio", "type": "number"},
         ],
     }])
-    await DataSourceExecutor().execute(source, "search", {"limit": "5", "ratio": "1.5"})
+    await _executor().execute_value(source, "search", {"limit": "5", "ratio": "1.5"})
     assert http.calls[0]["params"] == {"limit": 5, "ratio": 1.5}
 
 
@@ -741,7 +756,7 @@ async def test_a_boolean_string_becomes_a_boolean(http):
             {"name": "terse", "type": "boolean"},
         ],
     }])
-    await DataSourceExecutor().execute(source, "search", {"deep": "TRUE", "terse": "no"})
+    await _executor().execute_value(source, "search", {"deep": "TRUE", "terse": "no"})
     assert http.calls[0]["params"] == {"deep": True, "terse": False}
 
 
@@ -750,7 +765,7 @@ async def test_a_value_that_cannot_be_the_declared_type_is_refused(http):
         "name": "search", "path": "/s", "params": [{"name": "limit", "type": "number"}],
     }])
     with pytest.raises(ValueError, match="declared number"):
-        await DataSourceExecutor().execute(source, "search", {"limit": "many"})
+        await _executor().execute_value(source, "search", {"limit": "many"})
     assert http.calls == []
 
 
@@ -760,7 +775,7 @@ async def test_a_boolean_is_not_silently_accepted_as_a_number(http):
         "name": "search", "path": "/s", "params": [{"name": "limit", "type": "number"}],
     }])
     with pytest.raises(ValueError, match="declared number but got a boolean"):
-        await DataSourceExecutor().execute(source, "search", {"limit": True})
+        await _executor().execute_value(source, "search", {"limit": True})
 
 
 async def test_string_array_and_object_params_are_left_alone(http):
@@ -773,7 +788,7 @@ async def test_string_array_and_object_params_are_left_alone(http):
             {"name": "body", "type": "object"},
         ],
     }])
-    await DataSourceExecutor().execute(
+    await _executor().execute_value(
         source, "create", {"name": "7", "tags": ["a"], "body": {"k": 1}}
     )
     assert http.calls[0]["json"] == {"name": "7", "tags": ["a"], "body": {"k": 1}}
@@ -790,7 +805,7 @@ async def test_coercion_applies_across_the_dependency_closure(http):
         ]},
         {"name": "profile", "path": "/users/{whoami.id}"},
     ])
-    await DataSourceExecutor().execute(source, "profile", {"limit": "3"})
+    await _executor().execute_value(source, "profile", {"limit": "3"})
     assert http.calls[0]["params"] == {"limit": 3}
 
 
@@ -801,7 +816,7 @@ async def test_a_none_value_is_not_coerced_so_optional_stays_optional(http):
             {"name": "limit", "type": "number", "required": False},
         ],
     }])
-    await DataSourceExecutor().execute(source, "search", {"limit": None})
+    await _executor().execute_value(source, "search", {"limit": None})
     assert http.calls[0]["params"] == {}
 
 
@@ -816,7 +831,7 @@ async def test_query_params_are_sent_on_a_get(http):
         "query_params": {"valueRenderOption": "{params.render}"},
         "params": [{"name": "range"}, {"name": "render", "required": False}],
     }])
-    await DataSourceExecutor().execute(source, "read", {"range": "A1:B2", "render": "FORMULA"})
+    await _executor().execute_value(source, "read", {"range": "A1:B2", "render": "FORMULA"})
     assert http.calls[0]["params"] == {"valueRenderOption": "FORMULA"}
 
 
@@ -832,7 +847,7 @@ async def test_query_params_reach_the_query_string_of_a_write_not_the_body(http)
             {"name": "values", "type": "array"},
         ],
     }])
-    await DataSourceExecutor().execute(source, "write", {
+    await _executor().execute_value(source, "write", {
         "range": "A1", "value_input_option": "RAW", "values": [["x"]],
     })
     call = http.calls[0]
@@ -849,7 +864,7 @@ async def test_an_unresolved_query_param_is_dropped_rather_than_sent_empty(http)
         "query_params": {"valueRenderOption": "{params.render}", "fields": "a,b"},
         "params": [{"name": "render", "required": False}],
     }])
-    await DataSourceExecutor().execute(source, "read", {})
+    await _executor().execute_value(source, "read", {})
     assert http.calls[0]["params"] == {"fields": "a,b"}
 
 
@@ -861,7 +876,7 @@ async def test_a_query_param_ref_counts_as_declared_and_is_not_repeated(http):
         "query_params": {"pageSize": "{params.limit}"},
         "params": [{"name": "limit", "type": "number"}],
     }])
-    await DataSourceExecutor().execute(source, "read", {"limit": 5})
+    await _executor().execute_value(source, "read", {"limit": 5})
     # A whole-value placeholder keeps the native type, as everywhere else.
     assert http.calls[0]["params"] == {"pageSize": 5}
 
@@ -879,7 +894,7 @@ async def test_a_declared_default_fills_a_param_the_caller_omitted(http):
             "name": "value_input_option", "required": False, "default": "RAW",
         }],
     }])
-    await DataSourceExecutor().execute(source, "append", {})
+    await _executor().execute_value(source, "append", {})
     assert http.calls[0]["params"] == {"valueInputOption": "RAW"}
 
 
@@ -892,7 +907,7 @@ async def test_a_caller_value_beats_the_declared_default(http):
             "name": "value_input_option", "required": False, "default": "RAW",
         }],
     }])
-    await DataSourceExecutor().execute(source, "append", {"value_input_option": "USER_ENTERED"})
+    await _executor().execute_value(source, "append", {"value_input_option": "USER_ENTERED"})
     assert http.calls[0]["params"] == {"valueInputOption": "USER_ENTERED"}
 
 
@@ -914,15 +929,15 @@ async def test_an_operation_retry_override_beats_the_source_policy(http):
             {"name": "read", "path": "/read"},
         ],
     )
-    executor = DataSourceExecutor()
+    executor = _executor()
     with pytest.raises(Exception):
-        await executor.execute(source, "append", {})
+        await executor.execute_value(source, "append", {})
     assert http.count("/append") == 1
 
     # The source policy still applies to an operation that does not override.
     http.calls.clear()
     with pytest.raises(Exception):
-        await executor.execute(source, "read", {})
+        await executor.execute_value(source, "read", {})
     assert http.count("/read") == 3
 
 
@@ -958,7 +973,7 @@ async def test_google_auth_sends_the_impersonated_bearer_token(http, monkeypatch
         auth={"type": "google", "scopes": ["https://www.googleapis.com/auth/spreadsheets"]},
         operations=[{"name": "read", "path": "/v4/spreadsheets/x"}],
     )
-    await DataSourceExecutor().execute(source, "read", {})
+    await _executor().execute_value(source, "read", {})
     assert http.calls[0]["headers"]["Authorization"] == "Bearer impersonated-token"
     assert minted == [(
         "copilot@example.iam.gserviceaccount.com",
@@ -967,7 +982,7 @@ async def test_google_auth_sends_the_impersonated_bearer_token(http, monkeypatch
 
     # Second call reuses the cached token — a ~1h token must not be re-minted
     # once per outbound request.
-    await DataSourceExecutor().execute(source, "read", {})
+    await _executor().execute_value(source, "read", {})
     assert len(minted) == 1
     google_token_provider.reset_token_cache()
 
@@ -999,7 +1014,7 @@ async def test_google_auth_ignores_a_foreign_impersonate_subject(http, monkeypat
         },
         operations=[{"name": "read", "path": "/x"}],
     )
-    await DataSourceExecutor().execute(source, "read", {})
+    await _executor().execute_value(source, "read", {})
     assert minted == [("allowed@example.iam.gserviceaccount.com", ["scope-a"])]
     google_token_provider.reset_token_cache()
 
@@ -1034,6 +1049,6 @@ async def test_google_auth_drops_a_scope_outside_the_deployment_allow_list(http,
         },
         operations=[{"name": "read", "path": "/x"}],
     )
-    await DataSourceExecutor().execute(source, "read", {})
+    await _executor().execute_value(source, "read", {})
     assert minted == [["https://www.googleapis.com/auth/spreadsheets"]]
     google_token_provider.reset_token_cache()

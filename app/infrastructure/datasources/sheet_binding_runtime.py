@@ -170,6 +170,15 @@ async def _call(source: Any, executor: Any, operation: str, params: dict[str, An
             f"data source '{source.id}' has no '{operation}' operation — a "
             "binding needs the Google Sheets operations on the same source"
         )
+    # A binding's raw calls are internal steps with pure transforms between
+    # them, so this code needs the response in hand rather than a stream
+    # reference -- they are reads and writes of one range, bounded by
+    # construction. `execute_value` is asked for by name when the executor
+    # offers it, and anything executor-shaped that only implements `execute`
+    # (a test double, an older adapter) still works.
+    execute_value = getattr(executor, "execute_value", None)
+    if execute_value is not None:
+        return await execute_value(source, operation, params)
     return await executor.execute(source, operation, params)
 
 

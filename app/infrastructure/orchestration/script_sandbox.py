@@ -279,6 +279,50 @@ builtins.__import__ = _guarded_import
 # because the filter would not install is exactly the situation the caller was
 # told could not happen, and `local` is only a WRITE-level runtime because this
 # succeeds.
+# --- data stream -------------------------------------------------------
+# Opened HERE, before the filter goes up, because the filter denies openat:
+# after it no path can be opened at all. An already-open descriptor stays
+# readable -- read, lseek and fstat are on the allow-list -- and that is what
+# lets a script stream a result far larger than its own memory limit.
+_data_fh = None
+_data_path = _payload.get("data_path")
+_data_dest = _payload.get("data_dest")
+if _payload.get("data_from_stdin") and _data_dest:
+    # The stream lives on another pod, so the backend is pushing its bytes in
+    # on stdin. They land in a file first, so the script can seek and make
+    # more than one pass.
+    _sink = open(_data_dest, "wb")
+    try:
+        while True:
+            _block = sys.stdin.buffer.read(262144)
+            if not _block:
+                break
+            _sink.write(_block)
+    finally:
+        _sink.close()
+    _data_path = _data_dest
+if _data_path:
+    _data_fh = open(_data_path, "r", encoding="utf-8")
+
+
+def _records():
+    """Yield the stream's records, one at a time, from the open descriptor.
+
+    A generator, and it seeks to the start on every call, so a script may
+    iterate more than once without the data ever being resident.
+    """
+    if _data_fh is None:
+        raise RuntimeError(
+            "no data stream is attached to this step. Add `stream: <state key>` "
+            "naming the data_source output this script should read."
+        )
+    _data_fh.seek(0)
+    for _line in _data_fh:
+        _line = _line.strip()
+        if _line:
+            yield json.loads(_line)
+
+
 _seccomp_error = _install_seccomp()
 if _seccomp_error is not None:
     sys.stderr.write("sandbox: refusing to run, seccomp unavailable: %s\\n" % _seccomp_error)
@@ -292,10 +336,26 @@ sys.modules.pop("_ctypes", None)
 # bind into locals while its body resolved names against globals, so any script
 # whose helpers called each other died with NameError -- which is most scripts
 # doing real work. Module-level code expects a single namespace; give it one.
+# A data source result reaches a script as a file, never as a value in
+# `state`, so the script reads it:
+#
+#     total = 0
+#     for row in records():
+#         total += row["amount"]
+#     output = total
+#
+# `records()` is a generator over an already-open descriptor, so the script's
+# memory is one record at a time whatever the result's size. `stream` is the
+# raw file object for a script that wants to do its own parsing or seeking,
+# and `stream_records` is the record count, known up front.
 _scope = {{
     "__name__": "__sandbox__",
     "__builtins__": builtins,
     "state": _payload.get("state") or {{}},
+    "records": _records,
+    "stream": _data_fh,
+    "stream_records": _payload.get("stream_records") or 0,
+    "stream_truncated": bool(_payload.get("stream_truncated")),
     "output": None,
 }}
 
@@ -359,10 +419,36 @@ def _parse_result(stdout: Any) -> Any:
     )
 
 
-def _payload_json(code: str, state: dict[str, Any]) -> str:
+def _payload_json(
+    code: str,
+    state: dict[str, Any],
+    *,
+    data_path: str | None = None,
+    data_dest: str | None = None,
+    data_from_stdin: bool = False,
+    stream_records: int = 0,
+    stream_truncated: bool = False,
+) -> str:
     # ``default=str`` keeps non-JSON state values (datetimes, ObjectIds, …)
     # transportable instead of failing the whole step.
-    return json.dumps({"code": code, "state": state}, default=str)
+    body: dict[str, Any] = {"code": code, "state": state}
+    if data_path or data_from_stdin:
+        body.update(
+            data_path=data_path,
+            data_dest=data_dest,
+            data_from_stdin=data_from_stdin,
+            stream_records=stream_records,
+            stream_truncated=stream_truncated,
+        )
+    return json.dumps(body, default=str)
+
+
+# Where a streamed-in data file lands inside the sandbox container, and how
+# much room it is given there. The emptyDir is disk-backed, so this is a
+# quota against the node's disk rather than against the pod's memory.
+_K8S_DATA_DEST = "/data/stream.jsonl"
+_K8S_DATA_LIMIT_MB = int(os.environ.get("SANDBOX_DATA_LIMIT_MB", "2048"))
+_DOCKER_DATA_MOUNT = "/sandbox-data/stream.jsonl"
 
 
 async def run_script(
@@ -374,16 +460,63 @@ async def run_script(
     image: str = "python:3.12-slim",
     memory_mb: int = 512,
     namespace: str = "langgraph",
+    stream_path: str | None = None,
+    stream_copy: Any = None,
+    stream_records: int = 0,
+    stream_truncated: bool = False,
 ) -> Any:
-    """Run *code* in a sandbox and return the value it assigned to ``output``."""
-    payload = _payload_json(code, state)
+    """Run *code* in a sandbox and return the value it assigned to ``output``.
+
+    A data source result is handed over as a file, never as a value.  How it
+    gets there depends on where the sandbox runs:
+
+    ``stream_path``
+        The stream is on this pod's filesystem.  ``local`` opens the path
+        directly; ``docker`` bind-mounts it read-only.  Both then have a real
+        descriptor open before the seccomp filter denies ``openat``.
+    ``stream_copy``
+        An awaitable ``(sink) -> bytes_written`` that writes the stream's raw
+        bytes into a binary sink.  Used by ``k8s``, where the sandbox is a
+        different pod with no network and no shared filesystem: the bytes are
+        pushed into the pod's stdin and it writes its own file.  This is the
+        "stream it from one file to another" path.
+
+    ``stream_records`` and ``stream_truncated`` are handed to the script so it
+    knows how many records to expect and whether the read was cut short.
+    """
+    if runtime == "k8s":
+        payload = _payload_json(
+            code, state,
+            data_dest=_K8S_DATA_DEST,
+            data_from_stdin=stream_copy is not None,
+            stream_records=stream_records,
+            stream_truncated=stream_truncated,
+        )
+    elif runtime == "docker":
+        payload = _payload_json(
+            code, state,
+            data_path=_DOCKER_DATA_MOUNT if stream_path else None,
+            stream_records=stream_records,
+            stream_truncated=stream_truncated,
+        )
+    else:
+        payload = _payload_json(
+            code, state,
+            data_path=stream_path,
+            stream_records=stream_records,
+            stream_truncated=stream_truncated,
+        )
     if runtime == "local":
         return await _run_local(payload, timeout=timeout, memory_mb=memory_mb)
     if runtime == "docker":
-        return await _run_docker(payload, timeout=timeout, image=image, memory_mb=memory_mb)
+        return await _run_docker(
+            payload, timeout=timeout, image=image, memory_mb=memory_mb,
+            stream_path=stream_path,
+        )
     if runtime == "k8s":
         return await _run_k8s(
-            payload, timeout=timeout, image=image, memory_mb=memory_mb, namespace=namespace,
+            payload, timeout=timeout, image=image, memory_mb=memory_mb,
+            namespace=namespace, stream_copy=stream_copy,
         )
     raise ValueError(
         f"Unknown sandbox runtime '{runtime}'. Valid values are: 'local', 'docker', 'k8s'."
@@ -454,7 +587,14 @@ async def _run_local(payload: str, *, timeout: float, memory_mb: int) -> Any:
 # docker — throw-away container
 # ---------------------------------------------------------------------------
 
-async def _run_docker(payload: str, *, timeout: float, image: str, memory_mb: int) -> Any:
+async def _run_docker(
+    payload: str,
+    *,
+    timeout: float,
+    image: str,
+    memory_mb: int,
+    stream_path: str | None = None,
+) -> Any:
     import aiodocker
 
     workdir = tempfile.mkdtemp(prefix="script-sandbox-")
@@ -476,7 +616,14 @@ async def _run_docker(payload: str, *, timeout: float, image: str, memory_mb: in
             "AttachStderr": True,
             "WorkingDir": "/tmp",
             "HostConfig": {
-                "Binds": [f"{workdir}:/sandbox:ro"],
+                # The data stream is bind-mounted read-only rather than copied
+                # in: the container is on this host, so there is nothing to
+                # transfer, and the bootstrap opens the path before seccomp
+                # denies openat.
+                "Binds": (
+                    [f"{workdir}:/sandbox:ro"]
+                    + ([f"{stream_path}:{_DOCKER_DATA_MOUNT}:ro"] if stream_path else [])
+                ),
                 "ReadonlyRootfs": True,
                 "Tmpfs": {"/tmp": "rw,size=64m"},
                 "Memory": memory_mb * 1024 * 1024,
@@ -518,9 +665,125 @@ async def _run_docker(payload: str, *, timeout: float, image: str, memory_mb: in
 # k8s — one-shot pod
 # ---------------------------------------------------------------------------
 
+class _AttachSink:
+    """Binary sink that forwards each block to a pod's stdin over attach.
+
+    A file-like ``write`` so a store's ``copy_to`` needs to know nothing about
+    Kubernetes; the websocket's own buffering bounds how much is in flight.
+    """
+
+    __slots__ = ("_ws", "_written")
+
+    def __init__(self, ws: Any) -> None:
+        self._ws = ws
+        self._written = 0
+
+    def write(self, block: bytes) -> int:
+        self._ws.write_stdin(block)
+        self._written += len(block)
+        return len(block)
+
+    @property
+    def written(self) -> int:
+        return self._written
+
+
+async def _stream_into_pod(
+    core: Any,
+    name: str,
+    namespace: str,
+    stream_copy: Any,
+    *,
+    loop: Any,
+    timeout: float,
+    api_timeout: float,
+) -> int:
+    """Write a data stream into a running pod's stdin, then close it.
+
+    Blocks until the container is Running, because attach has nowhere to write
+    before that.  Closing the socket is what gives the script's read loop its
+    EOF, so it happens in a ``finally`` -- leaking an open stdin would hang the
+    sandbox until its timeout rather than fail it.
+    """
+    from kubernetes.stream import stream as k8s_stream
+
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        pod = await asyncio.wait_for(
+            loop.run_in_executor(
+                None,
+                lambda: core.read_namespaced_pod(
+                    name=name, namespace=namespace, _request_timeout=api_timeout,
+                ),
+            ),
+            timeout=api_timeout,
+        )
+        phase = pod.status.phase or "Pending"
+        if phase == "Running":
+            break
+        if phase in ("Succeeded", "Failed"):
+            # It finished without reading stdin at all. Nothing to send, and
+            # the caller's own log read will report why.
+            logger.warning(
+                "k8s sandbox %s reached %s before stdin could be attached",
+                name, phase,
+            )
+            return 0
+        await asyncio.sleep(0.25)
+    else:
+        raise ScriptSandboxError(
+            f"sandboxed script never reached Running, so its data stream could "
+            f"not be delivered (waited {timeout}s)"
+        )
+
+    ws = await asyncio.wait_for(
+        loop.run_in_executor(
+            None,
+            lambda: k8s_stream(
+                core.connect_get_namespaced_pod_attach,
+                name, namespace,
+                stderr=False, stdin=True, stdout=False, tty=False,
+                _preload_content=False,
+            ),
+        ),
+        timeout=api_timeout,
+    )
+    sink = _AttachSink(ws)
+    try:
+        written = await stream_copy(sink)
+    finally:
+        try:
+            await loop.run_in_executor(None, ws.close)
+        except Exception:  # noqa: BLE001 — the pod is going away regardless
+            logger.debug("k8s sandbox %s: stdin close failed", name, exc_info=True)
+    logger.info(
+        "k8s sandbox %s: streamed %d bytes of data in on stdin", name, written
+    )
+    return written
+
+
 async def _run_k8s(
-    payload: str, *, timeout: float, image: str, memory_mb: int, namespace: str,
+    payload: str,
+    *,
+    timeout: float,
+    image: str,
+    memory_mb: int,
+    namespace: str,
+    stream_copy: Any = None,
 ) -> Any:
+    """Run a script in a one-shot pod, streaming its data stream in on stdin.
+
+    The sandbox pod shares nothing with the backend: no network (seccomp denies
+    ``socket``), no service account, no filesystem in common.  So a data stream
+    cannot be fetched by the pod and cannot be mounted into it -- the backend
+    has to push it.  It goes in over the pod's stdin, in 256 KB blocks, and the
+    pod's bootstrap writes it to a disk-backed ``emptyDir`` before installing
+    the filter that would forbid opening it.
+
+    stdin rather than a shared volume because the alternative on GKE is an RWX
+    volume, which means Filestore: a paid NFS appliance and an IAM binding, for
+    a transfer that lasts seconds.
+    """
     from kubernetes import client as k8s_client, config as k8s_config
 
     try:
@@ -551,6 +814,16 @@ async def _run_k8s(
                 k8s_client.V1Volume(
                     name="tmp", empty_dir=k8s_client.V1EmptyDirVolumeSource(medium="Memory"),
                 ),
+                # Deliberately NOT medium="Memory" like /tmp above: a streamed
+                # data file lands here, and on a tmpfs those bytes would count
+                # against the pod's own memory limit -- which is the whole
+                # thing this design avoids.
+                k8s_client.V1Volume(
+                    name="data",
+                    empty_dir=k8s_client.V1EmptyDirVolumeSource(
+                        size_limit=f"{_K8S_DATA_LIMIT_MB}Mi"
+                    ),
+                ),
             ],
             containers=[
                 k8s_client.V1Container(
@@ -562,10 +835,24 @@ async def _run_k8s(
                     volume_mounts=[
                         k8s_client.V1VolumeMount(name="payload", mount_path="/sandbox", read_only=True),
                         k8s_client.V1VolumeMount(name="tmp", mount_path="/tmp"),
+                        k8s_client.V1VolumeMount(name="data", mount_path="/data"),
                     ],
+                    # stdin stays open until the backend has finished writing
+                    # the stream; stdin_once closes it after that single
+                    # attach, so the script's read loop sees a clean EOF.
+                    stdin=stream_copy is not None,
+                    stdin_once=stream_copy is not None,
                     resources=k8s_client.V1ResourceRequirements(
-                        limits={"memory": f"{memory_mb}Mi", "cpu": "1"},
-                        requests={"memory": f"{min(memory_mb, 128)}Mi", "cpu": "100m"},
+                        limits={
+                            "memory": f"{memory_mb}Mi",
+                            "cpu": "1",
+                            "ephemeral-storage": f"{_K8S_DATA_LIMIT_MB + 64}Mi",
+                        },
+                        requests={
+                            "memory": f"{min(memory_mb, 128)}Mi",
+                            "cpu": "100m",
+                            "ephemeral-storage": "64Mi",
+                        },
                     ),
                     security_context=k8s_client.V1SecurityContext(
                         allow_privilege_escalation=False,
@@ -617,6 +904,16 @@ async def _run_k8s(
                 namespace=namespace, body=pod_body, _request_timeout=api_timeout,
             )
         )
+
+        # Push the data stream in before waiting for the pod to finish: the
+        # bootstrap blocks on stdin until EOF, so nothing runs until this is
+        # done. attach() has to wait for Running first -- there is no stdin to
+        # write to while the container is still Pending.
+        if stream_copy is not None:
+            await _stream_into_pod(
+                core, name, namespace, stream_copy, loop=loop,
+                timeout=timeout, api_timeout=api_timeout,
+            )
 
         deadline = loop.time() + timeout
         phase = "Pending"

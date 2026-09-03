@@ -102,7 +102,12 @@ async def try_operation(
     )
 
     try:
-        raw = await (executor or DataSourceExecutor()).execute(trial, operation, params)
+        # execute_value, not execute: the point of a dry run is to show the
+        # caller the API's real response, so the records have to be in hand
+        # before shrink_sample can cap them.
+        raw = await (executor or DataSourceExecutor()).execute_value(
+            trial, operation, params
+        )
     except Exception as exc:
         logger.info("try-operation '%s' failed: %s", operation, exc)
         return {"status": "error", "error": str(exc), "api_output": None, "suggested_mapping": None}

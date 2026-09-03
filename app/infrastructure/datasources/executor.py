@@ -34,8 +34,11 @@ from app.domain.models.data_source_definition import (
     REF_PATTERN,
     DataSourceDefinition,
     OperationDefinition,
+    Paginate,
     operation_refs,
 )
+from app.domain.models.datastream import as_data_ref, is_data_ref
+from app.infrastructure.datasources.datastream import NotStreamable, StreamBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -135,13 +138,34 @@ class DataSourceExecutor:
     # accesses to any single (source, op, inputs) key.
     _CACHE_SWEEP_THRESHOLD = 500
 
-    def __init__(self, *, fanout_concurrency: int = 5, token_provider: Any = None) -> None:
+    # Ceiling on reading an intermediate document back for template
+    # resolution. A `{op.field}` value ends up in a URL or a GraphQL
+    # variable, so anything approaching this is a definition bug.
+    _INTERMEDIATE_MAX_BYTES = 8 * 1024 * 1024
+
+    def __init__(
+        self,
+        *,
+        fanout_concurrency: int = 5,
+        token_provider: Any = None,
+        stream_store: "Any" = None,
+    ) -> None:
         self._fanout_concurrency = fanout_concurrency
         # Provides bearer tokens for `service_identity` auth; when None the
         # process-wide provider is resolved lazily in build_auth_headers.
         self._token_provider = token_provider
+        # Where every result is written (see
+        # app.infrastructure.datasources.datastream).  Required: results do not
+        # travel as values, so without a store there is nowhere for one to go
+        # and `execute` refuses rather than quietly reverting to holding it all
+        # in memory.
+        self._stream_store = stream_store
         # cache key → (expiry monotonic timestamp, value)
         self._cache: dict[str, tuple[float, Any]] = {}
+
+    @property
+    def stream_store(self) -> "Any":
+        return self._stream_store
 
     # ------------------------------------------------------------------
     # Public API
@@ -199,7 +223,67 @@ class DataSourceExecutor:
                 )
                 for name, result in zip(level, results):
                     memo[name] = result
+                    if name != operation:
+                        # An intermediate result is read back into the memo
+                        # when it is a document, because that is what a
+                        # `{op.field}` template resolves against. A *list*
+                        # upstream stays a reference: it is a fan-out source,
+                        # and streaming it is the whole point. So the DAG
+                        # keeps working without any intermediate list ever
+                        # being resident.
+                        memo[name] = await self._resolve_intermediate(
+                            source, name, result
+                        )
         return memo[operation]
+
+    async def _resolve_intermediate(
+        self, source: DataSourceDefinition, name: str, result: Any
+    ) -> Any:
+        """Read a document-shaped intermediate back; leave a list a reference.
+
+        Bounded by ``_INTERMEDIATE_MAX_BYTES`` rather than by the source's own
+        ceiling: this value is about to be interpolated into a URL or a query,
+        so a document measured in megabytes is a mistake in the definition,
+        not a large read to be accommodated.
+        """
+        ref = as_data_ref(result)
+        if ref is None or ref.shape != "value":
+            return result
+        if self._stream_store is None:
+            return result
+        return await self._stream_store.read_all(
+            ref, max_bytes=self._INTERMEDIATE_MAX_BYTES
+        )
+
+    async def execute_value(
+        self,
+        source: DataSourceDefinition,
+        operation: str,
+        params: dict[str, Any],
+        *,
+        max_bytes: int = 0,
+    ) -> Any:
+        """Execute an operation and return its records, not a reference.
+
+        The deliberate opt-out of the stream contract, for the callers that
+        genuinely need a value in hand: a ``data_source`` step configured
+        ``result_mode: ram``, ``/try-operation``'s dry run, a test.
+
+        It refuses past *max_bytes* rather than degrading -- a silent partial
+        read is the failure the stream contract exists to remove -- and 0 means
+        no limit, which is only safe where the caller already knows the size.
+        """
+        ref_state = await self.execute(source, operation, params)
+        ref = as_data_ref(ref_state)
+        if ref is None:
+            # A sheet binding serves itself and may return a plain value.
+            return ref_state
+        if self._stream_store is None:
+            raise ValueError(
+                f"data source '{source.id}': no data stream store to read "
+                f"stream '{ref.id}' back from"
+            )
+        return await self._stream_store.read_all(ref, max_bytes=max_bytes)
 
     async def preview(
         self,
@@ -275,10 +359,17 @@ class DataSourceExecutor:
         # Same fan-out rule the real invocation follows: one array upstream
         # binds one request per element, and that element count *is* the number
         # of affected rows.
+        # A spilled upstream counts as an array here for the same reason it
+        # does in _execute_operation, and the stakes are higher: this number is
+        # what an approver is shown. Treating a handle as "not an array" would
+        # present a delete fanning out over 400,000 spilled rows as
+        # "1 affected row", which is the worst possible thing for this gate to
+        # get wrong.
         array_refs = {
             (head, path)
             for head, path in operation_refs(op)
-            if head != "params" and isinstance(memo.get(head), list)
+            if head != "params"
+            and (isinstance(memo.get(head), list) or is_data_ref(memo.get(head)))
         }
         array_heads = {head for head, _ in array_refs}
         if len(array_heads) > 1:
@@ -297,14 +388,35 @@ class DataSourceExecutor:
 
         head = next(iter(array_heads))
         binding_path = sorted(path for h, path in array_refs if h == head)[0]
-        elements = memo[head]
+        upstream = memo[head]
+        handle = as_data_ref(upstream)
+        if handle is None:
+            elements = upstream
+            affected = len(elements)
+        else:
+            # The count is exact from the handle; only the capped preview is
+            # read off disk, so previewing a delete over a spilled upstream
+            # costs one short read rather than loading what was spilled
+            # precisely because it did not fit.
+            affected = handle.items
+            if self._stream_store is None:
+                raise NotStreamable(
+                    f"Operation '{op.name}' fans out over a spilled upstream "
+                    f"'{head}' but no spill store is configured to preview it."
+                )
+            elements = [
+                item
+                async for item in self._stream_store.stream(
+                    handle, limit=max(_PREVIEW_TARGET_CAP, _PREVIEW_SAMPLE_CAP)
+                )
+            ]
         targets = [
             self._describe_target(source, op, params, memo, {head: element})
             for element in elements[:_PREVIEW_TARGET_CAP]
         ]
         sample = [_search(binding_path, element) for element in elements[:_PREVIEW_SAMPLE_CAP]]
         return DestructivePlan(
-            affected_rows=len(elements),
+            affected_rows=affected,
             targets=targets,
             sample=sample,
         )
@@ -382,10 +494,16 @@ class DataSourceExecutor:
         memo: dict[str, Any],
         client: httpx.AsyncClient,
     ) -> Any:
+        # An upstream that spilled is still a fan-out source: it is a list of
+        # items, it is just not resident. Treat a handle exactly like a list
+        # here so an operation downstream of a large read keeps working --
+        # without this it would look like "no array upstream", run once, and
+        # render the handle dict into the URL.
         array_refs = {
             (head, path)
             for head, path in operation_refs(op)
-            if head != "params" and isinstance(memo.get(head), list)
+            if head != "params"
+            and (isinstance(memo.get(head), list) or is_data_ref(memo.get(head)))
         }
         array_heads = {head for head, _ in array_refs}
         if len(array_heads) > 1:
@@ -400,7 +518,7 @@ class DataSourceExecutor:
         head = next(iter(array_heads))
         binding_path = sorted(path for h, path in array_refs if h == head)[0]
         binding_name = _leaf_name(binding_path)
-        elements = memo[head]
+        upstream = memo[head]
         semaphore = asyncio.Semaphore(self._fanout_concurrency)
 
         async def _one(element: Any) -> dict[str, Any]:
@@ -408,10 +526,72 @@ class DataSourceExecutor:
                 result = await self._invoke(source, op, params, memo, {head: element}, client)
             return {
                 binding_name: _search(binding_path, element),
-                "result": result,
+                # One element's response is a document -- one record fetched by
+                # id, one write acknowledged -- so it is read back and put in
+                # the entry directly. A reference per element would be a file
+                # per element, which is neither useful nor cheap; the
+                # *aggregate* is what gets streamed.
+                "result": await self._resolve_intermediate(source, op.name, result),
             }
 
-        return list(await asyncio.gather(*(_one(e) for e in elements)))
+        handle = as_data_ref(upstream)
+        if handle is None:
+            return list(await asyncio.gather(*(_one(e) for e in upstream)))
+        return await self._fanout_over_spill(
+            source, op, handle, _one, head, binding_name,
+        )
+
+    async def _fanout_over_spill(
+        self,
+        source: DataSourceDefinition,
+        op: OperationDefinition,
+        handle: Any,
+        one: Any,
+        head: str,
+        binding_name: str,
+    ) -> Any:
+        """Fan out over a spilled upstream, a window of elements at a time.
+
+        The in-memory path gathers every call at once, which is fine for a list
+        that already fit in memory. Here the upstream deliberately did not, so
+        the elements are pulled off disk in windows and only a window's worth
+        of calls is ever in flight -- and the *results* go through their own
+        budget, because N requests over a large upstream produce a large result
+        just as surely as one big response does.
+        """
+        store = self._stream_store
+        if store is None:
+            raise NotStreamable(
+                f"Operation '{op.name}' fans out over a spilled upstream "
+                f"'{head}' but no spill store is configured to read it back."
+            )
+        builder = StreamBuilder(
+            store=store,
+            max_result_bytes=source.max_result_bytes,
+            source_id=source.id,
+            operation=op.name,
+        )
+        # One window in flight, sized by the fan-out concurrency: enough to
+        # keep every slot busy, small enough that the window itself is never
+        # the memory problem.
+        window = max(1, self._fanout_concurrency) * 4
+        done = 0
+        try:
+            async for chunk in store.chunks(handle, size=window):
+                results = await asyncio.gather(*(one(e) for e in chunk))
+                await builder.add(list(results))
+                done += len(chunk)
+                if builder.full:
+                    logger.warning(
+                        "data source '%s' operation '%s': fan-out stopped at "
+                        "max_result_bytes after %d of %d element(s)",
+                        source.id, op.name, done, handle.items,
+                    )
+                    break
+            return await builder.finish()
+        except BaseException:
+            await builder.abort()
+            raise
 
     # ------------------------------------------------------------------
     # Single operation invocation (cache → pagination → retry → mapping)
@@ -430,12 +610,26 @@ class DataSourceExecutor:
         ttl = source.cache.ttl_seconds
         if ttl > 0:
             hit = self._cache.get(cache_key)
-            if hit is not None and hit[0] > time.monotonic():
-                logger.debug("data source '%s': cache hit for '%s'", source.id, op.name)
-                return hit[1]
             if hit is not None:
-                # Expired — drop eagerly instead of waiting for a sweep.
-                del self._cache[cache_key]
+                expiry, cached = hit
+                if expiry <= time.monotonic():
+                    # Expired — drop eagerly instead of waiting for a sweep.
+                    self._cache.pop(cache_key, None)
+                elif await self._stream_is_readable(cached):
+                    logger.debug(
+                        "data source '%s': cache hit for '%s'", source.id, op.name
+                    )
+                    return cached
+                else:
+                    # A live entry is not proof the stream is still readable:
+                    # files are swept on a TTL and lost on a restart. Treat a
+                    # vanished one as a miss rather than handing back a
+                    # reference to nothing.
+                    logger.info(
+                        "data source '%s': cached stream for '%s' is gone -- "
+                        "refetching", source.id, op.name,
+                    )
+                    self._cache.pop(cache_key, None)
 
         value = await self._fetch_all_pages(client, source, op, params, memo, bound)
 
@@ -444,6 +638,19 @@ class DataSourceExecutor:
             if len(self._cache) > self._CACHE_SWEEP_THRESHOLD:
                 self._purge_expired_cache()
         return value
+
+    async def _stream_is_readable(self, value: Any) -> bool:
+        """True when *value* is not a reference, or is one whose file is there."""
+        ref = as_data_ref(value)
+        if ref is None or self._stream_store is None:
+            return True
+        try:
+            await self._stream_store.local_path(ref)
+        except FileNotFoundError:
+            return False
+        except Exception:  # noqa: BLE001 — a store with no local path is fine
+            return True
+        return True
 
     def _purge_expired_cache(self) -> None:
         """Drop expired entries — called opportunistically so the cache
@@ -462,15 +669,60 @@ class DataSourceExecutor:
         memo: dict[str, Any],
         bound: dict[str, Any],
     ) -> Any:
-        if op.paginate is None:
-            raw = await self._request_with_retry(client, source, op, params, memo, bound, {})
-            return self._post_process(op, raw)
+        """Fetch an operation into the data stream store; return its ref.
 
-        paginate = op.paginate
-        pages: list[Any] = []
+        Always a ref, never the data.  Pages go to the file as they arrive and
+        are dropped, so this holds one page regardless of how many there are.
+        """
+        if self._stream_store is None:
+            raise ValueError(
+                f"data source '{source.id}' operation '{op.name}': no data "
+                f"stream store is configured. Results are written to a stream "
+                f"and passed on as a reference, so one is required."
+            )
+        builder = StreamBuilder(
+            store=self._stream_store,
+            max_result_bytes=source.max_result_bytes,
+            source_id=source.id,
+            operation=op.name,
+        )
+        try:
+            if op.paginate is None:
+                raw = await self._request_with_retry(
+                    client, source, op, params, memo, bound, {}
+                )
+                await builder.add(self._post_process(op, raw))
+            else:
+                await self._page_loop(
+                    client, source, op, params, memo, bound, op.paginate, builder
+                )
+            return await builder.finish()
+        except BaseException:
+            # A half-written stream is not a result. Drop it rather than leave
+            # an unreferenced file on a disk the pod has a quota on.
+            await builder.abort()
+            raise
+
+    async def _page_loop(
+        self,
+        client: httpx.AsyncClient,
+        source: DataSourceDefinition,
+        op: OperationDefinition,
+        params: dict[str, Any],
+        memo: dict[str, Any],
+        bound: dict[str, Any],
+        paginate: Paginate,
+        builder: StreamBuilder,
+    ) -> None:
+        """Walk the pages of one operation, feeding each into *builder*.
+
+        Pages are handed over one at a time and never retained here, so this
+        loop's memory is one page regardless of how many there are.
+        """
         cursor: Any = None
         page_number = 1
         offset = 0
+        pages = 0
 
         for _ in range(max(1, paginate.max_pages)):
             extra: dict[str, Any] = {}
@@ -501,26 +753,42 @@ class DataSourceExecutor:
                     logger.debug(
                         "data source '%s' operation '%s': 404 after %d page(s) "
                         "-- treating as end of pages",
-                        source.id, op.name, len(pages),
+                        source.id, op.name, pages,
                     )
-                    break
+                    return
                 raise
+
             mapped = self._post_process(op, raw)
             # Without a `mapping`, a dict-shaped page never looks "empty" and
             # page/offset pagination would loop to max_pages, returning raw
             # page dicts. `items_path` extracts the items array explicitly so
-            # both the stop-check below and `_combine_pages` see a list.
+            # both the stop-check below and the builder see a list.
             if op.mapping is None and paginate.items_path and isinstance(mapped, dict):
                 mapped = _search(paginate.items_path, mapped) or []
-            pages.append(mapped)
+
+            # The API's own total, read once from the first page. Where the
+            # data goes no longer depends on it -- it always goes to the
+            # stream -- but it puts the finished size in the log before the
+            # walk, and reports a read that will breach max_result_bytes at
+            # page one rather than at page forty.
+            if pages == 0 and paginate.total_path:
+                builder.project(_search(paginate.total_path, raw), mapped)
+
+            await builder.add(mapped)
+            pages += 1
+
+            if builder.full:
+                # max_result_bytes reached. Stop rather than keep paging into a
+                # result already flagged truncated.
+                return
 
             if paginate.type == "cursor":
                 cursor = _search(paginate.cursor_path, raw) if paginate.cursor_path else None
                 if not cursor:
-                    break
+                    return
             else:
                 if not mapped:
-                    break
+                    return
                 page_number += 1
                 offset += len(mapped) if isinstance(mapped, list) else 1
         else:
@@ -528,16 +796,15 @@ class DataSourceExecutor:
             # any stop condition firing. The result is very likely truncated, and
             # a caller that silently believes it has everything is the dangerous
             # case (for an alerting workflow, a short read reads as "nothing to
-            # report"). There is no channel to return a warning on, so say it
-            # loudly in the log.
+            # report"). Say it loudly in the log, and -- when the result spilled
+            # -- record it on the handle, which is a channel the log is not.
+            builder.mark_truncated()
             logger.warning(
                 "data source '%s' operation '%s': stopped at the max_pages limit "
                 "(%d) -- the result is probably incomplete, raise max_pages or "
                 "narrow the query",
                 source.id, op.name, paginate.max_pages,
             )
-
-        return _combine_pages(pages)
 
     async def _request_with_retry(
         self,
@@ -919,17 +1186,6 @@ def _search(expression: str | None, data: Any) -> Any:
 def _leaf_name(path: str) -> str:
     leaf = path.split(".")[-1]
     return leaf.split("[")[0] or path
-
-
-def _combine_pages(pages: list[Any]) -> Any:
-    if len(pages) == 1:
-        return pages[0]
-    if pages and all(isinstance(p, list) for p in pages):
-        combined: list[Any] = []
-        for page in pages:
-            combined.extend(page)
-        return combined
-    return pages
 
 
 async def build_auth_headers(auth: Any, token_provider: Any = None) -> dict[str, str]:

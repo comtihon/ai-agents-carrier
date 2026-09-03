@@ -54,6 +54,7 @@ from app.infrastructure.persistence.workflow_backend import (
 )
 from app.infrastructure.auth.service_token_provider import ServiceTokenProvider
 from app.infrastructure.datasources.executor import DataSourceExecutor
+from app.infrastructure.datasources.datastream import LocalDiskStreamStore, DataStreamStore
 from app.infrastructure.persistence.approval_backend import (
     ApprovalCaseBackend,
     MongoApprovalBackend,
@@ -89,6 +90,9 @@ class ApplicationContainer:
     # steps and for the /mcp/datasources tools.
     data_source_backend: DataSourceDefinitionBackend | None = None
     data_source_executor: DataSourceExecutor | None = None
+    # Reads back what the executor spilled; the `data_source`, `python` and
+    # `llm` steps all go through it.
+    stream_store: "DataStreamStore | None" = None
     # Privilege gate in front of destructive data-source operations: the store
     # of approval cases and the service that opens, decides and remembers them.
     # None in legacy test setups, which then run deletes ungated exactly as
@@ -150,6 +154,15 @@ class ApplicationContainer:
             self.pubsub_subscriber.start()
         if self.workflow_backend is not None:
             await self._load_registry()
+        # A local-disk spill does not survive the restart that just happened,
+        # so anything already on disk belongs to a run that can no longer read
+        # it. Sweeping at startup keeps a crash-loop from filling the node's
+        # disk with results nothing will ever claim.
+        if self.stream_store is not None:
+            try:
+                await self.stream_store.purge_older_than(self.settings.stream_ttl_seconds)
+            except Exception:
+                logger.exception("failed to purge expired spilled results")
         self._recover_task = asyncio.create_task(self._recover_incomplete_runs())
         # Data source MCP tools are loaded detached: the /mcp/datasources
         # endpoint only answers once uvicorn is serving, so this must never be
@@ -208,6 +221,8 @@ class ApplicationContainer:
             runner._data_source_backend = self.data_source_backend
         if self.data_source_executor is not None:
             runner._data_source_executor = self.data_source_executor
+        if self.stream_store is not None:
+            runner._stream_store = self.stream_store
         if self.approval_service is not None:
             runner._approval_service = self.approval_service
         if self.script_backend is not None:
@@ -1053,7 +1068,13 @@ def build_container(settings: Settings) -> ApplicationContainer:
     # Per-workflow storage: one collection, entries owned by workflow id.
     workflow_storage = MongoWorkflowStorageBackend(settings.mongodb_uri, settings.mongodb_database)
     service_token_provider = ServiceTokenProvider(settings)
-    data_source_executor = DataSourceExecutor(token_provider=service_token_provider)
+    # Where every data source result is written.
+    # Required, not optional: results do not travel as values, so every
+    # data source call needs somewhere to write its stream.
+    stream_store = LocalDiskStreamStore(settings.stream_dir)
+    data_source_executor = DataSourceExecutor(
+        token_provider=service_token_provider, stream_store=stream_store
+    )
     approval_backend = MongoApprovalBackend(settings.mongodb_uri, settings.mongodb_database)
     approval_service = ApprovalService(
         approval_backend,
@@ -1079,6 +1100,7 @@ def build_container(settings: Settings) -> ApplicationContainer:
         agent_backend=agent_backend,
         data_source_backend=data_source_backend,
         data_source_executor=data_source_executor,
+        stream_store=stream_store,
         approval_backend=approval_backend,
         approval_service=approval_service,
         event_backend=event_backend,
