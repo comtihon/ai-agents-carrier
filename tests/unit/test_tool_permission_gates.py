@@ -82,6 +82,18 @@ EXPECTED_TOOL_PERMISSIONS: dict[str, Permission] = {
     "run_workflow": Permission.WRITE,
     "list_runs": Permission.READ,
     "get_run": Permission.READ,
+    # A run's download manifest and one entry of it. Reads what a `data` step
+    # recorded and hands back a URL; the bytes are fetched over HTTP, where the
+    # same READ gate applies by method. Exactly as sensitive as get_run.
+    "list_run_data": Permission.READ,
+    "get_run_data_artifact": Permission.READ,
+    # The read side of the approval queue. Deciding a case is WRITE
+    # (approve_run / reject_run); reading one before deciding it must not cost
+    # more than reading any other record, or the informed decision becomes the
+    # privileged one. Matches the GET routes in app.api.routes.approvals, which
+    # the method table already puts at READ.
+    "list_pending_approvals": Permission.READ,
+    "get_approval": Permission.READ,
     "create_workflow": Permission.WRITE,
     "update_workflow": Permission.WRITE,
     "delete_workflow": Permission.DELETE,

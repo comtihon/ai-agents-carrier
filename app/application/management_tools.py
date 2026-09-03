@@ -32,6 +32,8 @@ if TYPE_CHECKING:
 
     from app.infrastructure.config.graph_loader import YamlGraphRegistry
     from app.infrastructure.persistence.agent_backend import AgentDefinitionBackend
+    from app.infrastructure.persistence.approval_backend import ApprovalCaseBackend
+    from app.infrastructure.persistence.data_artifact_backend import DataArtifactBackend
     from app.infrastructure.persistence.data_source_backend import DataSourceDefinitionBackend
     from app.infrastructure.persistence.event_backend import EventDefinitionBackend
     from app.infrastructure.persistence.mongo import MongoGraphRunRepository
@@ -127,6 +129,13 @@ class ManagementDeps:
     data_source_backend: "DataSourceDefinitionBackend | None" = None
     event_backend: "EventDefinitionBackend | None" = None
     script_backend: "ScriptDefinitionBackend | None" = None
+    # Run download manifests written by `data` steps. None means the tools that
+    # read them say so rather than pretending a run exported nothing.
+    data_artifact_backend: "DataArtifactBackend | None" = None
+    # Open/decided approval cases, for the read side of the approval queue.
+    # None means the tools that read it say so rather than reporting an empty
+    # queue, which would read as "nothing is waiting".
+    approval_backend: "ApprovalCaseBackend | None" = None
     refresh_runner: "Callable[[str], Awaitable[None]] | None" = None
     refresh_datasources: "Callable[[], Awaitable[None]] | None" = None
     # PubSubSubscriberManager when Pub/Sub triggers are enabled, else None.
@@ -150,6 +159,8 @@ def deps_from_container(
         data_source_backend=getattr(container, "data_source_backend", None),
         event_backend=getattr(container, "event_backend", None),
         script_backend=getattr(container, "script_backend", None),
+        data_artifact_backend=getattr(container, "data_artifact_backend", None),
+        approval_backend=getattr(container, "approval_backend", None),
         refresh_runner=getattr(container, "refresh_runner", None),
         refresh_datasources=refresh_datasources,
         pubsub_subscriber=getattr(container, "pubsub_subscriber", None),
@@ -472,6 +483,301 @@ async def get_run(deps: ManagementDeps, run_id: str) -> str:
     if err:
         parts.append(f"Error: {str(err)[:500]}")
     return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Run data downloads
+# ---------------------------------------------------------------------------
+#
+# Two origins, one mechanism. A `data` step's curated exports are listed by
+# default; the data source results already in the run's state are described in
+# exactly the same shape behind an opt-in, and both are fetched from the same
+# URL. That is deliberate: the data node is how data leaves the system, so a
+# data source result rides the same rails rather than getting a reader of its
+# own.
+#
+# A datasource entry is resolved by looking inside the state of the run named
+# in the call, never by opening a stream id the caller supplied -- a tool that
+# opened any `ds_*` id on request would be a cross-run read primitive. Doing it
+# through the run makes a result exactly as accessible as the run that produced
+# it, which is the rule the whole surface already follows.
+
+def _download_path(artifact: Any) -> str:
+    """Where an agent fetches the artifact's bytes.
+
+    The REST manifest returns this path relative to the API root, which is what
+    the frontend joins against its own base URL.  A tool caller has no such
+    base, so the configured API prefix is included here — the point of the tool
+    is that the URL it hands back is one that works.
+    """
+    from app.core.config import get_settings
+
+    prefix = (getattr(get_settings(), "api_prefix", "") or "").rstrip("/")
+    return f"{prefix}/runs/{artifact.run_id}/data/{artifact.id}"
+
+
+def _render_artifact(artifact: Any) -> str:
+    """One manifest entry, on one line.
+
+    ``truncated`` is spelled out rather than shown as a flag: the whole risk of
+    this feature is somebody treating a prefix as the complete answer, and an
+    LLM reading `truncated: true` in a list of fields is exactly the reader
+    most likely to skip past it.
+    """
+    source = f"{artifact.source_id}.{artifact.operation}".strip(".")
+    what = (
+        f"{artifact.items} item(s)" if artifact.shape == "list" else "1 document"
+    )
+    warning = (
+        " — INCOMPLETE: this is a truncated prefix of the data, not the whole "
+        "answer" if artifact.truncated else ""
+    )
+    return (
+        f"- **{artifact.id}** {artifact.name} [{artifact.origin}] "
+        f"({artifact.format}, {what}, {artifact.bytes} bytes) from step "
+        f"'{artifact.step_id}'"
+        + (f" via {source}" if source else "")
+        + f" — download: {_download_path(artifact)}"
+        + f" — expires: {artifact.expires_at.isoformat()}"
+        + warning
+    )
+
+
+def _datasource_ttl() -> float:
+    """How long an unpinned data source result is good for.
+
+    The ordinary spill window, because a datasource entry is *not* pinned. A
+    manifest that quoted the artifact TTL for it would be promising a week of
+    availability for bytes the sweep takes in six hours.
+    """
+    from app.core.config import get_settings
+
+    return float(getattr(get_settings(), "stream_ttl_seconds", 0.0) or 0.0)
+
+
+@requires(Permission.READ)
+async def list_run_data(
+    deps: ManagementDeps, run_id: str, include_datasource: bool = False
+) -> str:
+    from app.application.data_artifacts import list_run_artifacts
+
+    run = await deps.run_repository.get(run_id)
+    if run is None:
+        return f"Run '{run_id}' not found."
+    rows = await list_run_artifacts(
+        deps.data_artifact_backend,
+        run,
+        include_datasource=include_datasource,
+        datasource_ttl_seconds=_datasource_ttl(),
+    )
+    if not rows:
+        hint = (
+            "" if include_datasource else
+            " Pass include_datasource=true to list the raw data source results "
+            "this run fetched as well."
+        )
+        if deps.data_artifact_backend is None and not include_datasource:
+            return (
+                "Curated exports are unavailable: this backend has no data "
+                "artifact store configured." + hint
+            )
+        return (
+            f"Run '{run_id}' has no downloadable data. Either it ran no `data` "
+            f"step, or every selection that step declared resolved to nothing."
+            + hint
+        )
+    return "\n".join(_render_artifact(a) for a in rows)
+
+
+@requires(Permission.READ)
+async def get_run_data_artifact(
+    deps: ManagementDeps, run_id: str, artifact_id: str
+) -> str:
+    from app.application.data_artifacts import find_run_artifact
+
+    run = await deps.run_repository.get(run_id)
+    if run is None:
+        return f"Run '{run_id}' not found."
+    artifact = await find_run_artifact(
+        deps.data_artifact_backend,
+        run,
+        artifact_id,
+        datasource_ttl_seconds=_datasource_ttl(),
+    )
+    if artifact is None:
+        return f"No data artifact '{artifact_id}' for run '{run_id}'."
+    lines = [
+        f"Artifact: {artifact.id}",
+        f"Run: {artifact.run_id}",
+        f"Step: {artifact.step_id}",
+        f"Name: {artifact.name}",
+        f"Origin: {artifact.origin}",
+        f"Format: {artifact.format} (filename {artifact.filename})",
+        f"Shape: {artifact.shape}",
+        f"Items: {artifact.items}",
+        f"Stored bytes: {artifact.bytes}",
+        f"Truncated: {artifact.truncated}",
+        f"Created: {artifact.created_at.isoformat()}",
+        f"Expires: {artifact.expires_at.isoformat()}",
+        f"Download: {_download_path(artifact)}",
+    ]
+    source = f"{artifact.source_id}.{artifact.operation}".strip(".")
+    if source:
+        lines.append(f"Source: {source}")
+    if artifact.origin == "datasource":
+        lines.append(
+            "Note: this is a raw data source result, not a curated export. It "
+            "is not pinned, so it is swept on the ordinary stream TTL at the "
+            "expiry above and the download then returns 410."
+        )
+    if artifact.truncated:
+        lines.append(
+            "WARNING: this artifact is a truncated prefix of the data, not the "
+            "whole answer. Do not present a download of it as complete."
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Approval reads
+# ---------------------------------------------------------------------------
+#
+# `approve_run` and `reject_run` have existed for a while; reading the case they
+# decide has not. That was survivable while every case was "delete N rows", and
+# it is not any more: a case now carries `change_kind`, a `details` map, and a
+# cell-level `affected_sample` -- and for a generated (tier-2) write, `details`
+# says whether a language model wrote the code that produced those values. An
+# agent holding WRITE could approve exactly that, blind. These two tools are
+# what make an informed decision possible, so they sit at READ alongside the
+# GET routes in `app.api.routes.approvals` that answer the same questions.
+
+# Cases one call will list. The queue is a human work list; past a couple of
+# dozen the answer to "what is waiting" is "too much", not a longer page.
+_APPROVAL_LIST_MAX = 50
+# Characters of any one rendered value. A `params` map can carry a whole
+# request body, and a tool response is somebody's context window.
+_APPROVAL_VALUE_CHARS = 400
+# Sample entries shown in full. The sample exists so a decider can recognise
+# what is about to change, which the first several rows do.
+_APPROVAL_SAMPLE_ITEMS = 10
+
+
+def _approval_line(case: Any) -> str:
+    verdict = ""
+    if case.meta_llm is not None:
+        confidence = (
+            f", confidence {case.meta_llm.confidence:.2f}"
+            if case.meta_llm.confidence is not None else ""
+        )
+        verdict = (
+            f" — meta-LLM: {case.meta_llm.decision}{confidence}"
+            + (" (autonomous)" if case.meta_llm.autonomous else "")
+        )
+    return (
+        f"- **{case.id}** [{case.status}] {case.change_kind} via "
+        f"{case.datasource_name or case.datasource_id}.{case.operation} "
+        f"[{case.method}] — {case.affected_rows} row(s)"
+        + (f", workflow '{case.workflow_name or case.workflow_id}'"
+           if (case.workflow_name or case.workflow_id) else "")
+        + (f", run {case.run_id}" if case.run_id else "")
+        + f", opened {case.created_at.isoformat()}"
+        + verdict
+    )
+
+
+@requires(Permission.READ)
+async def list_pending_approvals(deps: ManagementDeps, limit: int = 20) -> str:
+    if deps.approval_backend is None:
+        return (
+            "Approvals are unavailable: this backend has no approval store "
+            "configured, so destructive operations run ungated."
+        )
+    cases = await deps.approval_backend.list(
+        status="pending", limit=max(1, min(limit, _APPROVAL_LIST_MAX))
+    )
+    if not cases:
+        return "No approvals are waiting."
+    return "\n".join(
+        [f"{len(cases)} approval(s) waiting:"]
+        + [_approval_line(c) for c in cases]
+        + ["Call get_approval with an id before approving or rejecting it."]
+    )
+
+
+@requires(Permission.READ)
+async def get_approval(deps: ManagementDeps, case_id: str) -> str:
+    if deps.approval_backend is None:
+        return (
+            "Approvals are unavailable: this backend has no approval store "
+            "configured, so destructive operations run ungated."
+        )
+    case = await deps.approval_backend.get(case_id)
+    if case is None:
+        return f"Approval case '{case_id}' not found."
+
+    parts = [
+        f"Case: {case.id}",
+        f"Status: {case.status}",
+        f"Change kind: {case.change_kind}",
+        f"Data source: {case.datasource_name or case.datasource_id}",
+        f"Operation: {case.operation} [{case.method}]",
+        f"Affected rows: {case.affected_rows}",
+        f"Surface: {case.surface}",
+        f"Opened: {case.created_at.isoformat()}",
+    ]
+    if case.workflow_id or case.workflow_name:
+        parts.append(f"Workflow: {case.workflow_name or case.workflow_id}")
+    if case.run_id:
+        parts.append(f"Run: {case.run_id}" + (f" step '{case.step_id}'" if case.step_id else ""))
+    if case.endpoint:
+        parts.append(f"Endpoint: {case.endpoint}")
+
+    if case.details:
+        # The `details` map is where a tier-2 write says that generated code
+        # produced these values. Rendered before the sample, because it changes
+        # how much the sample is worth trusting.
+        parts.append("Details:")
+        for key, value in case.details.items():
+            parts.append(f"  {key}: {_clip(str(value))}")
+    if case.targets:
+        parts.append("Targets: " + _clip(", ".join(str(t) for t in case.targets)))
+    if case.params:
+        parts.append("Params:")
+        for key, value in case.params.items():
+            parts.append(f"  {key}: {_clip(_compact(value))}")
+    if case.affected_sample:
+        shown = case.affected_sample[:_APPROVAL_SAMPLE_ITEMS]
+        parts.append(f"Affected sample ({len(shown)} of {len(case.affected_sample)}):")
+        for entry in shown:
+            parts.append(f"  {_clip(entry if isinstance(entry, str) else _compact(entry))}")
+    if case.meta_llm is not None:
+        verdict = case.meta_llm
+        parts.append(
+            f"Meta-LLM verdict: {verdict.decision}"
+            + (f" (confidence {verdict.confidence:.2f})"
+               if verdict.confidence is not None else "")
+            + (" — AUTONOMOUS: it decided on its own and the run is holding for "
+               "the veto window" if verdict.autonomous else "")
+        )
+        if verdict.reason:
+            parts.append(f"  reason: {_clip(verdict.reason)}")
+        if verdict.model:
+            parts.append(f"  model: {verdict.model}, history seen: {verdict.history_size}")
+    if case.veto_deadline is not None:
+        parts.append(f"Veto deadline: {case.veto_deadline.isoformat()}")
+    if case.decided_at is not None:
+        parts.append(
+            f"Decided: {case.decided_at.isoformat()} by "
+            f"{case.decided_by_name or case.decision_source or 'unknown'}"
+            + (f" — {_clip(case.reason)}" if case.reason else "")
+        )
+    return "\n".join(parts)
+
+
+def _clip(text: str) -> str:
+    if len(text) <= _APPROVAL_VALUE_CHARS:
+        return text
+    return f"{text[:_APPROVAL_VALUE_CHARS]}… [{len(text)} chars total]"
 
 
 def _sandbox_denial(steps: Any) -> str | None:

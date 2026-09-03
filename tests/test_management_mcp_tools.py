@@ -22,6 +22,8 @@ from tests.test_events_api import InMemoryEventBackend
 
 _EXPECTED_TOOLS = {
     "list_workflows", "get_workflow", "run_workflow", "list_runs", "get_run",
+    "list_run_data", "get_run_data_artifact",
+    "list_pending_approvals", "get_approval",
     "create_workflow", "update_workflow", "delete_workflow",
     "list_agents", "get_agent", "create_agent", "update_agent", "delete_agent",
     "list_datasources", "get_datasource", "create_datasource", "update_datasource",
@@ -106,7 +108,7 @@ async def test_registers_the_full_tool_set(mcp):
     _register(mcp, _Container())
     tools = await mcp.list_tools()
     assert {t.name for t in tools} == _EXPECTED_TOOLS
-    assert len(tools) == 57
+    assert len(tools) == 61
 
 
 async def test_ask_user_is_not_exposed_over_mcp(mcp):

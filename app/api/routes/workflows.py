@@ -275,9 +275,22 @@ def _init_step_statuses(runner: YamlGraphRunner) -> dict[str, str]:
     return {s["id"]: "pending" for s in runner.steps}
 
 
-def _step_status_for_output(node_name: str, output: dict) -> str:
+def _step_status_for_output(
+    node_name: str, output: dict, runner: YamlGraphRunner | None = None,
+    run: GraphRun | None = None,
+) -> str:
     from app.infrastructure.orchestration.yaml_graph import step_status_from_output
-    return step_status_from_output(node_name, output)
+
+    step = None
+    if runner is not None:
+        step = next((s for s in runner.steps if s["id"] == node_name), None)
+    return step_status_from_output(
+        node_name, output,
+        step_type=(step or {}).get("type"),
+        # "running" was published from inside the node, so it is the evidence
+        # that the body ran rather than being skipped by a `when` guard.
+        ran=bool(run is not None and run.step_statuses.get(node_name) == "running"),
+    )
 
 
 async def _stream_graph(
@@ -336,7 +349,7 @@ async def _stream_graph(
             for node_name, output in chunk.items():
                 if node_name in ("__start__", "__end__"):
                     continue
-                status = _step_status_for_output(node_name, output)
+                status = _step_status_for_output(node_name, output, runner, run)
                 run.step_inputs[node_name] = dict(current_state)
                 run.step_statuses[node_name] = status
                 run.current_step = node_name
@@ -829,6 +842,15 @@ async def delete_run(
         raise HTTPException(status_code=404, detail="Run not found")
     from app.services.agent_cleanup import cleanup_run_agents
     await cleanup_run_agents(run_id, container.settings)
+    # Drop the run's download manifest and unpin the streams it held. Without
+    # the unpin those streams would keep their retention exemption for good and
+    # the sweep would never reclaim them.
+    from app.application.data_artifacts import forget_run_artifacts
+    await forget_run_artifacts(
+        container.stream_store,
+        getattr(container, "data_artifact_backend", None),
+        run_id,
+    )
     container.live_runners.pop(run_id, None)
     await container.run_repository.delete(run_id)
 
