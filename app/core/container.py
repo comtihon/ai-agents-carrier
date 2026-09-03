@@ -165,12 +165,33 @@ class ApplicationContainer:
         # Confirm the store is usable before anything depends on it. A
         # misconfigured GCS store otherwise comes up Healthy and fails on the
         # first data source call of the deployment -- the worst place to learn
-        # about it, and how the missing project surfaced. check_ready turns
-        # that into a boot failure naming the bucket.
+        # about it, and how the missing project surfaced.
+        #
+        # Off the event loop and bounded, both learned the hard way: this is a
+        # blocking network call, and `startup()` runs inside the FastAPI
+        # lifespan *before* uvicorn binds the port. Called inline it delayed
+        # the bind, the liveness probe (initialDelaySeconds 10, period 20) got
+        # connection refused, and the kubelet SIGKILLed the container before
+        # it could serve -- a boot loop on a healthy cluster. So: a worker
+        # thread, and a deadline after which a slow bucket check is a warning
+        # rather than the reason a pod will not start.
         if self.stream_store is not None:
             check_ready = getattr(self.stream_store, "check_ready", None)
             if check_ready is not None:
-                check_ready()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(check_ready),
+                        timeout=self.settings.stream_ready_timeout_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    # Slow is not the same as broken. Refusing to boot here
+                    # would make a sluggish metadata server an outage.
+                    logger.warning(
+                        "data stream store: readiness check did not finish "
+                        "within %ss; continuing. If data source steps fail, "
+                        "check the bucket and the service account's access.",
+                        self.settings.stream_ready_timeout_seconds,
+                    )
         # A local-disk stream does not survive the restart that just happened,
         # so anything already on disk belongs to a run that can no longer read
         # it. Sweeping at startup keeps a crash-loop from filling the node's
