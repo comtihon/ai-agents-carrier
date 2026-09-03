@@ -55,6 +55,19 @@ spec:
 {{- end }}
 {{- end }}
 {{- end }}
+          # A startup probe, because this container's boot is genuinely slow:
+          # a uvx install for the jira MCP server, 63 tools, every workflow
+          # definition. The liveness probe below used to police that window
+          # and killed the container mid-boot whenever anything made startup a
+          # little slower. With a startupProbe the liveness probe does not run
+          # until the app has answered once, so liveness means "wedged" again
+          # rather than "slow to start".
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60      # up to 5 minutes to come up
           readinessProbe:
             httpGet:
               path: /ready

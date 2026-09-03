@@ -474,21 +474,45 @@ async def test_a_slow_readiness_check_does_not_stop_the_boot(monkeypatch, caplog
     await asyncio.sleep(0)
 
 
-async def test_the_readiness_check_runs_off_the_event_loop_in_startup():
-    """Pin the call shape, since inline blocking is what broke prod."""
+def test_startup_does_not_wait_on_the_stream_store():
+    """The boot path must not contain a GCS round trip.
+
+    startup() runs inside the FastAPI lifespan, before the port is bound.
+    This app already takes ~35s to boot and the liveness probe allows
+    ~30s, so two GCS calls in front of the bind were enough to have the
+    kubelet SIGKILL v1.2.174 and v1.2.175 mid-boot. The housekeeping is
+    detached instead; these assertions are what stops it drifting back.
+    """
     import inspect
 
     from app.core.container import ApplicationContainer
 
-    source = inspect.getsource(ApplicationContainer.startup)
+    startup = inspect.getsource(ApplicationContainer.startup)
 
-    assert "asyncio.to_thread(check_ready)" in source, (
-        "check_ready must run in a worker thread: startup() precedes the port "
-        "bind, so a blocking call here delays readiness and the liveness probe "
-        "kills the container"
-    )
-    assert "asyncio.wait_for" in source, "the check must be bounded by a deadline"
-    assert "stream_ready_timeout_seconds" in source
+    assert "_stream_store_housekeeping()" in startup
+    assert "create_task" in startup.split("_stream_store_housekeeping")[0].rsplit("\n", 2)[-2] \
+        or "asyncio.create_task(\n            self._stream_store_housekeeping()" in startup, \
+        "housekeeping must be detached with create_task, not awaited"
+    assert "await self.stream_store.purge_older_than" not in startup, \
+        "the TTL sweep is a GCS call and must not be on the boot path"
+    assert "check_ready()" not in startup, \
+        "the readiness check must not be called inline in startup"
+
+
+def test_the_housekeeping_is_bounded_and_survives_failure():
+    """A broken or slow store must not take the process down."""
+    import inspect
+
+    from app.core.container import ApplicationContainer
+
+    house = inspect.getsource(ApplicationContainer._stream_store_housekeeping)
+
+    assert "asyncio.to_thread(check_ready)" in house, "must not block the loop"
+    assert "asyncio.wait_for" in house, "must be bounded"
+    assert "stream_ready_timeout_seconds" in house
+    # Every failure path is caught: this runs detached, so an exception here
+    # would otherwise surface only as a dangling task.
+    assert house.count("except") >= 3
 
 
 def test_the_readiness_deadline_is_configurable():
