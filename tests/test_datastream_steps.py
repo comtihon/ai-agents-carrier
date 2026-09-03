@@ -374,3 +374,82 @@ def test_a_template_can_still_read_the_count():
 def test_stream_safe_state_leaves_ordinary_state_untouched():
     state = {"a": 1, "b": [1, 2]}
     assert _stream_safe_state(state) is state
+
+
+# ---------------------------------------------------------------------------
+# structured values in step params
+# ---------------------------------------------------------------------------
+#
+# A step config value that is exactly one placeholder has to reach a data
+# source as the object, not as str() of it. Without this, composing two data
+# sources -- read rows from one, write them to the other -- is impossible:
+# {"values": "{rows}"} arrived as "[['a', 1]]", a Python repr that is not even
+# valid JSON, and an `array` param passes a string through untouched.
+
+def test_a_list_reaches_params_as_a_list():
+    state = {"rows": [["p-1", "PROCESSING"], ["p-2", "PROCESSING"]]}
+
+    rendered = YamlGraphRunner._render_deep({"values": "{rows}"}, state)
+
+    assert rendered["values"] == state["rows"]
+    assert isinstance(rendered["values"], list)
+
+
+def test_a_dict_reaches_params_as_a_dict():
+    state = {"body": {"range": "Sheet1!A2", "majorDimension": "ROWS"}}
+
+    rendered = YamlGraphRunner._render_deep({"payload": "{body}"}, state)
+
+    assert rendered["payload"] == state["body"]
+
+
+def test_indexing_into_a_list_also_passes_through():
+    state = {"rows": [["a", 1], ["b", 2]]}
+
+    assert YamlGraphRunner._render_deep({"v": "{rows[0]}"}, state)["v"] == ["a", 1]
+
+
+def test_scalars_still_render_as_strings():
+    """Unchanged on purpose: the executor's declared-type coercion decides
+    what a number is, and {"page": "{n}"} must behave as it always has."""
+    state = {"n": 5, "msg": "hi", "flag": True}
+
+    rendered = YamlGraphRunner._render_deep(
+        {"a": "{n}", "b": "{msg}", "c": "{flag}"}, state
+    )
+
+    assert rendered == {"a": "5", "b": "hi", "c": "True"}
+
+
+def test_a_placeholder_inside_a_larger_string_is_still_a_string():
+    state = {"rows": [["a", 1]]}
+
+    out = YamlGraphRunner._render_deep({"v": "rows: {rows}"}, state)["v"]
+
+    assert isinstance(out, str)
+    assert out.startswith("rows: ")
+
+
+def test_a_missing_key_still_renders_empty():
+    assert YamlGraphRunner._render_deep({"v": "{nope}"}, {})["v"] == ""
+
+
+def test_a_data_stream_reference_is_never_passed_through_as_data():
+    """A ref is a dict, so it would qualify — but inlining one is exactly what
+    the summary rendering exists to prevent."""
+    ref = DataRef(id="ds_abc", items=4000, bytes=1_000_000,
+                  source_id="crm", operation="list")
+    state = {"contacts": ref.to_state()}
+
+    out = YamlGraphRunner._render_deep({"v": "{contacts}"}, state)["v"]
+
+    assert isinstance(out, str)
+    assert "4000 items" in out
+    assert "ds_abc" not in out
+
+
+def test_env_is_not_passed_through():
+    """{env.X} must keep going through the env accessor, not the state path."""
+    out = YamlGraphRunner._render_deep({"v": "{env.NOPE_NOT_SET}"}, {})["v"]
+
+    assert out == ""
