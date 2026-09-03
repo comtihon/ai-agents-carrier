@@ -1220,14 +1220,21 @@ async def get_datasource(deps: ManagementDeps, source_id: str) -> str:
         detail = {
             "name": op.name,
             "method": op.method,
+            "description": op.description,
             "path": op.path,
             "query": (op.query[:200] + "…") if op.query and len(op.query) > 200 else op.query,
             "variables": op.variables,
+            # Reported because update_datasource replaces the whole operation
+            # list: an operation read back without its query_params would lose
+            # the arguments its API takes in the query string of a write.
+            "query_params": op.query_params,
             "params": [
                 {"name": p.name, "type": p.type, "required": p.required} for p in op.params
             ],
+            "destructive": op.destructive,
             "mapping": op.mapping,
             "paginate": op.paginate.model_dump() if op.paginate else None,
+            "retries": op.retries.model_dump() if op.retries else None,
         }
         lines.append("  " + json.dumps({k: v for k, v in detail.items() if v is not None},
                                        ensure_ascii=False))
@@ -1249,6 +1256,798 @@ async def list_datasources(deps: ManagementDeps) -> str:
             f"{s.description or '(no description)'} — {detail}"
         )
     return "\n".join(lines)
+
+
+def _google_subject_error(auth: Any) -> str | None:
+    """Why a ``google`` auth block is unusable, as a tool-reply string.
+
+    Thin wrapper over
+    ``app.infrastructure.auth.google_token_provider.check_impersonate_subject``
+    so the MCP write paths enforce the same restriction as the REST ones: a
+    ``google`` block may name only the service account
+    ``GOOGLE_IMPERSONATE_SA`` points at, because the backend can impersonate
+    every account it has been granted token-creator on and the auth block is
+    caller-supplied.
+    """
+    from app.infrastructure.auth.google_token_provider import (
+        check_impersonate_subject,
+    )
+    return check_impersonate_subject(auth)
+
+
+@requires(Permission.READ)
+async def resolve_google_file(deps: ManagementDeps, ref: str) -> str:
+    """Resolve a Google Drive URL / file id and report whether we can reach it.
+
+    Same check the editor's Verify button makes, so an agent can attach a
+    spreadsheet by URL the way a person does: the document has to be shared
+    with the backend's service account, and only the backend can find out
+    whether it is.
+    """
+    from app.core.config import get_settings
+    from app.infrastructure.datasources.google_sheets import (
+        resolve_google_file as _resolve,
+    )
+    result = await _resolve(ref, get_settings())
+    if result.get("status") != "ok":
+        return f"{result.get('status')}: {result.get('error')}"
+    return "\n".join([
+        f"File id: {result['file_id']}",
+        f"Name: {result['name'] or '(untitled)'}",
+        f"Type: {result['mime_type']}",
+        f"Writable: {'yes' if result['can_edit'] else 'no (shared read-only)'}",
+    ])
+
+
+@requires(Permission.WRITE)
+async def create_google_sheets_datasource(
+    deps: ManagementDeps,
+    source_id: str = "google-sheets",
+    name: str = "Google Sheets",
+    description: str = "",
+) -> str:
+    """Create the Google Sheets data source with its Sheets v4 operations.
+
+    The operation templates come from code
+    (``app.infrastructure.datasources.google_sheets``) rather than being
+    retyped, so this and the editor's "Google Sheets" preset produce the same
+    source.  Writes are gated behind approval and default to ``RAW`` values.
+    """
+    if deps.data_source_backend is None:
+        return "Data source creation unavailable: no persistent backend configured."
+
+    from app.core.config import get_settings
+    from app.domain.models.data_source_definition import (
+        DataSourceDefinition,
+        validate_operations,
+    )
+    from app.infrastructure.datasources.google_sheets import google_sheets_template
+
+    settings = get_settings()
+    template = google_sheets_template(settings)
+    if not template["service_account"]:
+        return (
+            "Google auth is not configured on this backend — set "
+            "GOOGLE_IMPERSONATE_SA to the service account spreadsheets are "
+            "shared with, then create the source."
+        )
+
+    existing = await deps.data_source_backend.get(source_id)
+    if existing is not None:
+        return f"Data source '{source_id}' already exists. Use update_datasource to modify it."
+
+    try:
+        defn = DataSourceDefinition.model_validate({
+            "id": source_id,
+            "name": name or template["name"],
+            "description": description or template["description"],
+            "kind": template["kind"],
+            "base_url": template["base_url"],
+            "auth": template["auth"],
+            "operations": template["operations"],
+        })
+        validate_operations(defn)
+    except Exception as exc:
+        return f"Invalid data source definition: {exc}"
+
+    await deps.data_source_backend.create(defn)
+    await _publish_datasources(deps)
+    return (
+        f"Data source '{source_id}' created with {len(defn.operations)} "
+        f"operation(s): {', '.join(op.name for op in defn.operations)}. "
+        f"Share each spreadsheet with {template['service_account']} "
+        "(Editor, for writes) before calling it."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sheet bindings
+#
+# Same operations as the REST routes in app/api/routes/datasources.py, and the
+# same two validation layers: the pydantic shape, then validate_bindings (an
+# unknown column, a mode missing its required field).  An agent authoring a
+# binding must not have an easier time than a person authoring one in the form
+# -- a binding is what makes a write land on the right cells, and it is checked
+# the same way whichever surface wrote it.
+# ---------------------------------------------------------------------------
+
+async def _binding_source(deps: ManagementDeps, source_id: str):
+    """``(source, None)`` or ``(None, error_str)`` for a binding tool."""
+    if deps.data_source_backend is None:
+        return None, "Data source backend not configured."
+    resolved, err = await _resolve_datasource_id(deps, source_id)
+    if err:
+        return None, err
+    source = await deps.data_source_backend.get(resolved)
+    if source is None:
+        return None, f"Data source '{resolved}' not found."
+    # A stored `google` auth block naming a foreign principal is refused here
+    # too: this is the surface that would mint the token from it.
+    subject_error = _google_subject_error(
+        source.auth.model_dump(mode="json") if source.auth else None
+    )
+    if subject_error:
+        return None, subject_error
+    return source, None
+
+
+def _render_binding(binding: Any) -> str:
+    payload = binding.model_dump(mode="json")
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _tier_line(binding: Any) -> str:
+    """One line saying whether a binding holds generated code, and its state.
+
+    Tier is an outcome, never a setting: it is answered by looking at whether
+    the binding carries a transform. An agent reading a binding back has to be
+    told this without asking -- "deterministic form" and "code a model wrote"
+    are very different things to be about to run.
+    """
+    from app.application.sheet_compute_service import compute_status
+
+    status = compute_status(binding)
+    if not status["generated"]:
+        return "tier 1: mapped declaratively, deterministic, no code."
+
+    golden = status.get("golden") or {}
+    age = golden.get("verified_days_ago")
+    verified = (
+        f"last verified {age:.1f}d ago" if isinstance(age, (int, float))
+        else "never verified"
+    )
+    flags = []
+    if not status["activated"]:
+        flags.append("NOT ACTIVATED (compiled but switched off)")
+    if status["stale"]:
+        flags.append(f"STALE ({status['stale_reason']})")
+    if status["edited_by_human"]:
+        flags.append("edited by hand — will not be regenerated")
+    tail = ("; " + "; ".join(flags)) if flags else ""
+    return (
+        f"tier 2: GENERATED CODE ({status['script_id']}, model "
+        f"{status['model_id'] or 'unknown'}), {verified}{tail}. "
+        f"Instruction: {status['instruction'] or '(none)'}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tier 2: generated transforms
+# ---------------------------------------------------------------------------
+# Every rule these enforce lives in app.application.sheet_compute_service, so
+# this surface, the REST API and the chat agent cannot differ on any of them --
+# which is the failure worth designing against, because a caller who finds one
+# lenient surface stops using the strict one.
+#
+# Permission tiers follow the rest of the datasource tooling: reading is READ,
+# mutating is WRITE. On top of that, the three tools that *store executable
+# code* (compile, edit, activate) additionally require ADMIN, raised from
+# inside the service by auth.sandbox_guard.assert_generated_code_allowed. WRITE
+# gets you to the tool; ADMIN is what lets it save code nobody has read yet.
+
+
+def _compute_deps(deps: ManagementDeps) -> dict[str, Any]:
+    """The persistence and publication hooks the tier-2 service takes."""
+    return {
+        "backend": deps.data_source_backend,
+        "script_backend": deps.script_backend,
+        "publish": lambda: _publish_datasources(deps),
+    }
+
+
+def _render_compute_result(result: dict[str, Any], *, code: bool = True) -> str:
+    """A tier-2 service result as text an agent can act on."""
+    status = result.get("status")
+    name = result.get("binding") or "?"
+
+    if status == "needs":
+        lines = [
+            f"Binding '{name}': the instruction is ambiguous about the data, so "
+            "nothing was generated. Answer these and call compile again with "
+            "the answers (the exact question text is the key):",
+        ]
+        for need in result.get("needs") or []:
+            options = ", ".join(need.get("options") or []) or "(free text)"
+            lines.append(f"- {need['question']}\n  options: {options}")
+        return "\n".join(lines)
+
+    if status == "stale":
+        return (
+            f"Binding '{name}' is now STALE and switched off: "
+            f"{result.get('error')}"
+        )
+
+    compute = result.get("compute") or {}
+    lines = [f"Binding '{name}': {status}."]
+    if compute:
+        lines.append(
+            f"script {compute.get('script_id')} (hash {compute.get('content_hash')}), "
+            f"activated={compute.get('activated')}, stale={compute.get('stale')}, "
+            f"edited_by_human={compute.get('edited_by_human')}"
+        )
+    if result.get("rationale"):
+        lines.append(f"Rationale: {result['rationale']}")
+    if "output" in result:
+        lines.append(
+            "Output on the verification rows: "
+            + json.dumps(result["output"], ensure_ascii=False, default=str)[:1500]
+        )
+    if code and result.get("code"):
+        lines.append("Code:\n" + result["code"])
+    if status == "ok" and not (compute.get("activated") if compute else True):
+        lines.append(
+            "It is NOT running yet. Review the code and the output above, then "
+            "call activate_sheet_binding_code to switch it on."
+        )
+    return "\n".join(lines)
+
+
+async def _compute_call(fn: Any, **kwargs: Any) -> str:
+    """Run one tier-2 service call, turning every refusal into tool text."""
+    from app.application.sheet_compute_service import ComputeServiceError
+    from app.infrastructure.auth.sandbox_guard import GeneratedCodeNotPermittedError
+
+    try:
+        result = await fn(**kwargs)
+    except GeneratedCodeNotPermittedError as exc:
+        return f"Not permitted: {exc}"
+    except ComputeServiceError as exc:
+        return f"Refused: {exc}"
+    if result.get("status") == "error":
+        return (
+            f"Binding '{result.get('binding')}': compilation failed after "
+            f"{result.get('attempts')} attempt(s). The last checker rejection "
+            f"was:\n{result.get('error')}"
+        )
+    return _render_compute_result(result)
+
+
+@requires(Permission.WRITE)
+async def compile_sheet_binding_code(
+    deps: ManagementDeps,
+    name: str,
+    instruction: str = "",
+    answers_json: str = "",
+    force: bool = False,
+    source_id: str = "google-sheets",
+) -> str:
+    """Generate the computation of a binding a declarative form cannot express.
+
+    Tier 1 (save_sheet_binding) covers reading rows, reading a row by key and
+    setting named columns. It cannot express computation across rows -- grouping,
+    aggregation, arithmetic. This generates just that part: a small Python
+    function that turns the sheet's records into values, while the binding keeps
+    declaring the document, the tab, the key column and the columns that may be
+    written. Generated code produces values, never addresses, and cannot touch a
+    column the binding does not list.
+
+    Save the binding first (save_sheet_binding), including the column map a
+    write is allowed to set; this fills in its computation.
+
+    Three possible outcomes: clarifying questions (nothing is stored -- answer
+    them and call again with answers_json), a successful compile (the code is
+    stored switched OFF, and activate_sheet_binding_code turns it on after you
+    have read it), or a failure after several attempts with the checker's own
+    rejection.
+
+    Requires admin permission: it stores code that this backend later executes.
+
+    Args:
+        name: Binding to generate the computation for.
+        instruction: What to compute, in plain language. Omit to re-use the
+            instruction already stored on the binding, which is what a plain
+            recompile means.
+        answers_json: JSON object of {"<question>": "<answer>"} answering a
+            previous call's questions. Folded into the binding, so later
+            recompiles reproduce rather than re-guess.
+        force: Re-run the model even when nothing about the request changed.
+        source_id: Data source holding the binding (default "google-sheets").
+    """
+    source, err = await _binding_source(deps, source_id)
+    if err:
+        return err
+    answers: dict[str, str] = {}
+    if answers_json:
+        try:
+            parsed = json.loads(answers_json)
+        except json.JSONDecodeError as exc:
+            return f"Invalid answers_json: {exc}"
+        if not isinstance(parsed, dict):
+            return "answers_json must be a JSON object of question -> answer."
+        answers = {str(k): str(v) for k, v in parsed.items()}
+
+    from app.core.config import get_settings
+    from app.application.sheet_compute_service import compile_compute
+
+    executor = _binding_executor(deps)
+    if executor is None:
+        return "Data source executor not configured."
+    return await _compute_call(
+        compile_compute,
+        source=source,
+        name=name,
+        instruction=instruction or None,
+        answers=answers,
+        settings=get_settings(),
+        executor=executor,
+        force=force,
+        **_compute_deps(deps),
+    )
+
+
+@requires(Permission.READ)
+async def get_sheet_binding_code(
+    deps: ManagementDeps, name: str, source_id: str = "google-sheets"
+) -> str:
+    """Read the generated code of a binding, with its verification state.
+
+    Use this before activating a binding, and whenever one behaves oddly: it
+    reports the code itself, the model and instruction it came from, whether it
+    is activated or stale, whether a person has edited it, and when its golden
+    fixture last reproduced.
+
+    Args:
+        name: Binding to read the code of.
+        source_id: Data source holding the binding (default "google-sheets").
+    """
+    source, err = await _binding_source(deps, source_id)
+    if err:
+        return err
+    binding = source.get_binding(name)
+    if binding is None:
+        return f"Binding '{name}' not found on '{source.id}'."
+    if binding.compute is None:
+        return (
+            f"Binding '{name}' is a tier-1 binding: mapped declaratively, "
+            "deterministic, no code. There is nothing to review."
+        )
+    from app.infrastructure.datasources.sheet_compute import TRANSFORM_SIGNATURE
+
+    golden = binding.resolution.golden
+    fixture = (
+        f"{len(golden.input_rows)} row(s), output hash {golden.output_hash}"
+        if golden else "none"
+    )
+    return "\n".join([
+        _tier_line(binding),
+        f"Signature: {TRANSFORM_SIGNATURE}",
+        f"Golden fixture: {fixture}",
+        f"Output shape: {binding.compute.output_shape}",
+        "Code:",
+        binding.compute.code,
+    ])
+
+
+@requires(Permission.WRITE)
+async def edit_sheet_binding_code(
+    deps: ManagementDeps,
+    name: str,
+    code: str,
+    source_id: str = "google-sheets",
+) -> str:
+    """Replace a binding's generated code with a hand-written version.
+
+    Held to exactly the checks the generated version was: the same allow-list on
+    what the code may contain, the same sandbox, the same run-it-twice
+    determinism check, and the same rule that a write may only produce values
+    for the columns the binding lists. Being hand-written changes who is
+    accountable, not what the code may do.
+
+    This permanently stops regeneration for this binding: a later compile
+    refuses rather than overwriting the edit. The binding is also switched off
+    again, because this is new code and the previous approval was of the
+    previous code.
+
+    Requires admin permission: it stores code that this backend later executes.
+
+    Args:
+        name: Binding whose code to replace.
+        code: The full replacement source, defining transform(records, params).
+        source_id: Data source holding the binding (default "google-sheets").
+    """
+    source, err = await _binding_source(deps, source_id)
+    if err:
+        return err
+    from app.core.config import get_settings
+    from app.application.sheet_compute_service import edit_compute_code
+
+    return await _compute_call(
+        edit_compute_code,
+        source=source,
+        name=name,
+        code=code,
+        settings=get_settings(),
+        **_compute_deps(deps),
+    )
+
+
+@requires(Permission.WRITE)
+async def activate_sheet_binding_code(
+    deps: ManagementDeps, name: str, source_id: str = "google-sheets"
+) -> str:
+    """Switch a compiled transform on, after re-proving it against its fixture.
+
+    Compiling and activating are two separate events on purpose: the first says
+    the code passed its checks, the second says somebody read the code and its
+    output and accepted it. Read get_sheet_binding_code first -- activating
+    without doing so is exactly the step this design exists to make deliberate.
+
+    Requires admin permission: it puts generated code into service.
+
+    Args:
+        name: Binding to activate.
+        source_id: Data source holding the binding (default "google-sheets").
+    """
+    source, err = await _binding_source(deps, source_id)
+    if err:
+        return err
+    from app.core.config import get_settings
+    from app.application.sheet_compute_service import activate_compute
+
+    return await _compute_call(
+        activate_compute,
+        source=source,
+        name=name,
+        settings=get_settings(),
+        **_compute_deps(deps),
+    )
+
+
+@requires(Permission.WRITE)
+async def retest_sheet_binding_code(
+    deps: ManagementDeps, name: str, source_id: str = "google-sheets"
+) -> str:
+    """Re-run a binding's frozen test and re-check the sheet's header row.
+
+    Two independent questions: does the code still compute the answer it was
+    approved for, and does the sheet still have the header row it was written
+    against. Either one failing marks the binding stale and switches it off,
+    which is a change to it -- hence a write, not a read.
+
+    Args:
+        name: Binding to re-test.
+        source_id: Data source holding the binding (default "google-sheets").
+    """
+    source, err = await _binding_source(deps, source_id)
+    if err:
+        return err
+    from app.core.config import get_settings
+    from app.application.sheet_compute_service import retest_compute
+
+    executor = _binding_executor(deps)
+    if executor is None:
+        return "Data source executor not configured."
+    return await _compute_call(
+        retest_compute,
+        source=source,
+        name=name,
+        settings=get_settings(),
+        executor=executor,
+        **_compute_deps(deps),
+    )
+
+
+@requires(Permission.WRITE)
+async def mark_sheet_binding_stale(
+    deps: ManagementDeps,
+    name: str,
+    reason: str = "",
+    source_id: str = "google-sheets",
+) -> str:
+    """Switch a binding's generated code off until somebody re-confirms it.
+
+    Use this the moment a generated binding looks wrong. It stops running
+    immediately; re-testing it and activating it again are what bring it back.
+    No admin permission is needed -- stopping something suspicious should never
+    be the privileged direction.
+
+    Args:
+        name: Binding to mark stale.
+        reason: Why, recorded on the binding and shown in the editor.
+        source_id: Data source holding the binding (default "google-sheets").
+    """
+    source, err = await _binding_source(deps, source_id)
+    if err:
+        return err
+    from app.application.sheet_compute_service import mark_compute_stale
+
+    return await _compute_call(
+        mark_compute_stale,
+        source=source,
+        name=name,
+        reason=reason,
+        **_compute_deps(deps),
+    )
+
+
+@requires(Permission.READ)
+async def probe_google_sheet(
+    deps: ManagementDeps,
+    file_id: str,
+    sheet: str = "",
+    header_row: int = 1,
+    source_id: str = "google-sheets",
+) -> str:
+    """Read a spreadsheet's tabs, header row and a few real rows.
+
+    The one call a binding is authored from: every column name a binding may
+    use has to come from here, and the fingerprint it returns is what detects a
+    later change to the header row.
+    """
+    source, err = await _binding_source(deps, source_id)
+    if err:
+        return err
+    executor = _binding_executor(deps)
+    if executor is None:
+        return "Data source executor not configured."
+    from app.infrastructure.datasources.sheet_binding_runtime import probe_sheet
+    try:
+        result = await probe_sheet(source, executor, file_id, sheet or None, header_row)
+    except Exception as exc:  # noqa: BLE001 — reported like the REST probe does
+        return f"Could not probe that spreadsheet: {exc}"
+    lines = [
+        f"Spreadsheet: {file_id}",
+        f"Tab: {result['sheet']} (sheet_id {result['sheet_id']})",
+        "Tabs: " + ", ".join(f"{t['title']} ({t['sheet_id']})" for t in result["tabs"]),
+        "Named ranges: " + (", ".join(n["name"] for n in result["named_ranges"]) or "(none)"),
+        f"Header row: {result['header_row']}",
+        "Headers: " + ", ".join(result["headers"]),
+        f"Fingerprint: {result['fingerprint']}",
+        "Sample rows:",
+    ]
+    for row in result["sample_rows"]:
+        lines.append("  " + json.dumps(row, ensure_ascii=False))
+    return "\n".join(lines)
+
+
+def _binding_executor(deps: ManagementDeps) -> Any:
+    """The shared executor, or a fresh one.
+
+    ManagementDeps deliberately carries only backends, so the executor is not
+    one of its fields; a plain instance is equivalent here because everything a
+    binding needs comes from the source definition it is handed.
+    """
+    from app.infrastructure.datasources.executor import DataSourceExecutor
+    return DataSourceExecutor()
+
+
+@requires(Permission.READ)
+async def list_sheet_bindings(deps: ManagementDeps, source_id: str = "google-sheets") -> str:
+    """List the sheet bindings on a data source and what each one compiles to."""
+    source, err = await _binding_source(deps, source_id)
+    if err:
+        return err
+    if not source.bindings:
+        return f"Data source '{source.id}' has no bindings."
+    lines = [f"Bindings on '{source.id}' ({len(source.bindings)}):"]
+    for binding in source.bindings:
+        target = f"{binding.document.name or binding.document.file_id} / {binding.document.sheet}"
+        detail = (
+            f"mode {binding.read.mode}" if binding.operation == "read" and binding.read
+            else f"mode {binding.write.mode}" if binding.write else "?"
+        )
+        lines.append(
+            f"- **{binding.name}** ({binding.operation}, {detail}) on {target} "
+            f"-> operation '{binding.name}'"
+        )
+        lines.append("  " + _tier_line(binding))
+    return "\n".join(lines)
+
+
+@requires(Permission.READ)
+async def get_sheet_binding(
+    deps: ManagementDeps, name: str, source_id: str = "google-sheets"
+) -> str:
+    """Read one binding back in full, as the JSON save_sheet_binding accepts."""
+    source, err = await _binding_source(deps, source_id)
+    if err:
+        return err
+    binding = source.get_binding(name)
+    if binding is None:
+        return f"Binding '{name}' not found on '{source.id}'."
+    return _render_binding(binding)
+
+
+@requires(Permission.WRITE)
+async def save_sheet_binding(
+    deps: ManagementDeps,
+    binding_json: str,
+    source_id: str = "google-sheets",
+) -> str:
+    """Create or replace a sheet binding, compiling it into an operation.
+
+    Idempotent by name: a binding whose name already exists is replaced, so
+    re-sending a corrected binding is the way to fix one.
+    """
+    source, err = await _binding_source(deps, source_id)
+    if err:
+        return err
+    try:
+        payload = json.loads(binding_json)
+    except json.JSONDecodeError as exc:
+        return f"Invalid binding_json: {exc}"
+    if not isinstance(payload, dict):
+        return "binding_json must be a JSON object describing one binding."
+
+    from app.domain.models.data_source_definition import validate_operations
+    from app.domain.models.sheet_binding import (
+        SheetBinding,
+        header_fingerprint,
+        validate_bindings,
+    )
+    from app.infrastructure.datasources.sheet_binding_compile import (
+        refresh_binding_operations,
+        stamp_compiled,
+    )
+    from app.infrastructure.datasources.sheet_binding_library import (
+        ensure_binding_scripts,
+    )
+
+    try:
+        binding = SheetBinding.model_validate(payload)
+    except Exception as exc:
+        return f"Invalid binding: {exc}"
+    # Provenance and generated code are not caller-supplied; see the REST path
+    # (`_parse_binding`) for the reasoning. Carried over from what is stored, so
+    # editing the form of a tier-2 binding keeps its code, and never read from
+    # the payload, so this tool cannot fabricate LLM provenance or smuggle in a
+    # transform.
+    stored = source.get_binding(binding.name)
+    if stored is not None and stored.compute is not None:
+        binding.compute = stored.compute.model_copy(deep=True)
+        binding.resolution = stored.resolution.model_copy(deep=True)
+    else:
+        binding.compute = None
+        binding.resolution.tier = "binding"
+        binding.resolution.authored_by = "human"
+        binding.resolution.instruction = None
+        binding.resolution.model_id = None
+        binding.resolution.answers = {}
+        binding.resolution.golden = None
+        binding.resolution.script_id = None
+        binding.resolution.edited_by_human = False
+    if not binding.sheet_schema.fingerprint:
+        binding.sheet_schema.fingerprint = header_fingerprint(binding.sheet_schema.headers)
+
+    replacing = source.get_binding(binding.name) is not None
+    if not replacing and source.get_operation(binding.name) is not None:
+        return (
+            f"'{binding.name}' is already an operation of '{source.id}' — a "
+            "binding compiles to an operation, so the names cannot collide."
+        )
+    bindings = [b for b in source.bindings if b.name != binding.name] + [binding]
+    try:
+        validate_bindings(bindings)
+    except ValueError as exc:
+        return f"Invalid binding: {exc}"
+    updated = source.model_copy(update={
+        "bindings": [stamp_compiled(b) for b in bindings],
+        "operations": refresh_binding_operations(source, bindings),
+    })
+    try:
+        validate_operations(updated)
+    except ValueError as exc:
+        return f"Invalid binding: {exc}"
+
+    await deps.data_source_backend.update(source.id, updated)
+    await ensure_binding_scripts(deps.script_backend)
+    await _publish_datasources(deps)
+    verb = "replaced" if replacing else "created"
+    params = ", ".join(p.name for p in updated.get_operation(binding.name).params) or "none"
+    return (
+        f"Binding '{binding.name}' {verb} on '{source.id}' and compiled into "
+        f"operation '{binding.name}' (params: {params}). "
+        + (
+            "It is a write, so calls go through the approval gate."
+            if binding.operation == "write" else ""
+        )
+    ).strip()
+
+
+@requires(Permission.DELETE)
+async def delete_sheet_binding(
+    deps: ManagementDeps, name: str, source_id: str = "google-sheets"
+) -> str:
+    """Delete a binding and the operation it compiled to."""
+    source, err = await _binding_source(deps, source_id)
+    if err:
+        return err
+    if source.get_binding(name) is None:
+        return f"Binding '{name}' not found on '{source.id}'."
+    from app.infrastructure.datasources.sheet_binding_compile import (
+        refresh_binding_operations,
+    )
+    bindings = [b for b in source.bindings if b.name != name]
+    updated = source.model_copy(update={
+        "bindings": bindings,
+        "operations": refresh_binding_operations(source, bindings),
+    })
+    await deps.data_source_backend.update(source.id, updated)
+    await _publish_datasources(deps)
+    return f"Binding '{name}' and its operation deleted from '{source.id}'."
+
+
+@requires(Permission.READ)
+async def preview_sheet_binding(
+    deps: ManagementDeps,
+    name: str,
+    state_json: str = "",
+    source_id: str = "google-sheets",
+) -> str:
+    """Resolve a binding against sample state and report what it would do.
+
+    A write is planned, never sent: the sheet is read, the row resolved, the
+    header fingerprint checked and the write composed, and what comes back is
+    the target cells with their before and after values. A read is executed and
+    its result summarised.
+    """
+    source, err = await _binding_source(deps, source_id)
+    if err:
+        return err
+    binding = source.get_binding(name)
+    if binding is None:
+        return f"Binding '{name}' not found on '{source.id}'."
+    state: dict = {}
+    if state_json:
+        try:
+            state = json.loads(state_json)
+        except json.JSONDecodeError as exc:
+            return f"Invalid state_json: {exc}"
+        if not isinstance(state, dict):
+            return "state_json must be a JSON object."
+
+    executor = _binding_executor(deps)
+    from app.infrastructure.datasources.sheet_binding_runtime import (
+        params_from_state,
+        plan_write_binding,
+        render_cell_changes,
+        run_read_binding,
+    )
+    params = params_from_state(binding, state)
+    try:
+        if binding.operation == "read":
+            result = await run_read_binding(source, executor, binding, params)
+            count = len(result) if isinstance(result, list) else (0 if result is None else 1)
+            return (
+                f"Binding '{name}' would return {count} row(s):\n"
+                + json.dumps(result, ensure_ascii=False, default=str)[:4000]
+            )
+        plan = await plan_write_binding(source, executor, binding, params)
+        if plan["status"] == "skipped":
+            return f"Binding '{name}' would write nothing: {plan['reason']}"
+        lines = [
+            f"Binding '{name}' would write to "
+            f"{binding.document.name or binding.document.file_id} / "
+            f"{binding.document.sheet}"
+            + (f" row {plan['row_number']}" if plan.get("row_number") else " (new row)"),
+            f"valueInputOption {plan['value_input_option']}, "
+            f"blank_policy {plan['blank_policy']}",
+        ]
+        lines += ["  " + line for line in render_cell_changes(plan["cells"])]
+        lines.append("Columns not listed above are not touched.")
+        return "\n".join(lines)
+    except Exception as exc:  # noqa: BLE001 — a preview reports, never raises
+        return f"Binding '{name}' could not be previewed: {exc}"
 
 
 @requires(Permission.WRITE)
@@ -1306,6 +2105,12 @@ async def create_datasource(
             auth = json.loads(auth_json)
         except json.JSONDecodeError as exc:
             return f"Invalid auth_json: {exc}"
+
+    # `google` auth may name only the configured principal — the MCP surface
+    # must not be a way around the check the REST create path makes.
+    subject_error = _google_subject_error(auth)
+    if subject_error:
+        return subject_error
 
     existing = await deps.data_source_backend.get(source_id)
     if existing is not None:
@@ -1374,6 +2179,9 @@ async def update_datasource(
             payload["auth"] = json.loads(auth_json)
         except json.JSONDecodeError as exc:
             return f"Invalid auth_json: {exc}"
+        subject_error = _google_subject_error(payload["auth"])
+        if subject_error:
+            return subject_error
     if pubsub_json is not None:
         # {topic, subscription, project_id, event_schema} — kind == "pubsub".
         try:
@@ -1525,6 +2333,9 @@ async def create_datasource_from_schema(
             auth = json.loads(auth_json)
         except json.JSONDecodeError as exc:
             return f"Invalid auth_json: {exc}"
+    subject_error = _google_subject_error(auth)
+    if subject_error:
+        return subject_error
 
     from app.domain.models.data_source_definition import (
         DataSourceDefinition,

@@ -136,3 +136,69 @@ async def test_tool_call_reports_missing_source(mcp):
     await backend.delete("github")
     result = await mcp.call_tool("ds_github_list_repos", {"owner": "acme"})
     assert "not found" in str(result)
+
+
+# ---------------------------------------------------------------------------
+# The seeded google-sheets source on the MCP surface
+# ---------------------------------------------------------------------------
+
+def _sheets_definition() -> DataSourceDefinition:
+    from app.core.config import Settings
+    from app.infrastructure.datasources.google_sheets import google_sheets_template
+
+    template = google_sheets_template(
+        Settings(GOOGLE_IMPERSONATE_SA="copilot@example.iam.gserviceaccount.com")
+    )
+    return DataSourceDefinition.model_validate({
+        key: template[key]
+        for key in ("id", "name", "description", "kind", "base_url", "auth", "operations")
+    })
+
+
+async def test_google_sheets_operations_become_tools(mcp):
+    backend = InMemoryDataSourceBackend()
+    await backend.create(_sheets_definition())
+    await rebuild_datasource_tools(mcp, backend, lambda: _Container(backend))
+    tools = {t.name: t for t in await mcp.list_tools()}
+
+    assert set(tools) == {
+        "ds_google-sheets_get_metadata",
+        "ds_google-sheets_get_values",
+        "ds_google-sheets_batch_get_values",
+        "ds_google-sheets_update_values",
+        "ds_google-sheets_batch_update_values",
+        "ds_google-sheets_append_values",
+    }
+
+
+async def test_google_sheets_tool_descriptions_distinguish_the_operations(mcp):
+    """Six tools of one source are useless to a model if they all read alike."""
+    backend = InMemoryDataSourceBackend()
+    await backend.create(_sheets_definition())
+    await rebuild_datasource_tools(mcp, backend, lambda: _Container(backend))
+    tools = {t.name: t for t in await mcp.list_tools()}
+
+    read = tools["ds_google-sheets_get_values"].description or ""
+    write = tools["ds_google-sheets_append_values"].description or ""
+    assert "GET · READ" in read
+    assert "Read one range of cells" in read
+    assert "POST · WRITE" in write
+    assert "Append rows" in write
+    assert read != write
+
+
+async def test_google_sheets_tool_schemas_carry_param_types_and_descriptions(mcp):
+    backend = InMemoryDataSourceBackend()
+    await backend.create(_sheets_definition())
+    await rebuild_datasource_tools(mcp, backend, lambda: _Container(backend))
+    tools = {t.name: t for t in await mcp.list_tools()}
+
+    schema = tools["ds_google-sheets_append_values"].inputSchema
+    assert set(schema["properties"]) == {
+        "spreadsheet_id", "range", "values", "value_input_option", "insert_data_option",
+    }
+    assert sorted(schema["required"]) == ["range", "spreadsheet_id", "values"]
+    assert schema["properties"]["values"]["type"] == "array"
+    # A declared description reaches the model, so "range" is not a bare name.
+    assert "A1 notation" in schema["properties"]["range"]["description"]
+    assert "RAW" in schema["properties"]["value_input_option"]["description"]

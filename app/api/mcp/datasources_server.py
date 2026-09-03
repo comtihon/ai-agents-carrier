@@ -35,11 +35,12 @@ import logging
 import re
 from collections.abc import Callable
 from contextvars import ContextVar, Token
-from typing import Any
+from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import Field
 
 from app.domain.models.data_source_definition import (
     OperationDefinition,
@@ -239,9 +240,17 @@ def _tool_description(defn: Any, op: OperationDefinition) -> str:
     else:
         method = (op.method or "GET").upper()
         marker = "READ" if method in _SAFE_METHODS else "WRITE"
+    # The operation's own line comes before the source's blurb: a source with
+    # six operations repeats the blurb six times, and what distinguishes them
+    # is what each one does.
+    blurb = " ".join(
+        part for part in (
+            (getattr(op, "description", "") or "").strip(),
+            (defn.description or "").strip(),
+        ) if part
+    )
     return (
-        f"{defn.name or defn.id} — {op.name} [{method} · {marker}]. "
-        f"{(defn.description or '').strip()}"
+        f"{defn.name or defn.id} — {op.name} [{method} · {marker}]. {blurb}"
     ).strip()
 
 
@@ -358,19 +367,28 @@ def _make_handler(
             )
             return {"error": str(exc)}
 
+    # A declared description travels as Annotated[..., Field(description=...)]
+    # so FastMCP's schema builder puts it in the tool's inputSchema — without
+    # it a param is a bare name and the model has to guess what "range" means.
+    annotations = {
+        spec.name: (
+            Annotated[_PY_TYPES.get(spec.type, str), Field(description=spec.description)]
+            if spec.description
+            else _PY_TYPES.get(spec.type, str)
+        )
+        for spec in params
+    }
     signature_params = [
         inspect.Parameter(
             spec.name,
             inspect.Parameter.KEYWORD_ONLY,
-            annotation=_PY_TYPES.get(spec.type, str),
+            annotation=annotations[spec.name],
             default=inspect.Parameter.empty if spec.required else None,
         )
         for spec in params
     ]
     handler.__signature__ = inspect.Signature(signature_params)  # type: ignore[attr-defined]
-    handler.__annotations__ = {
-        spec.name: _PY_TYPES.get(spec.type, str) for spec in params
-    }
+    handler.__annotations__ = annotations
     handler.__name__ = tool_name_for(source_id, operation)
     return handler
 

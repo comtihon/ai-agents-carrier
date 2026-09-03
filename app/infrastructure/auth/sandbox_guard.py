@@ -149,3 +149,71 @@ def assert_sandbox_allowed(definition: Any, permissions: frozenset[Permission] |
     offending = find_admin_only_python_steps(definition)
     if offending:
         raise SandboxNotPermittedError(list(offending), offending)
+
+
+# ---------------------------------------------------------------------------
+# Generated code (sheet binding tier 2)
+# ---------------------------------------------------------------------------
+# A tier-2 sheet binding stores a Python transform an LLM wrote from an
+# instruction a user typed, and the backend later runs it. That is code
+# execution on the backend, arriving through a surface whose other operations
+# are ordinary data edits -- so it is gated at the same tier as an unsandboxed
+# `python` workflow step, for the same reason and through this same module.
+#
+# It is NOT the same *risk*: a tier-2 transform runs inside the seccomp sandbox
+# (no filesystem, no network, no processes), whereas `sandbox: false` runs in the
+# backend process next to every credential. The gate is nevertheless ADMIN
+# rather than WRITE because of who writes the code and how it gets there.
+# Holding WRITE means "may edit definitions"; a definition is data a person
+# read before saving. Generated code is neither -- nobody has read it when the
+# compile call is made, and the instruction that produced it is untrusted input
+# that a prompt-injection attempt reaches the model through. Storing executable
+# code the caller has not seen is a privileged act, so it needs the privileged
+# tier.
+#
+# Deliberately not gated here: *running* an already-activated binding, reading
+# its code, listing it, previewing it. Those are the data-level operations the
+# datasource surfaces already govern, and requiring ADMIN to run a binding an
+# administrator activated would make the feature unusable by the people it is
+# for.
+
+class GeneratedCodeNotPermittedError(PermissionError):
+    """Raised when a caller without ADMIN tries to store generated code."""
+
+    def __init__(self, what: str = "a generated transform") -> None:
+        super().__init__(
+            f"Storing {what} requires admin permission. A tier-2 sheet binding "
+            "holds Python that a language model wrote from an instruction, and "
+            "which this backend then executes -- sandboxed, but still code that "
+            "nobody has read at the moment it is stored. Authoring one is "
+            "therefore an administrator's action, not an ordinary definition "
+            "edit. A tier-1 binding (a form: no code) needs only WRITE, and "
+            "running or previewing a binding an administrator activated needs "
+            "no special permission at all."
+        )
+
+
+def generated_code_permitted() -> bool:
+    """Whether the ambient caller may store generated code.
+
+    Reads the ambient principal rather than taking one, because the tool cores
+    in ``app.application.management_tools`` are called by three surfaces that
+    each bind identity differently -- and because an *unbound* principal (no
+    authenticating wrapper ran at all: OAuth off, an in-process call) is allowed
+    here for the same reason the REST routes fall back to permitting it. That
+    is the deployment's pre-RBAC posture, not a hole this function opens.
+    """
+    from app.infrastructure.auth.authorization import missing_permission
+
+    return missing_permission(Permission.ADMIN) is None
+
+
+def assert_generated_code_allowed(what: str = "a generated transform") -> None:
+    """Raise :class:`GeneratedCodeNotPermittedError` unless the caller has ADMIN.
+
+    Call this on every path that *stores* generated code -- compile, recompile,
+    a human edit of the code, and activation -- so that no surface is the easy
+    way in. Reads and runs are deliberately not covered; see the note above.
+    """
+    if not generated_code_permitted():
+        raise GeneratedCodeNotPermittedError(what)

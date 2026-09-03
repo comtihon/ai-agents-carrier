@@ -391,6 +391,10 @@ def register_management_tools(
                 e.g. {"type": "bearer", "token": "<token>"},
                 {"type": "basic", "username": "...", "password": "..."} or
                 {"type": "header", "header_name": "X-Api-Key", "value": "..."}.
+                {"type": "google", "scopes": [...]} carries no secret — the
+                backend impersonates its configured Google service account.
+                For Google Sheets use create_google_sheets_datasource instead,
+                which brings the operations with it.
         """
         return await core.create_datasource(
             deps(), source_id, name, base_url, operations_json, description,
@@ -430,6 +434,321 @@ def register_management_tools(
             deps(), source_id, name, description, base_url,
             operations_json or None, auth_json or None, pubsub_json or None,
         )
+
+    async def resolve_google_file(ref: str) -> str:
+        """Check whether the backend can reach a Google Drive document.
+
+        Call this before creating or using a Google Sheets data source: access
+        is granted per document by sharing it with the backend's service
+        account, so a URL a person can open is not necessarily one the backend
+        can read. Reports the file id, name, type and whether writes will work,
+        or which address the document has to be shared with.
+
+        Args:
+            ref: The document's URL as copied from the browser, or its bare
+                file id.
+        """
+        return await core.resolve_google_file(deps(), ref)
+
+    async def create_google_sheets_datasource(
+        source_id: str = "google-sheets",
+        name: str = "Google Sheets",
+        description: str = "",
+    ) -> str:
+        """Create the Google Sheets data source with its Sheets v4 operations.
+
+        Reads (get_metadata, get_values, batch_get_values) plus writes
+        (update_values, batch_update_values, append_values). The writes are
+        gated behind approval, and values are written as RAW text rather than
+        formulas. Every spreadsheet must be shared with the backend's service
+        account first — check with resolve_google_file.
+
+        Args:
+            source_id: Identifier to store it under (default "google-sheets").
+            name: Display name.
+            description: What this source is for; empty uses a default that
+                names the address spreadsheets must be shared with.
+        """
+        return await core.create_google_sheets_datasource(
+            deps(), source_id, name, description
+        )
+
+    async def probe_google_sheet(
+        file_id: str,
+        sheet: str = "",
+        header_row: int = 1,
+        source_id: str = "google-sheets",
+    ) -> str:
+        """Read a spreadsheet's tabs, header row, sample rows and fingerprint.
+
+        Call this before authoring a binding, and use its output verbatim: a
+        binding may only name columns that appear in the headers it returns,
+        and the fingerprint it reports has to be stored with the binding so a
+        later change to the header row is detected instead of silently writing
+        to the wrong column.
+
+        Args:
+            file_id: Spreadsheet file id (resolve_google_file returns it).
+            sheet: Tab title; empty means the first tab.
+            header_row: 1-based row the column names are on (default 1).
+            source_id: The Google Sheets data source to probe through.
+        """
+        return await core.probe_google_sheet(
+            deps(), file_id, sheet, header_row, source_id
+        )
+
+    async def list_sheet_bindings(source_id: str = "google-sheets") -> str:
+        """List the declarative sheet bindings on a data source.
+
+        Each binding compiles into an operation of the same name, so anything
+        listed here is callable as `operation: <binding name>` from a workflow
+        `data_source` step or as its own MCP tool.
+
+        Args:
+            source_id: The data source id or name.
+        """
+        return await core.list_sheet_bindings(deps(), source_id)
+
+    async def get_sheet_binding(name: str, source_id: str = "google-sheets") -> str:
+        """Read one binding back as the JSON save_sheet_binding accepts.
+
+        Args:
+            name: The binding name.
+            source_id: The data source id or name.
+        """
+        return await core.get_sheet_binding(deps(), name, source_id)
+
+    async def save_sheet_binding(
+        binding_json: str,
+        source_id: str = "google-sheets",
+    ) -> str:
+        """Create or replace a declarative Google Sheets binding.
+
+        A binding says what to read or write and where, as data — no code and
+        no prose. Saving one compiles it into an operation of the same name on
+        the same data source, which is what makes it callable from a workflow
+        step, /try-operation and the datasources MCP tools.
+
+        Probe the sheet first (probe_google_sheet): every column name here must
+        appear in that sheet's header row, and `schema.fingerprint` must be the
+        one the probe reported, or the binding is refused.
+
+        Shape (read):
+          {"version": 1, "name": "read_open_projects",
+           "document": {"provider": "google_sheets", "file_id": "...",
+                        "name": "...", "sheet": "Projects", "sheet_id": 123},
+           "schema": {"header_row": 1, "headers": ["project_id", "status"],
+                      "fingerprint": "sha256:..."},
+           "operation": "read",
+           "read": {"mode": "rows", "columns": ["project_id", "status"],
+                    "filter": {"op": "and", "clauses": [
+                        {"column": "status", "op": "eq",
+                         "value": {"literal": "open"}}]},
+                    "limit": 200},
+           "output": {"key": "projects"}}
+
+        Shape (write):
+          {..., "operation": "write",
+           "write": {"mode": "update_by_key", "key_column": "project_id",
+                     "key_value": {"from": "state.project.id"},
+                     "on_missing": "error", "value_input_option": "RAW",
+                     "blank_policy": "skip",
+                     "columns": {"status": {"from": "state.classification"},
+                                 "notes": {"literal": "Reviewed"}}}}
+
+        Read modes: rows (columns required, optional filter, optional limit),
+        row_by_key (key_column + key_value + columns, on_missing null|error),
+        cells (range as {"a1": "Projects!D7"} or {"named_range": "total"}).
+        Write modes: update_by_key (on_missing error|append|skip), append_row,
+        set_cells. Filter operators: eq ne lt lte gt gte in contains.
+
+        Two rules worth stating plainly:
+        - write.columns is a map, and a column left out of it is NEVER
+          touched. That is what makes a write safe next to a human editor.
+          Do not list a column just to keep its current value.
+        - value_input_option defaults to RAW, which stores every value as
+          inert text. USER_ENTERED makes a value beginning with "=" a live
+          formula; values from workflow state are not trusted text, so a
+          leading =, +, - or @ is prefixed with an apostrophe unless the
+          binding also sets "allow_formulas": true.
+
+        Every {"from": "state.<path>"} becomes a declared param of the
+        compiled operation, named after the path, which the caller supplies.
+
+        Args:
+            binding_json: The binding as a JSON object (shapes above).
+            source_id: The Google Sheets data source to save it on.
+        """
+        return await core.save_sheet_binding(deps(), binding_json, source_id)
+
+    async def delete_sheet_binding(name: str, source_id: str = "google-sheets") -> str:
+        """Delete a sheet binding and the operation it compiled to.
+
+        Args:
+            name: The binding name.
+            source_id: The data source id or name.
+        """
+        return await core.delete_sheet_binding(deps(), name, source_id)
+
+    async def preview_sheet_binding(
+        name: str,
+        state_json: str = "",
+        source_id: str = "google-sheets",
+    ) -> str:
+        """Dry-run a binding against sample state; nothing is written.
+
+        For a write this reads the sheet, resolves the target row, checks the
+        header fingerprint and composes the write, then reports each cell with
+        its before and after value. Use it to confirm a binding lands on the
+        cells you intended before a workflow calls it for real.
+
+        Args:
+            name: The binding name.
+            state_json: JSON object standing in for workflow state, e.g.
+                {"project": {"id": "P-1"}} for a binding referencing
+                state.project.id.
+            source_id: The data source id or name.
+        """
+        return await core.preview_sheet_binding(
+            deps(), name, state_json, source_id
+        )
+
+    async def compile_sheet_binding_code(
+        name: str,
+        instruction: str = "",
+        answers_json: str = "",
+        force: bool = False,
+        source_id: str = "google-sheets",
+    ) -> str:
+        """Generate the computation of a binding a declarative form cannot express.
+
+        Tier 1 (save_sheet_binding) covers reading rows, reading a row by key and
+        setting named columns. It cannot express computation across rows --
+        grouping, aggregation, arithmetic. This generates just that part: a small
+        Python function turning the sheet's records into values, while the binding
+        keeps declaring the document, the tab, the key column and the columns that
+        may be written. Generated code produces values, never addresses, and cannot
+        touch a column the binding does not list.
+
+        Save the binding first with save_sheet_binding, including the column map a
+        write may set; this fills in its computation.
+
+        Three outcomes: clarifying questions (nothing stored -- answer them and call
+        again with answers_json), a successful compile (code stored switched OFF;
+        read it with get_sheet_binding_code, then activate it), or failure after
+        several attempts with the checker's own rejection.
+
+        Requires admin permission: it stores code this backend later executes.
+
+        Args:
+            name: Binding to generate the computation for.
+            instruction: What to compute, in plain language. Omit to re-use the
+                instruction stored on the binding, which is what a recompile means.
+            answers_json: JSON object of {"<question>": "<answer>"} answering a
+                previous call's questions.
+            force: Re-run the model even when nothing about the request changed.
+            source_id: The data source id or name.
+        """
+        return await core.compile_sheet_binding_code(
+            deps(), name, instruction, answers_json, force, source_id
+        )
+
+    async def get_sheet_binding_code(
+        name: str,
+        source_id: str = "google-sheets",
+    ) -> str:
+        """Read a binding's generated code, with its verification state.
+
+        Use this before activating a binding, and whenever one behaves oddly: it
+        reports the code, the model and instruction it came from, whether it is
+        activated or stale, whether a person has edited it, and when its frozen
+        test last reproduced.
+
+        Args:
+            name: Binding to read the code of.
+            source_id: The data source id or name.
+        """
+        return await core.get_sheet_binding_code(deps(), name, source_id)
+
+    async def edit_sheet_binding_code(
+        name: str,
+        code: str,
+        source_id: str = "google-sheets",
+    ) -> str:
+        """Replace a binding's generated code with a hand-written version.
+
+        Held to exactly the checks the generated version was: the same allow-list on
+        what the code may contain, the same sandbox, the same run-it-twice
+        determinism check, and the same rule that a write may only produce values
+        for the columns the binding lists.
+
+        This permanently stops regeneration for this binding -- a later compile
+        refuses rather than overwriting the edit -- and switches the binding off
+        again, because this is new code and the previous approval was of the
+        previous code.
+
+        Requires admin permission: it stores code this backend later executes.
+
+        Args:
+            name: Binding whose code to replace.
+            code: Full replacement source, defining transform(records, params).
+            source_id: The data source id or name.
+        """
+        return await core.edit_sheet_binding_code(deps(), name, code, source_id)
+
+    async def activate_sheet_binding_code(
+        name: str,
+        source_id: str = "google-sheets",
+    ) -> str:
+        """Switch a compiled transform on, re-proving it against its frozen test.
+
+        Compiling and activating are separate events on purpose: the first says the
+        code passed its checks, the second says somebody read the code and its
+        output and accepted it. Read get_sheet_binding_code first.
+
+        Requires admin permission: it puts generated code into service.
+
+        Args:
+            name: Binding to activate.
+            source_id: The data source id or name.
+        """
+        return await core.activate_sheet_binding_code(deps(), name, source_id)
+
+    async def retest_sheet_binding_code(
+        name: str,
+        source_id: str = "google-sheets",
+    ) -> str:
+        """Re-run a binding's frozen test and re-check the sheet's header row.
+
+        Two independent questions: does the code still compute the answer it was
+        approved for, and does the sheet still have the header row it was written
+        against. Either failing marks the binding stale and switches it off, which
+        is a change to it -- hence a write, not a read.
+
+        Args:
+            name: Binding to re-test.
+            source_id: The data source id or name.
+        """
+        return await core.retest_sheet_binding_code(deps(), name, source_id)
+
+    async def mark_sheet_binding_stale(
+        name: str,
+        reason: str = "",
+        source_id: str = "google-sheets",
+    ) -> str:
+        """Switch a binding's generated code off until somebody re-confirms it.
+
+        Use this the moment a generated binding looks wrong. It stops running
+        immediately; re-testing and activating it again are what bring it back. No
+        admin permission is needed -- stopping something suspicious should never be
+        the privileged direction.
+
+        Args:
+            name: Binding to mark stale.
+            reason: Why, recorded on the binding and shown in the editor.
+            source_id: The data source id or name.
+        """
+        return await core.mark_sheet_binding_stale(deps(), name, reason, source_id)
 
     async def create_pubsub_datasource(
         source_id: str,
@@ -856,6 +1175,12 @@ def register_management_tools(
         delete_datasource, import_datasource_schema,
         list_scripts, get_script, create_script, update_script, delete_script,
         create_pubsub_datasource, list_pubsub_subscriptions,
+        resolve_google_file, create_google_sheets_datasource,
+        probe_google_sheet, list_sheet_bindings, get_sheet_binding,
+        save_sheet_binding, delete_sheet_binding, preview_sheet_binding,
+        compile_sheet_binding_code, get_sheet_binding_code,
+        edit_sheet_binding_code, activate_sheet_binding_code,
+        retest_sheet_binding_code, mark_sheet_binding_stale,
         list_events, get_event, create_event, update_event, delete_event,
         create_datasource_from_schema, add_datasource_operations_from_schema,
         terminate_run, retry_run, restart_from_step, approve_run, reject_run,

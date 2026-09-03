@@ -20,6 +20,8 @@ from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, Field
 
+from app.domain.models.sheet_binding import SheetBinding
+
 
 # ---------------------------------------------------------------------------
 # Auth (discriminated union — mirrors app/domain/models/agent_addon.py)
@@ -62,8 +64,34 @@ class ServiceIdentityAuth(BaseModel):
     identity: str | None = None
 
 
+class GoogleAuth(BaseModel):
+    """Bearer token for a Google Workspace API, minted by impersonation.
+
+    Carries no secret, like :class:`ServiceIdentityAuth`, but for a different
+    reason: on GKE the backend already *is* a Google principal (Workload
+    Identity, no key file).  It cannot call Sheets/Drive as itself, because the
+    token the metadata server hands out is ``cloud-platform``-scoped and those
+    APIs refuse it.  So it mints a token *for another* service account it holds
+    ``roles/iam.serviceAccountTokenCreator`` on, with the narrow
+    ``target_scopes`` below.  Documents are shared with that account by email,
+    which is also what makes access auditable and revocable per document.
+
+    ``impersonate_subject`` names that account.  It is NOT free-form: a caller
+    could otherwise point a data source at any service account this backend can
+    impersonate and borrow its authority.  It is resolved from
+    ``GOOGLE_IMPERSONATE_SA`` at request time and a stored/incoming value that
+    disagrees is refused -- see
+    ``app.infrastructure.auth.google_token_provider``.
+    """
+
+    type: Literal["google"] = "google"
+    # None means "the configured one"; a value must equal it.
+    impersonate_subject: str | None = None
+    scopes: list[str] = Field(default_factory=list)
+
+
 AnyDataSourceAuth = Annotated[
-    Union[BearerAuth, BasicAuth, HeaderAuth, NoAuth, ServiceIdentityAuth],
+    Union[BearerAuth, BasicAuth, HeaderAuth, NoAuth, ServiceIdentityAuth, GoogleAuth],
     Field(discriminator="type"),
 ]
 
@@ -79,6 +107,13 @@ class ParamSpec(BaseModel):
     type: Literal["string", "number", "boolean", "array", "object"] = "string"
     required: bool = True
     description: str = ""
+    # Value used when the caller supplies none.  Needed where the target API
+    # demands an argument that has no safe implicit value: Google Sheets
+    # rejects a write with no ``valueInputOption``, and letting the API pick
+    # would mean ``USER_ENTERED`` — which turns a value starting with ``=``
+    # into a live formula.  ``None`` means "no default"; a default never makes
+    # a ``required`` param optional, it only fills a blank one.
+    default: Any | None = None
 
 
 class Paginate(BaseModel):
@@ -119,12 +154,33 @@ class OperationDefinition(BaseModel):
 
     name: str
     method: str = "GET"
+    # What this operation does, in one line.  Read by an agent, not a person:
+    # it is what the MCP tool description says beyond the source's own blurb,
+    # and six similarly named operations of one source are otherwise
+    # indistinguishable to a model.
+    description: str = ""
     # HTTP sources: path appended to base_url; supports {params.x} / {op.field}.
     path: str | None = None
     # GraphQL sources: the query document and its variables.
     query: str | None = None
     variables: dict[str, Any] | None = None
     params: list[ParamSpec] = Field(default_factory=list)
+    # Query-string arguments, rendered for EVERY method and appended to the
+    # URL.  Distinct from a declared param the executor has not consumed
+    # elsewhere: such a "loose" param goes into the JSON body on POST/PUT,
+    # which is wrong for APIs that take a control argument in the query string
+    # of a write -- Google Sheets' ``valueInputOption`` /
+    # ``insertDataOption`` are exactly that.  Values are templates like any
+    # other, so ``{"valueInputOption": "{params.value_input_option}"}`` works.
+    #
+    # Named ``query_params`` rather than ``query`` because ``query`` already
+    # holds the GraphQL document above.
+    query_params: dict[str, str] | None = None
+    # Per-operation override of the source's retry policy.  ``None`` -- the
+    # default -- uses the source's.  Set it on an operation that is not
+    # idempotent (an append), where a retry after a timeout that in fact
+    # succeeded duplicates the write.
+    retries: "RetryPolicy | None" = None
     # Tri-state override of the "is this call destructive?" verdict that
     # otherwise comes from ``method`` (see
     # ``app.infrastructure.datasources.destructive``).  ``True`` puts a POST
@@ -174,6 +230,15 @@ class DataSourceDefinition(BaseModel):
     auth: AnyDataSourceAuth = Field(default_factory=NoAuth)
     default_headers: dict[str, str] = Field(default_factory=dict)
     operations: list[OperationDefinition] = Field(default_factory=list)
+    # Declarative read/write descriptions over a Google spreadsheet, authored
+    # in a form rather than written as operation templates (see
+    # app/domain/models/sheet_binding.py).  A binding is data, not another kind
+    # of operation: saving one *compiles* it into an OperationDefinition of the
+    # same name in ``operations`` above, which is why nothing downstream --
+    # workflow steps, the approval gate, /try-operation, the MCP tool list --
+    # needed to learn a new concept.  Both are stored: the binding is what the
+    # editor reads back, the operation is what the runtime calls.
+    bindings: list[SheetBinding] = Field(default_factory=list)
     # Only meaningful when kind == "pubsub".
     pubsub: PubSubSpec | None = None
     cache: CachePolicy = Field(default_factory=CachePolicy)
@@ -183,6 +248,12 @@ class DataSourceDefinition(BaseModel):
     # Timestamps
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+    def get_binding(self, name: str) -> SheetBinding | None:
+        for binding in self.bindings:
+            if binding.name == name:
+                return binding
+        return None
 
     def get_operation(self, name: str) -> OperationDefinition | None:
         for op in self.operations:
@@ -234,6 +305,7 @@ def operation_refs(operation: OperationDefinition) -> set[tuple[str, str]]:
     refs |= extract_refs(operation.path or "")
     refs |= extract_refs(operation.query or "")
     refs |= extract_refs(operation.variables or {})
+    refs |= extract_refs(operation.query_params or {})
     return refs
 
 

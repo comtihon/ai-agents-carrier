@@ -803,3 +803,237 @@ async def test_a_none_value_is_not_coerced_so_optional_stays_optional(http):
     }])
     await DataSourceExecutor().execute(source, "search", {"limit": None})
     assert http.calls[0]["params"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Declared query-string arguments (OperationDefinition.query_params)
+# ---------------------------------------------------------------------------
+
+async def test_query_params_are_sent_on_a_get(http):
+    http.handler = lambda call: {"ok": True}
+    source = _source(operations=[{
+        "name": "read", "path": "/values/{params.range}",
+        "query_params": {"valueRenderOption": "{params.render}"},
+        "params": [{"name": "range"}, {"name": "render", "required": False}],
+    }])
+    await DataSourceExecutor().execute(source, "read", {"range": "A1:B2", "render": "FORMULA"})
+    assert http.calls[0]["params"] == {"valueRenderOption": "FORMULA"}
+
+
+async def test_query_params_reach_the_query_string_of_a_write_not_the_body(http):
+    """The whole reason the field exists: a loose param would land in the body."""
+    http.handler = lambda call: {"ok": True}
+    source = _source(operations=[{
+        "name": "write", "method": "PUT", "path": "/values/{params.range}",
+        "query_params": {"valueInputOption": "{params.value_input_option}"},
+        "params": [
+            {"name": "range"},
+            {"name": "value_input_option", "required": False},
+            {"name": "values", "type": "array"},
+        ],
+    }])
+    await DataSourceExecutor().execute(source, "write", {
+        "range": "A1", "value_input_option": "RAW", "values": [["x"]],
+    })
+    call = http.calls[0]
+    assert call["method"] == "PUT"
+    assert call["params"] == {"valueInputOption": "RAW"}
+    # `values` is the only param left over, so it — and only it — is the body.
+    assert call["json"] == {"values": [["x"]]}
+
+
+async def test_an_unresolved_query_param_is_dropped_rather_than_sent_empty(http):
+    http.handler = lambda call: {"ok": True}
+    source = _source(operations=[{
+        "name": "read", "path": "/values",
+        "query_params": {"valueRenderOption": "{params.render}", "fields": "a,b"},
+        "params": [{"name": "render", "required": False}],
+    }])
+    await DataSourceExecutor().execute(source, "read", {})
+    assert http.calls[0]["params"] == {"fields": "a,b"}
+
+
+async def test_a_query_param_ref_counts_as_declared_and_is_not_repeated(http):
+    """A param consumed by query_params must not also be sent as a loose one."""
+    http.handler = lambda call: {"ok": True}
+    source = _source(operations=[{
+        "name": "read", "path": "/values",
+        "query_params": {"pageSize": "{params.limit}"},
+        "params": [{"name": "limit", "type": "number"}],
+    }])
+    await DataSourceExecutor().execute(source, "read", {"limit": 5})
+    # A whole-value placeholder keeps the native type, as everywhere else.
+    assert http.calls[0]["params"] == {"pageSize": 5}
+
+
+# ---------------------------------------------------------------------------
+# Declared param defaults
+# ---------------------------------------------------------------------------
+
+async def test_a_declared_default_fills_a_param_the_caller_omitted(http):
+    http.handler = lambda call: {"ok": True}
+    source = _source(operations=[{
+        "name": "append", "method": "POST", "path": "/append",
+        "query_params": {"valueInputOption": "{params.value_input_option}"},
+        "params": [{
+            "name": "value_input_option", "required": False, "default": "RAW",
+        }],
+    }])
+    await DataSourceExecutor().execute(source, "append", {})
+    assert http.calls[0]["params"] == {"valueInputOption": "RAW"}
+
+
+async def test_a_caller_value_beats_the_declared_default(http):
+    http.handler = lambda call: {"ok": True}
+    source = _source(operations=[{
+        "name": "append", "method": "POST", "path": "/append",
+        "query_params": {"valueInputOption": "{params.value_input_option}"},
+        "params": [{
+            "name": "value_input_option", "required": False, "default": "RAW",
+        }],
+    }])
+    await DataSourceExecutor().execute(source, "append", {"value_input_option": "USER_ENTERED"})
+    assert http.calls[0]["params"] == {"valueInputOption": "USER_ENTERED"}
+
+
+# ---------------------------------------------------------------------------
+# Per-operation retry policy
+# ---------------------------------------------------------------------------
+
+async def test_an_operation_retry_override_beats_the_source_policy(http):
+    """An append is not idempotent — one attempt, whatever the source says."""
+    def handler(call):
+        return FakeResponse({}, status_code=500)
+
+    http.handler = handler
+    source = _source(
+        retries={"attempts": 3, "backoff": 0},
+        operations=[
+            {"name": "append", "method": "POST", "path": "/append",
+             "retries": {"attempts": 1}},
+            {"name": "read", "path": "/read"},
+        ],
+    )
+    executor = DataSourceExecutor()
+    with pytest.raises(Exception):
+        await executor.execute(source, "append", {})
+    assert http.count("/append") == 1
+
+    # The source policy still applies to an operation that does not override.
+    http.calls.clear()
+    with pytest.raises(Exception):
+        await executor.execute(source, "read", {})
+    assert http.count("/read") == 3
+
+
+# ---------------------------------------------------------------------------
+# `google` auth
+# ---------------------------------------------------------------------------
+
+async def test_google_auth_sends_the_impersonated_bearer_token(http, monkeypatch):
+    """Nothing real is minted: the provider is stubbed, as it always must be."""
+    from app.infrastructure.auth import google_token_provider
+
+    minted: list[tuple[str, list[str]]] = []
+
+    def _fake_mint(subject, scopes):
+        minted.append((subject, list(scopes)))
+        return "impersonated-token", 3600.0
+
+    google_token_provider.reset_token_cache()
+    monkeypatch.setattr(google_token_provider, "_mint_token", _fake_mint)
+    monkeypatch.setattr(
+        google_token_provider,
+        "configured_subject",
+        lambda settings=None: "copilot@example.iam.gserviceaccount.com",
+    )
+    monkeypatch.setattr(
+        google_token_provider,
+        "configured_scopes",
+        lambda settings=None: ["https://www.googleapis.com/auth/spreadsheets"],
+    )
+
+    http.handler = lambda call: {"ok": True}
+    source = _source(
+        auth={"type": "google", "scopes": ["https://www.googleapis.com/auth/spreadsheets"]},
+        operations=[{"name": "read", "path": "/v4/spreadsheets/x"}],
+    )
+    await DataSourceExecutor().execute(source, "read", {})
+    assert http.calls[0]["headers"]["Authorization"] == "Bearer impersonated-token"
+    assert minted == [(
+        "copilot@example.iam.gserviceaccount.com",
+        ["https://www.googleapis.com/auth/spreadsheets"],
+    )]
+
+    # Second call reuses the cached token — a ~1h token must not be re-minted
+    # once per outbound request.
+    await DataSourceExecutor().execute(source, "read", {})
+    assert len(minted) == 1
+    google_token_provider.reset_token_cache()
+
+
+async def test_google_auth_ignores_a_foreign_impersonate_subject(http, monkeypatch):
+    """A stored value pointing elsewhere must not reach generateAccessToken."""
+    from app.infrastructure.auth import google_token_provider
+
+    minted: list[tuple[str, list[str]]] = []
+    google_token_provider.reset_token_cache()
+    monkeypatch.setattr(
+        google_token_provider,
+        "_mint_token",
+        lambda subject, scopes: (minted.append((subject, list(scopes))), ("t", 3600.0))[1],
+    )
+    monkeypatch.setattr(
+        google_token_provider, "configured_subject", lambda settings=None: "allowed@example.iam.gserviceaccount.com",
+    )
+    monkeypatch.setattr(
+        google_token_provider, "configured_scopes", lambda settings=None: ["scope-a"],
+    )
+
+    http.handler = lambda call: {"ok": True}
+    source = _source(
+        auth={
+            "type": "google",
+            "impersonate_subject": "someone-else@example.iam.gserviceaccount.com",
+            "scopes": ["scope-a"],
+        },
+        operations=[{"name": "read", "path": "/x"}],
+    )
+    await DataSourceExecutor().execute(source, "read", {})
+    assert minted == [("allowed@example.iam.gserviceaccount.com", ["scope-a"])]
+    google_token_provider.reset_token_cache()
+
+
+async def test_google_auth_drops_a_scope_outside_the_deployment_allow_list(http, monkeypatch):
+    from app.infrastructure.auth import google_token_provider
+
+    minted: list[list[str]] = []
+    google_token_provider.reset_token_cache()
+    monkeypatch.setattr(
+        google_token_provider,
+        "_mint_token",
+        lambda subject, scopes: (minted.append(list(scopes)), ("t", 3600.0))[1],
+    )
+    monkeypatch.setattr(
+        google_token_provider, "configured_subject", lambda settings=None: "allowed@example.iam.gserviceaccount.com",
+    )
+    monkeypatch.setattr(
+        google_token_provider,
+        "configured_scopes",
+        lambda settings=None: ["https://www.googleapis.com/auth/spreadsheets"],
+    )
+
+    http.handler = lambda call: {"ok": True}
+    source = _source(
+        auth={
+            "type": "google",
+            "scopes": [
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/cloud-platform",
+            ],
+        },
+        operations=[{"name": "read", "path": "/x"}],
+    )
+    await DataSourceExecutor().execute(source, "read", {})
+    assert minted == [["https://www.googleapis.com/auth/spreadsheets"]]
+    google_token_provider.reset_token_cache()
