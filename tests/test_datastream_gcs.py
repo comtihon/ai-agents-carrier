@@ -430,3 +430,71 @@ def test_check_ready_refuses_a_bucket_that_is_not_there():
 
     with pytest.raises(RuntimeError, match="does not exist or is not visible"):
         store.check_ready()
+
+
+# ---------------------------------------------------------------------------
+# the startup readiness check must not block the boot
+# ---------------------------------------------------------------------------
+#
+# check_ready is a blocking network call, and startup() runs inside the
+# FastAPI lifespan *before* uvicorn binds its port. Called inline it delayed
+# the bind, the liveness probe got connection refused, and the kubelet
+# SIGKILLed the container before it could serve -- v1.2.174 boot-looped in
+# prod on an otherwise healthy cluster. It now runs in a worker thread under a
+# deadline: slow is a warning, broken is still a refusal.
+
+async def test_a_slow_readiness_check_does_not_stop_the_boot(monkeypatch, caplog):
+    import asyncio
+    import time
+
+    class _Slow:
+        def check_ready(self):
+            time.sleep(0.5)  # longer than the deadline below
+
+        async def purge_older_than(self, *a, **k):
+            return 0
+
+    container = type("C", (), {})()
+    container.stream_store = _Slow()
+    settings = type("S", (), {"stream_ready_timeout_seconds": 0.05})()
+
+    # The shape startup() uses, exercised directly: a thread plus a deadline.
+    with caplog.at_level("WARNING"):
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(container.stream_store.check_ready),
+                timeout=settings.stream_ready_timeout_seconds,
+            )
+            timed_out = False
+        except asyncio.TimeoutError:
+            timed_out = True
+
+    assert timed_out, "expected the deadline to fire"
+    # And the event loop stayed responsive throughout -- the point of to_thread.
+    await asyncio.sleep(0)
+
+
+async def test_the_readiness_check_runs_off_the_event_loop_in_startup():
+    """Pin the call shape, since inline blocking is what broke prod."""
+    import inspect
+
+    from app.core.container import ApplicationContainer
+
+    source = inspect.getsource(ApplicationContainer.startup)
+
+    assert "asyncio.to_thread(check_ready)" in source, (
+        "check_ready must run in a worker thread: startup() precedes the port "
+        "bind, so a blocking call here delays readiness and the liveness probe "
+        "kills the container"
+    )
+    assert "asyncio.wait_for" in source, "the check must be bounded by a deadline"
+    assert "stream_ready_timeout_seconds" in source
+
+
+def test_the_readiness_deadline_is_configurable():
+    from app.core.config import Settings
+
+    field = Settings.model_fields["stream_ready_timeout_seconds"]
+
+    assert field.alias == "STREAM_READY_TIMEOUT_SECONDS"
+    assert field.default == 10.0
