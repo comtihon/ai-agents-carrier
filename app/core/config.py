@@ -465,6 +465,15 @@ class Settings(BaseSettings):
     # on its own) and then to the project of the ambient credential, so a
     # deployment that already sets the standard variable needs nothing here.
     stream_gcs_project: str = Field(default="", alias="STREAM_GCS_PROJECT")
+    # Deadline for the startup readiness check on the stream store. Past it the
+    # check is abandoned with a warning and the pod boots anyway: the check
+    # runs before uvicorn binds its port, so making it unbounded turns a slow
+    # bucket into a liveness-probe boot loop. A definitive failure -- no such
+    # bucket, no access -- still refuses to start, because that is a
+    # configuration error rather than a slow network.
+    stream_ready_timeout_seconds: float = Field(
+        default=10.0, alias="STREAM_READY_TIMEOUT_SECONDS"
+    )
     stream_dir: str = Field(default="/tmp/carrier-streams", alias="STREAM_DIR")
     # Age at which an unreferenced stream file is swept, in seconds. A run that
     # outlives this and then reads its ref gets a clear "stream is gone" error
