@@ -66,6 +66,51 @@ class DestructivePlan:
     # The values bound from the upstream array (ids, names) — what an approver
     # reads to recognise what is being removed. Capped the same way.
     sample: list[Any] = field(default_factory=list)
+    # What kind of change this is, which decides the words an approver reads
+    # and the question the meta-LLM is asked. "delete" is the default because
+    # removing rows is what the gate was built for; a sheet binding writes
+    # cells instead, and calling that a deletion of N rows describes neither
+    # the blast radius nor the risk.
+    change_kind: str = "delete"
+    # Free-form label -> value pairs shown beside the operation and included
+    # in the meta-LLM prompt. For a sheet write this is the document, the tab
+    # and — the part that changes an answer — whether a model wrote the
+    # computation behind it.
+    details: dict[str, str] = field(default_factory=dict)
+
+
+def _binding_details(binding: Any) -> dict[str, str]:
+    """Context an approver needs about the binding behind a sheet write.
+
+    The operation name alone does not say which spreadsheet is about to change,
+    nor the thing that most affects whether a person says yes: whether the
+    values were computed by code a language model wrote. Both are stated here
+    rather than left for the approver to go and look up.
+    """
+    document = getattr(binding, "document", None)
+    details: dict[str, str] = {}
+    if document is not None:
+        name = getattr(document, "name", "") or getattr(document, "file_id", "")
+        if name:
+            details["Document"] = name
+        tab = getattr(document, "sheet", "")
+        if tab:
+            details["Tab"] = tab
+    details["Binding"] = getattr(binding, "name", "") or "—"
+
+    compute = getattr(binding, "compute", None)
+    if compute is None:
+        details["Values from"] = "a hand-authored column mapping"
+    else:
+        resolution = getattr(binding, "resolution", None)
+        model = getattr(resolution, "model_id", "") or "an unrecorded model"
+        edited = bool(getattr(resolution, "edited_by_human", False))
+        details["Values from"] = (
+            f"generated code, since edited by a person (originally {model})"
+            if edited
+            else f"generated code written by {model}"
+        )
+    return details
 
 
 def _binding_for(source: DataSourceDefinition, operation: str) -> Any:
@@ -189,7 +234,13 @@ class DataSourceExecutor:
             rows, targets, sample = await binding_destructive_plan(
                 source, self, binding, params
             )
-            return DestructivePlan(affected_rows=rows, targets=targets, sample=sample)
+            return DestructivePlan(
+                affected_rows=rows,
+                targets=targets,
+                sample=sample,
+                change_kind="write",
+                details=_binding_details(binding),
+            )
         op = source.get_operation(operation)
         if op is None:
             raise ValueError(

@@ -364,18 +364,28 @@ def _approval_blocks(case: Any, *, mode: str = "request") -> list[dict[str, Any]
     or ``notice`` (already done, no buttons — offering an action on a closed
     case would be a lie).
     """
-    rows = "1 row" if case.affected_rows == 1 else f"{case.affected_rows} rows"
+    # "12 rows to delete" is the wrong sentence for a spreadsheet write, and
+    # the wrong sentence is worse than a vague one: it tells the approver the
+    # data is going away when it is being overwritten in place.
+    write = getattr(case, "change_kind", "delete") == "write"
+    unit = "cell" if write else "row"
+    count = f"1 {unit}" if case.affected_rows == 1 else f"{case.affected_rows} {unit}s"
+    subject = "Spreadsheet write" if write else "Data deletion"
     headline = {
-        "request": f"*Data deletion awaiting approval* — `{rows}`",
-        "veto": f"*Data deletion auto-approved* — `{rows}`",
-        "notice": f"*Data deletion confirmed* — `{rows}`",
-    }.get(mode, f"*Data deletion* — `{rows}`")
+        "request": f"*{subject} awaiting approval* — `{count}`",
+        "veto": f"*{subject} auto-approved* — `{count}`",
+        "notice": f"*{subject} confirmed* — `{count}`",
+    }.get(mode, f"*{subject}* — `{count}`")
     fields = [
         {"type": "mrkdwn", "text": f"*Data source*\n{case.datasource_name or case.datasource_id}"},
         {"type": "mrkdwn", "text": f"*Operation*\n`{case.operation}` [{case.method}]"},
         {"type": "mrkdwn", "text": f"*Workflow*\n{case.workflow_name or case.workflow_id or '—'}"},
         {"type": "mrkdwn", "text": f"*Run*\n`{case.run_id or '—'}`"},
     ]
+    # Slack renders at most 10 fields in one section and the four above are the
+    # ones every case has, so take at most six more.
+    for label, value in list((getattr(case, "details", None) or {}).items())[:6]:
+        fields.append({"type": "mrkdwn", "text": f"*{label}*\n{_truncate(str(value), 300)}"})
     blocks: list[dict[str, Any]] = [
         {"type": "section", "text": {"type": "mrkdwn", "text": headline}},
         {"type": "section", "fields": fields},
@@ -401,7 +411,10 @@ def _approval_blocks(case: Any, *, mode: str = "request") -> list[dict[str, Any]
             listing += f"\n• …and {more} more"
         blocks.append({
             "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*Targets*\n{_truncate(listing, 1200)}"},
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*{'Changes' if write else 'Targets'}*\n{_truncate(listing, 1200)}",
+            },
         })
 
     verdict = case.meta_llm

@@ -79,8 +79,17 @@ class ApprovalCase(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
     # The number this whole feature turns on.
     affected_rows: int = 0
-    # A short, human-readable sample of what is being removed.
+    # A short, human-readable sample of what the operation acts on: the rows
+    # being removed for a delete, the before/after of each cell for a write.
     affected_sample: list[Any] = Field(default_factory=list)
+    # Which of those two this is. Decides the wording an approver reads and the
+    # question the meta-LLM is asked; "delete" keeps the behaviour every
+    # existing case had before writes joined the gate.
+    change_kind: Literal["delete", "write", "other"] = "delete"
+    # Label -> value context shown beside the operation and given to the
+    # meta-LLM: which document a write targets, and whether a model wrote the
+    # code that produced its values.
+    details: dict[str, str] = Field(default_factory=dict)
 
     history_key: str = ""
 

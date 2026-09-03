@@ -82,6 +82,8 @@ class ApprovalService:
         step_id: str | None = None,
         agent_id: str = "",
         surface: CallSurface = "workflow",
+        change_kind: str = "delete",
+        details: dict[str, str] | None = None,
     ) -> ApprovalCase:
         """Write a pending case, consult the meta-LLM, announce it.
 
@@ -108,6 +110,8 @@ class ApprovalService:
             params=dict(params or {}),
             affected_rows=affected_rows,
             affected_sample=[str(s) for s in sample],
+            change_kind=change_kind if change_kind in ("delete", "write", "other") else "other",
+            details=dict(details or {}),
             history_key=history_key_for(workflow_id, getattr(source, "id", ""), operation),
         )
 
@@ -600,27 +604,38 @@ def _history_lines(history: list[ApprovalCase]) -> str:
 def _build_prompt(case: ApprovalCase, history: list[ApprovalCase], *, autonomous: bool) -> str:
     import json as _json
 
+    # A write is not a deletion, and asking the model about the wrong kind of
+    # change biases the answer: "is it safe to delete these 12 rows" invites a
+    # different judgement from "is it safe to overwrite these 12 cells".
+    write = case.change_kind == "write"
+    what = "write" if write else "deletion"
+    differs = (
+        "different cells, different values, a much larger cell count"
+        if write
+        else "a much larger row count, different inputs, a different target set"
+    )
     role = (
-        "You are deciding, on your own authority, whether this deletion runs. "
+        f"You are deciding, on your own authority, whether this {what} runs. "
         "A long unbroken streak of identical human decisions on this exact "
         "operation has earned you that authority — so follow the streak unless "
-        "this case is materially different from the ones in it (a much larger "
-        "row count, different inputs, a different target set)."
+        f"this case is materially different from the ones in it ({differs})."
         if autonomous
         else "You are advising a human reviewer. They decide; you only "
         "recommend, and your recommendation is shown next to the buttons."
     )
     sample = ", ".join(case.affected_sample[:10]) or "(none captured)"
+    context = "".join(f"{label}: {value}\n" for label, value in case.details.items())
     return (
         f"A workflow is about to run a destructive data-source operation.\n\n"
         f"{role}\n\n"
         f"CURRENT CASE\n"
+        f"{context}"
         f"Workflow: {case.workflow_name or case.workflow_id or '(none)'}\n"
         f"Data source: {case.datasource_name or case.datasource_id}\n"
         f"Operation: {case.operation} [{case.method}]\n"
         f"Endpoint: {case.endpoint}\n"
-        f"Rows affected: {case.affected_rows}\n"
-        f"Targets (sample): {sample}\n"
+        f"{'Cells' if write else 'Rows'} affected: {case.affected_rows}\n"
+        f"{'Changes' if write else 'Targets'} (sample): {sample}\n"
         f"Inputs: {_json.dumps(case.params, default=str)[:1500]}\n\n"
         f"PRIOR DECISIONS on this workflow + data source + operation "
         f"(newest first):\n{_history_lines(history)}\n\n"
