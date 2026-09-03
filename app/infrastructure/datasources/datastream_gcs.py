@@ -159,6 +159,7 @@ class GcsStreamStore(DataStreamStore):
         bucket: str,
         *,
         prefix: str = "",
+        project: str = "",
         client: Any = None,
     ) -> None:
         if not bucket:
@@ -168,6 +169,14 @@ class GcsStreamStore(DataStreamStore):
             )
         self._bucket_name = bucket
         self._prefix = prefix.strip("/")
+        # Passed to the storage client explicitly. A bare ``storage.Client()``
+        # cannot determine the project under Workload Identity -- the
+        # credential the metadata server returns carries none -- and raises
+        # OSError("Project was not passed and could not be determined from the
+        # environment"). Empty is allowed: the client then falls back to
+        # GOOGLE_CLOUD_PROJECT and to the credential's own project, which is
+        # what works off-cluster.
+        self._project = project.strip()
         # Injected in tests; built lazily otherwise so importing this module
         # never needs credentials.
         self._client = client
@@ -177,8 +186,39 @@ class GcsStreamStore(DataStreamStore):
         if self._client is None:
             from google.cloud import storage
 
-            self._client = storage.Client()
+            self._client = (
+                storage.Client(project=self._project)
+                if self._project
+                else storage.Client()
+            )
         return self._client.bucket(self._bucket_name)
+
+    def check_ready(self) -> None:
+        """Build the client and confirm the bucket is reachable.
+
+        Called once at startup so a misconfigured store is a boot failure with
+        the bucket named, rather than an OSError on the first data source call
+        of the deployment -- which is how the missing project surfaced: the
+        pod came up Healthy and the fault waited for the first run.
+        """
+        try:
+            bucket = self._bucket()
+            exists = bucket.exists()
+        except Exception as exc:  # noqa: BLE001 — re-raised with the cause named
+            raise RuntimeError(
+                f"data stream store: cannot reach gcs bucket "
+                f"'{self._bucket_name}'"
+                f"{f' in project {self._project}' if self._project else ''}: "
+                f"{type(exc).__name__}: {exc}. Set STREAM_GCS_PROJECT (or "
+                f"GOOGLE_CLOUD_PROJECT) when running under Workload Identity, "
+                f"and check the backend service account holds "
+                f"roles/storage.objectAdmin on the bucket."
+            ) from exc
+        if not exists:
+            raise RuntimeError(
+                f"data stream store: gcs bucket '{self._bucket_name}' does not "
+                f"exist or is not visible to this service account"
+            )
 
     def _key_for(self, stream_id: str) -> str:
         # Same refusal as the local store, and for the same reason: the id
