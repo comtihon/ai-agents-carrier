@@ -80,7 +80,7 @@ class DataRef(BaseModel):
         tail = ", truncated (incomplete)" if self.truncated else ""
         origin = f"{self.source_id}.{self.operation}".strip(".")
         return (
-            f"<spilled result{f' from {origin}' if origin else ''}: "
+            f"<data stream{f' from {origin}' if origin else ''}: "
             f"{what}, {size}{tail}; not inlined — read it in chunks>"
         )
 
