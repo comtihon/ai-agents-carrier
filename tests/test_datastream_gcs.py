@@ -101,6 +101,11 @@ class _FakeBucket:
             blob.updated = existing.updated
         return blob
 
+    def exists(self) -> bool:
+        # The real bucket has this; check_ready calls it to prove the bucket
+        # is reachable rather than merely nameable.
+        return True
+
     def get_blob(self, name: str) -> _FakeBlob | None:
         if name not in self.objects:
             return None
@@ -314,3 +319,114 @@ def test_selecting_gcs_builds_the_gcs_store(monkeypatch):
     )
     assert isinstance(store, GcsStreamStore)
     assert store._key_for("ds_1") == "p/ds_1.jsonl"
+
+
+# ---------------------------------------------------------------------------
+# the project the client is built with
+# ---------------------------------------------------------------------------
+#
+# Under Workload Identity a bare ``storage.Client()`` cannot determine the
+# project: the credential the metadata server returns carries none, so the
+# client raises OSError("Project was not passed and could not be determined
+# from the environment"). That happened in prod -- and because the only caller
+# at boot was the TTL purge, whose exception is caught and logged, the pod came
+# up Healthy and the fault waited for the first data source call of the
+# deployment. These tests pin both halves of the fix: the project reaches the
+# client, and a store that cannot reach its bucket fails at startup instead.
+
+def _fake_storage_module(monkeypatch, record: dict):
+    """Replace ``google.cloud.storage`` with a recorder.
+
+    Patched as an attribute of the real ``google.cloud`` package, because that
+    is what ``from google.cloud import storage`` resolves to once the genuine
+    package is importable -- a sys.modules entry alone is bypassed.
+    """
+    import types
+
+    import google.cloud
+
+    module = types.ModuleType("google.cloud.storage")
+
+    def _client(**kwargs):
+        record["kwargs"] = kwargs
+        record["called"] = True
+        return _FakeClient()
+
+    module.Client = _client
+    monkeypatch.setattr(google.cloud, "storage", module, raising=False)
+    return module
+
+
+def test_the_project_is_passed_to_the_storage_client(monkeypatch):
+    """The fix for the prod OSError: the project must reach the client."""
+    record: dict = {}
+    _fake_storage_module(monkeypatch, record)
+
+    GcsStreamStore("carrier-test", project="some-gcp-project")._bucket()
+
+    assert record["kwargs"] == {"project": "some-gcp-project"}
+
+
+def test_no_project_configured_leaves_the_client_to_work_it_out(monkeypatch):
+    """Off-cluster the ambient credential does carry one; do not override it."""
+    record: dict = {}
+    _fake_storage_module(monkeypatch, record)
+
+    GcsStreamStore("carrier-test")._bucket()
+
+    assert record["called"] is True
+    assert record["kwargs"] == {}, "expected Client() with no project kwarg"
+
+
+def test_the_project_is_never_defaulted_to_a_literal_in_this_repo():
+    """Which project is deployment configuration, not application knowledge.
+
+    It arrives as STREAM_GCS_PROJECT from the infrastructure repo. A default
+    baked in here would silently point one environment at another's bucket.
+    """
+    from app.core.config import Settings
+
+    field = Settings.model_fields["stream_gcs_project"]
+
+    assert field.default == ""
+    assert field.alias == "STREAM_GCS_PROJECT"
+
+
+async def test_check_ready_passes_when_the_bucket_is_reachable(client):
+    store = GcsStreamStore("carrier-test", client=client)
+
+    store.check_ready()  # must not raise
+
+
+def test_check_ready_names_the_bucket_when_the_client_cannot_be_built():
+    class _Broken:
+        def bucket(self, name):
+            raise OSError(
+                "Project was not passed and could not be determined from the "
+                "environment."
+            )
+
+    store = GcsStreamStore("carrier-test", client=_Broken())
+
+    with pytest.raises(RuntimeError) as exc:
+        store.check_ready()
+
+    message = str(exc.value)
+    assert "carrier-test" in message
+    assert "STREAM_GCS_PROJECT" in message
+    assert "Project was not passed" in message
+
+
+def test_check_ready_refuses_a_bucket_that_is_not_there():
+    class _Missing:
+        def bucket(self, name):
+            class _B:
+                @staticmethod
+                def exists():
+                    return False
+            return _B()
+
+    store = GcsStreamStore("carrier-test", client=_Missing())
+
+    with pytest.raises(RuntimeError, match="does not exist or is not visible"):
+        store.check_ready()

@@ -454,6 +454,17 @@ class Settings(BaseSettings):
     # Optional key prefix inside the bucket, so one bucket can be shared with
     # other things. Empty means objects sit at the root.
     stream_gcs_prefix: str = Field(default="", alias="STREAM_GCS_PREFIX")
+    # GCP project the bucket is billed to. Passed to the storage client
+    # explicitly, because a bare ``storage.Client()`` cannot work it out under
+    # Workload Identity: the credential the metadata server hands back carries
+    # no project, so the client raises "Project was not passed and could not be
+    # determined from the environment" -- on first use, which meant the first
+    # data source call of the deployment rather than at startup.
+    #
+    # Empty falls back to GOOGLE_CLOUD_PROJECT (what google-cloud-storage reads
+    # on its own) and then to the project of the ambient credential, so a
+    # deployment that already sets the standard variable needs nothing here.
+    stream_gcs_project: str = Field(default="", alias="STREAM_GCS_PROJECT")
     stream_dir: str = Field(default="/tmp/carrier-streams", alias="STREAM_DIR")
     # Age at which an unreferenced stream file is swept, in seconds. A run that
     # outlives this and then reads its ref gets a clear "stream is gone" error
