@@ -137,6 +137,7 @@ class ApplicationContainer:
     # can't be garbage-collected mid-flight, and cancelled on shutdown().
     _recover_task: asyncio.Task | None = field(default=None, init=False, repr=False, compare=False)
     _datasources_mcp_task: asyncio.Task | None = field(default=None, init=False, repr=False, compare=False)
+    _stream_housekeeping_task: asyncio.Task | None = field(default=None, init=False, repr=False, compare=False)
 
     async def startup(self) -> None:
         # Fail fast on an enabled-but-incomplete outbound auth configuration.
@@ -162,51 +163,21 @@ class ApplicationContainer:
             self.pubsub_subscriber.start()
         if self.workflow_backend is not None:
             await self._load_registry()
-        # Confirm the store is usable before anything depends on it. A
-        # misconfigured GCS store otherwise comes up Healthy and fails on the
-        # first data source call of the deployment -- the worst place to learn
-        # about it, and how the missing project surfaced.
+        # The stream store's two housekeeping calls -- a readiness probe and
+        # the TTL sweep -- are deliberately NOT awaited here.
         #
-        # Off the event loop and bounded, both learned the hard way: this is a
-        # blocking network call, and `startup()` runs inside the FastAPI
-        # lifespan *before* uvicorn binds the port. Called inline it delayed
-        # the bind, the liveness probe (initialDelaySeconds 10, period 20) got
-        # connection refused, and the kubelet SIGKILLed the container before
-        # it could serve -- a boot loop on a healthy cluster. So: a worker
-        # thread, and a deadline after which a slow bucket check is a warning
-        # rather than the reason a pod will not start.
-        if self.stream_store is not None:
-            check_ready = getattr(self.stream_store, "check_ready", None)
-            if check_ready is not None:
-                try:
-                    await asyncio.wait_for(
-                        asyncio.to_thread(check_ready),
-                        timeout=self.settings.stream_ready_timeout_seconds,
-                    )
-                except asyncio.TimeoutError:
-                    # Slow is not the same as broken. Refusing to boot here
-                    # would make a sluggish metadata server an outage.
-                    logger.warning(
-                        "data stream store: readiness check did not finish "
-                        "within %ss; continuing. If data source steps fail, "
-                        "check the bucket and the service account's access.",
-                        self.settings.stream_ready_timeout_seconds,
-                    )
-        # A local-disk stream does not survive the restart that just happened,
-        # so anything already on disk belongs to a run that can no longer read
-        # it. Sweeping at startup keeps a crash-loop from filling the node's
-        # disk with results nothing will ever claim.
-        if self.stream_store is not None:
-            try:
-                # Pinned streams are the exception: a `data` step told somebody
-                # they could download those, so they are held to the much longer
-                # artifact window instead of being swept with the backlog.
-                await self.stream_store.purge_older_than(
-                    self.settings.stream_ttl_seconds,
-                    pinned_seconds=self.settings.data_artifact_ttl_seconds,
-                )
-            except Exception:
-                logger.exception("failed to purge expired data streams")
+        # `startup()` runs inside the FastAPI lifespan, so nothing it awaits
+        # has bound the port yet. This app already takes ~35s to boot (a uvx
+        # install for the jira MCP server, 63 tools, six workflow
+        # definitions), and the liveness probe allows initialDelay 10s +
+        # period 20s. Two GCS round trips on that path -- each a token mint
+        # plus a TLS handshake on a CPU-throttled container -- were enough to
+        # push the bind past the probe, and the kubelet SIGKILLed v1.2.174 and
+        # v1.2.175 before either could serve. Neither call is something a
+        # request depends on, so neither belongs in front of the port.
+        self._stream_housekeeping_task = asyncio.create_task(
+            self._stream_store_housekeeping()
+        )
         self._recover_task = asyncio.create_task(self._recover_incomplete_runs())
         # Data source MCP tools are loaded detached: the /mcp/datasources
         # endpoint only answers once uvicorn is serving, so this must never be
@@ -277,6 +248,46 @@ class ApplicationContainer:
             runner._service_token_provider = self.service_token_provider
         if self.workflow_storage is not None:
             runner._storage_backend = self.workflow_storage
+
+    async def _stream_store_housekeeping(self) -> None:
+        """Check the stream store and sweep it, after the server is serving.
+
+        Runs once, detached. A configuration fault here is loud in the log and
+        will also fail the first data source step with the bucket named, which
+        is enough -- refusing to boot over it turned out to cost more than it
+        bought, because "cannot reach the bucket in ten seconds" and "the
+        bucket is misconfigured" are not the same statement and only the
+        second is worth an outage.
+        """
+        if self.stream_store is None:
+            return
+        check_ready = getattr(self.stream_store, "check_ready", None)
+        if check_ready is not None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(check_ready),
+                    timeout=self.settings.stream_ready_timeout_seconds,
+                )
+                logger.info("data stream store: ready")
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "data stream store: readiness check did not finish within "
+                    "%ss. Data source steps may fail; check the bucket and the "
+                    "service account's access.",
+                    self.settings.stream_ready_timeout_seconds,
+                )
+            except Exception:
+                logger.exception("data stream store: not usable")
+        try:
+            # Pinned streams are the exception: a `data` step told somebody
+            # they could download those, so they are held to the much longer
+            # artifact window instead of being swept with the backlog.
+            await self.stream_store.purge_older_than(
+                self.settings.stream_ttl_seconds,
+                pinned_seconds=self.settings.data_artifact_ttl_seconds,
+            )
+        except Exception:
+            logger.exception("failed to purge expired data streams")
 
     async def _load_datasources_mcp(self) -> None:
         """Publish data source MCP tools, then connect the local MCP server.
