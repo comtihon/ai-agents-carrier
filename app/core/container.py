@@ -162,7 +162,16 @@ class ApplicationContainer:
             self.pubsub_subscriber.start()
         if self.workflow_backend is not None:
             await self._load_registry()
-        # A local-disk spill does not survive the restart that just happened,
+        # Confirm the store is usable before anything depends on it. A
+        # misconfigured GCS store otherwise comes up Healthy and fails on the
+        # first data source call of the deployment -- the worst place to learn
+        # about it, and how the missing project surfaced. check_ready turns
+        # that into a boot failure naming the bucket.
+        if self.stream_store is not None:
+            check_ready = getattr(self.stream_store, "check_ready", None)
+            if check_ready is not None:
+                check_ready()
+        # A local-disk stream does not survive the restart that just happened,
         # so anything already on disk belongs to a run that can no longer read
         # it. Sweeping at startup keeps a crash-loop from filling the node's
         # disk with results nothing will ever claim.
@@ -176,7 +185,7 @@ class ApplicationContainer:
                     pinned_seconds=self.settings.data_artifact_ttl_seconds,
                 )
             except Exception:
-                logger.exception("failed to purge expired spilled results")
+                logger.exception("failed to purge expired data streams")
         self._recover_task = asyncio.create_task(self._recover_incomplete_runs())
         # Data source MCP tools are loaded detached: the /mcp/datasources
         # endpoint only answers once uvicorn is serving, so this must never be
@@ -1076,12 +1085,15 @@ def _build_stream_store(settings: Settings) -> DataStreamStore:
         from app.infrastructure.datasources.datastream_gcs import GcsStreamStore
 
         logger.info(
-            "data stream store: gcs bucket '%s'%s",
+            "data stream store: gcs bucket '%s'%s%s",
             settings.stream_gcs_bucket,
             f" prefix '{settings.stream_gcs_prefix}'" if settings.stream_gcs_prefix else "",
+            f" project '{settings.stream_gcs_project}'" if settings.stream_gcs_project else "",
         )
         return GcsStreamStore(
-            settings.stream_gcs_bucket, prefix=settings.stream_gcs_prefix
+            settings.stream_gcs_bucket,
+            prefix=settings.stream_gcs_prefix,
+            project=settings.stream_gcs_project,
         )
     if backend != "local":
         # Refused rather than silently defaulted: a typo in STREAM_BACKEND
