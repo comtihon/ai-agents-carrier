@@ -26,6 +26,12 @@ _EXPECTED_TOOLS = {
     "list_agents", "get_agent", "create_agent", "update_agent", "delete_agent",
     "list_datasources", "get_datasource", "create_datasource", "update_datasource",
     "create_pubsub_datasource", "list_pubsub_subscriptions",
+    "resolve_google_file", "create_google_sheets_datasource",
+    "probe_google_sheet", "list_sheet_bindings", "get_sheet_binding",
+    "save_sheet_binding", "delete_sheet_binding", "preview_sheet_binding",
+    "compile_sheet_binding_code", "get_sheet_binding_code",
+    "edit_sheet_binding_code", "activate_sheet_binding_code",
+    "retest_sheet_binding_code", "mark_sheet_binding_stale",
     "list_scripts", "get_script", "create_script", "update_script", "delete_script",
     "list_events", "get_event", "create_event", "update_event", "delete_event",
     "delete_datasource", "import_datasource_schema",
@@ -100,7 +106,7 @@ async def test_registers_the_full_tool_set(mcp):
     _register(mcp, _Container())
     tools = await mcp.list_tools()
     assert {t.name for t in tools} == _EXPECTED_TOOLS
-    assert len(tools) == 43
+    assert len(tools) == 57
 
 
 async def test_ask_user_is_not_exposed_over_mcp(mcp):
@@ -612,3 +618,186 @@ async def test_create_workflow_can_be_called_disabled_and_with_storage():
 
     update_props = schemas["update_workflow"]["properties"]
     assert "use_storage" in update_props, "cannot turn storage on after the fact"
+
+
+# ---------------------------------------------------------------------------
+# Google Sheets over MCP
+#
+# The MCP surface must not be a way around the REST path's checks: the same
+# impersonate_subject restriction applies, and the source it creates is the one
+# code defines rather than one a model retyped. No Google is reached — the
+# token mint and the Drive call are both stubbed.
+# ---------------------------------------------------------------------------
+
+_GOOGLE_SA = "copilot@engineering-368717.iam.gserviceaccount.com"
+
+
+@pytest.fixture
+def google_configured(monkeypatch):
+    from app.core.config import Settings, get_settings
+    from app.infrastructure.auth import google_token_provider
+
+    settings = Settings(GOOGLE_IMPERSONATE_SA=_GOOGLE_SA)
+    get_settings.cache_clear()
+    monkeypatch.setattr("app.core.config.get_settings", lambda: settings)
+    # google_token_provider imported get_settings by name, so the module's own
+    # reference has to be replaced as well as the one in app.core.config.
+    monkeypatch.setattr(google_token_provider, "get_settings", lambda: settings)
+    google_token_provider.reset_token_cache()
+    monkeypatch.setattr(
+        google_token_provider, "_mint_token", lambda subject, scopes: ("tok", 3600.0)
+    )
+    yield settings
+    google_token_provider.reset_token_cache()
+    get_settings.cache_clear()
+
+
+async def test_create_google_sheets_datasource_seeds_the_operations(mcp, google_configured):
+    backend = InMemoryDataSourceBackend()
+    _register(mcp, _Container(data_source_backend=backend))
+
+    result = str(await mcp.call_tool("create_google_sheets_datasource", {}))
+
+    stored = await backend.get("google-sheets")
+    assert stored is not None, result
+    assert stored.base_url == "https://sheets.googleapis.com"
+    assert stored.auth.type == "google"
+    assert [op.name for op in stored.operations] == [
+        "get_metadata", "get_values", "batch_get_values",
+        "update_values", "batch_update_values", "append_values",
+    ]
+    # The reply tells the agent what it still has to do per spreadsheet.
+    assert _GOOGLE_SA in result
+
+
+async def test_create_google_sheets_datasource_says_so_when_unconfigured(mcp, monkeypatch):
+    from app.core.config import Settings, get_settings
+
+    get_settings.cache_clear()
+    monkeypatch.setattr("app.core.config.get_settings", lambda: Settings())
+    backend = InMemoryDataSourceBackend()
+    _register(mcp, _Container(data_source_backend=backend))
+
+    result = str(await mcp.call_tool("create_google_sheets_datasource", {}))
+    assert "GOOGLE_IMPERSONATE_SA" in result
+    assert await backend.get("google-sheets") is None
+    get_settings.cache_clear()
+
+
+async def test_create_datasource_over_mcp_refuses_a_foreign_google_subject(
+    mcp, google_configured
+):
+    backend = InMemoryDataSourceBackend()
+    _register(mcp, _Container(data_source_backend=backend))
+
+    result = str(await mcp.call_tool("create_datasource", {
+        "source_id": "sneaky", "name": "Sneaky",
+        "base_url": "https://sheets.googleapis.com",
+        "operations_json": "[]",
+        "auth_json": '{"type": "google", '
+                     '"impersonate_subject": "prod-admin@x.iam.gserviceaccount.com"}',
+    }))
+    assert _GOOGLE_SA in result
+    assert await backend.get("sneaky") is None
+
+
+async def test_update_datasource_over_mcp_refuses_a_foreign_google_subject(
+    mcp, google_configured
+):
+    backend = InMemoryDataSourceBackend()
+    _register(mcp, _Container(data_source_backend=backend))
+    await mcp.call_tool("create_google_sheets_datasource", {})
+
+    result = str(await mcp.call_tool("update_datasource", {
+        "source_id": "google-sheets",
+        "auth_json": '{"type": "google", '
+                     '"impersonate_subject": "prod-admin@x.iam.gserviceaccount.com"}',
+    }))
+    assert _GOOGLE_SA in result
+    stored = await backend.get("google-sheets")
+    assert stored is not None and stored.auth.impersonate_subject is None
+
+
+async def test_get_datasource_reports_query_params_so_an_update_cannot_drop_them(
+    mcp, google_configured
+):
+    """update_datasource replaces every operation — what it reads back must be whole."""
+    backend = InMemoryDataSourceBackend()
+    _register(mcp, _Container(data_source_backend=backend))
+    await mcp.call_tool("create_google_sheets_datasource", {})
+
+    result = str(await mcp.call_tool("get_datasource", {"source_id": "google-sheets"}))
+    assert "valueInputOption" in result
+    assert "query_params" in result
+
+
+async def test_resolve_google_file_reports_the_document(mcp, google_configured, monkeypatch):
+    backend = InMemoryDataSourceBackend()
+    _register(mcp, _Container(data_source_backend=backend))
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {
+                "id": "sheet-1", "name": "Q3 pipeline",
+                "mimeType": "application/vnd.google-apps.spreadsheet",
+                "capabilities": {"canEdit": True},
+            }
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, params=None, headers=None):
+            return _Resp()
+
+    monkeypatch.setattr(
+        "app.infrastructure.datasources.google_sheets.httpx.AsyncClient",
+        lambda **kwargs: _Client(),
+    )
+
+    result = str(await mcp.call_tool("resolve_google_file", {
+        "ref": "https://docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUv/edit",
+    }))
+    assert "Q3 pipeline" in result
+    assert "Writable: yes" in result
+
+
+async def test_resolve_google_file_reports_no_access_instead_of_raising(
+    mcp, google_configured, monkeypatch
+):
+    backend = InMemoryDataSourceBackend()
+    _register(mcp, _Container(data_source_backend=backend))
+
+    class _Resp:
+        status_code = 403
+        text = "forbidden"
+
+        def json(self):
+            return {}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, params=None, headers=None):
+            return _Resp()
+
+    monkeypatch.setattr(
+        "app.infrastructure.datasources.google_sheets.httpx.AsyncClient",
+        lambda **kwargs: _Client(),
+    )
+
+    result = str(await mcp.call_tool("resolve_google_file", {
+        "ref": "https://docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUv/edit",
+    }))
+    assert "no_access" in result
+    assert _GOOGLE_SA in result

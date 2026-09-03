@@ -53,6 +53,7 @@ class ApprovalCaseBackend(ABC):
         workflow_id: str | None = None,
         datasource_id: str | None = None,
         run_id: str | None = None,
+        operation: str | None = None,
     ) -> int: ...
 
     @abstractmethod
@@ -152,6 +153,7 @@ class MongoApprovalBackend(ApprovalCaseBackend):
         workflow_id: str | None,
         datasource_id: str | None,
         run_id: str | None,
+        operation: str | None = None,
     ) -> dict:
         query: dict[str, Any] = {}
         if status:
@@ -162,6 +164,8 @@ class MongoApprovalBackend(ApprovalCaseBackend):
             query["datasource_id"] = datasource_id
         if run_id:
             query["run_id"] = run_id
+        if operation:
+            query["operation"] = operation
         return query
 
     async def list(
@@ -189,9 +193,10 @@ class MongoApprovalBackend(ApprovalCaseBackend):
         workflow_id: str | None = None,
         datasource_id: str | None = None,
         run_id: str | None = None,
+        operation: str | None = None,
     ) -> int:
         return await self._col.count_documents(
-            self._query(status, workflow_id, datasource_id, run_id)
+            self._query(status, workflow_id, datasource_id, run_id, operation)
         )
 
     async def history(self, history_key: str, limit: int = 20) -> list[ApprovalCase]:
@@ -285,10 +290,14 @@ class InMemoryApprovalBackend(ApprovalCaseBackend):
         rows.sort(key=lambda c: c.created_at, reverse=True)
         return rows[offset: offset + limit]
 
-    async def count(self, *, status=None, workflow_id=None, datasource_id=None, run_id=None) -> int:
+    async def count(
+        self, *, status=None, workflow_id=None, datasource_id=None, run_id=None,
+        operation=None,
+    ) -> int:
         return sum(
             1 for c in self._cases.values()
             if self._match(c, status, workflow_id, datasource_id, run_id)
+            and (not operation or c.operation == operation)
         )
 
     async def history(self, history_key: str, limit: int = 20) -> list[ApprovalCase]:

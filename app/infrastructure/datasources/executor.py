@@ -68,6 +68,20 @@ class DestructivePlan:
     sample: list[Any] = field(default_factory=list)
 
 
+def _binding_for(source: DataSourceDefinition, operation: str) -> Any:
+    """The sheet binding *operation* was compiled from, or ``None``.
+
+    A name comparison against ``source.bindings``, kept out of line so both
+    ``execute`` and ``preview`` ask the question the same way. ``getattr`` so a
+    definition-shaped object from an older document (or a test double) without
+    the field is simply "no bindings".
+    """
+    for binding in getattr(source, "bindings", None) or []:
+        if getattr(binding, "name", None) == operation:
+            return binding
+    return None
+
+
 class DataSourceExecutor:
     """Executes one operation of a data source, resolving its upstream DAG."""
 
@@ -94,6 +108,17 @@ class DataSourceExecutor:
         operation: str,
         params: dict[str, Any],
     ) -> Any:
+        binding = _binding_for(source, operation)
+        if binding is not None:
+            # A declarative sheet binding compiled to this operation name. Its
+            # HTTP work is several Sheets calls with pure transforms between
+            # them, so it is served here rather than by rendering one request:
+            # the delegate calls back into ``execute`` for each raw operation
+            # it needs. Intercepting at the top of ``execute`` is what makes a
+            # binding reachable from every caller at once -- workflow step, MCP
+            # tool, /try-operation -- with no new step type anywhere.
+            from app.infrastructure.datasources.sheet_binding_runtime import run_binding
+            return await run_binding(source, self, binding, params)
         op = source.get_operation(operation)
         if op is None:
             raise ValueError(
@@ -149,7 +174,22 @@ class DataSourceExecutor:
         goes out. That is deliberate: re-reading is how an approval that sat in
         Slack for an hour does not act on an hour-old list. Set a
         ``cache.ttl_seconds`` on the source when the extra read is not wanted.
+
+        A compiled sheet binding answers this itself: what an approver needs to
+        see there is not a row count but the cells about to change, so the
+        binding runtime plans the write (read, resolve the row, check the
+        header fingerprint, build) and hands back the before/after of every
+        cell as the plan's ``sample``.
         """
+        binding = _binding_for(source, operation)
+        if binding is not None and binding.operation == "write":
+            from app.infrastructure.datasources.sheet_binding_runtime import (
+                binding_destructive_plan,
+            )
+            rows, targets, sample = await binding_destructive_plan(
+                source, self, binding, params
+            )
+            return DestructivePlan(affected_rows=rows, targets=targets, sample=sample)
         op = source.get_operation(operation)
         if op is None:
             raise ValueError(
@@ -458,7 +498,11 @@ class DataSourceExecutor:
         bound: dict[str, Any],
         extra: dict[str, Any],
     ) -> Any:
-        attempts = max(1, source.retries.attempts)
+        # An operation may override the source's policy — an append is not
+        # idempotent, so a retry after a timeout that in fact succeeded would
+        # write the rows twice.
+        policy = op.retries or source.retries
+        attempts = max(1, policy.attempts)
         last_error: Exception | None = None
         for attempt in range(attempts):
             try:
@@ -467,7 +511,7 @@ class DataSourceExecutor:
                 last_error = exc
                 if attempt == attempts - 1:
                     break
-                delay = source.retries.backoff * (2 ** attempt)
+                delay = policy.backoff * (2 ** attempt)
                 logger.warning(
                     "data source '%s' operation '%s' attempt %d/%d failed (%s) — "
                     "retrying in %.2fs",
@@ -522,13 +566,24 @@ class DataSourceExecutor:
             if p.name in params and p.name not in referenced and params[p.name] is not None
         }
 
+        # Declared query-string arguments apply to every method: an API may
+        # take a control argument in the query string of a POST/PUT, where a
+        # loose param would land in the JSON body instead.  ``extra`` (the
+        # pagination cursor) still wins, and so does a loose param of the same
+        # name on a method that carries them in the query string.
+        query = {
+            key: value
+            for key, value in (self._render(op.query_params or {}, params, memo, bound)).items()
+            if value is not None and value != ""
+        }
+
         if method in ("GET", "DELETE", "HEAD"):
             resp = await client.request(
-                method, url, params={**loose, **extra}, headers=headers
+                method, url, params={**query, **loose, **extra}, headers=headers
             )
         else:
             resp = await client.request(
-                method, url, params=extra, json=loose or None, headers=headers
+                method, url, params={**query, **extra}, json=loose or None, headers=headers
             )
         resp.raise_for_status()
         return resp.json()
@@ -724,7 +779,7 @@ _FALSE_STRINGS = frozenset({"false", "0", "no", "off"})
 def _coerce_params(
     ops: list[OperationDefinition], params: dict[str, Any]
 ) -> dict[str, Any]:
-    """Coerce caller values to the types their ``ParamSpec`` declares.
+    """Fill declared defaults, then coerce values to their declared types.
 
     ``ParamSpec.type`` was advisory: an MCP caller got type checking for free
     from the synthesised tool signature, but the ``data_source`` workflow step
@@ -734,6 +789,9 @@ def _coerce_params(
     behaviour, and a value that cannot be the declared type fails with the
     param named instead of producing a silently wrong request.
 
+    A declared ``default`` is filled in first, so it reaches the type coercion
+    and the required check like any caller-supplied value.
+
     Only ``number`` and ``boolean`` are touched — the two with an unambiguous
     parse from a string.  ``string`` / ``array`` / ``object`` are left alone:
     stringifying whatever arrived would hide mistakes rather than surface them,
@@ -742,6 +800,10 @@ def _coerce_params(
     """
     coerced = dict(params)
     for spec in (spec for op in ops for spec in op.params):
+        if coerced.get(spec.name) is None and spec.default is not None:
+            # Filled before the required check, so a declared default also
+            # satisfies a required param the caller left out.
+            coerced[spec.name] = spec.default
         if spec.name not in coerced or coerced[spec.name] is None:
             continue
         if spec.type == "number":
@@ -829,8 +891,19 @@ async def build_auth_headers(auth: Any, token_provider: Any = None) -> dict[str,
     at request time by *token_provider* (the process-wide provider is used when
     none is injected), using the identity the auth block names — or the
     deployment's default one when it names none.
+
+    ``google`` carries no stored secret either: the token is minted by
+    impersonating the configured service account, with a module-level cache in
+    the provider so a ~1h token is not re-minted on every request.  The target
+    principal comes from settings, never from the auth block — see
+    ``app.infrastructure.auth.google_token_provider``.
     """
     kind = getattr(auth, "type", "none")
+    if kind == "google":
+        from app.infrastructure.auth.google_token_provider import (
+            get_google_auth_header,
+        )
+        return await get_google_auth_header(auth)
     if kind == "service_identity":
         provider = token_provider
         if provider is None:

@@ -630,3 +630,278 @@ async def test_a_pubsub_datasource_is_refused_and_points_at_events(client):
     assert resp.status_code == 422
     assert "/events" in resp.json()["detail"]
     assert await backend.get("orders-events") is None
+
+
+# ─── Google Sheets ────────────────────────────────────────────────────────────
+#
+# Nothing here reaches Google: the impersonated-token mint is stubbed at
+# app.infrastructure.auth.google_token_provider._mint_token and the Drive call
+# goes through a fake httpx client, the same way the probe tests fake theirs.
+
+GOOGLE_SA = "copilot@engineering-368717.iam.gserviceaccount.com"
+
+SHEET_URL = (
+    "https://docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789/edit#gid=0"
+)
+SHEET_ID = "1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
+
+
+def _google_settings(**overrides) -> Settings:
+    return Settings(GOOGLE_IMPERSONATE_SA=GOOGLE_SA, **overrides)
+
+
+@pytest.fixture
+async def google_client(monkeypatch):
+    """Client whose backend has GOOGLE_IMPERSONATE_SA set and no real Google."""
+    from app.core.config import get_settings
+    from app.infrastructure.auth import google_token_provider
+
+    google_token_provider.reset_token_cache()
+    monkeypatch.setattr(
+        google_token_provider, "_mint_token", lambda subject, scopes: ("tok", 3600.0)
+    )
+
+    settings = _google_settings()
+    backend = InMemoryDataSourceBackend()
+    app = create_app()
+    container = _build_container(backend)
+    object.__setattr__(container, "settings", settings) if hasattr(
+        container, "__dataclass_fields__"
+    ) else setattr(container, "settings", settings)
+    app.state.container = container
+    app.dependency_overrides[get_settings] = lambda: settings
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        yield c, backend
+    google_token_provider.reset_token_cache()
+
+
+def _fake_drive(status_code: int, payload: dict | None = None, recorder: list | None = None):
+    """A fake httpx.AsyncClient factory answering the Drive files.get call."""
+    class _Resp:
+        def __init__(self) -> None:
+            self.status_code = status_code
+            self.text = "drive says no"
+
+        def json(self):
+            return payload or {}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, params=None, headers=None):
+            if recorder is not None:
+                recorder.append({"url": url, "params": dict(params or {}), "headers": dict(headers or {})})
+            return _Resp()
+
+    return lambda **kwargs: _Client()
+
+
+async def test_google_resolve_returns_the_document_it_can_see(google_client, monkeypatch):
+    c, _ = google_client
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        "app.infrastructure.datasources.google_sheets.httpx.AsyncClient",
+        _fake_drive(200, {
+            "id": SHEET_ID,
+            "name": "Q3 pipeline",
+            "mimeType": "application/vnd.google-apps.spreadsheet",
+            "capabilities": {"canEdit": True},
+        }, calls),
+    )
+
+    resp = await c.post("/api/v1/datasources/google/resolve", json={"ref": SHEET_URL})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {
+        "status": "ok",
+        "error": None,
+        "file_id": SHEET_ID,
+        "name": "Q3 pipeline",
+        "mime_type": "application/vnd.google-apps.spreadsheet",
+        "can_edit": True,
+        "service_account": GOOGLE_SA,
+    }
+    # Asked Drive as the impersonated account, for exactly the fields the UI
+    # shows, and in a way that also works for a file on a shared drive.
+    assert calls[0]["url"].endswith(f"/drive/v3/files/{SHEET_ID}")
+    assert calls[0]["params"] == {
+        "fields": "id,name,mimeType,capabilities/canEdit",
+        "supportsAllDrives": "true",
+    }
+    assert calls[0]["headers"]["Authorization"] == "Bearer tok"
+
+
+async def test_google_resolve_accepts_a_bare_file_id(google_client, monkeypatch):
+    """The Picker hands back an id, not a URL."""
+    c, _ = google_client
+    monkeypatch.setattr(
+        "app.infrastructure.datasources.google_sheets.httpx.AsyncClient",
+        _fake_drive(200, {
+            "id": SHEET_ID, "name": "Sheet", "capabilities": {"canEdit": False},
+            "mimeType": "application/vnd.google-apps.spreadsheet",
+        }),
+    )
+    resp = await c.post("/api/v1/datasources/google/resolve", json={"ref": SHEET_ID})
+    assert resp.json()["status"] == "ok"
+    assert resp.json()["can_edit"] is False
+
+
+async def test_google_resolve_reports_no_access_with_the_address_to_share_with(
+    google_client, monkeypatch
+):
+    """403/404 is the expected first answer, not a 500."""
+    c, _ = google_client
+    monkeypatch.setattr(
+        "app.infrastructure.datasources.google_sheets.httpx.AsyncClient",
+        _fake_drive(404),
+    )
+    resp = await c.post("/api/v1/datasources/google/resolve", json={"ref": SHEET_URL})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "no_access"
+    assert body["service_account"] == GOOGLE_SA
+    assert GOOGLE_SA in body["error"]
+
+
+async def test_google_resolve_names_a_doc_as_a_doc(google_client):
+    c, _ = google_client
+    resp = await c.post(
+        "/api/v1/datasources/google/resolve",
+        json={"ref": "https://docs.google.com/document/d/1AbCdEfGhIjKlMnOpQrStUv/edit"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "wrong_type"
+    assert "Google Doc" in body["error"]
+
+
+async def test_google_resolve_names_a_slides_deck_as_a_slides_deck(google_client):
+    c, _ = google_client
+    resp = await c.post(
+        "/api/v1/datasources/google/resolve",
+        json={"ref": "https://docs.google.com/presentation/d/1AbCdEfGhIjKlMnOpQ/edit"},
+    )
+    assert resp.json()["status"] == "wrong_type"
+    assert "Slides" in resp.json()["error"]
+
+
+async def test_google_resolve_rejects_something_that_is_not_a_drive_ref(google_client):
+    c, _ = google_client
+    resp = await c.post(
+        "/api/v1/datasources/google/resolve", json={"ref": "https://example.com/nope"}
+    )
+    assert resp.json()["status"] == "invalid"
+
+
+async def test_google_resolve_says_so_when_the_backend_is_not_configured(client):
+    """No GOOGLE_IMPERSONATE_SA — a deployment gap, still not a 5xx."""
+    c, _ = client
+    resp = await c.post("/api/v1/datasources/google/resolve", json={"ref": SHEET_URL})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "not_configured"
+    assert "GOOGLE_IMPERSONATE_SA" in body["error"]
+
+
+async def test_sheets_template_is_saveable_through_the_normal_create_path(google_client):
+    c, backend = google_client
+    template = (await c.get("/api/v1/datasources/google/sheets-template")).json()
+    assert template["base_url"] == "https://sheets.googleapis.com"
+    assert template["auth"]["type"] == "google"
+    assert template["service_account"] == GOOGLE_SA
+    assert template["default_value_input_option"] == "RAW"
+
+    payload = {k: template[k] for k in
+               ("id", "name", "description", "kind", "base_url", "auth", "operations")}
+    resp = await c.post("/api/v1/datasources", json=payload)
+    assert resp.status_code == 201, resp.text
+
+    stored = await backend.get("google-sheets")
+    assert stored is not None
+    names = [op.name for op in stored.operations]
+    assert names == [
+        "get_metadata", "get_values", "batch_get_values",
+        "update_values", "batch_update_values", "append_values",
+    ]
+    # Every write is gated; no read is.
+    gated = {op.name for op in stored.operations if op.destructive}
+    assert gated == {"update_values", "batch_update_values", "append_values"}
+    # Append is not idempotent, so it is not retried.
+    append = stored.get_operation("append_values")
+    assert append is not None and append.retries is not None
+    assert append.retries.attempts == 1
+    # RAW, not USER_ENTERED — a value starting with "=" must stay text.
+    value_input = next(
+        p for p in append.params if p.name == "value_input_option"
+    )
+    assert value_input.default == "RAW"
+
+
+async def test_google_auth_carries_no_secret_to_redact(google_client):
+    c, _ = google_client
+    template = (await c.get("/api/v1/datasources/google/sheets-template")).json()
+    payload = {k: template[k] for k in
+               ("id", "name", "description", "kind", "base_url", "auth", "operations")}
+    await c.post("/api/v1/datasources", json=payload)
+
+    body = (await c.get("/api/v1/datasources/google-sheets")).json()
+    assert body["auth"]["type"] == "google"
+    # Nothing to redact, and nothing invented either.
+    assert "********" not in str(body["auth"])
+    assert body["auth"]["impersonate_subject"] is None
+
+
+async def test_create_refuses_a_google_block_naming_another_service_account(google_client):
+    """The auth block is caller-supplied; the target principal is not."""
+    c, _ = google_client
+    resp = await c.post("/api/v1/datasources", json={
+        "id": "sneaky",
+        "base_url": "https://sheets.googleapis.com",
+        "auth": {
+            "type": "google",
+            "impersonate_subject": "prod-admin@engineering-368717.iam.gserviceaccount.com",
+        },
+        "operations": [],
+    })
+    assert resp.status_code == 422
+    assert GOOGLE_SA in resp.json()["detail"]
+
+
+async def test_create_accepts_a_google_block_naming_the_configured_account(google_client):
+    c, _ = google_client
+    resp = await c.post("/api/v1/datasources", json={
+        "id": "sheets",
+        "base_url": "https://sheets.googleapis.com",
+        "auth": {"type": "google", "impersonate_subject": GOOGLE_SA},
+        "operations": [],
+    })
+    assert resp.status_code == 201, resp.text
+
+
+async def test_update_refuses_a_google_block_naming_another_service_account(google_client):
+    c, backend = google_client
+    await c.post("/api/v1/datasources", json={
+        "id": "sheets", "base_url": "https://sheets.googleapis.com",
+        "auth": {"type": "google"}, "operations": [],
+    })
+    resp = await c.put("/api/v1/datasources/sheets", json={
+        "auth": {"type": "google", "impersonate_subject": "other@x.iam.gserviceaccount.com"},
+    })
+    assert resp.status_code == 422
+    stored = await backend.get("sheets")
+    assert stored is not None and stored.auth.impersonate_subject is None
+
+
+async def test_google_auth_cannot_take_its_subject_from_backend_config(google_client):
+    """`from_config` is for secrets, and this auth type has none."""
+    c, _ = google_client
+    resp = await c.post("/api/v1/datasources", json={
+        "id": "sheets", "base_url": "https://sheets.googleapis.com",
+        "auth": {"type": "google", "from_config": "SOME_KEY"}, "operations": [],
+    })
+    assert resp.status_code == 422
+    assert "no secret" in resp.json()["detail"]

@@ -116,7 +116,27 @@ class ApprovalService:
         case.meta_llm = verdict
 
         if verdict is not None and verdict.autonomous:
-            self._apply_autonomous_decision(case, verdict)
+            probation = await self._tier2_write_probation(source, operation)
+            if probation is not None:
+                # The streak says "a person has waved this through often enough".
+                # For generated code that is not yet the same claim: a golden
+                # fixture over five sample rows is not evidence over five
+                # hundred real ones, and the rows the model never saw are
+                # exactly where a transform goes wrong. So the first N runs of a
+                # tier-2 write go to a person regardless of any trusted setting,
+                # and the meta-LLM's opinion rides along as advice instead of
+                # becoming the decision.
+                verdict.autonomous = False
+                verdict.reason = (
+                    f"{verdict.reason}\n\n[held for review: {probation}]"
+                ).strip()
+                logger.info(
+                    "approval %s: tier-2 write '%s' still on probation (%s) — "
+                    "autonomous decision withheld",
+                    case.id, operation, probation,
+                )
+            else:
+                self._apply_autonomous_decision(case, verdict)
 
         await self._backend.create(case)
         await self._announce(case)
@@ -258,6 +278,56 @@ class ApprovalService:
                 break
             length += 1
         return streak_value, length
+
+    async def _tier2_write_probation(self, source: Any, operation: str) -> str | None:
+        """Why this tier-2 write may not be decided autonomously yet, or None.
+
+        Returns a short explanation while the binding is still inside its
+        probation window, so the reason can be shown on the case rather than
+        the withholding looking arbitrary.
+
+        Only *human* approvals count, and they are counted per data source and
+        per operation (not per workflow, as the meta-LLM streak is): probation
+        is a property of the generated code, and the same code writing to the
+        same sheet has the same risk whichever workflow calls it.
+        """
+        binding = None
+        getter = getattr(source, "get_binding", None)
+        if callable(getter):
+            binding = getter(operation)
+        compute = getattr(binding, "compute", None) if binding is not None else None
+        if compute is None or getattr(binding, "operation", "") != "write":
+            return None
+
+        required = int(getattr(self._settings, "sheets_compute_write_probation_runs", 5) or 0)
+        if required <= 0:
+            return None
+
+        try:
+            approvals = await self._backend.list(
+                status="approved",
+                datasource_id=getattr(source, "id", ""),
+                operation=operation,
+                limit=max(required * 4, 50),
+            )
+        except TypeError:
+            # A backend that predates the `operation` filter: fall back to
+            # filtering here rather than skipping probation, which would be the
+            # unsafe direction to fail in.
+            approvals = [
+                c for c in await self._backend.list(
+                    status="approved",
+                    datasource_id=getattr(source, "id", ""),
+                    limit=max(required * 8, 100),
+                )
+                if c.operation == operation
+            ]
+        human = sum(1 for c in approvals if c.decision_source != "meta_llm")
+        if human >= required:
+            return None
+        return (
+            f"generated-code write, {human} of {required} human approvals so far"
+        )
 
     async def _consult_meta_llm(
         self, case: ApprovalCase, history: list[ApprovalCase]

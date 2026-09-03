@@ -505,6 +505,66 @@ class Settings(BaseSettings):
     agent_poll_interval_seconds: int = Field(default=10, alias="AGENT_POLL_INTERVAL_SECONDS")
     agent_max_loops: int = Field(default=3, alias="AGENT_MAX_LOOPS")
 
+    # --- Google Workspace (Sheets / Drive / Docs) ---
+    # Service account the backend impersonates for `google` data source auth.
+    # Not a secret: it is an email the backend holds
+    # roles/iam.serviceAccountTokenCreator on, and the only principal a
+    # `google` auth block is allowed to name. Documents are shared with this
+    # address, so it is also what the UI tells the user to grant access to.
+    # Unset means the feature is off — better than defaulting to some
+    # account's authority nobody asked for.
+    google_impersonate_sa: str | None = Field(default=None, alias="GOOGLE_IMPERSONATE_SA")
+    # OAuth2 scopes to mint that token with. The metadata server's own token is
+    # cloud-platform-scoped and Sheets/Drive reject it, so the scopes have to be
+    # stated; an auth block may narrow them further but not widen them.
+    google_impersonate_scopes: list[str] = Field(
+        default=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive.file",
+        ],
+        alias="GOOGLE_IMPERSONATE_SCOPES",
+    )
+
+    # --- Sheet bindings, tier 2 (LLM-generated pure transforms) ---
+    # Reads are on by default: a generated read computes a value and hands it
+    # back, and the worst a bad one does is return a wrong number to the step
+    # that asked.
+    sheets_compute_enabled: bool = Field(default=True, alias="SHEETS_COMPUTE_ENABLED")
+    # Writes are OFF by default, and this is not timidity. A generated read is
+    # wrong in the response; a generated write is wrong *in somebody's
+    # spreadsheet*, and a golden fixture over five sample rows is not evidence
+    # over five hundred real ones. Turning this on is a deployment-level
+    # decision, taken once the operators have looked at what tier 2 actually
+    # generates for their sheets.
+    sheets_compute_writes_enabled: bool = Field(
+        default=False, alias="SHEETS_COMPUTE_WRITES_ENABLED"
+    )
+    # Human approvals a tier-2 write binding must accumulate before the
+    # meta-LLM's autonomy streak is allowed to answer for it. Independent of
+    # `approval_auto_decide_threshold` on purpose: that streak is about an
+    # operation a person wrote and has watched work, this one is about code a
+    # model wrote and nobody has watched at scale yet.
+    sheets_compute_write_probation_runs: int = Field(
+        default=5, alias="SHEETS_COMPUTE_WRITE_PROBATION_RUNS"
+    )
+    # Model the compile step calls, pinned. Recorded into every binding it
+    # generates (`resolution.model_id`) and part of the cache key, so changing
+    # it invalidates generated code rather than silently mixing two models'
+    # output across one datasource.
+    sheets_compute_model: str | None = Field(default=None, alias="SHEETS_COMPUTE_MODEL")
+    # Attempts the compile loop makes, feeding each gate's exact rejection back
+    # to the model. Three, then it stops and says so: a fourth attempt on the
+    # same instruction has, in practice, nothing new to go on.
+    sheets_compute_max_attempts: int = Field(
+        default=3, alias="SHEETS_COMPUTE_MAX_ATTEMPTS"
+    )
+    # Wall-clock ceiling for one transform run in the sandbox. Far below a
+    # workflow python step's 60s: a pure transform over a probe's worth of rows
+    # either finishes at once or is looping.
+    sheets_compute_timeout_seconds: float = Field(
+        default=10.0, alias="SHEETS_COMPUTE_TIMEOUT_SECONDS"
+    )
+
     # --- Meta-LLM (lightweight analysis after agent steps complete) ---
     meta_llm_provider: str | None = Field(default="openrouter", alias="META_LLM_PROVIDER")
     meta_llm_model: str = Field(default="moonshotai/kimi-k2.6", alias="META_LLM_MODEL")

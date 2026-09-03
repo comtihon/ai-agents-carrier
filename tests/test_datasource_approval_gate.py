@@ -540,3 +540,188 @@ async def test_try_run_confirmations_stay_out_of_the_decision_history():
     assert await backend.history(key) == []
     # They are still in the audit trail.
     assert await backend.count() == 12
+
+
+# ---------------------------------------------------------------------------
+# Tier-2 write probation
+# ---------------------------------------------------------------------------
+# A generated-code write is held to a person for its first N runs regardless of
+# any autonomy streak. The streak means "somebody has waved this operation
+# through ten times"; for code a model wrote that is not yet the same claim,
+# because a golden fixture over five sample rows is not evidence over five
+# hundred real ones -- and the rows the model never saw are exactly where a
+# transform goes wrong.
+
+def _tier2_source():
+    """A google-sheets source whose `update_project` operation is tier 2."""
+    from app.domain.models.sheet_binding import SheetBinding
+    from tests.test_sheet_bindings_api import _sheets_source
+    from tests.test_sheet_compute import _compute_write_binding
+
+    return _sheets_source().model_copy(update={
+        "bindings": [SheetBinding.model_validate(_compute_write_binding())],
+    })
+
+
+def _tier2_decided(n: int, *, source: str = "ui") -> list[ApprovalCase]:
+    base = datetime.now(timezone.utc)
+    return [
+        ApprovalCase(
+            id=f"apr_t2_{source}_{i}",
+            status="approved",
+            workflow_id="wf",
+            datasource_id="google-sheets",
+            operation="update_project",
+            history_key=history_key_for("wf", "google-sheets", "update_project"),
+            affected_rows=1,
+            decision_source=source,
+            decided_by_name="ada",
+            decided_at=base - timedelta(minutes=i),
+        )
+        for i in range(n)
+    ]
+
+
+async def _open_tier2(service, backend):
+    return await service.open_case(
+        source=_tier2_source(),
+        operation="update_project",
+        method="POST",
+        params={"project_id": "P-1"},
+        affected_rows=1,
+        targets=["POST https://sheets.googleapis.com/.../values:batchUpdate"],
+        sample=["P-1"],
+        workflow_id="wf",
+        run_id="run-1",
+        step_id="write-step",
+    )
+
+
+async def test_a_tier2_write_is_held_for_review_during_probation(monkeypatch):
+    """A long streak does not buy a generated write its autonomy yet."""
+    backend = InMemoryApprovalBackend()
+    # Ten human approvals: enough for any hand-written operation to go autonomous.
+    await _seed(backend, _tier2_decided(10))
+    seen = _stub_llm(monkeypatch, "approve")
+
+    case = await _open_tier2(
+        _service(backend, sheets_compute_write_probation_runs=20), backend
+    )
+
+    # The streak still made the meta-LLM answer with authority...
+    assert seen["autonomous"] is True
+    # ...and probation took it away again.
+    assert case.status == "pending"
+    assert case.decision_source is None
+    assert case.meta_llm is not None
+    assert case.meta_llm.autonomous is False
+    # The reason says why, so the withholding does not look arbitrary.
+    assert "held for review" in case.meta_llm.reason
+    assert "10 of 20 human approvals" in case.meta_llm.reason
+
+
+async def test_a_tier2_write_goes_autonomous_once_probation_is_served(monkeypatch):
+    backend = InMemoryApprovalBackend()
+    await _seed(backend, _tier2_decided(10))
+    _stub_llm(monkeypatch, "approve")
+
+    case = await _open_tier2(
+        _service(backend, sheets_compute_write_probation_runs=5), backend
+    )
+
+    assert case.status == "approved"
+    assert case.decision_source == "meta_llm"
+    assert case.meta_llm is not None and case.meta_llm.autonomous is True
+
+
+async def test_probation_counts_only_human_approvals(monkeypatch):
+    """The meta-LLM's own autonomous calls do not shorten probation.
+
+    Otherwise the model reads its own output back as evidence of safety and
+    ratchets one early mistake into a standing policy -- the same reasoning
+    that makes ``_streak`` ignore its own decisions, applied to the count.
+
+    The ten human approvals here are the *newest*, so the streak is intact and
+    the meta-LLM does get authority; probation is then the only thing that
+    takes it away, which is what isolates this to the counting rule.
+    """
+    backend = InMemoryApprovalBackend()
+    base = datetime.now(timezone.utc)
+    human = [
+        ApprovalCase(
+            id=f"apr_t2_human_{i}", status="approved", workflow_id="wf",
+            datasource_id="google-sheets", operation="update_project",
+            history_key=history_key_for("wf", "google-sheets", "update_project"),
+            affected_rows=1, decision_source="ui", decided_by_name="ada",
+            decided_at=base - timedelta(minutes=i),
+        )
+        for i in range(10)
+    ]
+    older_autonomous = [
+        ApprovalCase(
+            id=f"apr_t2_bot_{i}", status="approved", workflow_id="wf",
+            datasource_id="google-sheets", operation="update_project",
+            history_key=history_key_for("wf", "google-sheets", "update_project"),
+            affected_rows=1, decision_source="meta_llm",
+            decided_at=base - timedelta(days=1, minutes=i),
+        )
+        for i in range(12)
+    ]
+    await _seed(backend, human + older_autonomous)
+    seen = _stub_llm(monkeypatch, "approve")
+
+    case = await _open_tier2(
+        _service(backend, sheets_compute_write_probation_runs=15), backend
+    )
+
+    assert seen["autonomous"] is True, "the human streak is intact"
+    # 22 approvals in total, but only the 10 human ones count.
+    assert case.status == "pending"
+    assert case.meta_llm is not None and case.meta_llm.autonomous is False
+    assert "10 of 15 human approvals" in case.meta_llm.reason
+
+
+async def test_a_tier2_write_with_no_history_at_all_is_held(monkeypatch):
+    """The first run of a generated write always goes to a person."""
+    backend = InMemoryApprovalBackend()
+    _stub_llm(monkeypatch, "approve")
+
+    case = await _open_tier2(
+        _service(backend, sheets_compute_write_probation_runs=5), backend
+    )
+
+    assert case.status == "pending"
+    # No history means the meta-LLM is not consulted at all, so there is
+    # nothing for probation to override -- it is held by the earlier rule, and
+    # the outcome is the one that matters.
+    assert case.meta_llm is None
+
+
+async def test_probation_does_not_touch_a_tier1_write(monkeypatch):
+    """The gate is about generated code, not about writes in general."""
+    from app.domain.models.sheet_binding import SheetBinding
+    from tests.test_sheet_bindings_api import _sheets_source, _write_binding
+
+    backend = InMemoryApprovalBackend()
+    await _seed(backend, _tier2_decided(10))
+    _stub_llm(monkeypatch, "approve")
+    tier1 = _sheets_source().model_copy(update={
+        "bindings": [SheetBinding.model_validate(_write_binding())],
+    })
+
+    case = await _service(
+        backend, sheets_compute_write_probation_runs=20
+    ).open_case(
+        source=tier1,
+        operation="update_project",
+        method="POST",
+        params={"project_id": "P-1"},
+        affected_rows=1,
+        targets=["POST https://sheets.googleapis.com/"],
+        sample=["P-1"],
+        workflow_id="wf",
+        run_id="run-1",
+    )
+
+    assert case.status == "approved"
+    assert case.decision_source == "meta_llm"

@@ -99,6 +99,35 @@ EXPECTED_TOOL_PERMISSIONS: dict[str, Permission] = {
     "delete_datasource": Permission.DELETE,
     "create_pubsub_datasource": Permission.WRITE,
     "list_pubsub_subscriptions": Permission.READ,
+    # Reads Drive metadata as the backend's impersonated service account and
+    # writes nothing, so READ — the same tier as get_datasource.
+    "resolve_google_file": Permission.READ,
+    "create_google_sheets_datasource": Permission.WRITE,
+    # Sheet bindings.  Probing and previewing read the spreadsheet as the
+    # impersonated service account and write nothing -- a preview plans the
+    # write and stops, which is the whole point of it -- so they sit at READ
+    # with the other inspection tools.  Saving a binding compiles it into an
+    # operation of the data source, so it is a definition change: WRITE.
+    "probe_google_sheet": Permission.READ,
+    "list_sheet_bindings": Permission.READ,
+    "get_sheet_binding": Permission.READ,
+    "preview_sheet_binding": Permission.READ,
+    "save_sheet_binding": Permission.WRITE,
+    "delete_sheet_binding": Permission.DELETE,
+    # Tier 2 (generated transforms).  Classified like the rest of the datasource
+    # tooling -- reading is READ, mutating is WRITE -- with one extra layer that
+    # this table does not express: compile, edit and activate additionally
+    # require ADMIN, enforced inside the shared service by
+    # auth.sandbox_guard.assert_generated_code_allowed.  WRITE gets a caller to
+    # the tool; ADMIN is what lets it store code nobody has read yet.  Marking a
+    # binding stale is only WRITE on purpose: switching generated code *off*
+    # must never be the privileged direction.
+    "get_sheet_binding_code": Permission.READ,
+    "compile_sheet_binding_code": Permission.WRITE,
+    "edit_sheet_binding_code": Permission.WRITE,
+    "activate_sheet_binding_code": Permission.WRITE,
+    "retest_sheet_binding_code": Permission.WRITE,
+    "mark_sheet_binding_stale": Permission.WRITE,
     # script library — `python` steps reference these by script_id
     "list_scripts": Permission.READ,
     "get_script": Permission.READ,
