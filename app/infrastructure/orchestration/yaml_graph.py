@@ -3312,10 +3312,55 @@ class YamlGraphRunner:
         except ValueError:
             return template
 
+    # A config value that is exactly one placeholder, e.g. "{rows}".
+    _WHOLE_PLACEHOLDER = re.compile(r"^\{([A-Za-z_][A-Za-z0-9_]*)((?:\[[^\]]+\]|\.[A-Za-z_][A-Za-z0-9_]*)*)\}$")
+
+    @classmethod
+    def _render_whole(cls, template: str, state: dict) -> Any:
+        """The referenced object itself when *template* is one placeholder.
+
+        ``{"values": "{rows}"}`` has to reach a data source as the list, not as
+        ``"[['a', 1], ['b', 2]]"`` -- a Python repr, which is not even valid
+        JSON, and which an ``array`` param passes through untouched. That is
+        what a step composing two data sources needs: read rows from one, write
+        them to the other.
+
+        Only lists and dicts are passed through. Scalars keep rendering as
+        strings so that ``{"page": "{n}"}`` behaves exactly as it always has
+        and the executor's declared-type coercion stays the thing that decides
+        what a number is.
+        """
+        match = cls._WHOLE_PLACEHOLDER.match(template)
+        if match is None:
+            return None
+        head, path = match.group(1), match.group(2)
+        if head == "env" or head not in state:
+            return None
+        current: Any = state[head]
+        for part in re.findall(r"\[([^\]]+)\]|\.([A-Za-z_][A-Za-z0-9_]*)", path):
+            key = part[0] or part[1]
+            try:
+                if isinstance(current, (list, tuple)) and key.lstrip("-").isdigit():
+                    current = current[int(key)]
+                else:
+                    current = current[key]
+            except (KeyError, IndexError, TypeError):
+                return None
+        if as_data_ref(current) is not None:
+            # Never pass a stream reference through as data. It is a dict, so
+            # it would qualify, but inlining one is exactly what the summary
+            # rendering exists to prevent -- a step that wants the records
+            # names it with `stream:` and reads the file.
+            return None
+        return current if isinstance(current, (list, dict)) else None
+
     @classmethod
     def _render_deep(cls, value: Any, state: dict) -> Any:
         """Recursively render {key} templates in dicts, lists, and strings."""
         if isinstance(value, str):
+            whole = cls._render_whole(value, state)
+            if whole is not None:
+                return whole
             return cls._render(value, state)
         if isinstance(value, dict):
             return {k: cls._render_deep(v, state) for k, v in value.items()}
