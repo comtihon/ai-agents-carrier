@@ -522,3 +522,35 @@ def test_the_readiness_deadline_is_configurable():
 
     assert field.alias == "STREAM_READY_TIMEOUT_SECONDS"
     assert field.default == 10.0
+
+
+def test_no_gcs_call_is_made_on_the_event_loop():
+    """Nothing network-touching may sit at an async method's own indentation.
+
+    purge_older_than built its storage client one line outside the worker
+    thread created for the listing. Client construction is blocking --
+    credentials, and a metadata round trip under Workload Identity -- so with
+    GCS slow it wedged the process: the port stayed open while /health and
+    /ready timed out, the kubelet pulled the pod, nginx served 503, and prod
+    was down.
+
+    The shape of that bug is a `self._bucket()` or `self._blob(...)` call
+    indented by exactly eight spaces, i.e. directly in a method body rather
+    than inside a nested def that gets handed to asyncio.to_thread.
+    """
+    import inspect
+    import re
+
+    from app.infrastructure.datasources import datastream_gcs
+
+    source = inspect.getsource(datastream_gcs)
+    offenders = [
+        line
+        for line in source.splitlines()
+        if re.match(r"^ {8}(self\._bucket\(\)|self\._blob\(|self\._client\.)", line)
+    ]
+
+    assert not offenders, (
+        "these calls sit in a method body rather than inside a to_thread "
+        f"closure, so they run on the event loop: {offenders}"
+    )
