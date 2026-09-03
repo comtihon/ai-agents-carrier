@@ -725,3 +725,85 @@ async def test_probation_does_not_touch_a_tier1_write(monkeypatch):
 
     assert case.status == "approved"
     assert case.decision_source == "meta_llm"
+
+
+# ---------------------------------------------------------------------------
+# What an approver reads: a write is not a deletion
+# ---------------------------------------------------------------------------
+
+def _rendered(case: ApprovalCase, mode: str = "request") -> str:
+    from app.infrastructure.notifications.webhook_notifier import _approval_blocks
+
+    import json as _json
+    return _json.dumps(_approval_blocks(case, mode=mode))
+
+
+def test_a_delete_still_reads_as_a_deletion_of_rows():
+    """The default wording is unchanged — every pre-existing case is a delete."""
+    text = _rendered(ApprovalCase(id="apr_1", affected_rows=12, affected_sample=["42"]))
+    assert "Data deletion awaiting approval" in text
+    assert "12 rows" in text
+    assert "Targets" in text
+    assert "cell" not in text
+
+
+def test_a_write_reads_as_a_write_of_cells():
+    """Calling an overwrite a deletion tells the approver the data is going away."""
+    case = ApprovalCase(
+        id="apr_2",
+        affected_rows=3,
+        affected_sample=["Projects!B2 (status): 'open' -> 'closed'"],
+        change_kind="write",
+    )
+    text = _rendered(case)
+    assert "Spreadsheet write awaiting approval" in text
+    assert "3 cells" in text
+    assert "Changes" in text
+    assert "deletion" not in text
+    assert "rows" not in text
+
+
+def test_one_cell_is_singular():
+    case = ApprovalCase(id="apr_3", affected_rows=1, change_kind="write")
+    assert "1 cell`" in _rendered(case)
+
+
+def test_details_reach_the_approver():
+    """Which document, and whether a model wrote the values, are shown."""
+    case = ApprovalCase(
+        id="apr_4",
+        affected_rows=1,
+        affected_sample=["Projects!B2: 'a' -> 'b'"],
+        change_kind="write",
+        details={
+            "Document": "RC Projects Tracker",
+            "Tab": "Projects",
+            "Values from": "generated code written by some-model",
+        },
+    )
+    text = _rendered(case)
+    assert "RC Projects Tracker" in text
+    assert "generated code written by some-model" in text
+
+
+def test_the_meta_llm_is_asked_about_a_write_not_a_deletion():
+    """Asking the wrong question biases the answer, so the prompt adapts."""
+    from app.application.approval_service import _build_prompt
+
+    case = ApprovalCase(
+        id="apr_5",
+        affected_rows=2,
+        affected_sample=["Projects!B2: 'a' -> 'b'"],
+        change_kind="write",
+        details={"Document": "RC Projects Tracker"},
+    )
+    prompt = _build_prompt(case, [], autonomous=True)
+    assert "whether this write runs" in prompt
+    assert "deletion" not in prompt
+    assert "Cells affected: 2" in prompt
+    assert "RC Projects Tracker" in prompt
+
+    delete = ApprovalCase(id="apr_6", affected_rows=2)
+    delete_prompt = _build_prompt(delete, [], autonomous=True)
+    assert "whether this deletion runs" in delete_prompt
+    assert "Rows affected: 2" in delete_prompt

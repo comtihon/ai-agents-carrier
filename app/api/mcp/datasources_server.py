@@ -315,6 +315,8 @@ async def _await_approval(
         run_id=run_id,
         agent_id=agent_id,
         surface="mcp",
+        change_kind=plan.change_kind,
+        details=plan.details,
     )
     logger.info(
         "data source '%s' operation '%s': %d row(s) held for approval (case %s)",

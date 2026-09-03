@@ -2069,6 +2069,8 @@ class YamlGraphRunner:
                 run_id=run_id,
                 step_id=step_id,
                 surface="workflow",
+                change_kind=plan.change_kind,
+                details=plan.details,
             )
 
         if case.status == "pending":

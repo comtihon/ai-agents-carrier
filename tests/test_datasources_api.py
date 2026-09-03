@@ -638,7 +638,7 @@ async def test_a_pubsub_datasource_is_refused_and_points_at_events(client):
 # app.infrastructure.auth.google_token_provider._mint_token and the Drive call
 # goes through a fake httpx client, the same way the probe tests fake theirs.
 
-GOOGLE_SA = "copilot@engineering-368717.iam.gserviceaccount.com"
+GOOGLE_SA = "copilot@example.iam.gserviceaccount.com"
 
 SHEET_URL = (
     "https://docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789/edit#gid=0"
@@ -863,7 +863,7 @@ async def test_create_refuses_a_google_block_naming_another_service_account(goog
         "base_url": "https://sheets.googleapis.com",
         "auth": {
             "type": "google",
-            "impersonate_subject": "prod-admin@engineering-368717.iam.gserviceaccount.com",
+            "impersonate_subject": "other-sa@example.iam.gserviceaccount.com",
         },
         "operations": [],
     })

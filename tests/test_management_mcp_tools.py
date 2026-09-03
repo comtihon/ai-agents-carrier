@@ -629,7 +629,7 @@ async def test_create_workflow_can_be_called_disabled_and_with_storage():
 # token mint and the Drive call are both stubbed.
 # ---------------------------------------------------------------------------
 
-_GOOGLE_SA = "copilot@engineering-368717.iam.gserviceaccount.com"
+_GOOGLE_SA = "copilot@example.iam.gserviceaccount.com"
 
 
 @pytest.fixture

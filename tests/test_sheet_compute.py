@@ -96,7 +96,7 @@ def _settings(**overrides: Any) -> Settings:
         "sheets_compute_writes_enabled": True,
         "sheets_compute_max_attempts": 3,
         "sheets_compute_timeout_seconds": 15.0,
-        "google_impersonate_sa": "copilot@engineering-368717.iam.gserviceaccount.com",
+        "google_impersonate_sa": "copilot@example.iam.gserviceaccount.com",
     }
     values.update(overrides)
     return Settings(**values)

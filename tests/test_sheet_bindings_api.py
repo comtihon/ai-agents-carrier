@@ -84,7 +84,7 @@ def _sheets_source() -> DataSourceDefinition:
 # and the probe / preview routes re-check that against the *stored* definition
 # before minting a token, so the backend has to be configured for these tests
 # even though no real token is ever minted.
-GOOGLE_SA = "copilot@engineering-368717.iam.gserviceaccount.com"
+GOOGLE_SA = "copilot@example.iam.gserviceaccount.com"
 
 
 @pytest.fixture
