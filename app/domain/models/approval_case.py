@@ -19,7 +19,13 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 ApprovalStatus = Literal["pending", "approved", "rejected", "expired", "cancelled"]
-DecisionSource = Literal["ui", "slack", "meta_llm", "timeout", "api"]
+# "mcp" is the management MCP server's own decision: an agent or an operator
+# approving through a tool call rather than the UI, Slack or the REST API. It
+# was missing, so every approve_run / reject_run through that server raised a
+# pydantic literal_error and the gated call never ran -- the run reported
+# "approved; resuming" and then failed with a validation error instead of
+# writing. Found by an end-to-end test whose sheet stayed empty.
+DecisionSource = Literal["ui", "slack", "meta_llm", "timeout", "api", "mcp"]
 CallSurface = Literal["workflow", "mcp", "try_run"]
 
 
