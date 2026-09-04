@@ -122,8 +122,10 @@ class _FakeClient:
     def bucket(self, name: str) -> _FakeBucket:
         return _FakeBucket(self, name)
 
-    def list_blobs(self, bucket: str, prefix: str = ""):
-        return [b for name, b in list(self.blobs.items()) if name.startswith(prefix)]
+    def list_blobs(self, bucket: str, prefix: str = "", max_results: int | None = None):
+        out = [b for name, b in list(self.blobs.items())
+               if name.startswith(prefix or "")]
+        return out[:max_results] if max_results else out
 
 
 @pytest.fixture
@@ -417,19 +419,44 @@ def test_check_ready_names_the_bucket_when_the_client_cannot_be_built():
     assert "Project was not passed" in message
 
 
-def test_check_ready_refuses_a_bucket_that_is_not_there():
+def test_check_ready_reports_a_bucket_that_is_not_there():
+    """A missing bucket surfaces as the listing's own 404, with it named."""
     class _Missing:
         def bucket(self, name):
-            class _B:
-                @staticmethod
-                def exists():
-                    return False
-            return _B()
+            return object()
+
+        def list_blobs(self, bucket, prefix=None, max_results=None):
+            raise RuntimeError("404 GET .../b/carrier-test: bucket does not exist")
 
     store = GcsStreamStore("carrier-test", client=_Missing())
 
-    with pytest.raises(RuntimeError, match="does not exist or is not visible"):
+    with pytest.raises(RuntimeError) as exc:
         store.check_ready()
+
+    assert "carrier-test" in str(exc.value)
+    assert "does not exist" in str(exc.value)
+
+
+def test_check_ready_does_not_require_buckets_get():
+    """objectAdmin grants objects.list but NOT buckets.get.
+
+    Probing with bucket.exists() reported a 403 against a store that was
+    working, because exists() is storage.buckets.get and the backend holds
+    exactly roles/storage.objectAdmin.
+    """
+    import inspect
+
+    from app.infrastructure.datasources.datastream_gcs import GcsStreamStore as G
+
+    code = "\n".join(
+        line for line in inspect.getsource(G.check_ready).splitlines()
+        if not line.lstrip().startswith("#")
+    )
+
+    assert ".exists()" not in code, (
+        "bucket.exists() is storage.buckets.get, which objectAdmin lacks"
+    )
+    assert "list_blobs" in code
 
 
 # ---------------------------------------------------------------------------

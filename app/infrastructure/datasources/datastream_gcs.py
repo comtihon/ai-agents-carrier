@@ -201,9 +201,20 @@ class GcsStreamStore(DataStreamStore):
         of the deployment -- which is how the missing project surfaced: the
         pod came up Healthy and the fault waited for the first run.
         """
+        # Probed by listing one object, NOT by asking whether the bucket
+        # exists. A bucket-existence check is storage.buckets.get, which
+        # roles/storage.objectAdmin does not grant -- and objectAdmin is
+        # exactly what the backend holds, correctly, for a store that only
+        # ever reads and writes objects. So the existence check reported
+        # "cannot reach gcs bucket ...: 403" against a store that was working
+        # perfectly. A one-object listing needs storage.objects.list, which
+        # objectAdmin does grant, and it proves the same three things:
+        # credentials, network path, and that the bucket resolves.
         try:
-            bucket = self._bucket()
-            exists = bucket.exists()
+            self._bucket()  # forces client construction
+            next(iter(self._client.list_blobs(  # type: ignore[union-attr]
+                self._bucket_name, max_results=1, prefix=self._prefix or None,
+            )), None)
         except Exception as exc:  # noqa: BLE001 — re-raised with the cause named
             raise RuntimeError(
                 f"data stream store: cannot reach gcs bucket "
@@ -214,11 +225,7 @@ class GcsStreamStore(DataStreamStore):
                 f"and check the backend service account holds "
                 f"roles/storage.objectAdmin on the bucket."
             ) from exc
-        if not exists:
-            raise RuntimeError(
-                f"data stream store: gcs bucket '{self._bucket_name}' does not "
-                f"exist or is not visible to this service account"
-            )
+
 
     def _key_for(self, stream_id: str) -> str:
         # Same refusal as the local store, and for the same reason: the id
