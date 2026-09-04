@@ -4,7 +4,9 @@ import asyncio
 import base64
 import json
 import logging
+import contextlib
 import os
+import tempfile
 import re
 import string
 from collections.abc import Awaitable, Callable
@@ -2539,16 +2541,28 @@ class YamlGraphRunner:
 
                     settings = get_settings()
                     delivery = await self._stream_delivery(ref, sandbox_runtime, step_id)
-                    result = await run_script(
-                        code,
-                        dict(state),
-                        runtime=sandbox_runtime,
-                        timeout=float(step.get("timeout_seconds") or settings.script_sandbox_timeout),
-                        image=step.get("sandbox_image") or settings.script_sandbox_image,
-                        memory_mb=settings.script_sandbox_memory_mb,
-                        namespace=settings.agent_namespace,
-                        **delivery,
-                    )
+                    # Popped rather than passed on: run_script knows nothing
+                    # about it, and it must be removed whether the script
+                    # succeeds or fails.
+                    tmp_stream = delivery.pop("_tempfile", None)
+                    try:
+                        result = await run_script(
+                            code,
+                            dict(state),
+                            runtime=sandbox_runtime,
+                            timeout=float(step.get("timeout_seconds") or settings.script_sandbox_timeout),
+                            image=step.get("sandbox_image") or settings.script_sandbox_image,
+                            memory_mb=settings.script_sandbox_memory_mb,
+                            namespace=settings.agent_namespace,
+                            **delivery,
+                        )
+                    finally:
+                        # A failing script must not leave the materialised copy
+                        # behind: these are whole data source results, and the
+                        # pod has a 4Gi ephemeral-storage limit.
+                        if tmp_stream:
+                            with contextlib.suppress(OSError):
+                                os.unlink(tmp_stream)
                 else:
                     # Single namespace for globals and locals -- see the same
                     # fix in script_sandbox's bootstrap. Two namespaces make a
@@ -2620,15 +2634,33 @@ class YamlGraphRunner:
             return {"stream_copy": _copy, **common}
 
         path = await store.local_path(ref)
-        if path is None:
-            # A store that keeps bytes off this filesystem (GridFS, object
-            # storage) has no path to hand over, so the same transfer the
-            # cross-pod case uses is used here too.
-            async def _copy_local(sink: Any) -> int:
-                return await store.copy_to(ref, sink)
+        if path is not None:
+            return {"stream_path": path, **common}
 
-            return {"stream_copy": _copy_local, **common}
-        return {"stream_path": path, **common}
+        # A store that keeps its bytes off this filesystem -- GCS, GridFS --
+        # has no path to hand over. The `local` and `docker` runtimes can only
+        # be given a path (their payload channel is already carrying the code
+        # and state), so the bytes are fetched down to a temp file here and
+        # that is what the sandbox opens. Only `k8s` takes a copy callable,
+        # because there the transfer has to cross into another pod anyway.
+        #
+        # Without this, STREAM_BACKEND=gcs plus the default sandbox_runtime
+        # silently delivered no stream at all: the script's records() raised
+        # "no data stream is attached" while the fetch had plainly succeeded.
+        fd, tmp = tempfile.mkstemp(prefix="carrier-stream-", suffix=".jsonl")
+        os.close(fd)
+        try:
+            with open(tmp, "wb") as sink:
+                written = await store.copy_to(ref, sink)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+        logger.info(
+            "[%s] step '%s' materialised %d byte(s) of stream %s to %s for the "
+            "%s sandbox", self.id, step_id, written, ref.id, tmp, runtime,
+        )
+        return {"stream_path": tmp, "_tempfile": tmp, **common}
 
     async def _llm_map_reduce(
         self,
