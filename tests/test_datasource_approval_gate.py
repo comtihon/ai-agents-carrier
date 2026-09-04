@@ -156,9 +156,19 @@ def test_explicit_flag_gates_a_post_and_frees_a_delete():
     assert is_destructive(source.get_operation("clear_cache"), source) is False
 
 
-def test_graphql_operations_are_only_destructive_when_stated():
-    source = _source(kind="graphql", operations=[{"name": "mutate", "query": "mutation { x }"}])
-    assert is_destructive(source.get_operation("mutate"), source) is False
+def test_a_graphql_mutation_is_destructive_and_a_query_is_not():
+    """The document decides, not the verb — every GraphQL call is a POST.
+
+    This used to answer False for both: safe for a query, wrong for a
+    mutation. See tests/test_graphql_destructive.py for the full matrix.
+    """
+    source = _source(kind="graphql", operations=[
+        {"name": "mutate", "query": "mutation { x { ok } }"},
+        {"name": "read", "query": "query { projects { id } }"},
+    ])
+
+    assert is_destructive(source.get_operation("mutate"), source) is True
+    assert is_destructive(source.get_operation("read"), source) is False
 
 
 # ---------------------------------------------------------------------------
