@@ -953,13 +953,36 @@ class DataSourceExecutor:
             if value is not None and value != ""
         }
 
+        # Pagination goes wherever the operation says. A search endpoint that
+        # takes its filters in a POST body takes its cursor there too --
+        # HubSpot's object search wants {"after", "limit"} in the body, and in
+        # the query string they do nothing, which is why that operation could
+        # not declare pagination at all before this.
+        where = (
+            op.paginate.resolved_location(kind=source.kind, method=method)
+            if op.paginate
+            else "query"
+        )
+        query_extra = extra if where == "query" else {}
+        body_extra = extra if where == "body" else {}
+
         if method in ("GET", "DELETE", "HEAD"):
             resp = await client.request(
-                method, url, params={**query, **loose, **extra}, headers=headers
+                method, url,
+                params={**query, **loose, **query_extra},
+                headers=headers,
             )
         else:
+            body: dict[str, Any] | None = dict(loose) if loose else None
+            if body_extra:
+                body = body or {}
+                for path, value in body_extra.items():
+                    _set_path(body, path, value)
             resp = await client.request(
-                method, url, params={**query, **extra}, json=loose or None, headers=headers
+                method, url,
+                params={**query, **query_extra},
+                json=body,
+                headers=headers,
             )
         resp.raise_for_status()
         return resp.json()
