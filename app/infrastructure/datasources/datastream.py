@@ -586,9 +586,16 @@ class StreamBuilder:
         max_result_bytes: int,
         source_id: str = "",
         operation: str = "",
+        limit: int | None = None,
     ) -> None:
         self._store = store
         self._max = max(0, max_result_bytes)
+        # How many records the caller actually wants. None means everything
+        # the source has -- the paginator then walks until the API says it is
+        # done, which is the point of asking for no limit. A limit is not a
+        # truncation: stopping because enough was collected is the caller
+        # getting what it asked for, so `truncated` stays False.
+        self._limit = limit if limit is None or limit > 0 else None
         self._source_id = source_id
         self._operation = operation
         self._writer: StreamWriter | None = None
@@ -602,8 +609,32 @@ class StreamBuilder:
     # -- state ----------------------------------------------------------
     @property
     def full(self) -> bool:
-        """True once the ceiling is reached — the caller must stop paging."""
-        return self._truncated
+        """True once there is no reason to fetch another page.
+
+        Either the byte ceiling was reached (a truncation, flagged as one) or
+        the caller's row limit was satisfied (not a truncation).
+        """
+        return self._truncated or self.limit_reached
+
+    @property
+    def limit_reached(self) -> bool:
+        return self._limit is not None and self._items >= self._limit
+
+    @property
+    def remaining(self) -> int | None:
+        """Rows still wanted, or ``None`` when the caller set no limit.
+
+        The paginator uses it to size the next page, so a limit of 10 against
+        a 100-row page size fetches ten rows rather than a hundred and throws
+        ninety away.
+        """
+        if self._limit is None:
+            return None
+        return max(0, self._limit - self._items)
+
+    @property
+    def items_written(self) -> int:
+        return self._items
 
     @property
     def bytes_written(self) -> int:
@@ -665,6 +696,15 @@ class StreamBuilder:
             self._scalar_adds += 1
         if not items:
             return
+        if self._limit is not None:
+            room = self._limit - self._items
+            if room <= 0:
+                return
+            if len(items) > room:
+                # The page that crosses the limit is trimmed rather than
+                # dropped or kept whole: the caller asked for N rows and gets
+                # exactly N.
+                items = items[:room]
         writer = await self._ensure_writer()
         self._bytes += await writer.append_many(items)
         self._items += len(items)

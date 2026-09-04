@@ -55,7 +55,7 @@ async def test_data_source_node_stores_executor_result():
 
     assert state["repos"] == [{"name": "repo-a"}]
     backend.get.assert_awaited_once_with("github")
-    executor.execute.assert_awaited_once_with(_DEFINITION, "list_repos", {"owner": "acme"})
+    executor.execute.assert_awaited_once_with(_DEFINITION, "list_repos", {"owner": "acme"}, limit=None)
 
 
 async def test_data_source_node_captures_executor_error():

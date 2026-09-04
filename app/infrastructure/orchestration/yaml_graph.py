@@ -807,6 +807,22 @@ class _StreamRef:
         return f"_StreamRef({self._handle.id})"
 
 
+def _positive_int(value: Any) -> int | None:
+    """A step's optional row limit, or ``None`` when it is not set.
+
+    Blank, zero, negative and unparseable all mean "no limit" rather than an
+    error: an empty field in the editor is how a workflow says "everything",
+    and failing a step over it would be worse than reading it that way.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
 def _stream_sample_block(ref: Any, sample: list[Any]) -> str:
     """The stated-sample text appended to a prompt for a streamed input.
 
@@ -925,6 +941,8 @@ class YamlGraphRunner:
                                        #   output_key instead of failing the run
             source: github             # data_source only — DataSourceDefinition id
             operation: list_repos      # data_source only — operation to invoke
+            limit: 500                 # data_source only — cap on records
+                                       #   collected; unset fetches every page
             result_mode: auto          # data_source only — auto (default)
                                        #   leaves the stream reference in
                                        #   state; ram loads the records back
@@ -2227,7 +2245,16 @@ class YamlGraphRunner:
                         "affected_rows": gate["affected_rows"],
                     }}
 
-                result = await self._data_source_executor.execute(source, operation, params)
+                # `limit` caps how many records the step collects. Unset
+                # means everything the source has: the executor then walks a
+                # paginated operation page by page until the API says it is
+                # done. Which page is being fetched is the data source's
+                # business -- a step says how much it wants, never how to get
+                # it.
+                limit = _positive_int(step.get("limit"))
+                result = await self._data_source_executor.execute(
+                    source, operation, params, limit=limit
+                )
 
                 # The executor always returns a reference, never the data.
                 # `result_mode` decides what this step leaves in state:
