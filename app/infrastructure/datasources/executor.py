@@ -182,7 +182,18 @@ class DataSourceExecutor:
         source: DataSourceDefinition,
         operation: str,
         params: dict[str, Any],
+        *,
+        limit: int | None = None,
     ) -> Any:
+        """Run one operation and return a reference to its result.
+
+        ``limit`` caps how many records are collected. ``None`` -- the default
+        -- means everything the source has: a paginated operation is then
+        walked page by page until the API says there is nothing left, which is
+        the whole point of not stating a limit. Pagination is the data
+        source's business, not the caller's; a caller says how much it wants,
+        never which page.
+        """
         binding = _binding_for(source, operation)
         if binding is not None:
             # A declarative sheet binding compiled to this operation name. Its
@@ -223,7 +234,7 @@ class DataSourceExecutor:
                 ops = [source.get_operation(name) for name in level]
                 results = await asyncio.gather(
                     *(
-                        self._execute_operation(source, o, params, memo, client)
+                        self._execute_operation(source, o, params, memo, client, limit=limit)
                         for o in ops if o
                     )
                 )
@@ -500,6 +511,8 @@ class DataSourceExecutor:
         params: dict[str, Any],
         memo: dict[str, Any],
         client: httpx.AsyncClient,
+        *,
+        limit: int | None = None,
     ) -> Any:
         # An upstream that spilled is still a fan-out source: it is a list of
         # items, it is just not resident. Treat a handle exactly like a list
@@ -520,7 +533,7 @@ class DataSourceExecutor:
                 f"is supported"
             )
         if not array_heads:
-            return await self._invoke(source, op, params, memo, {}, client)
+            return await self._invoke(source, op, params, memo, {}, client, limit=limit)
 
         head = next(iter(array_heads))
         binding_path = sorted(path for h, path in array_refs if h == head)[0]
@@ -612,8 +625,12 @@ class DataSourceExecutor:
         memo: dict[str, Any],
         bound: dict[str, Any],
         client: httpx.AsyncClient,
+        *,
+        limit: int | None = None,
     ) -> Any:
-        cache_key = self._cache_key(source, op, params, memo, bound)
+        # The limit is part of the key: a 10-row read and a whole-source read
+        # are different results, and serving one for the other would be silent.
+        cache_key = self._cache_key(source, op, params, memo, bound, limit=limit)
         ttl = source.cache.ttl_seconds
         if ttl > 0:
             hit = self._cache.get(cache_key)
@@ -638,7 +655,9 @@ class DataSourceExecutor:
                     )
                     self._cache.pop(cache_key, None)
 
-        value = await self._fetch_all_pages(client, source, op, params, memo, bound)
+        value = await self._fetch_all_pages(
+            client, source, op, params, memo, bound, limit=limit
+        )
 
         if ttl > 0:
             self._cache[cache_key] = (time.monotonic() + ttl, value)
@@ -675,6 +694,8 @@ class DataSourceExecutor:
         params: dict[str, Any],
         memo: dict[str, Any],
         bound: dict[str, Any],
+        *,
+        limit: int | None = None,
     ) -> Any:
         """Fetch an operation into the data stream store; return its ref.
 
@@ -692,6 +713,7 @@ class DataSourceExecutor:
             max_result_bytes=source.max_result_bytes,
             source_id=source.id,
             operation=op.name,
+            limit=limit,
         )
         try:
             if op.paginate is None:
@@ -731,7 +753,17 @@ class DataSourceExecutor:
         offset = 0
         pages = 0
 
-        for _ in range(max(1, paginate.max_pages)):
+        # max_pages 0 means "no ceiling": walk until the API says it is done.
+        # That is what a caller with no row limit is asking for, and
+        # max_result_bytes still bounds the total.
+        unlimited_pages = paginate.max_pages <= 0
+        page_cap = 1 if unlimited_pages else max(1, paginate.max_pages)
+
+        page = 0
+        while page < page_cap:
+            page += 1
+            if unlimited_pages:
+                page_cap = page + 1  # keep going; the stop conditions decide
             extra: dict[str, Any] = {}
             if paginate.type == "cursor":
                 if cursor is not None:
@@ -740,6 +772,15 @@ class DataSourceExecutor:
                 extra[paginate.param] = page_number
             else:  # offset
                 extra[paginate.param] = offset
+            if paginate.size_param:
+                # Ask for only as many as are still wanted, so a limit of 10
+                # against a 100-row page size costs one small page rather
+                # than a big one that is then thrown away.
+                size = max(1, paginate.page_size)
+                remaining = builder.remaining
+                if remaining is not None:
+                    size = max(1, min(size, remaining))
+                extra[paginate.size_param] = size
 
             try:
                 raw = await self._request_with_retry(
@@ -785,8 +826,16 @@ class DataSourceExecutor:
             pages += 1
 
             if builder.full:
-                # max_result_bytes reached. Stop rather than keep paging into a
-                # result already flagged truncated.
+                # Either the caller's row limit is satisfied -- nothing more is
+                # wanted -- or max_result_bytes was reached and the result is
+                # already flagged truncated. Either way there is no reason to
+                # ask for another page.
+                if builder.limit_reached:
+                    logger.debug(
+                        "data source '%s' operation '%s': row limit of %d "
+                        "reached after %d page(s)",
+                        source.id, op.name, builder.items_written, pages,
+                    )
                 return
 
             if paginate.type == "cursor":
@@ -798,18 +847,19 @@ class DataSourceExecutor:
                     return
                 page_number += 1
                 offset += len(mapped) if isinstance(mapped, list) else 1
-        else:
-            # The for-loop ran to completion, i.e. max_pages was reached without
-            # any stop condition firing. The result is very likely truncated, and
-            # a caller that silently believes it has everything is the dangerous
-            # case (for an alerting workflow, a short read reads as "nothing to
-            # report"). Say it loudly in the log, and -- when the result spilled
-            # -- record it on the handle, which is a channel the log is not.
+
+        # Fell out of the loop with no stop condition having fired, i.e. the
+        # max_pages ceiling was reached. The result is very likely incomplete,
+        # and a caller that silently believes it has everything is the
+        # dangerous case (for an alerting workflow a short read reads as
+        # "nothing to report"). Say it loudly in the log and record it on the
+        # ref, which is a channel the log is not.
+        if not unlimited_pages:
             builder.mark_truncated()
             logger.warning(
                 "data source '%s' operation '%s': stopped at the max_pages limit "
-                "(%d) -- the result is probably incomplete, raise max_pages or "
-                "narrow the query",
+                "(%d) -- the result is probably incomplete, raise max_pages "
+                "(0 = no ceiling) or narrow the query",
                 source.id, op.name, paginate.max_pages,
             )
 
@@ -864,7 +914,8 @@ class DataSourceExecutor:
             variables = self._render(op.variables or {}, params, memo, bound)
             if not isinstance(variables, dict):
                 variables = {}
-            variables.update(extra)
+            for path, value in extra.items():
+                _set_path(variables, path, value)
             resp = await client.post(
                 source.base_url,
                 json={"query": query, "variables": variables},
@@ -1035,6 +1086,7 @@ class DataSourceExecutor:
         params: dict[str, Any],
         memo: dict[str, Any],
         bound: dict[str, Any],
+        limit: int | None = None,
     ) -> str:
         resolved_params = {
             p.name: params.get(p.name) for p in op.params if p.name in params
@@ -1043,7 +1095,7 @@ class DataSourceExecutor:
             rendered = source.cache.key_template
             for name, value in resolved_params.items():
                 rendered = rendered.replace(f"{{params.{name}}}", str(value))
-            return f"{source.id}|{op.name}|{rendered}"
+            return f"{source.id}|{op.name}|{rendered}|limit={limit}"
         # Include the resolved value of every ref the operation's templates
         # bind — params AND upstream/fan-out results — so an operation that
         # depends on upstream data gets a distinct cache key per upstream
@@ -1055,7 +1107,12 @@ class DataSourceExecutor:
             )
             for head, path in operation_refs(op)
         }
-        payload = {"params": resolved_params, "refs": resolved_refs, "bound": bound}
+        payload = {
+            "params": resolved_params,
+            "refs": resolved_refs,
+            "bound": bound,
+            "limit": limit,
+        }
         return f"{source.id}|{op.name}|{_canonical_json(payload)}"
 
 
@@ -1069,6 +1126,29 @@ _PATH_SEPARATOR_RE = re.compile(r"[/\\]")
 
 # Segments that mean "somewhere else" rather than "a name".
 _TRAVERSAL_SEGMENTS = frozenset({".", ".."})
+
+
+def _set_path(target: dict[str, Any], path: str, value: Any) -> None:
+    """Set ``a.b.c`` inside nested dicts, creating the levels on the way.
+
+    Pagination for a GraphQL source has to reach a field of an input object:
+    control-center's ``pagination`` is ``PaginationInput{limit, skip}``, so the
+    offset belongs at ``pagination.skip``, not at a top-level variable of that
+    name. A path with no dots behaves exactly as a plain key assignment did.
+
+    An intermediate level that exists but is not a dict is replaced rather than
+    merged into: the paginator owns these fields, and a scalar sitting where an
+    object belongs is a definition mistake, not data worth preserving.
+    """
+    parts = path.split(".")
+    cursor = target
+    for part in parts[:-1]:
+        nxt = cursor.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cursor[part] = nxt
+        cursor = nxt
+    cursor[parts[-1]] = value
 
 
 def _encode_path_value(value: Any, *, op_name: str, placeholder: str) -> str:

@@ -135,7 +135,22 @@ class Paginate(BaseModel):
     type: Literal["cursor", "page", "offset"] = "page"
     cursor_path: str | None = None
     items_path: str | None = None
+    # Where the cursor / page number / offset goes. For an HTTP source this is
+    # a query-string argument. For a GraphQL source it is a variable, and it
+    # may be a DOTTED PATH into a nested input object -- control-center takes
+    # ``pagination: PaginationInput{limit, skip}``, so ``pagination.skip``
+    # reaches the right field where a flat name could not.
     param: str
+    # Where the page size goes, same dotted-path rules. Declaring it is what
+    # lets the executor choose the page size, and therefore what lets a caller
+    # ask for fewer rows than a whole page.
+    size_param: str | None = None
+    # Rows requested per page when ``size_param`` is set.
+    page_size: int = 100
+    # Safety ceiling on the number of pages. 0 means no ceiling: walk until
+    # the API says there is nothing left. That is what "fetch everything" has
+    # to mean for a source whose whole result is wanted, and it is safe to
+    # offer because ``max_result_bytes`` still bounds the total.
     max_pages: int = 10
     # JMESPath expression pointing at the API's own total-record count in a
     # raw page response ("total", "totalCount", "meta.total", …).  It is the
