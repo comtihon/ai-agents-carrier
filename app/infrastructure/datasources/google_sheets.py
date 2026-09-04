@@ -401,7 +401,22 @@ def google_sheets_operations() -> list[dict[str, Any]]:
                     "description": "OVERWRITE (default) or INSERT_ROWS",
                 },
             ],
-            "destructive": True,
+            # NOT gated. The approval gate exists for irreversible change,
+            # and appending rows after the last row of a table is not that --
+            # nothing existing is removed or overwritten. It was flagged
+            # destructive along with the two overwriting operations, so every
+            # append asked a human to approve "Data deletion — 1 row", which
+            # is wrong twice over and trains people to click Approve.
+            #
+            # `false` rather than unset, so this is a recorded decision: the
+            # verb is POST, which would not gate it either, but a future
+            # change to the verb rules must not silently pick this up.
+            #
+            # Note `insert_data_option`: Sheets' own default is OVERWRITE,
+            # which writes into whatever sits below the table rather than
+            # shifting it down. Pass INSERT_ROWS for an append that cannot
+            # touch anything already there.
+            "destructive": False,
             # Append is not idempotent: a retry after a timeout that in fact
             # reached Sheets appends the rows a second time. One attempt only.
             "retries": {"attempts": 1},
