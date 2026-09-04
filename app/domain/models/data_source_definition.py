@@ -116,13 +116,31 @@ class ParamSpec(BaseModel):
     default: Any | None = None
 
 
+# Verbs that carry their arguments in the query string rather than a body.
+_QUERY_METHODS = frozenset({"GET", "DELETE", "HEAD", "OPTIONS"})
+
+
 class Paginate(BaseModel):
     """Pagination strategy for a single operation.
 
+    Three kinds, and each works wherever the arguments have to go -- a query
+    string, a JSON body, or GraphQL variables (see ``location``), flat or
+    nested:
+
     cursor:  ``cursor_path`` is a JMESPath expression pointing at the next
-             cursor in the response; it is sent back as ``param``.
+             cursor in the response; it is sent back as ``param``. Covers
+             HubSpot's ``paging.next.after`` and Relay's
+             ``pageInfo.endCursor`` alike.
     page:    ``param`` carries a 1-based page number.
-    offset:  ``param`` carries the number of items already fetched.
+    offset:  ``param`` carries the number of items already fetched -- an
+             offset/limit API, including GraphQL's usual
+             ``pagination: {limit, skip}`` input object.
+
+    Declaring one is what makes paging the SOURCE's business: the executor
+    walks the pages and a caller says only how many rows it wants (or
+    nothing, for all of them). Without a block here, a workflow has to pass
+    page arguments itself, which is how ``pagination`` ended up as visible
+    step configuration reading ``[object Object]``.
 
     ``items_path`` (all modes) is a JMESPath expression pointing at the
     items array within a raw (unmapped) page response. It is used, when the
@@ -147,6 +165,29 @@ class Paginate(BaseModel):
     size_param: str | None = None
     # Rows requested per page when ``size_param`` is set.
     page_size: int = 100
+    # WHERE the pagination arguments go.
+    #
+    # "auto" is right almost always and is chosen from the operation's shape:
+    #   graphql            -> the GraphQL variables
+    #   GET/DELETE/HEAD    -> the query string
+    #   POST/PUT/PATCH     -> the JSON body
+    #
+    # The last one is the reason this field exists. A search endpoint that
+    # takes its filters in a POST body takes its cursor there too --
+    # HubSpot's /objects/{type}/search wants ``{"after": ..., "limit": ...}``
+    # in the body, and sending them in the query string does nothing at all,
+    # so that operation could not declare pagination and had to be walked by
+    # hand. Override only for an endpoint that genuinely disagrees with its
+    # own verb.
+    location: Literal["auto", "query", "body", "variables"] = "auto"
+
+    def resolved_location(self, *, kind: str, method: str) -> str:
+        """Where the pagination arguments actually go for this operation."""
+        if self.location != "auto":
+            return self.location
+        if kind == "graphql":
+            return "variables"
+        return "query" if (method or "GET").upper() in _QUERY_METHODS else "body"
     # Safety ceiling on the number of pages. 0 means no ceiling: walk until
     # the API says there is nothing left. That is what "fetch everything" has
     # to mean for a source whose whole result is wanted, and it is safe to
@@ -352,6 +393,43 @@ def operation_refs(operation: OperationDefinition) -> set[tuple[str, str]]:
     return refs
 
 
+def _validate_paginate(
+    definition: DataSourceDefinition, op: OperationDefinition
+) -> None:
+    """Reject a pagination block that cannot do what it says.
+
+    Caught here rather than at request time because the failure is silent
+    otherwise: a dotted path in a query string becomes a literal argument
+    named ``pagination.skip``, which the API ignores, so every page comes back
+    identical and the walk stops looking like it worked.
+    """
+    paginate = op.paginate
+    if paginate is None:
+        return
+    where = paginate.resolved_location(kind=definition.kind, method=op.method)
+    if where == "query":
+        for field in ("param", "size_param"):
+            value = getattr(paginate, field, None)
+            if value and "." in value:
+                raise ValueError(
+                    f"Operation '{op.name}': paginate.{field} '{value}' is a "
+                    f"nested path, but this operation's pagination goes in the "
+                    f"query string, where nesting has no meaning. Use a flat "
+                    f"name, or set paginate.location to 'body'."
+                )
+    if paginate.type == "cursor" and not paginate.cursor_path:
+        raise ValueError(
+            f"Operation '{op.name}': paginate.type is 'cursor' but no "
+            f"cursor_path is set, so there is nothing to read the next cursor "
+            f"from — the walk would stop after one page."
+        )
+    if definition.kind == "graphql" and where == "query":
+        raise ValueError(
+            f"Operation '{op.name}': a GraphQL operation's pagination goes in "
+            f"its variables; 'query' is not a place it can go."
+        )
+
+
 def validate_operations(definition: DataSourceDefinition) -> None:
     """Raise ``ValueError`` when the operation DAG is not resolvable.
 
@@ -360,6 +438,9 @@ def validate_operations(definition: DataSourceDefinition) -> None:
     depends on actual response shapes and is therefore enforced at runtime by
     the executor, not here.
     """
+    for op in definition.operations:
+        _validate_paginate(definition, op)
+
     names = [op.name for op in definition.operations]
     duplicates = {n for n in names if names.count(n) > 1}
     if duplicates:
