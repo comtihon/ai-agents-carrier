@@ -80,6 +80,12 @@ class DestructivePlan:
     # and — the part that changes an answer — whether a model wrote the
     # computation behind it.
     details: dict[str, str] = field(default_factory=dict)
+    # WHICH rows are touched, said without reference to their contents
+    # ("row 7", "a new row"). The Slack approval message uses this instead of
+    # `sample`, so a channel never carries data values; empty when the
+    # operation has no row identity (a fan-out delete over API resources),
+    # where the count is the whole story anyway.
+    rows_label: str = ""
 
 
 def _binding_details(binding: Any) -> dict[str, str]:
@@ -315,13 +321,14 @@ class DataSourceExecutor:
             from app.infrastructure.datasources.sheet_binding_runtime import (
                 binding_destructive_plan,
             )
-            rows, targets, sample = await binding_destructive_plan(
+            rows, targets, sample, rows_label = await binding_destructive_plan(
                 source, self, binding, params
             )
             return DestructivePlan(
                 affected_rows=rows,
                 targets=targets,
                 sample=sample,
+                rows_label=rows_label,
                 change_kind="write",
                 details=_binding_details(binding),
             )

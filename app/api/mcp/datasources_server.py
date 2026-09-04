@@ -312,6 +312,7 @@ async def _await_approval(
         affected_rows=plan.affected_rows,
         targets=plan.targets,
         sample=plan.sample,
+        rows_label=plan.rows_label,
         workflow_id=workflow_id,
         run_id=run_id,
         agent_id=agent_id,

@@ -84,6 +84,7 @@ class ApprovalService:
         surface: CallSurface = "workflow",
         change_kind: str = "delete",
         details: dict[str, str] | None = None,
+        rows_label: str = "",
     ) -> ApprovalCase:
         """Write a pending case, consult the meta-LLM, announce it.
 
@@ -110,6 +111,7 @@ class ApprovalService:
             params=dict(params or {}),
             affected_rows=affected_rows,
             affected_sample=[str(s) for s in sample],
+            affected_rows_label=rows_label,
             change_kind=change_kind if change_kind in ("delete", "write", "other") else "other",
             details=dict(details or {}),
             history_key=history_key_for(workflow_id, getattr(source, "id", ""), operation),
@@ -159,6 +161,7 @@ class ApprovalService:
         decided_by_name: str = "",
         decided_by_id: str = "",
         surface: CallSurface = "try_run",
+        rows_label: str = "",
     ) -> ApprovalCase:
         """Record a deletion somebody confirmed to their own face, already approved.
 
@@ -188,6 +191,7 @@ class ApprovalService:
             params=dict(params or {}),
             affected_rows=affected_rows,
             affected_sample=[str(s) for s in sample],
+            affected_rows_label=rows_label,
             history_key=history_key_for("", getattr(source, "id", ""), operation),
             decision_source="ui",
             decided_by_name=decided_by_name,
@@ -642,6 +646,12 @@ def _build_prompt(case: ApprovalCase, history: list[ApprovalCase], *, autonomous
         "Weigh how closely this case matches the prior ones. A row count far "
         "outside the range of the history is a reason to reject even when every "
         "prior case was approved.\n"
+        "Your REASON is posted to a Slack channel, which is a wider audience "
+        "than the people who can already see this data. Describe the SHAPE of "
+        "the case -- counts, the operation, how it compares to the history -- "
+        "and do NOT quote or paraphrase any value from the sample, the inputs "
+        "or the endpoint above. Say \"12 rows, in line with the last 8 "
+        "approvals\", never \"deleting the contact for <name>\".\n"
         "Respond with ONLY:\n"
         "DECISION: APPROVE or DECISION: REJECT\n"
         "REASON: <one line>"
