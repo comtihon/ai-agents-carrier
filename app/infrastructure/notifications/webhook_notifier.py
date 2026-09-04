@@ -348,7 +348,6 @@ APPROVAL_APPROVE_ACTION = "ds_approval_approve"
 APPROVAL_REJECT_ACTION = "ds_approval_reject"
 APPROVAL_VETO_ACTION = "ds_approval_veto"
 
-_APPROVAL_SAMPLE_LINES = 10
 
 
 def _approval_blocks(case: Any, *, mode: str = "request") -> list[dict[str, Any]]:
@@ -376,46 +375,48 @@ def _approval_blocks(case: Any, *, mode: str = "request") -> list[dict[str, Any]
         "veto": f"*{subject} auto-approved* — `{count}`",
         "notice": f"*{subject} confirmed* — `{count}`",
     }.get(mode, f"*{subject}* — `{count}`")
+    # DELIBERATELY VALUE-FREE.
+    #
+    # This message goes to a Slack channel, which is a much wider audience
+    # than the data source editor. It used to carry `Targets` (rendered
+    # request URLs, so record ids), `Input` (the operation's params verbatim)
+    # and `Changes` (the actual before/after cell values) -- CRM fields and
+    # spreadsheet contents posted into a channel, to answer a question that
+    # only needs "how much, and where".
+    #
+    # So: what is being changed, how much of it, and which rows -- by number.
+    # No values. `case.affected_sample`, `case.params` and `case.targets` are
+    # untouched on the model and still rendered by the authenticated surfaces
+    # (the editor, the management MCP's get_approval), where showing the data
+    # to someone who already has access to it is the point.
     fields = [
-        {"type": "mrkdwn", "text": f"*Data source*\n{case.datasource_name or case.datasource_id}"},
-        {"type": "mrkdwn", "text": f"*Operation*\n`{case.operation}` [{case.method}]"},
         {"type": "mrkdwn", "text": f"*Workflow*\n{case.workflow_name or case.workflow_id or '—'}"},
-        {"type": "mrkdwn", "text": f"*Run*\n`{case.run_id or '—'}`"},
+        {
+            "type": "mrkdwn",
+            "text": (
+                f"*Operation*\n"
+                f"{case.datasource_name or case.datasource_id} · "
+                f"`{case.operation}`"
+            ),
+        },
     ]
-    # Slack renders at most 10 fields in one section and the four above are the
-    # ones every case has, so take at most six more.
-    for label, value in list((getattr(case, "details", None) or {}).items())[:6]:
-        fields.append({"type": "mrkdwn", "text": f"*{label}*\n{_truncate(str(value), 300)}"})
+    if case.affected_rows_label:
+        fields.append(
+            {"type": "mrkdwn", "text": f"*Rows*\n{case.affected_rows_label}"}
+        )
+    # The one detail that survives the trim, because it is provenance rather
+    # than data and it changes the answer: whether the values being written
+    # were computed by code a language model wrote. Dropping it would make the
+    # message shorter and the decision worse.
+    provenance = (getattr(case, "details", None) or {}).get("Values from")
+    if provenance:
+        fields.append(
+            {"type": "mrkdwn", "text": f"*Values from*\n{_truncate(str(provenance), 300)}"}
+        )
     blocks: list[dict[str, Any]] = [
         {"type": "section", "text": {"type": "mrkdwn", "text": headline}},
         {"type": "section", "fields": fields},
     ]
-
-    if case.endpoint:
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*Endpoint*\n`{_truncate(case.endpoint, 400)}`"},
-        })
-    if case.params:
-        import json as _json
-        body = _json.dumps(case.params, default=str, indent=2)
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*Input*\n```{_truncate(body, 1200)}```"},
-        })
-    if case.affected_sample:
-        shown = case.affected_sample[:_APPROVAL_SAMPLE_LINES]
-        more = case.affected_rows - len(shown)
-        listing = "\n".join(f"• {s}" for s in shown)
-        if more > 0:
-            listing += f"\n• …and {more} more"
-        blocks.append({
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"*{'Changes' if write else 'Targets'}*\n{_truncate(listing, 1200)}",
-            },
-        })
 
     verdict = case.meta_llm
     if verdict is not None and verdict.decision != "abstain":

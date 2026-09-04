@@ -758,8 +758,9 @@ def test_a_delete_still_reads_as_a_deletion_of_rows():
     text = _rendered(ApprovalCase(id="apr_1", affected_rows=12, affected_sample=["42"]))
     assert "Data deletion awaiting approval" in text
     assert "12 rows" in text
-    assert "Targets" in text
     assert "cell" not in text
+    # Value-free: the Slack message states the shape, never the data.
+    assert "Targets" not in text
 
 
 def test_a_write_reads_as_a_write_of_cells():
@@ -773,9 +774,9 @@ def test_a_write_reads_as_a_write_of_cells():
     text = _rendered(case)
     assert "Spreadsheet write awaiting approval" in text
     assert "3 cells" in text
-    assert "Changes" in text
     assert "deletion" not in text
-    assert "rows" not in text
+    # Value-free: the before/after cell values stay out of Slack.
+    assert "Changes" not in text
 
 
 def test_one_cell_is_singular():
@@ -797,8 +798,10 @@ def test_details_reach_the_approver():
         },
     )
     text = _rendered(case)
-    assert "RC Projects Tracker" in text
+    # Only the provenance detail survives the trim -- it is a safety signal,
+    # not a data value. The document name and the rest of `details` do not.
     assert "generated code written by some-model" in text
+    assert "RC Projects Tracker" not in text
 
 
 def test_the_meta_llm_is_asked_about_a_write_not_a_deletion():
@@ -822,3 +825,95 @@ def test_the_meta_llm_is_asked_about_a_write_not_a_deletion():
     delete_prompt = _build_prompt(delete, [], autonomous=True)
     assert "whether this deletion runs" in delete_prompt
     assert "Rows affected: 2" in delete_prompt
+
+
+# ---------------------------------------------------------------------------
+# the Slack message must not carry data values
+# ---------------------------------------------------------------------------
+#
+# It used to post `Targets` (rendered request URLs, so record ids), `Input`
+# (the operation's params verbatim) and `Changes` (actual before/after cell
+# values) into a Slack channel -- CRM fields and spreadsheet contents, to
+# answer a question that only needs "how much, and where". The authenticated
+# surfaces still show all of it; a channel is a wider audience.
+
+def test_the_slack_message_carries_no_row_values():
+    case = ApprovalCase(
+        id="apr_leak",
+        datasource_id="hubspot-crm",
+        datasource_name="HubSpot CRM",
+        operation="archive_object",
+        method="DELETE",
+        workflow_id="cleanup",
+        workflow_name="Contact cleanup",
+        run_id="r1",
+        step_id="s1",
+        affected_rows=3,
+        endpoint="DELETE https://api.hubapi.com/crm/v3/objects/contacts/8801",
+        targets=[
+            "DELETE https://api.hubapi.com/crm/v3/objects/contacts/8801",
+            "DELETE https://api.hubapi.com/crm/v3/objects/contacts/8802",
+        ],
+        affected_sample=["ada@example.com", "grace@example.com"],
+        params={"objectType": "contacts", "email": "ada@example.com"},
+    )
+
+    text = _rendered(case)
+
+    # The shape is there.
+    assert "3 rows" in text
+    assert "Contact cleanup" in text
+    assert "archive_object" in text
+    # The data is not -- by value, by id, and by label.
+    for leaked in (
+        "ada@example.com", "grace@example.com", "8801", "8802",
+        "api.hubapi.com", "Targets", "Input", "Endpoint",
+    ):
+        assert leaked not in text, f"{leaked!r} must not reach Slack"
+
+
+def test_the_slack_message_names_the_row_without_its_contents():
+    case = ApprovalCase(
+        id="apr_row",
+        datasource_id="google-sheets",
+        datasource_name="Google Sheets",
+        operation="write_status",
+        method="POST",
+        workflow_id="tracker",
+        workflow_name="Status tracker",
+        run_id="r2",
+        step_id="s2",
+        affected_rows=2,
+        change_kind="write",
+        affected_rows_label="row 7",
+        affected_sample=["B7: 'draft' -> 'delivered'"],
+    )
+
+    text = _rendered(case)
+
+    assert "row 7" in text
+    assert "2 cells" in text
+    assert "delivered" not in text, "the new cell value must not reach Slack"
+    assert "draft" not in text
+
+
+def test_the_meta_llm_is_told_not_to_quote_values_in_its_reason():
+    """Its REASON is posted to Slack, and it sees the sample and the inputs.
+
+    Rewriting the message blocks alone would not have closed the leak: a model
+    that has been shown the values will happily quote them back in one line of
+    free text.
+    """
+    from app.application import approval_service as svc
+
+    prompt_builder = next(
+        getattr(svc, name) for name in dir(svc)
+        if name.startswith("_") and "prompt" in name.lower()
+        and callable(getattr(svc, name))
+    )
+    import inspect
+
+    source = inspect.getsource(prompt_builder)
+
+    assert "posted to a Slack channel" in source
+    assert "do NOT quote" in source

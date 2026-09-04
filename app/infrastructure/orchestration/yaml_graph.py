@@ -2330,6 +2330,7 @@ class YamlGraphRunner:
                 affected_rows=plan.affected_rows,
                 targets=plan.targets,
                 sample=plan.sample,
+                rows_label=plan.rows_label,
                 workflow_id=self.id,
                 run_id=run_id,
                 step_id=step_id,

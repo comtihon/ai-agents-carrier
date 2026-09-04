@@ -803,26 +803,35 @@ async def binding_destructive_plan(
     executor: Any,
     binding: SheetBinding,
     params: dict[str, Any],
-) -> tuple[int, list[str], list[Any]]:
-    """``(affected_rows, targets, sample)`` for the approval gate.
+) -> tuple[int, list[str], list[Any], str]:
+    """``(affected_rows, targets, sample, rows_label)`` for the approval gate.
 
     ``affected_rows`` counts cells actually being written, so a write whose
     every column was skipped reports zero and the gate lets it through — there
     is nothing for a person to approve.
+
+    ``rows_label`` names WHICH rows are touched without saying anything about
+    their contents ("row 7", "a new row"). It exists so the Slack message can
+    state the blast radius without carrying data values into a channel — the
+    values stay in ``sample``, which only the authenticated editor and the
+    management MCP read.
     """
     plan = await plan_write_binding(source, executor, binding, params)
     if plan["status"] == "skipped":
-        return 0, [], []
+        return 0, [], [], ""
     written = [c for c in plan["cells"] if c["action"] == "write"]
     target = (
         f"{binding.document.name or binding.document.file_id} · "
         f"{binding.document.sheet}"
     )
+    rows_label = ""
     if plan.get("row_number"):
-        target = f"{target} row {plan['row_number']}"
+        rows_label = f"row {plan['row_number']}"
+        target = f"{target} {rows_label}"
     elif plan["mode"] == "append_row":
+        rows_label = "a new row"
         target = f"{target} (new row)"
-    return len(written), [target], render_cell_changes(plan["cells"])
+    return len(written), [target], render_cell_changes(plan["cells"]), rows_label
 
 
 def a1_for_column(binding: SheetBinding, column: str, row_number: int) -> str:

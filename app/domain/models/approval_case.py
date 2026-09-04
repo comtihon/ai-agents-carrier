@@ -88,6 +88,11 @@ class ApprovalCase(BaseModel):
     # A short, human-readable sample of what the operation acts on: the rows
     # being removed for a delete, the before/after of each cell for a write.
     affected_sample: list[Any] = Field(default_factory=list)
+    # WHICH rows are affected, stated without their contents ("row 7").
+    # The Slack message renders this instead of `affected_sample`, so a
+    # channel never carries data values; the authenticated surfaces (the data
+    # source editor, the management MCP) keep showing the sample itself.
+    affected_rows_label: str = ""
     # Which of those two this is. Decides the wording an approver reads and the
     # question the meta-LLM is asked; "delete" keeps the behaviour every
     # existing case had before writes joined the gate.
