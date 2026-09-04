@@ -453,3 +453,85 @@ def test_env_is_not_passed_through():
     out = YamlGraphRunner._render_deep({"v": "{env.NOPE_NOT_SET}"}, {})["v"]
 
     assert out == ""
+
+
+# ---------------------------------------------------------------------------
+# a store whose bytes are not on this filesystem
+# ---------------------------------------------------------------------------
+#
+# With STREAM_BACKEND=gcs the store has no local path. `local` and `docker`
+# can only be handed a path -- their payload channel already carries the code
+# and state -- and only `k8s` consumes a copy callable. So a copy callable
+# returned for `local` reached run_script and was ignored: the fetch plainly
+# succeeded, the ref was in state, and the script's records() still raised
+# "no data stream is attached". Silent, and on the DEFAULT runtime.
+
+class _RemoteOnlyStore:
+    """A store with no local_path, like GcsStreamStore."""
+
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+        self.copies = 0
+
+    async def local_path(self, ref):
+        return None
+
+    async def copy_to(self, ref, sink):
+        self.copies += 1
+        sink.write(self.payload)
+        return len(self.payload)
+
+
+async def test_a_remote_store_is_materialised_for_the_local_sandbox(tmp_path):
+    import json as _json
+    import os
+
+    payload = b"".join(
+        _json.dumps(r).encode() + b"\n" for r in ROWS[:5]
+    )
+    store = _RemoteOnlyStore(payload)
+    ref = DataRef(id="ds_remote", items=5, bytes=len(payload))
+
+    runner = _runner([{"id": "s", "type": "python"}])
+    runner._stream_store = store
+
+    delivery = await runner._stream_delivery(ref, "local", "s")
+
+    assert store.copies == 1, "the bytes must be fetched down"
+    assert "stream_copy" not in delivery, (
+        "local cannot consume a copy callable — run_script ignores it"
+    )
+    path = delivery["stream_path"]
+    assert delivery["_tempfile"] == path
+    assert open(path, "rb").read() == payload
+    assert delivery["stream_records"] == 5
+    os.unlink(path)
+
+
+async def test_k8s_still_gets_a_copy_callable_not_a_temp_file(tmp_path):
+    """k8s has to cross into another pod, so no local materialisation."""
+    store = _RemoteOnlyStore(b'{"a":1}\n')
+    ref = DataRef(id="ds_remote", items=1, bytes=8)
+
+    runner = _runner([{"id": "s", "type": "python"}])
+    runner._stream_store = store
+
+    delivery = await runner._stream_delivery(ref, "k8s", "s")
+
+    assert callable(delivery["stream_copy"])
+    assert "stream_path" not in delivery
+    assert "_tempfile" not in delivery
+    assert store.copies == 0, "nothing is fetched until the pod is attached"
+
+
+async def test_a_local_disk_store_is_handed_its_path_directly(streamed):
+    """No copy when the bytes are already on this filesystem."""
+    store, ref = streamed
+
+    runner = _runner([{"id": "s", "type": "python"}])
+    runner._stream_store = store
+
+    delivery = await runner._stream_delivery(ref, "local", "s")
+
+    assert delivery["stream_path"].endswith(f"{ref.id}.jsonl")
+    assert "_tempfile" not in delivery, "nothing to clean up"
