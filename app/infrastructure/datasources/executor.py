@@ -38,6 +38,7 @@ from app.domain.models.data_source_definition import (
     operation_refs,
 )
 from app.domain.models.datastream import as_data_ref, is_data_ref
+from app.infrastructure.datasources.destructive import DESTRUCTIVE_METHODS
 from app.infrastructure.datasources.datastream import NotStreamable, StreamBuilder
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,47 @@ class DestructivePlan:
     # operation has no row identity (a fan-out delete over API resources),
     # where the count is the whole story anyway.
     rows_label: str = ""
+
+
+def _rows_from_params(
+    op: OperationDefinition, params: dict[str, Any]
+) -> tuple[int, str]:
+    """How many rows a non-fan-out call is about to touch, and how to say it.
+
+    The fan-out case counts elements exactly. Without one the count was
+    hard-coded to 1, so a Sheets write of ten rows told the approver "1 row" --
+    the one number the message exists to convey, wrong.
+
+    A write's payload is normally one array param (Sheets' ``values``,
+    HubSpot's ``inputs``), so exactly one array-typed param that holds a list
+    gives the count. Ambiguity is left alone: two array params, or none, falls
+    back to 1, because a guess here is worse than a vague answer.
+    """
+    arrays = [
+        p.name for p in op.params
+        if p.type == "array" and isinstance(params.get(p.name), list)
+    ]
+    if len(arrays) != 1:
+        return 1, ""
+    rows = len(params[arrays[0]])
+    return max(1, rows), f"{rows} from `{arrays[0]}`"
+
+
+def _change_kind_for(op: OperationDefinition, source: DataSourceDefinition) -> str:
+    """What kind of change this operation makes, for the words an approver reads.
+
+    Read off the operation rather than defaulting, because the default was
+    "delete" and only the sheet-binding path ever overrode it -- so a gated
+    Google Sheets write announced itself as "Data deletion awaiting approval",
+    which is wrong and teaches people that the words do not mean anything.
+
+    A DELETE verb removes rows. Anything else that reaches the gate is a
+    write: it got there by being flagged ``destructive`` or by being a GraphQL
+    mutation, neither of which implies removal.
+    """
+    if (op.method or "GET").upper() in DESTRUCTIVE_METHODS:
+        return "delete"
+    return "write"
 
 
 def _binding_details(binding: Any) -> dict[str, str]:
@@ -398,10 +440,13 @@ class DataSourceExecutor:
             )
 
         if not array_heads:
+            rows, label = _rows_from_params(op, params)
             return DestructivePlan(
-                affected_rows=1,
+                affected_rows=rows,
                 targets=[self._describe_target(source, op, params, memo, {})],
                 sample=[params] if params else [],
+                change_kind=_change_kind_for(op, source),
+                rows_label=label,
             )
 
         head = next(iter(array_heads))
@@ -437,6 +482,7 @@ class DataSourceExecutor:
             affected_rows=affected,
             targets=targets,
             sample=sample,
+            change_kind=_change_kind_for(op, source),
         )
 
     def _describe_target(

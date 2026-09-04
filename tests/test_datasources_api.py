@@ -842,9 +842,12 @@ async def test_sheets_template_is_saveable_through_the_normal_create_path(google
         "get_metadata", "get_values", "batch_get_values",
         "update_values", "batch_update_values", "append_values",
     ]
-    # Every write is gated; no read is.
+    # The two OVERWRITING writes are gated. Reads are not, and neither is
+    # append: it adds rows after the last one and removes nothing, so the
+    # gate has nothing to protect. It used to be gated with the other two,
+    # which made every append ask a person to approve "Data deletion".
     gated = {op.name for op in stored.operations if op.destructive}
-    assert gated == {"update_values", "batch_update_values", "append_values"}
+    assert gated == {"update_values", "batch_update_values"}
     # Append is not idempotent, so it is not retried.
     append = stored.get_operation("append_values")
     assert append is not None and append.retries is not None
