@@ -129,7 +129,7 @@ async def test_approving_runs_the_deletion():
         _CONFIG,
     )
 
-    executor.execute.assert_awaited_once_with(_SOURCE, "drop", {})
+    executor.execute.assert_awaited_once_with(_SOURCE, "drop", {}, limit=None)
     assert state["removed"] == {"deleted": 3}
     assert state["_approval_case_id"] == "apr_1"
     service.decide.assert_awaited_once()
