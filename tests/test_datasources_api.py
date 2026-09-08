@@ -923,3 +923,58 @@ async def test_google_auth_cannot_take_its_subject_from_backend_config(google_cl
     })
     assert resp.status_code == 422
     assert "no secret" in resp.json()["detail"]
+
+
+async def test_google_resolve_mints_a_drive_metadata_token_not_drive_file(monkeypatch):
+    """The access check runs on drive.metadata.readonly, and only that.
+
+    drive.file covers only documents this backend created, so under it Drive
+    answers 404 for a spreadsheet that was *shared* with the service account —
+    and resolve then reported a readable document as not shared yet. The scope
+    is also deliberately narrow: this call reads a name, a type and canEdit,
+    and the token it mints must not be able to read a cell.
+    """
+    from app.infrastructure.auth import google_token_provider
+    from app.infrastructure.datasources.google_sheets import resolve_google_file
+
+    google_token_provider.reset_token_cache()
+    minted: list[list[str]] = []
+
+    def _record(subject, scopes):
+        minted.append(list(scopes))
+        return "tok", 3600.0
+
+    monkeypatch.setattr(google_token_provider, "_mint_token", _record)
+    monkeypatch.setattr(
+        "app.infrastructure.datasources.google_sheets.httpx.AsyncClient",
+        _fake_drive(200, {
+            "id": SHEET_ID,
+            "name": "Shared with us",
+            "mimeType": "application/vnd.google-apps.spreadsheet",
+            "capabilities": {"canEdit": True},
+        }),
+    )
+
+    result = await resolve_google_file(SHEET_URL, _google_settings())
+    assert result["status"] == "ok"
+    assert minted == [["https://www.googleapis.com/auth/drive.metadata.readonly"]]
+    google_token_provider.reset_token_cache()
+
+
+def test_the_deployment_default_scopes_allow_the_drive_metadata_scope():
+    """resolve narrows to the metadata scope, and narrowing drops the unallowed.
+
+    So a deployment default that left the scope out would silently put the
+    token back to the full Sheets set and 404 all over again.
+    """
+    from app.infrastructure.auth.google_token_provider import (
+        DRIVE_METADATA_SCOPE,
+        configured_scopes,
+        resolve_scopes,
+    )
+
+    settings = _google_settings()
+    assert DRIVE_METADATA_SCOPE in configured_scopes(settings)
+    assert resolve_scopes(
+        {"type": "google", "scopes": [DRIVE_METADATA_SCOPE]}, settings
+    ) == [DRIVE_METADATA_SCOPE]
