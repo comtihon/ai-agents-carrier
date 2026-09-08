@@ -701,8 +701,12 @@ async def list_pending_approvals(deps: ManagementDeps, limit: int = 20) -> str:
             "Approvals are unavailable: this backend has no approval store "
             "configured, so destructive operations run ungated."
         )
+    # A summary read: the line below quotes the id, the kind, the source, the
+    # operation, the row count and the verdict, and none of the bulky fields.
+    # get_approval is what carries those, which the tool tells the caller to
+    # use before deciding anything.
     cases = await deps.approval_backend.list(
-        status="pending", limit=max(1, min(limit, _APPROVAL_LIST_MAX))
+        status="pending", limit=max(1, min(limit, _APPROVAL_LIST_MAX)), summary=True
     )
     if not cases:
         return "No approvals are waiting."

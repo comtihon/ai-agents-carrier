@@ -221,3 +221,112 @@ async def test_every_route_reports_a_missing_backend_as_501(client_without_backe
     # The badge count is the exception: a dock that cannot draw a number must
     # still draw the rail.
     assert (await c.get("/api/v1/approvals/pending/count")).json() == {"count": 0}
+
+
+# ─── Summary reads ────────────────────────────────────────────────────────────
+#
+# The queue row shows a data source, an operation, a row count and a verdict.
+# The fields it does *not* show are the unbounded ones — the caller's inputs,
+# every resolved target, a per-row (on a write, per-cell) sample, and the
+# details map — and fetching fifty of those to draw fifty one-line rows is what
+# made the panel slow to open. `view=summary` leaves them out.
+
+
+def _fat_case(**overrides) -> ApprovalCase:
+    return _case(
+        params={"body": "x" * 500},
+        targets=[f"https://files.test/f{i}" for i in range(50)],
+        affected_sample=[{"row": i, "before": "a", "after": "b"} for i in range(50)],
+        details={"document": "Q3 sheet", "values_from": "generated code"},
+        **overrides,
+    )
+
+
+async def test_summary_view_leaves_out_the_bulky_fields(client):
+    c, backend = client
+    await backend.create(_fat_case())
+
+    row = (await c.get("/api/v1/approvals", params={"view": "summary"})).json()["items"][0]
+
+    for field in ("params", "targets", "affected_sample", "details"):
+        assert field not in row, f"{field} should not be in a summary row"
+
+
+async def test_summary_view_keeps_everything_a_row_renders(client):
+    c, backend = client
+    await backend.create(_fat_case(
+        workflow_name="Nightly cleanup",
+        affected_rows=1240,
+        change_kind="write",
+    ))
+
+    row = (await c.get("/api/v1/approvals", params={"view": "summary"})).json()["items"][0]
+
+    assert row["id"] == "apr_1"
+    assert row["status"] == "pending"
+    assert row["datasource_name"] == "File store"
+    assert row["operation"] == "drop"
+    assert row["method"] == "DELETE"
+    assert row["affected_rows"] == 1240
+    assert row["workflow_name"] == "Nightly cleanup"
+    assert row["change_kind"] == "write"
+    assert row["summary"]
+
+
+async def test_full_view_is_the_default_so_old_callers_keep_their_fields(client):
+    c, backend = client
+    await backend.create(_fat_case())
+
+    row = (await c.get("/api/v1/approvals")).json()["items"][0]
+
+    assert row["params"] == {"body": "x" * 500}
+    assert len(row["targets"]) == 50
+    assert len(row["affected_sample"]) == 50
+    assert row["details"]["document"] == "Q3 sheet"
+
+
+async def test_reading_one_case_always_carries_the_values(client):
+    c, backend = client
+    await backend.create(_fat_case())
+    # The panel lists summaries and the detail page reads the case by id, so
+    # this is the request that has to hold everything the reviewer decides on.
+    await c.get("/api/v1/approvals", params={"view": "summary"})
+
+    case = (await c.get("/api/v1/approvals/apr_1")).json()
+
+    assert case["params"] == {"body": "x" * 500}
+    assert len(case["affected_sample"]) == 50
+
+
+async def test_a_summary_read_does_not_empty_the_stored_case(client):
+    c, backend = client
+    await backend.create(_fat_case())
+
+    await c.get("/api/v1/approvals", params={"view": "summary"})
+
+    stored = await backend.get("apr_1")
+    assert stored is not None
+    assert stored.params == {"body": "x" * 500}
+    assert len(stored.targets) == 50
+
+
+async def test_history_can_be_read_as_summaries(client):
+    c, backend = client
+    await backend.create(_fat_case(
+        id="done", status="approved", decided_by_name="ada", reason="routine",
+        decided_at=datetime.now(timezone.utc),
+    ))
+
+    body = (await c.get("/api/v1/approvals/history", params={
+        "workflow_id": "wf", "datasource_id": "files", "operation": "drop",
+        "view": "summary",
+    })).json()
+
+    row = body["items"][0]
+    assert row["decided_by_name"] == "ada"
+    assert row["reason"] == "routine"
+    assert "affected_sample" not in row
+    # The streak is what the page reads off this response; it must survive the
+    # projection, because it is computed from fields a summary keeps.
+    assert body["streak"] == 1
+    assert body["streak_decision"] == "approved"
