@@ -579,10 +579,16 @@ class Settings(BaseSettings):
     # OAuth2 scopes to mint that token with. The metadata server's own token is
     # cloud-platform-scoped and Sheets/Drive reject it, so the scopes have to be
     # stated; an auth block may narrow them further but not widen them.
+    # drive.metadata.readonly is what makes the access check work: drive.file
+    # covers only documents this backend created, so a *shared* spreadsheet
+    # answers 404 under it and the resolve endpoint used to report a document
+    # as unshared while the Sheets API read it happily. Keep it in any narrowed
+    # set, or resolve_google_file goes back to lying.
     google_impersonate_scopes: list[str] = Field(
         default=[
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive.file",
+            "https://www.googleapis.com/auth/drive.metadata.readonly",
         ],
         alias="GOOGLE_IMPERSONATE_SCOPES",
     )

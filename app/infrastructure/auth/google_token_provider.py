@@ -54,12 +54,24 @@ _DEFAULT_TOKEN_TTL_SECONDS = 3600
 # generateAccessToken cannot exceed an hour without an org policy allowing it.
 _TOKEN_LIFETIME_SECONDS = 3600
 
-# Scopes a Google Sheets data source needs: the spreadsheet itself, plus
-# drive.file so the resolve endpoint can read the metadata of a document that
-# was shared with the impersonated account.
+# Reading a document's Drive metadata — the access check behind
+# ``resolve_google_file``. It is NOT drive.file: that scope covers only files
+# the app itself created or the user picked through Drive's own picker, so a
+# spreadsheet that was *shared* with the impersonated account answers 404 under
+# it, and resolve reported "not shared with the service account yet" for a
+# document it could in fact read through the Sheets API. metadata.readonly is
+# the narrowest scope that answers the question honestly: it reads a file's
+# name, type and capabilities and cannot read a single cell.
+DRIVE_METADATA_SCOPE = "https://www.googleapis.com/auth/drive.metadata.readonly"
+
+# Scopes a Google Sheets data source needs: the spreadsheets themselves, the
+# Drive metadata scope above so the resolve endpoint can see a shared document,
+# and drive.file, which stays because a document this backend *creates* is
+# reachable under it without the document ever being shared with anyone.
 SHEETS_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.file",
+    DRIVE_METADATA_SCOPE,
 ]
 
 

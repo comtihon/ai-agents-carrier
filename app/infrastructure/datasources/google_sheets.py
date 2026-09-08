@@ -28,6 +28,7 @@ import httpx
 
 from app.core.config import Settings
 from app.infrastructure.auth.google_token_provider import (
+    DRIVE_METADATA_SCOPE,
     SHEETS_SCOPES,
     GoogleAuthError,
     configured_subject,
@@ -128,8 +129,14 @@ async def resolve_google_file(
         }
 
     try:
+        # Only the Drive metadata scope: this call reads a file's name, type
+        # and capabilities and nothing else, so the token it mints cannot read
+        # a cell. Deliberately NOT drive.file, which covers only documents this
+        # backend created — under it a spreadsheet that was merely *shared*
+        # with the service account answers 404, and this function then reported
+        # "not shared yet" for a document the Sheets API could read.
         headers = await get_google_auth_header(
-            {"type": "google", "scopes": list(SHEETS_SCOPES)}, settings
+            {"type": "google", "scopes": [DRIVE_METADATA_SCOPE]}, settings
         )
     except GoogleAuthError as exc:
         # Unset GOOGLE_IMPERSONATE_SA is a deployment gap, not a user mistake.

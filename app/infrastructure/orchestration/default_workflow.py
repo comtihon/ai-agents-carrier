@@ -123,6 +123,12 @@ def build_default_workflow(
         data_source_backend=data_source_backend,
         event_backend=event_backend,
         data_artifact_backend=data_artifact_backend,
+        # The container's executor when there is one: the sheet-binding tools
+        # (probe, preview, retest) make real Sheets calls, and only that
+        # executor holds the data stream store every data source result is
+        # written to. Without it they fail with "no data stream store is
+        # configured" rather than reading the sheet.
+        data_source_executor=getattr(container, "data_source_executor", None),
         refresh_runner=refresh_runner,
         refresh_datasources=refresh_datasources,
     )

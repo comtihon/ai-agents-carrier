@@ -217,3 +217,47 @@ async def test_a_writer_cannot_delete_a_binding(deps, executor):
 
     assert "Not permitted" in result
     assert len((await deps.data_source_backend.get("google-sheets")).bindings) == 1
+
+
+# ---------------------------------------------------------------------------
+# Which executor the binding tools run on
+# ---------------------------------------------------------------------------
+
+def test_binding_tools_run_on_the_container_executor():
+    """The container's executor, because only that one has the stream store.
+
+    Every data source result is written to a stream and handed on as a
+    reference, so an executor built inside the tool raised "no data stream
+    store is configured" on its first call — which made probe_google_sheet, and
+    with it the whole binding-authoring path, unusable in a real deployment.
+    """
+    wired = object()
+    deps = ManagementDeps(
+        registry=None,  # type: ignore[arg-type]
+        run_repository=None,  # type: ignore[arg-type]
+        data_source_executor=wired,
+    )
+    assert core._binding_executor(deps) is wired
+
+
+def test_binding_tools_fall_back_to_a_local_executor():
+    """A caller that assembles deps itself (a test, a script) still works."""
+    from app.infrastructure.datasources.executor import DataSourceExecutor
+
+    deps = ManagementDeps(
+        registry=None,  # type: ignore[arg-type]
+        run_repository=None,  # type: ignore[arg-type]
+    )
+    assert isinstance(core._binding_executor(deps), DataSourceExecutor)
+
+
+def test_deps_from_container_carries_the_executor():
+    """The wiring itself, so the field cannot be added and left unfilled."""
+    class _Container:
+        yaml_graph_registry = None
+        run_repository = None
+        data_source_executor = object()
+
+    container = _Container()
+    deps = core.deps_from_container(container)
+    assert deps.data_source_executor is container.data_source_executor

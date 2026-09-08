@@ -136,6 +136,14 @@ class ManagementDeps:
     # None means the tools that read it say so rather than reporting an empty
     # queue, which would read as "nothing is waiting".
     approval_backend: "ApprovalCaseBackend | None" = None
+    # The container's DataSourceExecutor, for the sheet-binding tools that have
+    # to make a real Sheets call (probe, preview, retest). It is not optional in
+    # practice: an executor built here instead would carry no data stream store,
+    # and every data source result is written to a stream and passed on as a
+    # reference — so a locally built one raised "no data stream store is
+    # configured" on the first call, which made probe_google_sheet unusable and
+    # with it the whole binding-authoring path.
+    data_source_executor: Any = None
     refresh_runner: "Callable[[str], Awaitable[None]] | None" = None
     refresh_datasources: "Callable[[], Awaitable[None]] | None" = None
     # PubSubSubscriberManager when Pub/Sub triggers are enabled, else None.
@@ -161,6 +169,7 @@ def deps_from_container(
         script_backend=getattr(container, "script_backend", None),
         data_artifact_backend=getattr(container, "data_artifact_backend", None),
         approval_backend=getattr(container, "approval_backend", None),
+        data_source_executor=getattr(container, "data_source_executor", None),
         refresh_runner=getattr(container, "refresh_runner", None),
         refresh_datasources=refresh_datasources,
         pubsub_subscriber=getattr(container, "pubsub_subscriber", None),
@@ -2127,12 +2136,21 @@ async def probe_google_sheet(
 
 
 def _binding_executor(deps: ManagementDeps) -> Any:
-    """The shared executor, or a fresh one.
+    """The container's executor, or a fresh one as a last resort.
 
-    ManagementDeps deliberately carries only backends, so the executor is not
-    one of its fields; a plain instance is equivalent here because everything a
-    binding needs comes from the source definition it is handed.
+    It has to be the container's: that one holds the data stream store, and a
+    data source result is always written to a stream and handed on as a
+    reference. An executor built here has no store, so its very first call
+    raised "no data stream store is configured" — which is what broke
+    probe_google_sheet, and with it the only way to author a binding.
+
+    The fallback stays for a caller that assembles ManagementDeps itself (a
+    test, a script): everything else a binding needs comes from the source
+    definition it is handed, so a storeless executor is fine right up to the
+    moment it has to stream something.
     """
+    if deps.data_source_executor is not None:
+        return deps.data_source_executor
     from app.infrastructure.datasources.executor import DataSourceExecutor
     return DataSourceExecutor()
 
