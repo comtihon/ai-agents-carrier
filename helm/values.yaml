@@ -2,7 +2,7 @@ replicaCount: 1
 
 image:
   repository: ghcr.io/comtihon/ai-agents-carrier
-  tag: v1.2.185
+  tag: v1.2.186
   pullPolicy: IfNotPresent
 
 serviceAccount:
