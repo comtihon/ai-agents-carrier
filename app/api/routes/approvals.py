@@ -68,9 +68,18 @@ def _principal(request: Request) -> tuple[str, str]:
     return str(name), str(claims.get("sub") or "")
 
 
-def _case_json(case: ApprovalCase) -> dict:
+# Fields a summary read never loaded. Dropped from the response rather than
+# sent empty: a client must be able to tell "this case has no params" from
+# "you did not ask for them".
+_BULKY_FIELDS = ("params", "targets", "affected_sample", "details")
+
+
+def _case_json(case: ApprovalCase, *, summary: bool = False) -> dict:
     data = case.model_dump(mode="json")
     data["summary"] = case.summary_line()
+    if summary:
+        for field in _BULKY_FIELDS:
+            data.pop(field, None)
     return data
 
 
@@ -84,12 +93,22 @@ async def list_approvals(
     run_id: str | None = None,
     limit: int = 50,
     offset: int = 0,
+    view: Literal["full", "summary"] = "full",
     container: ApplicationContainer = Depends(get_container),
 ):
-    """The approval queue and its history, newest first."""
+    """The approval queue and its history, newest first.
+
+    ``view=summary`` leaves out the inputs, the resolved targets, the affected
+    sample and the details map. A queue row shows none of them, and on a write
+    case the sample holds a before/after for every cell — fifty of those is
+    megabytes crossing the wire to draw a list of one-line rows. Read one case
+    by id to get them. ``full`` stays the default so no existing caller silently
+    loses fields it was relying on.
+    """
     _require_backend(container)
     assert container.approval_backend is not None
     limit = max(1, min(limit, 200))
+    summary = view == "summary"
     cases = await container.approval_backend.list(
         status=status,
         workflow_id=workflow_id,
@@ -97,6 +116,7 @@ async def list_approvals(
         run_id=run_id,
         limit=limit,
         offset=offset,
+        summary=summary,
     )
     total = await container.approval_backend.count(
         status=status,
@@ -105,7 +125,7 @@ async def list_approvals(
         run_id=run_id,
     )
     return {
-        "items": [_case_json(c) for c in cases],
+        "items": [_case_json(c, summary=summary) for c in cases],
         "total": total,
         "limit": limit,
         "offset": offset,
@@ -126,6 +146,7 @@ async def decision_history(
     datasource_id: str,
     operation: str,
     limit: int = 25,
+    view: Literal["full", "summary"] = "full",
     container: ApplicationContainer = Depends(get_container),
 ):
     """Past decisions in one bucket — what the meta-LLM reads, shown to people too.
@@ -137,7 +158,10 @@ async def decision_history(
     _require_backend(container)
     assert container.approval_backend is not None
     key = history_key_for(workflow_id, datasource_id, operation)
-    cases = await container.approval_backend.history(key, limit=max(1, min(limit, 100)))
+    summary = view == "summary"
+    cases = await container.approval_backend.history(
+        key, limit=max(1, min(limit, 100)), summary=summary
+    )
 
     streak_value: str | None = None
     streak = 0
@@ -153,7 +177,7 @@ async def decision_history(
     threshold = int(getattr(container.settings, "approval_auto_decide_threshold", 10) or 10)
     return {
         "history_key": key,
-        "items": [_case_json(c) for c in cases],
+        "items": [_case_json(c, summary=summary) for c in cases],
         "streak": streak,
         "streak_decision": streak_value,
         "threshold": threshold,

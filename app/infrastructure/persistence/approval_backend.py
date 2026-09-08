@@ -43,7 +43,16 @@ class ApprovalCaseBackend(ABC):
         run_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
-    ) -> list[ApprovalCase]: ...
+        summary: bool = False,
+    ) -> list[ApprovalCase]:
+        """Cases newest first.
+
+        ``summary`` drops the bulky fields — the inputs, the resolved targets,
+        the affected sample and the details map. A queue row shows none of
+        them, and on a write case the sample is a before/after of every cell:
+        fifty of those is megabytes on the wire to render a list of one-line
+        rows. The fields come back in full from ``get``.
+        """
 
     @abstractmethod
     async def count(
@@ -57,7 +66,9 @@ class ApprovalCaseBackend(ABC):
     ) -> int: ...
 
     @abstractmethod
-    async def history(self, history_key: str, limit: int = 20) -> list[ApprovalCase]:
+    async def history(
+        self, history_key: str, limit: int = 20, *, summary: bool = False
+    ) -> list[ApprovalCase]:
         """Decided cases in one bucket, newest first.
 
         Try-run confirmations are excluded. They are real approvals and they
@@ -96,6 +107,11 @@ class MongoApprovalBackend(ApprovalCaseBackend):
     # Surfaces whose decisions carry weight in the history. Try-run is absent:
     # see ``ApprovalCaseBackend.history``.
     _HISTORY_SURFACES = ("workflow", "mcp")
+    # Left out of a summary read. Every one of these is unbounded: the inputs
+    # a caller passed, every resolved target, a per-row (for a write, per-cell)
+    # sample, and the details map. None of them is on a list row.
+    _BULKY_FIELDS = ("params", "targets", "affected_sample", "details")
+    _SUMMARY_PROJECTION = {f: 0 for f in _BULKY_FIELDS}
 
     def __init__(self, uri: str, database: str) -> None:
         from motor.motor_asyncio import AsyncIOMotorClient
@@ -177,9 +193,13 @@ class MongoApprovalBackend(ApprovalCaseBackend):
         run_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
+        summary: bool = False,
     ) -> list[ApprovalCase]:
         cursor = (
-            self._col.find(self._query(status, workflow_id, datasource_id, run_id))
+            self._col.find(
+                self._query(status, workflow_id, datasource_id, run_id),
+                projection=self._SUMMARY_PROJECTION if summary else None,
+            )
             .sort("created_at", -1)
             .skip(offset)
             .limit(limit)
@@ -199,13 +219,18 @@ class MongoApprovalBackend(ApprovalCaseBackend):
             self._query(status, workflow_id, datasource_id, run_id, operation)
         )
 
-    async def history(self, history_key: str, limit: int = 20) -> list[ApprovalCase]:
+    async def history(
+        self, history_key: str, limit: int = 20, *, summary: bool = False
+    ) -> list[ApprovalCase]:
         cursor = (
-            self._col.find({
-                "history_key": history_key,
-                "status": {"$in": list(self._DECIDED)},
-                "surface": {"$in": list(self._HISTORY_SURFACES)},
-            })
+            self._col.find(
+                {
+                    "history_key": history_key,
+                    "status": {"$in": list(self._DECIDED)},
+                    "surface": {"$in": list(self._HISTORY_SURFACES)},
+                },
+                projection=self._SUMMARY_PROJECTION if summary else None,
+            )
             .sort("decided_at", -1)
             .limit(limit)
         )
@@ -279,16 +304,28 @@ class InMemoryApprovalBackend(ApprovalCaseBackend):
             and (run_id is None or case.run_id == run_id)
         )
 
+    @staticmethod
+    def _stripped(case: ApprovalCase) -> ApprovalCase:
+        """A copy without the bulky fields, mirroring the Mongo projection.
+
+        A copy, not the stored row: handing out the row itself and clearing it
+        would empty the case everyone else reads.
+        """
+        return case.model_copy(update={
+            "params": {}, "targets": [], "affected_sample": [], "details": {},
+        })
+
     async def list(
         self, *, status=None, workflow_id=None, datasource_id=None, run_id=None,
-        limit: int = 50, offset: int = 0,
+        limit: int = 50, offset: int = 0, summary: bool = False,
     ) -> list[ApprovalCase]:
         rows = [
             c for c in self._cases.values()
             if self._match(c, status, workflow_id, datasource_id, run_id)
         ]
         rows.sort(key=lambda c: c.created_at, reverse=True)
-        return rows[offset: offset + limit]
+        page = rows[offset: offset + limit]
+        return [self._stripped(c) for c in page] if summary else page
 
     async def count(
         self, *, status=None, workflow_id=None, datasource_id=None, run_id=None,
@@ -300,7 +337,9 @@ class InMemoryApprovalBackend(ApprovalCaseBackend):
             and (not operation or c.operation == operation)
         )
 
-    async def history(self, history_key: str, limit: int = 20) -> list[ApprovalCase]:
+    async def history(
+        self, history_key: str, limit: int = 20, *, summary: bool = False
+    ) -> list[ApprovalCase]:
         rows = [
             c for c in self._cases.values()
             if c.history_key == history_key
@@ -308,7 +347,8 @@ class InMemoryApprovalBackend(ApprovalCaseBackend):
             and c.surface != "try_run"
         ]
         rows.sort(key=lambda c: c.decided_at or c.created_at, reverse=True)
-        return rows[:limit]
+        page = rows[:limit]
+        return [self._stripped(c) for c in page] if summary else page
 
     async def find_pending_for_run(
         self, run_id: str, step_id: str | None = None
