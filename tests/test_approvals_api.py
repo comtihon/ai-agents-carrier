@@ -330,3 +330,57 @@ async def test_history_can_be_read_as_summaries(client):
     # projection, because it is computed from fields a summary keeps.
     assert body["streak"] == 1
     assert body["streak_decision"] == "approved"
+
+
+# ─── A run that died while parked on its gate ────────────────────────────────
+#
+# A workflow-surface case has no timeout on purpose: the run is parked inside a
+# LangGraph interrupt and the case waits for a person for as long as it takes.
+# The hole that leaves is a run that dies while parked — terminated, evicted,
+# lost to a restart. The case stayed pending forever, the queue kept offering
+# Approve and Reject, and both answered "Run is not awaiting approval (status:
+# failed)" because there was no run left to resume.
+
+
+async def test_deciding_a_case_whose_run_is_gone_cancels_it(client):
+    c, backend = client
+    await backend.create(_case(surface="workflow", run_id="run-dead"))
+    # claim_for_resume returning None is how run_control reports "not parked".
+    container = c._transport.app.state.container  # type: ignore[attr-defined]
+    container.run_repository.claim_for_resume = AsyncMock(return_value=None)
+    container.run_repository.get = AsyncMock(return_value=MagicMock(status="failed"))
+
+    resp = await c.post("/api/v1/approvals/apr_1/decide", json={"approved": True})
+
+    assert resp.status_code == 409
+    assert "has been cancelled" in resp.json()["detail"]
+    stored = await backend.get("apr_1")
+    assert stored is not None
+    assert stored.status == "cancelled"
+
+
+async def test_a_cancelled_orphan_leaves_the_pending_queue(client):
+    c, backend = client
+    await backend.create(_case(surface="workflow", run_id="run-dead"))
+    container = c._transport.app.state.container  # type: ignore[attr-defined]
+    container.run_repository.claim_for_resume = AsyncMock(return_value=None)
+    container.run_repository.get = AsyncMock(return_value=MagicMock(status="failed"))
+
+    await c.post("/api/v1/approvals/apr_1/decide", json={"approved": False})
+
+    queue = (await c.get("/api/v1/approvals", params={"status": "pending"})).json()
+    assert queue["items"] == []
+
+
+async def test_the_run_that_vanished_entirely_is_treated_the_same(client):
+    c, backend = client
+    await backend.create(_case(surface="workflow", run_id="run-gone"))
+    container = c._transport.app.state.container  # type: ignore[attr-defined]
+    container.run_repository.claim_for_resume = AsyncMock(return_value=None)
+    container.run_repository.get = AsyncMock(return_value=None)
+
+    resp = await c.post("/api/v1/approvals/apr_1/decide", json={"approved": True})
+
+    assert resp.status_code == 404
+    stored = await backend.get("apr_1")
+    assert stored is not None and stored.status == "cancelled"

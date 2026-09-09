@@ -482,6 +482,50 @@ class ApprovalService:
         await self._backend.update(case)
         return case
 
+    async def abandon(self, case_id: str, reason: str) -> ApprovalCase | None:
+        """Close a case whose run can no longer act on it.
+
+        A workflow-surface case has no timeout: the run is parked inside a
+        LangGraph ``interrupt`` and the case waits for a person indefinitely,
+        by design. That leaves one hole — if the run dies while parked
+        (terminated by a user, evicted, lost to a restart) the case stays
+        ``pending`` forever, the queue keeps offering Approve and Reject on it,
+        and both answers fail with "Run is not awaiting approval (status:
+        failed)" because there is nothing left to resume. Cancelling the case
+        says what actually happened and gets it out of the queue.
+        """
+        case = await self._backend.claim_for_decision(case_id)
+        if case is None:
+            return None
+        case.status = "cancelled"
+        case.decision_source = "api"
+        case.decided_at = datetime.now(timezone.utc)
+        case.reason = reason
+        await self._backend.update(case)
+        await self._announce_outcome(case)
+        return case
+
+    async def cancel_open_for_run(self, run_id: str, reason: str) -> list[ApprovalCase]:
+        """Abandon every still-open case belonging to one run.
+
+        A run can have parked on more than one gate over its life, so this
+        drains rather than closing a single case; the loop stops as soon as a
+        lookup finds nothing, or when a case refuses the claim (somebody
+        answered it in the same instant), which is also what keeps it finite.
+        """
+        if not run_id:
+            return []
+        closed: list[ApprovalCase] = []
+        while True:
+            case = await self.find_open_case(run_id)
+            if case is None:
+                break
+            abandoned = await self.abandon(case.id, reason)
+            if abandoned is None:
+                break
+            closed.append(abandoned)
+        return closed
+
     # ------------------------------------------------------------------
     # Waiting
     # ------------------------------------------------------------------
