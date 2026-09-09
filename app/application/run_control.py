@@ -196,6 +196,25 @@ async def terminate_run(
     run.touch()
     await container.run_repository.update(run)
     container.live_runners.pop(run_id, None)
+    # A run parked on an approval gate takes its case down with it. Left open,
+    # the case sits in the queue forever offering two buttons that both answer
+    # "Run is not awaiting approval (status: failed)" — there is no run left to
+    # resume. Failing to cancel it must not fail the termination, though: the
+    # run is already stopped by this point.
+    # getattr, not attribute access: this function is also called with the
+    # management server's own lighter container, which carries a run repository
+    # and not much else.
+    approval_service = getattr(container, "approval_service", None)
+    if approval_service is not None:
+        try:
+            await approval_service.cancel_open_for_run(
+                run_id, "Run terminated by user before the decision"
+            )
+        except Exception:
+            logger.warning(
+                "approvals: could not cancel open cases for terminated run %s",
+                run_id, exc_info=True,
+            )
     return run
 
 

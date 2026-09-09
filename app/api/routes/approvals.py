@@ -308,4 +308,18 @@ async def _resume_workflow_run(
                 name, subject, "ui",
             )
     except RunControlError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+        # The run is gone or is no longer parked — terminated, evicted, lost to
+        # a restart. Neither answer can ever be delivered to it, so the case is
+        # closed here rather than left in the queue for somebody to keep
+        # clicking. Both buttons used to fail with this exact status forever.
+        detail = exc.detail
+        if exc.status_code in (404, 409):
+            abandoned = await container.approval_service.abandon(
+                case.id, f"The run stopped before the decision — {exc.detail}"
+            )
+            if abandoned is not None:
+                detail = (
+                    f"{exc.detail}. This case cannot be answered any more and "
+                    "has been cancelled."
+                )
+        raise HTTPException(status_code=exc.status_code, detail=detail) from exc

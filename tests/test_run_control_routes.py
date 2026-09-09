@@ -278,3 +278,92 @@ async def test_restart_from_unknown_step_is_refused(client, monkeypatch):
     resp = await c.post(f"{_RUNS}/tid1/restart-from-step", json={"step_id": "nope"})
     assert resp.status_code == 409
     assert "Unknown step_id" in resp.json()["detail"]
+
+
+# ─── Terminating a run that was parked on an approval gate ───────────────────
+
+
+def _parked_case(run_id: str = "tid1"):
+    from app.domain.models.approval_case import ApprovalCase, history_key_for
+    return ApprovalCase(
+        id="apr_1",
+        status="pending",
+        surface="workflow",
+        run_id=run_id,
+        step_id="w1",
+        workflow_id="wf",
+        datasource_id="sheets",
+        datasource_name="Google Sheets",
+        operation="append_values",
+        method="POST",
+        affected_rows=1,
+        history_key=history_key_for("wf", "sheets", "append_values"),
+    )
+
+
+async def _with_approvals(container):
+    from app.application.approval_service import ApprovalService
+    from app.core.config import Settings
+    from app.infrastructure.persistence.approval_backend import InMemoryApprovalBackend
+    backend = InMemoryApprovalBackend()
+    await backend.create(_parked_case())
+    container.approval_backend = backend
+    container.approval_service = ApprovalService(backend, Settings())
+    return backend
+
+
+async def test_terminate_cancels_the_case_the_run_was_parked_on(client, monkeypatch):
+    """Otherwise the case outlives its run and can never be answered.
+
+    The run is marked failed, so the resume the decision needs is gone: both
+    Approve and Reject would answer "Run is not awaiting approval (status:
+    failed)" for as long as the case sat in the queue.
+    """
+    c, container = client
+    monkeypatch.setattr("app.services.agent_cleanup.cleanup_run_agents", AsyncMock())
+    container.run_repository.get = AsyncMock(return_value=_run("running"))
+    backend = await _with_approvals(container)
+
+    resp = await c.post(f"{_RUNS}/tid1/terminate")
+
+    assert resp.status_code == 200
+    case = await backend.get("apr_1")
+    assert case is not None
+    assert case.status == "cancelled"
+    assert "terminated" in case.reason.lower()
+
+
+async def test_terminate_leaves_another_runs_case_alone(client, monkeypatch):
+    c, container = client
+    monkeypatch.setattr("app.services.agent_cleanup.cleanup_run_agents", AsyncMock())
+    container.run_repository.get = AsyncMock(return_value=_run("running", "tid1"))
+    from app.application.approval_service import ApprovalService
+    from app.core.config import Settings
+    from app.infrastructure.persistence.approval_backend import InMemoryApprovalBackend
+    backend = InMemoryApprovalBackend()
+    await backend.create(_parked_case(run_id="someone-else"))
+    container.approval_backend = backend
+    container.approval_service = ApprovalService(backend, Settings())
+
+    await c.post(f"{_RUNS}/tid1/terminate")
+
+    case = await backend.get("apr_1")
+    assert case is not None and case.status == "pending"
+
+
+async def test_terminate_still_succeeds_when_the_case_cannot_be_cancelled(
+    client, monkeypatch,
+):
+    """The run is already stopped by then; a bookkeeping failure is not fatal."""
+    c, container = client
+    monkeypatch.setattr("app.services.agent_cleanup.cleanup_run_agents", AsyncMock())
+    container.run_repository.get = AsyncMock(return_value=_run("running"))
+    await _with_approvals(container)
+    container.approval_service.cancel_open_for_run = AsyncMock(
+        side_effect=RuntimeError("mongo down")
+    )
+
+    resp = await c.post(f"{_RUNS}/tid1/terminate")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "failed"
