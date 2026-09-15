@@ -68,6 +68,13 @@ def is_destructive(operation: Any, source: Any = None) -> bool:
     explicit = getattr(operation, "destructive", None)
     if explicit is not None:
         return bool(explicit)
+    if source is not None and getattr(source, "kind", "http") == "bigquery":
+        # Never destructive, and not because of the verb: the bigquery executor
+        # refuses any statement BigQuery does not itself report as a SELECT,
+        # before a byte is billed. ``method`` is meaningless on these sources,
+        # so reading it would only let a stray "DELETE" open an approval case
+        # for a query that cannot delete anything.
+        return False
     if source is not None and getattr(source, "kind", "http") == "graphql":
         # Read the document, not the verb. Before this, every GraphQL source
         # was unconditionally non-destructive, which is the safe answer for a

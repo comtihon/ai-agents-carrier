@@ -87,6 +87,12 @@ EXPECTED_TOOL_PERMISSIONS: dict[str, Permission] = {
     # same READ gate applies by method. Exactly as sensitive as get_run.
     "list_run_data": Permission.READ,
     "get_run_data_artifact": Permission.READ,
+    # The bytes themselves. READ for the same reason the two above are: a run's
+    # data is exactly as sensitive as the run, and this caller can already read
+    # the run and this artifact's metadata. Any stricter gate here would make
+    # the content privileged while its description is not, which protects
+    # nothing and only pushes callers back to the HTTP route they cannot use.
+    "read_run_data_artifact": Permission.READ,
     # The read side of the approval queue. Deciding a case is WRITE
     # (approve_run / reject_run); reading one before deciding it must not cost
     # more than reading any other record, or the informed decision becomes the
