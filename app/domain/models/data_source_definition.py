@@ -232,6 +232,12 @@ class OperationDefinition(BaseModel):
     # GraphQL sources: the query document and its variables.
     query: str | None = None
     variables: dict[str, Any] | None = None
+    # BigQuery sources: the SELECT to run.  Declared params are bound as named
+    # query parameters (``@month_start``) by the BigQuery client -- they are
+    # NOT rendered into this text the way ``path`` templates are, deliberately:
+    # substituting a caller's value into SQL is injection by construction.
+    # Write ``@name`` where the value goes and declare ``name`` in ``params``.
+    sql: str | None = None
     params: list[ParamSpec] = Field(default_factory=list)
     # Query-string arguments, rendered for EVERY method and appended to the
     # URL.  Distinct from a declared param the executor has not consumed
@@ -287,13 +293,39 @@ class PubSubSpec(BaseModel):
     event_schema: dict[str, Any] | None = None
 
 
+class BigQuerySpec(BaseModel):
+    """Settings for a ``kind="bigquery"`` data source.
+
+    Carries no credential: BigQuery accepts the ``cloud-platform``-scoped
+    Workload Identity token the backend already holds, so such a source needs
+    no ``auth`` block and what it can read is decided by the dataset-level IAM
+    granted to ``langgraph-backend@`` in terraform, not by anything stored
+    here.
+    """
+
+    # Billing/execution project.  Empty means the backend's own — which is
+    # also the project whose IAM decides what is readable.
+    project_id: str = ""
+    # Dataset location ("EU", "US"). Empty lets the client infer it; set it
+    # when a query spans a region the default would guess wrong.
+    location: str = ""
+    # Hard cap on bytes billed per run. The dry run refuses a query projected
+    # to exceed it BEFORE it runs, so this bounds spend rather than merely
+    # aborting a query that has already cost money. 0 means the module default.
+    maximum_bytes_billed: int = 0
+    # Row ceiling. Exceeding it is an error, never a silent truncation: a short
+    # aggregate is indistinguishable from a real one once it reaches a report.
+    # 0 means the module default.
+    max_rows: int = 0
+
+
 class DataSourceDefinition(BaseModel):
     """Persistent definition of one remote API exposed as named operations."""
 
     id: str
     name: str = ""
     description: str | None = None
-    kind: Literal["http", "graphql", "pubsub"] = "http"
+    kind: Literal["http", "graphql", "pubsub", "bigquery"] = "http"
     base_url: str = ""
     auth: AnyDataSourceAuth = Field(default_factory=NoAuth)
     default_headers: dict[str, str] = Field(default_factory=dict)
@@ -309,6 +341,9 @@ class DataSourceDefinition(BaseModel):
     bindings: list[SheetBinding] = Field(default_factory=list)
     # Only meaningful when kind == "pubsub".
     pubsub: PubSubSpec | None = None
+    # Only meaningful when kind == "bigquery". Absent means the module
+    # defaults: backend's own project, inferred location, 20 GiB scan cap.
+    bigquery: BigQuerySpec | None = None
     cache: CachePolicy = Field(default_factory=CachePolicy)
     timeout_seconds: float = 30
     retries: RetryPolicy = Field(default_factory=RetryPolicy)
