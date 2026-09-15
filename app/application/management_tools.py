@@ -148,6 +148,16 @@ class ManagementDeps:
     refresh_datasources: "Callable[[], Awaitable[None]] | None" = None
     # PubSubSubscriberManager when Pub/Sub triggers are enabled, else None.
     pubsub_subscriber: Any = None
+    # The data stream store, so an artifact's BYTES can be returned through the
+    # MCP the same way its metadata already is. Without it the only route to
+    # the content is the HTTP download, which is guarded by OAuthMiddleware and
+    # needs a Zitadel user token -- an MCP client holds an API key and is
+    # rejected, so a `data` step's export was reachable from the carrier UI and
+    # from nowhere else. Reading it here is not a weaker path to the same
+    # thing: this deps object is only built for an already-authenticated
+    # management caller, who can already read the run and the artifact's
+    # metadata, and a run's data is exactly as sensitive as the run.
+    stream_store: Any = None
 
 
 def deps_from_container(
@@ -173,6 +183,7 @@ def deps_from_container(
         refresh_runner=getattr(container, "refresh_runner", None),
         refresh_datasources=refresh_datasources,
         pubsub_subscriber=getattr(container, "pubsub_subscriber", None),
+        stream_store=getattr(container, "stream_store", None),
     )
 
 
@@ -644,7 +655,124 @@ async def get_run_data_artifact(
             "WARNING: this artifact is a truncated prefix of the data, not the "
             "whole answer. Do not present a download of it as complete."
         )
+    lines.append(
+        "Read the bytes with read_run_data_artifact; the Download URL above "
+        "needs a Zitadel user token and will reject an API key."
+    )
     return "\n".join(lines)
+
+
+# How much artifact content one read returns. Sized for a management client's
+# context rather than for the artifact: a monthly metrics export is a few KB
+# and arrives whole, while a 200 MB CSV is paged rather than refused.
+_ARTIFACT_READ_LIMIT = 200_000
+
+
+@requires(Permission.READ)
+async def read_run_data_artifact(
+    deps: ManagementDeps,
+    run_id: str,
+    artifact_id: str,
+    offset: int = 0,
+    limit: int = _ARTIFACT_READ_LIMIT,
+) -> str:
+    """Return an artifact's actual content, paged.
+
+    Exists because the HTTP download at ``/api/v1/runs/{id}/data/{artifact}``
+    is authenticated by ``OAuthMiddleware`` and needs a Zitadel *user* token.
+    That is the right gate for that route -- a run's data is as sensitive as
+    the run -- but it means an MCP client, which authenticates with an API key,
+    could read an artifact's metadata and never its bytes. A workflow whose
+    whole point was to produce a file was therefore usable from the carrier UI
+    and from nowhere else.
+
+    This is not a weaker door onto the same room. The caller has already been
+    authenticated by the management server and can already read the run itself
+    and this artifact's metadata through the tools next to this one; the bytes
+    are the same sensitivity as both. The gate is unchanged for the HTTP route.
+
+    Content is decoded as UTF-8 and returned as text, so this suits JSON, JSONL
+    and CSV -- the three formats a ``data`` step produces. Paging is by BYTE
+    offset, and a page boundary may split a multi-byte character or a line;
+    callers concatenate the pages and parse the whole.
+    """
+    from app.application.data_artifacts import (
+        DataArtifactError,
+        find_run_artifact,
+        prepare_download,
+    )
+    from app.infrastructure.datasources.datastream import StreamGone
+
+    run = await deps.run_repository.get(run_id)
+    if run is None:
+        return f"Run '{run_id}' not found."
+    artifact = await find_run_artifact(
+        deps.data_artifact_backend,
+        run,
+        artifact_id,
+        datasource_ttl_seconds=_datasource_ttl(),
+    )
+    if artifact is None:
+        return f"No data artifact '{artifact_id}' for run '{run_id}'."
+
+    store = deps.stream_store
+    if store is None:
+        return (
+            "No data stream store is configured on this backend, so artifact "
+            "content cannot be read."
+        )
+
+    offset = max(0, int(offset))
+    limit = max(1, min(int(limit), _ARTIFACT_READ_LIMIT))
+
+    try:
+        download = await prepare_download(store, artifact)
+    except StreamGone as exc:
+        # The same distinction the HTTP route draws with 410: the artifact is
+        # a real thing this run produced and the bytes are gone, which is a
+        # different fact from "no such artifact".
+        return (
+            f"The bytes of artifact '{artifact_id}' are gone (swept or "
+            f"deleted): {exc}"
+        )
+    except DataArtifactError as exc:
+        return f"Artifact '{artifact_id}' cannot be read: {exc}"
+
+    # Walk the stream, keeping only the window asked for. The chunks are
+    # consumed either way -- prepare_download opens a real read -- but nothing
+    # outside the window is retained, so reading page 40 of a large export
+    # costs time rather than memory.
+    collected = bytearray()
+    seen = 0
+    truncated_here = False
+    async for chunk in download.chunks:
+        if not chunk:
+            continue
+        start = max(0, offset - seen)
+        if start < len(chunk):
+            collected.extend(chunk[start : start + (limit - len(collected))])
+        seen += len(chunk)
+        if len(collected) >= limit:
+            truncated_here = True
+            break
+
+    text = bytes(collected).decode("utf-8", errors="replace")
+    header = [
+        f"Artifact: {artifact.id} ({artifact.format}, {artifact.items} items, "
+        f"{artifact.bytes} stored bytes)",
+        f"Bytes {offset}-{offset + len(collected)} of this read.",
+    ]
+    if artifact.truncated:
+        header.append(
+            "WARNING: the artifact itself is a truncated prefix of the data. "
+            "Do not present it as complete."
+        )
+    if truncated_here:
+        header.append(
+            f"More content follows. Read on with offset="
+            f"{offset + len(collected)}."
+        )
+    return "\n".join(header) + "\n---\n" + text
 
 
 # ---------------------------------------------------------------------------

@@ -129,6 +129,9 @@ def build_default_workflow(
         # written to. Without it they fail with "no data stream store is
         # configured" rather than reading the sheet.
         data_source_executor=getattr(container, "data_source_executor", None),
+        # Same store the HTTP download route uses, so read_run_data_artifact
+        # can return an artifact's bytes here as well.
+        stream_store=getattr(container, "stream_store", None),
         refresh_runner=refresh_runner,
         refresh_datasources=refresh_datasources,
     )
@@ -213,6 +216,38 @@ def build_default_workflow(
             artifact_id: The artifact id (from list_run_data).
         """
         return await core.get_run_data_artifact(deps, run_id, artifact_id)
+
+    @tool
+    async def read_run_data_artifact(
+        run_id: str,
+        artifact_id: str,
+        offset: int = 0,
+        limit: int = 200_000,
+    ) -> str:
+        """Read one artifact's actual content, paged.
+
+        This is how an MCP client gets the bytes: the Download URL that
+        get_run_data_artifact reports needs a Zitadel user token and rejects an
+        API key, so it works from the carrier UI and not from here.
+
+        Content comes back as text, which suits the three formats a `data` step
+        produces (json, jsonl, csv). Paging is by BYTE offset and a page
+        boundary may split a line or a multi-byte character — concatenate the
+        pages before parsing. When the reply says more content follows, call
+        again with the offset it gives.
+
+        An artifact marked truncated is a prefix of the data, not the whole
+        answer — never describe a read of one as complete.
+
+        Args:
+            run_id: The run the artifact belongs to.
+            artifact_id: The artifact id (from list_run_data).
+            offset: Byte offset to start at (default 0).
+            limit: Maximum bytes to return (default and cap 200000).
+        """
+        return await core.read_run_data_artifact(
+            deps, run_id, artifact_id, offset, limit
+        )
 
     @tool
     async def list_pending_approvals(limit: int = 20) -> str:
@@ -1196,6 +1231,7 @@ def build_default_workflow(
 
     platform_tools = [list_workflows, get_workflow, run_workflow, list_runs, get_run, ask_user,
                       list_run_data, get_run_data_artifact,
+                      read_run_data_artifact,
                       list_pending_approvals, get_approval,
                       create_workflow, update_workflow, delete_workflow,
                       list_agents, get_agent, create_agent, update_agent, delete_agent,

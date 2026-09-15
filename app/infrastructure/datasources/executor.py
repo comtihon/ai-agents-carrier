@@ -38,6 +38,9 @@ from app.domain.models.data_source_definition import (
     operation_refs,
 )
 from app.domain.models.datastream import as_data_ref, is_data_ref
+from app.infrastructure.datasources.bigquery import (
+    run_operation as run_bigquery_operation,
+)
 from app.infrastructure.datasources.destructive import DESTRUCTIVE_METHODS
 from app.infrastructure.datasources.datastream import NotStreamable, StreamBuilder
 
@@ -701,9 +704,18 @@ class DataSourceExecutor:
                     )
                     self._cache.pop(cache_key, None)
 
-        value = await self._fetch_all_pages(
-            client, source, op, params, memo, bound, limit=limit
-        )
+        if source.kind == "bigquery":
+            # BigQuery has its own client, its own parameter binding and its
+            # own notion of a page (a job polled to completion), so it does not
+            # go through the HTTP request/pagination machinery at all. It joins
+            # again right here, returning the same list-of-dicts shape a mapped
+            # HTTP response arrives in -- so caching above, and mapping,
+            # streaming and python steps below, are unchanged.
+            value = await run_bigquery_operation(source, op, params, limit=limit)
+        else:
+            value = await self._fetch_all_pages(
+                client, source, op, params, memo, bound, limit=limit
+            )
 
         if ttl > 0:
             self._cache[cache_key] = (time.monotonic() + ttl, value)
