@@ -550,6 +550,11 @@ def build_default_workflow(
                 {"type": "header", "header_name": "X-Api-Key", "value": "..."}.
                 {"type": "google", "scopes": [...]} carries no secret — the
                 backend impersonates its configured Google service account.
+                Better than pasting a secret: replace the secret field with
+                "from_config" naming a backend credential env var, e.g.
+                {"type": "basic", "username": "svc@example.com",
+                 "from_config": "JIRA_API_TOKEN"} — the backend substitutes the
+                value, so the secret never passes through this call.
                 For Google Sheets use create_google_sheets_datasource instead,
                 which brings the operations with it.
         """
@@ -575,7 +580,10 @@ def build_default_workflow(
             description: New description (omit to keep current).
             base_url: New base URL (omit to keep current).
             operations_json: JSON array replacing ALL operations (omit to keep current).
-            auth_json: JSON auth block replacing the current one (omit to keep current).
+            auth_json: JSON auth block replacing the current one (omit to keep
+                current). Same shape as create_datasource's, "from_config"
+                included — that is how a credential is rotated without the new
+                value passing through this call.
             pubsub_json: For kind="pubsub" sources — JSON object
                 {topic, subscription, project_id, event_schema} replacing the
                 current Pub/Sub block (omit to keep current).
