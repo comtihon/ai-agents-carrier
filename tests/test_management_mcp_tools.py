@@ -551,6 +551,83 @@ async def test_update_datasource_can_rotate_the_stored_credential(mcp):
     assert stored.base_url == "https://api.example"
 
 
+# ---------------------------------------------------------------------------
+# `from_config` over MCP. The REST write paths have resolved it for a while;
+# these paths did not, so an MCP caller had to read the real secret out of
+# Secret Manager and paste it into the tool call to create an authenticated
+# source at all — the one thing `from_config` exists to prevent.
+
+async def test_create_datasource_resolves_the_secret_from_config(mcp, monkeypatch):
+    backend = InMemoryDataSourceBackend()
+    _register(mcp, _Container(data_source_backend=backend))
+    monkeypatch.setenv("JIRA_API_TOKEN", "resolved-jira-token")
+
+    await mcp.call_tool("create_datasource", {
+        "source_id": "jira", "name": "Jira", "base_url": "https://api.example",
+        "operations_json": '[{"name": "search", "path": "/search"}]',
+        "auth_json": '{"type": "basic", "username": "svc@example.com",'
+                     ' "from_config": "JIRA_API_TOKEN"}',
+    })
+
+    stored = await backend.get("jira")
+    assert stored.auth.username == "svc@example.com"
+    assert stored.auth.password == "resolved-jira-token"
+
+
+async def test_create_datasource_with_an_unset_config_key_creates_nothing(mcp, monkeypatch):
+    backend = InMemoryDataSourceBackend()
+    _register(mcp, _Container(data_source_backend=backend))
+    monkeypatch.delenv("JIRA_API_TOKEN", raising=False)
+
+    result = str(await mcp.call_tool("create_datasource", {
+        "source_id": "jira", "name": "Jira", "base_url": "https://api.example",
+        "operations_json": '[{"name": "search", "path": "/search"}]',
+        "auth_json": '{"type": "bearer", "from_config": "JIRA_API_TOKEN"}',
+    }))
+
+    # Told, not silently stored with an empty credential — which would have
+    # surfaced later as an opaque 401 from a definition that looks fine.
+    assert "JIRA_API_TOKEN" in result
+    assert await backend.get("jira") is None
+
+
+async def test_create_datasource_refuses_from_config_on_a_secretless_auth_type(
+    mcp, monkeypatch
+):
+    backend = InMemoryDataSourceBackend()
+    _register(mcp, _Container(data_source_backend=backend))
+    monkeypatch.setenv("JIRA_API_TOKEN", "resolved-jira-token")
+
+    result = str(await mcp.call_tool("create_datasource", {
+        "source_id": "jira", "name": "Jira", "base_url": "https://api.example",
+        "operations_json": "[]",
+        "auth_json": '{"type": "none", "from_config": "JIRA_API_TOKEN"}',
+    }))
+
+    assert "no secret" in result.lower()
+    assert await backend.get("jira") is None
+
+
+async def test_update_datasource_rotates_the_credential_from_config(mcp, monkeypatch):
+    backend = InMemoryDataSourceBackend()
+    _register(mcp, _Container(data_source_backend=backend))
+    await mcp.call_tool("create_datasource", {
+        "source_id": "api", "name": "API", "base_url": "https://api.example",
+        "operations_json": '[{"name": "list_things", "path": "/things"}]',
+        "auth_json": '{"type": "bearer", "token": "old-token"}',
+    })
+    monkeypatch.setenv("ROTATED_TOKEN", "rotated-value")
+
+    await mcp.call_tool("update_datasource", {
+        "source_id": "api",
+        "auth_json": '{"type": "bearer", "from_config": "ROTATED_TOKEN"}',
+    })
+
+    stored = await backend.get("api")
+    assert stored.auth.token == "rotated-value"
+    assert [op.name for op in stored.operations] == ["list_things"]
+
+
 async def test_update_datasource_without_json_fields_keeps_them(mcp):
     backend = InMemoryDataSourceBackend()
     _register(mcp, _Container(data_source_backend=backend))

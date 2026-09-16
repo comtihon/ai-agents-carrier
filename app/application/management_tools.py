@@ -1722,6 +1722,25 @@ def _google_subject_error(auth: Any) -> str | None:
     return check_impersonate_subject(auth)
 
 
+def _resolved_auth(auth: Any) -> tuple[Any, str | None]:
+    """Resolve an auth block's ``from_config`` reference, or say why it cannot.
+
+    The MCP surface honours ``from_config`` for the same reason the REST one
+    does, only more so: a caller here is usually an agent or a Claude session,
+    and without this it would have to read the real secret out of Secret
+    Manager and paste it into the tool call to create an authenticated source
+    at all. With it the secret never leaves the backend.
+    """
+    from app.infrastructure.auth.config_secrets import (
+        AuthFromConfigError,
+        resolve_auth_from_config,
+    )
+    try:
+        return resolve_auth_from_config(auth), None
+    except AuthFromConfigError as exc:
+        return auth, str(exc)
+
+
 @requires(Permission.READ)
 async def resolve_google_file(deps: ManagementDeps, ref: str) -> str:
     """Resolve a Google Drive URL / file id and report whether we can reach it.
@@ -2568,6 +2587,10 @@ async def create_datasource(
     if subject_error:
         return subject_error
 
+    auth, from_config_error = _resolved_auth(auth)
+    if from_config_error:
+        return from_config_error
+
     existing = await deps.data_source_backend.get(source_id)
     if existing is not None:
         return f"Data source '{source_id}' already exists. Use update_datasource to modify it."
@@ -2638,6 +2661,9 @@ async def update_datasource(
         subject_error = _google_subject_error(payload["auth"])
         if subject_error:
             return subject_error
+        payload["auth"], from_config_error = _resolved_auth(payload["auth"])
+        if from_config_error:
+            return from_config_error
     if pubsub_json is not None:
         # {topic, subscription, project_id, event_schema} — kind == "pubsub".
         try:
@@ -2672,14 +2698,25 @@ async def update_datasource(
 # transcribing JSON.
 
 def _parse_auth_block(auth_json: str):
-    """(auth_model, None) or (None, error_str) from a JSON auth block."""
+    """(auth_model, None) or (None, error_str) from a JSON auth block.
+
+    Resolves ``from_config`` first, so a schema behind a credential can be
+    fetched by naming the backend's config key rather than pasting the secret.
+    """
     if not auth_json:
         return None, None
     from pydantic import TypeAdapter
 
     from app.domain.models.data_source_definition import AnyDataSourceAuth
     try:
-        return TypeAdapter(AnyDataSourceAuth).validate_python(json.loads(auth_json)), None
+        raw = json.loads(auth_json)
+    except json.JSONDecodeError as exc:
+        return None, f"Invalid auth_json: {exc}"
+    raw, from_config_error = _resolved_auth(raw)
+    if from_config_error:
+        return None, from_config_error
+    try:
+        return TypeAdapter(AnyDataSourceAuth).validate_python(raw), None
     except Exception as exc:
         return None, f"Invalid auth_json: {exc}"
 
@@ -2792,6 +2829,9 @@ async def create_datasource_from_schema(
     subject_error = _google_subject_error(auth)
     if subject_error:
         return subject_error
+    auth, from_config_error = _resolved_auth(auth)
+    if from_config_error:
+        return from_config_error
 
     from app.domain.models.data_source_definition import (
         DataSourceDefinition,
