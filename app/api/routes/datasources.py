@@ -59,6 +59,13 @@ from app.infrastructure.datasources.discovery import (
     parse_spec,
     probe_and_discover,
 )
+from app.infrastructure.auth.config_secrets import (
+    FROM_CONFIG_FIELD,
+    REDACTED_SECRET,
+    SECRET_FIELDS as _SECRET_FIELDS,
+    AuthFromConfigError,
+    resolve_auth_from_config,
+)
 from app.infrastructure.auth.google_token_provider import check_impersonate_subject
 from app.infrastructure.datasources.destructive import is_destructive
 from app.infrastructure.datasources.google_sheets import (
@@ -207,17 +214,9 @@ class TryOperationRequest(BaseModel):
 
 # ─── Secret redaction ─────────────────────────────────────────────────────────
 
-REDACTED_SECRET = "********"
-
-# Secret field(s) per auth type; anything else in the block is not secret.
-# `none`, `service_identity` and `google` are absent on purpose: they store no
-# secret, so there is nothing to redact, preserve across an update, or resolve
-# from config (a `from_config` on one of them is a 422 below).
-_SECRET_FIELDS: dict[str, tuple[str, ...]] = {
-    "bearer": ("token",),
-    "basic": ("password",),
-    "header": ("value",),
-}
+# REDACTED_SECRET and _SECRET_FIELDS are imported from
+# app.infrastructure.auth.config_secrets, which the management MCP write paths
+# share — see _resolve_auth_from_config below.
 
 _AUTH_ADAPTER: TypeAdapter = TypeAdapter(AnyDataSourceAuth)
 
@@ -247,39 +246,22 @@ def _merge_auth_secrets(incoming: dict[str, Any], existing: dict[str, Any]) -> d
     return incoming
 
 
-FROM_CONFIG_FIELD = "from_config"
-
-
 def _resolve_auth_from_config(auth: Any, settings: Settings) -> Any:
-    """Turn a ``from_config`` reference into the named backend config value.
+    """Resolve a ``from_config`` reference, reporting failure as a 422.
 
     Callers that must not handle a secret themselves may send, in place of the
     secret field, ``{"type": "bearer", "from_config": "AFP_SERVICE_TOKEN"}``.
     The key names an entry of the backend's forwardable config (the same set
-    ``GET /llm/config/keys`` exposes by name); its value replaces the auth
-    type's single secret field and is stored like any pasted secret.
+    ``GET /llm/config/keys`` exposes by name).
 
-    An unknown or blank key is a 422: storing an empty secret instead would
-    resurface later as an opaque 401 from the target API.
+    The resolution itself lives in ``app.infrastructure.auth.config_secrets``
+    because the management MCP write paths do the same thing; only the way a
+    failure is reported differs.
     """
-    if not isinstance(auth, dict) or FROM_CONFIG_FIELD not in auth:
-        return auth
-    resolved = dict(auth)
-    key = (resolved.pop(FROM_CONFIG_FIELD) or "").strip()
-    auth_type = resolved.get("type", "")
-    fields = _SECRET_FIELDS.get(auth_type, ())
-    if not fields:
-        raise HTTPException(
-            status_code=422,
-            detail=f"auth type '{auth_type}' has no secret that can come from config",
-        )
-    if not key:
-        raise HTTPException(status_code=422, detail="auth.from_config must name a config key")
-    available = settings.get_forwardable_config()
-    if key not in available:
-        raise HTTPException(status_code=422, detail=f"config key '{key}' is not set on this backend")
-    resolved[fields[0]] = available[key]
-    return resolved
+    try:
+        return resolve_auth_from_config(auth, settings)
+    except AuthFromConfigError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 def _reject_foreign_google_subject(auth: Any, settings: Settings) -> None:
