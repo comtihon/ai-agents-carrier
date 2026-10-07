@@ -42,7 +42,7 @@ API at `http://localhost:8000`. Health check: `GET /health`.
 | `OAUTH_ENABLED` | `false` | Enable JWT Bearer auth on all endpoints |
 | `OAUTH_JWKS_URL` | — | JWKS endpoint for token validation |
 | `OAUTH_ISSUER` | — | Expected token issuer; also where the userinfo endpoint is derived from |
-| `OAUTH_AUDIENCE` | — | Expected audience; audience is not verified when unset |
+| `OAUTH_AUDIENCE` | — | Expected audience, or several comma-separated (a token passes with any one); audience is not verified when unset |
 | `AUTH_ENFORCE_PERMISSIONS` | `false` | Enforce the role→permission model. Off = every authenticated caller has full access, and denials are only reported (see [Role-based permissions](#role-based-permissions)) |
 | `AUTH_PROJECT_ID` | — | Identity-provider project whose roles claim is read (machine tokens carry `urn:zitadel:iam:org:project:<id>:roles`) |
 | `AUTH_ACCESS_ROLES` | `[]` | Roles allowed to reach the API at all. Allow-list: an unlisted role is denied |

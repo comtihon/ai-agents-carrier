@@ -26,12 +26,18 @@ class AuthService:
         jwks_url: str,
         issuer: str | None = None,
         algorithms: list[str] | None = None,
-        audience: str | None = None,
+        audience: str | list[str] | None = None,
     ):
         self.jwks_url = jwks_url
         self.issuer = issuer
         self.algorithms = algorithms or ["RS256"]
-        self.audience = audience
+        # Accepted audiences: a JWT passes when its "aud" holds any one of them.
+        # A string may list several, comma-separated (OAUTH_AUDIENCE), e.g. the
+        # issuer for this backend's own clients plus the Zitadel project id carried
+        # by user tokens forwarded from another service.
+        if isinstance(audience, str):
+            audience = audience.split(",")
+        self.audience: list[str] | None = [a.strip() for a in audience or [] if a.strip()] or None
         self._kid_cache: dict[str, dict] = {}
         self._last_updated: datetime | None = None
 
