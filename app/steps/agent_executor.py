@@ -745,6 +745,28 @@ async def execute_agent_step(
     agent_config_payload = _build_agent_config(agent_def, settings, step=step, run_id=run_id, state=state)
     resolved_env_vars: dict[str, str] = agent_config_payload.get("env_vars") or {}
 
+    # ACP agents (behind acp-web-proxy) are driven over a WebSocket instead of
+    # /start + /poll; everything after the raw output is shared.
+    if agent_def.protocol == "acp":
+        from app.steps.acp_executor import run_acp_agent
+        raw_output = await run_acp_agent(
+            step=step,
+            agent_def=agent_def,
+            input_data=input_data,
+            agent_config=agent_config_payload,
+            runtime=runtime,
+            run_id=run_id,
+            task_key=task_key,
+            callback_base_url=callback_base_url,
+            settings=settings,
+            run_repository=run_repository,
+            agent_task_repository=agent_task_repository,
+        )
+        return await _finalize_agent_output(
+            step, raw_output, input_data, settings,
+            run_id=run_id, run_repository=run_repository, use_meta_llm=use_meta_llm,
+        )
+
     # --- Warm pod reuse: check if a warm pod is available for this agent ---
     _is_warm_reuse = False
     _warm_agent_url: str | None = None
@@ -1154,6 +1176,30 @@ async def execute_agent_step(
         step_id, run_id, list(raw_output),
     )
 
+    return await _finalize_agent_output(
+        step, raw_output, input_data, settings,
+        run_id=run_id, run_repository=run_repository, use_meta_llm=use_meta_llm,
+    )
+
+
+
+async def _finalize_agent_output(
+    step: dict[str, Any],
+    raw_output: dict[str, Any],
+    input_data: dict[str, Any],
+    settings: "Settings",
+    *,
+    run_id: str,
+    run_repository: Any = None,
+    use_meta_llm: bool = True,
+) -> dict[str, Any]:
+    """Turn an agent's raw final output into the step's state update.
+
+    Shared by every agent protocol: structured-output extraction, the
+    unanswered-question gate, the meta-LLM quality gate and output mapping
+    do not depend on how the agent was driven.
+    """
+    step_id: str = step["id"]
     # --- 5d-pre. Extract structured output from free-form "result" text ---
     # Agent pod frameworks wrap Claude's response in {"result": "...", "token_usage": {...}}
     # even when the Output Protocol or system prompt instructed Claude to return structured
