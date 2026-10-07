@@ -266,3 +266,49 @@ async def test_ascii_junk_token_still_reaches_userinfo():
             await service.validate_token("plain-junk")
 
     mock_client.get.assert_called_once()
+
+
+# ── Audience: one or several accepted values ─────────────────────────────────
+
+
+def _signed_jwt(aud):
+    import jwt as pyjwt
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    token = pyjwt.encode(
+        {"sub": "u1", "iss": "https://auth.example.com", "aud": aud,
+         "exp": datetime.now(timezone.utc) + timedelta(minutes=5)},
+        key, algorithm="RS256", headers={"kid": "k1"},
+    )
+    return token, key.public_key()
+
+
+def _jwt_service(audience) -> AuthService:
+    return AuthService(
+        jwks_url="https://auth.example.com/oauth/v2/keys",
+        issuer="https://auth.example.com",
+        audience=audience,
+    )
+
+
+def test_comma_separated_audience_is_split_and_blanks_dropped():
+    assert _jwt_service(" https://auth.example.com , 315,").audience == ["https://auth.example.com", "315"]
+    assert _jwt_service(" , ").audience is None
+    assert _jwt_service(None).audience is None
+
+
+@pytest.mark.parametrize("aud", [["client-1", "315"], "https://auth.example.com"])
+async def test_jwt_passes_when_any_accepted_audience_matches(aud):
+    token, public_key = _signed_jwt(aud)
+    service = _jwt_service("https://auth.example.com,315")
+    with patch.object(service, "_get_public_key", AsyncMock(return_value=public_key)):
+        assert (await service.validate_token(token))["sub"] == "u1"
+
+
+async def test_jwt_fails_when_no_accepted_audience_matches():
+    token, public_key = _signed_jwt(["client-1", "999"])
+    service = _jwt_service("https://auth.example.com,315")
+    with patch.object(service, "_get_public_key", AsyncMock(return_value=public_key)):
+        with pytest.raises(AuthError, match="Invalid token"):
+            await service.validate_token(token)
