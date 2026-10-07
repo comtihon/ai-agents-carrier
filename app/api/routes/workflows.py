@@ -229,7 +229,10 @@ async def _get_interrupt_payload(runner: YamlGraphRunner | None, run: GraphRun) 
 
 
 async def _run_response(
-    run: GraphRun, runner: YamlGraphRunner | None = None, partial: bool = False
+    run: GraphRun,
+    runner: YamlGraphRunner | None = None,
+    partial: bool = False,
+    run_repository: Any = None,
 ) -> dict:
     """Build the run payload the API answers with.
 
@@ -240,6 +243,10 @@ async def _run_response(
     """
     workflow_name, steps = await _steps_from_definition(run, runner)
     interrupt_payload = await _get_interrupt_payload(runner, run)
+    dynamic_jobs: dict = {}
+    if run.dynamic and not partial and run_repository is not None:
+        from app.infrastructure.orchestration.dynamic.node import child_summaries
+        dynamic_jobs = await child_summaries(run_repository, run.id)
     return {
         "id": run.id,
         "workflow_id": run.graph_id,
@@ -268,6 +275,12 @@ async def _run_response(
         "created_at": run.created_at.isoformat(),
         "updated_at": run.updated_at.isoformat(),
         "partial": partial,
+        "kind": run.kind,
+        "parent_run_id": run.parent_run_id,
+        # Dynamic steps: the agent DAG (jobs, attempts, decisions) per step,
+        # and a live summary of each attempt's child run by child run id.
+        "dynamic": run.dynamic or {},
+        "dynamic_jobs": dynamic_jobs,
     }
 
 
@@ -581,6 +594,15 @@ def _guard_sandbox(request: Request, steps: object) -> None:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
+def _guard_dynamic(steps: object) -> None:
+    """Reject a dynamic step whose config would only fail at run time."""
+    from app.infrastructure.orchestration.dynamic.node import validate_dynamic_steps
+
+    errors = validate_dynamic_steps(steps)
+    if errors:
+        raise HTTPException(status_code=422, detail="; ".join(errors))
+
+
 @router.post("", status_code=201)
 async def create_workflow(
     request: Request,
@@ -591,6 +613,7 @@ async def create_workflow(
     _require_backend(container)
     assert container.workflow_backend is not None
     _guard_sandbox(request, body.steps)
+    _guard_dynamic(body.steps)
 
     existing = await container.workflow_backend.get(body.id)
     if existing is not None:
@@ -774,7 +797,7 @@ async def get_run(
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
     runner = _get_runner_for_run(run, container)
-    return await _run_response(run, runner)
+    return await _run_response(run, runner, run_repository=container.run_repository)
 
 
 @router.post("/runs/{run_id}/approve")
@@ -979,6 +1002,7 @@ async def update_workflow(
     assert container.workflow_backend is not None
     if body.steps is not None:
         _guard_sandbox(request, body.steps)
+        _guard_dynamic(body.steps)
 
     existing = await container.workflow_backend.get(workflow_id)
     if existing is None:
