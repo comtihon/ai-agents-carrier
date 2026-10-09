@@ -61,6 +61,14 @@ class AgentDefinition(BaseModel):
     # Addons
     addons: list[AnyAgentAddon] = Field(default_factory=list)
 
+    # How carrier talks to the agent process:
+    #   "http-poll" — the pi-cloud-agent HTTP API (/start, /poll, /terminate)
+    #   "acp"       — ACP over WebSocket through acp-web-proxy in the pod
+    protocol: Literal["http-poll", "acp"] = "http-poll"
+    # ACP only: which agent of the proxy's config to launch (e.g. "pi",
+    # "claude", "codex"); None = the proxy's default agent.
+    acp_agent: str | None = None
+
     # Timestamps
     created_at: datetime | None = None
     updated_at: datetime | None = None

@@ -42,6 +42,8 @@ class AgentDefinitionRequest(BaseModel):
     helm_chart: str | None = None
     helm_values: dict = Field(default_factory=dict)
     addons: list[dict] = Field(default_factory=list)
+    protocol: Literal["http-poll", "acp"] = "http-poll"
+    acp_agent: str | None = None
 
 
 class AgentDefinitionUpdateRequest(BaseModel):
@@ -55,6 +57,10 @@ class AgentDefinitionUpdateRequest(BaseModel):
     # None = omitted by caller -> preserve existing addons on update.
     # Explicit [] = caller intentionally clears addons.
     addons: list[dict] | None = None
+    # None = omitted -> keep the stored value (a PUT from an older client must
+    # not silently switch an ACP agent back to the poll protocol).
+    protocol: Literal["http-poll", "acp"] | None = None
+    acp_agent: str | None = None
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -162,6 +168,8 @@ async def create_agent(
         helm_chart=body.helm_chart,
         helm_values=body.helm_values,
         addons=_addon_adapter.validate_python(body.addons),
+        protocol=body.protocol,
+        acp_agent=body.acp_agent or None,
     )
     saved = await container.agent_backend.create(defn)
     return saved.model_dump(mode="json")
@@ -220,6 +228,8 @@ async def update_agent(
         helm_values=body.helm_values,
         created_at=existing.created_at,
         addons=addons,
+        protocol=existing.protocol if body.protocol is None else body.protocol,
+        acp_agent=(existing.acp_agent if body.protocol is None else (body.acp_agent or None)),
     )
     saved = await container.agent_backend.update(agent_id, defn)
     return saved.model_dump(mode="json")
