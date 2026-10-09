@@ -21,6 +21,7 @@ _LIST_PROJECTION = {
     "step_outputs": 0,
     "routing_log": 0,
     "trace_data": 0,
+    "dynamic": 0,
 }
 
 
@@ -89,7 +90,9 @@ class MongoGraphRunRepository:
         search: str | None = None,
         exclude_workflow_ids: list[str] | None = None,
     ) -> dict:
-        query: dict = {}
+        # Dynamic-workflow job attempts are runs of their own, but belong to
+        # their parent's DAG, not to the run list.
+        query: dict = {"kind": {"$ne": "job"}}
         if workflow_id and not exclude_workflow_ids:
             query["graph_id"] = workflow_id
         elif exclude_workflow_ids and not workflow_id:
@@ -157,6 +160,19 @@ class MongoGraphRunRepository:
 
     async def delete(self, run_id: str) -> None:
         await self._collection.delete_one({"_id": run_id})
+
+    async def set_dynamic(self, run_id: str, step_id: str, data: dict[str, Any]) -> None:
+        """Write one dynamic step's DAG without touching the rest of the run."""
+        await self._collection.update_one({"_id": run_id}, {"$set": {f"dynamic.{step_id}": data}})
+
+    async def list_children(self, parent_run_id: str) -> list[GraphRun]:
+        """Dynamic job attempts spawned by *parent_run_id* (summary projection)."""
+        cursor = self._collection.find(
+            {"parent_run_id": parent_run_id, "kind": "job"},
+            {"step_inputs": 0, "routing_log": 0, "trace_data": 0},
+        )
+        docs = await cursor.to_list(length=None)
+        return [self._from_doc(doc) for doc in docs]
 
 
 _PVC_COLLECTION = "pvc_leases"

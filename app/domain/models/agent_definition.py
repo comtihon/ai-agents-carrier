@@ -24,7 +24,9 @@ class AgentDefinition(BaseModel):
     Fields
     ------
     description:
-        Human-readable label shown in the UI.  NOT forwarded to the agent.
+        What the agent is for, in the author's words. Shown in the UI and given
+        to the dynamic-workflow dispatcher, which picks agents for jobs by it
+        (together with the agent's addons). NOT forwarded to the agent itself.
     agent_input:
         All runtime configuration sent to the agent on every run.
         Typical keys: ``system_prompt``, ``model``, ``tools``, ``max_tokens``.
@@ -42,7 +44,7 @@ class AgentDefinition(BaseModel):
 
     id: str
     name: str = ""
-    description: str | None = None          # human label — NOT sent to agent
+    description: str | None = None          # UI + dispatcher roster — NOT sent to agent
     default_runtime: Literal["local", "docker", "k8s"] = "local"
 
     # Sent to the agent on every run:

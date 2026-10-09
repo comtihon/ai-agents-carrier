@@ -105,6 +105,13 @@ system_prompt: |
   - `llm` — single LLM call; the result is stored under `output_key`
   - `langgraph-agent` / `claude-agent` — run an external agent container
   - `workflow` — child workflow
+  - `dynamic` — let the dispatcher (meta-LLM) build the agent DAG at run time:
+    `agent_pool` (list of {agent_id, max_instances, categories}), `jobs`
+    (min/max per category: planning, execution, validation, integration),
+    `automation` (ask | plan | auto | bypass), optional `limits`, `repo`,
+    `shared_volume`, `dispatcher_instructions`, `output_key`. Agents are picked
+    by their description and addons, so describe agents well. A workflow made
+    of a single dynamic step (optionally after a trigger) is a "dynamic workflow".
 
   ## Guidelines
 

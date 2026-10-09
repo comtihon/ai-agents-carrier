@@ -1047,6 +1047,10 @@ async def create_workflow(
     denied = _sandbox_denial(steps)
     if denied:
         return denied
+    from app.infrastructure.orchestration.dynamic.node import validate_dynamic_steps
+    dynamic_errors = validate_dynamic_steps(steps)
+    if dynamic_errors:
+        return "Invalid dynamic step: " + "; ".join(dynamic_errors)
 
     existing = await deps.workflow_backend.get(workflow_id)
     if existing is not None:
@@ -1128,6 +1132,10 @@ async def update_workflow(
         denied = _sandbox_denial(steps)
         if denied:
             return denied
+        from app.infrastructure.orchestration.dynamic.node import validate_dynamic_steps
+        dynamic_errors = validate_dynamic_steps(steps)
+        if dynamic_errors:
+            return "Invalid dynamic step: " + "; ".join(dynamic_errors)
         from app.application.graph_layout import apply_layout
         from app.application.script_capture import capture_inline_scripts
         from app.application.step_normalization import implicit_edges, normalize_edges
