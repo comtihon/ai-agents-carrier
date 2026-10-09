@@ -430,17 +430,26 @@ def build_default_workflow(
         return await core.get_agent(deps, agent_id)
 
     @tool
-    async def create_agent(agent_id: str, name: str, description: str = "", default_runtime: str = "local", agent_input_json: str = "{}") -> str:
-        """Create a new agent definition. agent_input_json is a JSON object of default input overrides."""
+    async def create_agent(agent_id: str, name: str, description: str = "", default_runtime: str = "local", agent_input_json: str = "{}", protocol: str = "http-poll", acp_agent: str = None) -> str:
+        """Create a new agent definition. agent_input_json is a JSON object of default input overrides.
+
+        protocol: "http-poll" (pi-cloud-agent /start + /poll, the default) or
+        "acp" (ACP over WebSocket through acp-web-proxy). acp_agent names the
+        agent in the proxy's config (e.g. pi, claude, codex); empty = proxy default.
+        """
         return await core.create_agent(
-            deps, agent_id, name, description, default_runtime, agent_input_json
+            deps, agent_id, name, description, default_runtime, agent_input_json, protocol, acp_agent
         )
 
     @tool
-    async def update_agent(agent_id: str, name: str = None, description: str = None, default_runtime: str = None, agent_input_json: str = None) -> str:
-        """Update an existing agent definition. Only provided fields are changed; others preserved."""
+    async def update_agent(agent_id: str, name: str = None, description: str = None, default_runtime: str = None, agent_input_json: str = None, protocol: str = None, acp_agent: str = None) -> str:
+        """Update an existing agent definition. Only provided fields are changed; others preserved.
+
+        protocol: "http-poll" or "acp". acp_agent: the proxy's agent name for
+        ACP agents (pi, claude, codex); "" resets it to the proxy default.
+        """
         return await core.update_agent(
-            deps, agent_id, name, description, default_runtime, agent_input_json
+            deps, agent_id, name, description, default_runtime, agent_input_json, protocol, acp_agent
         )
 
     @tool
