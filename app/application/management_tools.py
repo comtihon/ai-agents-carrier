@@ -1212,6 +1212,11 @@ async def get_agent(deps: ManagementDeps, agent_id: str) -> str:
     return _json.dumps(agent.model_dump(mode="json"), indent=2, default=str)
 
 
+# How carrier talks to an agent process: the pi-cloud-agent HTTP poll API,
+# or ACP over WebSocket through acp-web-proxy.
+_AGENT_PROTOCOLS = ("http-poll", "acp")
+
+
 @requires(Permission.WRITE)
 async def create_agent(
     deps: ManagementDeps,
@@ -1220,9 +1225,13 @@ async def create_agent(
     description: str = "",
     default_runtime: str = "local",
     agent_input_json: str = "{}",
+    protocol: str = "http-poll",
+    acp_agent: str | None = None,
 ) -> str:
     if deps.agent_backend is None:
         return "Agent backend not configured."
+    if protocol not in _AGENT_PROTOCOLS:
+        return f"Invalid protocol '{protocol}'. Must be one of: {', '.join(_AGENT_PROTOCOLS)}."
     import json as _json
     try:
         agent_input = _json.loads(agent_input_json)
@@ -1242,6 +1251,8 @@ async def create_agent(
         description=description,
         default_runtime=default_runtime,
         agent_input=agent_input,
+        protocol=protocol,
+        acp_agent=(acp_agent or None) if protocol == "acp" else None,
     )
     await deps.agent_backend.create(new_agent)
     return f"Agent '{agent_id}' created."
@@ -1255,9 +1266,13 @@ async def update_agent(
     description: str = None,
     default_runtime: str = None,
     agent_input_json: str = None,
+    protocol: str = None,
+    acp_agent: str = None,
 ) -> str:
     if deps.agent_backend is None:
         return "Agent backend not configured."
+    if protocol is not None and protocol not in _AGENT_PROTOCOLS:
+        return f"Invalid protocol '{protocol}'. Must be one of: {', '.join(_AGENT_PROTOCOLS)}."
     resolved, err = await _resolve_agent_id(deps, agent_id)
     if err:
         return err
@@ -1283,6 +1298,13 @@ async def update_agent(
             updated.agent_input = agent_input
         except Exception as e:
             return f"Invalid agent_input_json: {e}"
+    if protocol is not None:
+        updated.protocol = protocol  # type: ignore[assignment]
+        if protocol != "acp":
+            updated.acp_agent = None
+    if acp_agent is not None:
+        # "" clears it (the proxy's default agent).
+        updated.acp_agent = acp_agent or None
     await deps.agent_backend.update(resolved, updated)
     return f"Agent '{resolved}' updated."
 
