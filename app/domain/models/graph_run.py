@@ -30,6 +30,10 @@ class GraphRun(BaseModel):
     user_request: str = ""
     status: Literal["running", "waiting_approval", "waiting_agent", "completed", "failed", "cancelled", "rejected"]
     parent_run_id: str | None = None  # set when this run was spawned by a workflow step
+    # "job": one attempt of a dynamic-workflow job, executed under its own run id
+    # so parallel instances of one agent never share a container/pod identity.
+    # Hidden from the run list; reached through the parent's dynamic DAG.
+    kind: Literal["workflow", "job"] = "workflow"
     agent_url: str | None = None  # URL of the running agent HTTP server (set while waiting_agent)
     # Snapshot of the workflow definition at the time the run was started.
     # Stored so that approval-resume uses the exact same definition even after
@@ -46,6 +50,9 @@ class GraphRun(BaseModel):
     # resume we know the exact position in the graph and can clear stale sentinels
     # (e.g. __failed_step__ left over from a previous loop iteration).
     routing_log: list[RoutingEvent] = Field(default_factory=list)
+    # Dynamic steps' run-time records (step_id → DynamicRunState dump): the
+    # agent DAG the dispatcher built, every job attempt, every decision.
+    dynamic: dict[str, Any] = Field(default_factory=dict)
     # LangSmith / local tracing
     langsmith_run_id: str | None = None
     trace_data: dict[str, Any] = Field(default_factory=dict)

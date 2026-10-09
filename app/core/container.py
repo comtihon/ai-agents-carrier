@@ -729,6 +729,17 @@ class ApplicationContainer:
                 logger.exception("Failed to recover run %s", run.id)
 
     async def _recover_run(self, run: GraphRun) -> None:
+        if run.kind == "job":
+            # A dynamic job attempt has no graph of its own: the parent's dynamic
+            # step re-dispatches lost attempts when the parent recovers. Close
+            # this one and free whatever agent it was holding.
+            from app.services.agent_cleanup import cleanup_run_agents
+            await cleanup_run_agents(run.id, self.settings, warm_pod_repository=self.warm_pod_repository)
+            run.status = "cancelled"
+            run.state = {**(run.state or {}), "error": "Backend restarted; the parent run retries this job"}
+            run.touch()
+            await self.run_repository.update(run)
+            return
         runner = self._build_runner_for_recovery(run)
         if runner is None:
             logger.warning("run %s: cannot recover — workflow '%s' not available", run.id, run.graph_id)

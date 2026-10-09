@@ -191,6 +191,20 @@ async def terminate_run(
         raise RunControlError(409, f"Run is not active (status: {run.status})")
     from app.services.agent_cleanup import cleanup_run_agents
     await cleanup_run_agents(run_id, container.settings)
+    # Dynamic job attempts run under child run ids with agents of their own.
+    list_children = getattr(container.run_repository, "list_children", None)
+    if list_children is not None:
+        try:
+            for child in await list_children(run_id):
+                if child.status in ("running", "waiting_agent", "waiting_approval"):
+                    await cleanup_run_agents(child.id, container.settings)
+                    full = await container.run_repository.get(child.id)
+                    if full is not None:
+                        full.status = "cancelled"
+                        full.touch()
+                        await container.run_repository.update(full)
+        except Exception:
+            logger.warning("run %s: stopping dynamic job runs failed", run_id, exc_info=True)
     run.status = "failed"
     run.state = {**(run.state or {}), "error": "Terminated by user"}
     run.touch()
@@ -309,6 +323,11 @@ async def _resume_rejected(
     approver_source: str = "ui",
 ) -> None:
     from app.api.routes.workflows import _stream_graph
+    # A rejected dynamic-workflow decision is an instruction (re-plan, skip the
+    # handback, …), not the end of the run: a run that goes on to complete has
+    # completed, not been rejected.
+    paused_at = next((s for s in runner.steps if s.get("id") == run.current_step), None)
+    rejection_continues = bool(paused_at and paused_at.get("type") == "dynamic_gate")
     await _stream_graph(
         runner, run, container,
         Command(resume={
@@ -320,7 +339,7 @@ async def _resume_rejected(
             "decided_at": datetime.now(timezone.utc).isoformat(),
         }),
     )
-    if run.status == "completed":
+    if run.status == "completed" and not rejection_continues:
         run.status = "rejected"
         run.touch()
         await container.run_repository.update(run)
@@ -384,6 +403,10 @@ async def retry_run(
             found_failed = True
         if found_failed:
             run.step_statuses[sid] = "pending"
+            # A dynamic step keeps its finished jobs and retries the rest.
+            if step.get("type") == "dynamic" and sid in (run.dynamic or {}):
+                from app.infrastructure.orchestration.dynamic.engine import reset_for_retry
+                run.dynamic[sid] = reset_for_retry(run.dynamic[sid])
 
     # Seed the LangGraph checkpoint at the last completed step
     config = _config(run.id)
@@ -466,6 +489,9 @@ async def restart_from_step(
         run.step_statuses[sid] = "pending"
         run.step_inputs.pop(sid, None)
         run.step_outputs.pop(sid, None)
+        # Restarting a dynamic step means planning it afresh.
+        if step.get("type") == "dynamic":
+            (run.dynamic or {}).pop(sid, None)
 
     # Clear per-attempt transient keys so they don't suppress new notifications
     for _k in ("_slack_ask_context_ts", "_slack_ask_context_channel", "_pending_question"):
