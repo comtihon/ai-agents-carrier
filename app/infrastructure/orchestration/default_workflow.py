@@ -328,12 +328,21 @@ def build_default_workflow(
                 execute (OpenHands code execution), workflow (child workflow),
                 http_call (outbound HTTP), langgraph-agent, claude-agent,
                 data_source (invoke a DataSourceDefinition operation),
-                dynamic (the dispatcher picks agents from `agent_pool` into
-                planning/execution/validation/integration jobs at run time;
+                dynamic (a meta-agent orchestrates a DAG of jobs on LangGraph:
+                it plans the request or first gathers information, splits the
+                work into planning/execution/validation/integration jobs across
+                agents from `agent_pool`, grants each job the `datasources` it
+                needs, and on a validator's change request or an agent's
+                question answers, rewinds the DAG or rearranges it; every
+                category is optional; set `plan` to author the job DAG yourself;
                 fields: agent_pool [{agent_id, max_instances, categories}],
-                jobs {category: {min, max}}, automation ask|plan|auto|bypass,
-                limits, repo {url, base_branch, verify}, shared_volume,
-                dispatcher_instructions, output_key).
+                jobs {category: {min, max}}, datasources [{source_id,
+                operations, description}], plan [{id, category, agent_id,
+                prompt, depends_on, owns, datasources}], automation
+                ask|plan|auto|bypass, limits {max_total_jobs, max_retries,
+                max_rearrangements, max_replans, max_parallel}, repo {url,
+                base_branch, verify}, shared_volume, dispatcher_instructions,
+                output_key).
                 Example: [{"id": "trigger", "type": "http"}, {"id": "classify", "type": "llm", "system_prompt": "...", "user_template": "...", "output_key": "verdict"}]
                 Also available: storage (this workflow's own key/value state),
                 slack (post/reply/read/DM/delete via a messaging provider),

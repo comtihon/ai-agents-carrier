@@ -1124,8 +1124,7 @@ class YamlGraphRunner:
         # Behaviour is unchanged: normalisation writes down the destination the
         # edge builder would have picked anyway, which is why the positional
         # branches further down survive as an unreachable belt-and-braces.
-        from app.infrastructure.orchestration.dynamic.node import expand_dynamic_steps
-        self._steps: list[dict[str, Any]] = expand_dynamic_steps(normalize_edges(definition["steps"]))
+        self._steps: list[dict[str, Any]] = normalize_edges(definition["steps"])
         self._llm = llm
         self._llm_factory = llm_factory
         self._mcp = mcp_tools_provider
@@ -1223,16 +1222,6 @@ class YamlGraphRunner:
                         sg.add_edge(sid, step_ids[i + 1])
                     else:
                         sg.add_edge(sid, END)
-                continue
-
-            # dynamic: onward when the engine finished, to its gate when it paused.
-            if step_type == "dynamic":
-                from app.infrastructure.orchestration.dynamic.node import router as _dyn_router
-                route_fn, gate_id, nxt = _dyn_router(step)
-                sg.add_conditional_edges(
-                    sid, route_fn,
-                    {gate_id: gate_id, nxt: (nxt if nxt in all_ids else END)},
-                )
                 continue
 
             routes = step.get("routes") or []
@@ -1351,16 +1340,13 @@ class YamlGraphRunner:
         elif t == "dynamic":
             from app.infrastructure.orchestration.dynamic.node import make_dynamic_node
             fn = make_dynamic_node(self, step)
-        elif t == "dynamic_gate":
-            from app.infrastructure.orchestration.dynamic.node import make_gate_node
-            fn = make_gate_node(self, step)
         else:
             raise ValueError(f"Unknown step type '{t}' in graph '{self.id}'")
         wrapped = self._wrap_with_status_running(self._wrap_with_loop_guard(step, fn), step)
         wrapped = self._wrap_with_when(step, wrapped)
         return self._wrap_with_fail_guard(step, wrapped)
 
-    _NO_LOOP_GUARD_TYPES: frozenset = frozenset({"ask_context", "human_approval", "cron", "http", "pubsub", "parallel", "join", "proceed_or", "switch", "langgraph-agent", "claude-agent", "dynamic", "dynamic_gate"})
+    _NO_LOOP_GUARD_TYPES: frozenset = frozenset({"ask_context", "human_approval", "cron", "http", "pubsub", "parallel", "join", "proceed_or", "switch", "langgraph-agent", "claude-agent", "dynamic"})
     # join handles __failed_step__ itself via failure_policy; all others must abort when
     # a previous step has already written the sentinel into state.
     _NO_FAIL_GUARD_TYPES: frozenset = frozenset({"join", "proceed_or"})
