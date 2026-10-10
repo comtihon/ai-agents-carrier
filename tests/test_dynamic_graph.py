@@ -1,4 +1,4 @@
-"""A dynamic step inside a real LangGraph run: job subgraph, gate, resume, child job runs."""
+"""A dynamic step inside a real workflow run: meta-agent, job subgraph, gates, child job runs."""
 
 from __future__ import annotations
 
@@ -53,22 +53,43 @@ STEPS = [
         "type": "dynamic",
         "automation": "plan",
         "agent_pool": [
+            {"agent_id": "researcher", "categories": ["planning"]},
             {"agent_id": "coder", "max_instances": 2, "categories": ["execution"]},
             {"agent_id": "tester", "categories": ["validation"]},
         ],
+        "datasources": [{"source_id": "crm", "operations": ["get_account", "list_accounts"]}],
         "output_key": "outcome",
     },
     {"id": "after", "type": "llm", "output_key": "after_out"},
 ]
 
 
-def _plan_llm(*answers):
-    queue = list(answers)
+def _job(id: str, category: str, agent: str, deps: list[str] | None = None, **extra) -> dict:
+    return {"id": id, "category": category, "agent_id": agent, "prompt": id, "depends_on": deps or [], **extra}
+
+
+def _meta_llm(*decisions):
+    """Patch target for build_llm_call: a meta-LLM answering scripted decisions."""
+    queue = list(decisions)
+    prompts: list[str] = []
 
     async def call(system, user):
-        return "```json\n" + json.dumps(queue.pop(0)) + "\n```", None
+        prompts.append(user)
+        decision = queue.pop(0)
+        if "actions" not in decision:
+            decision = {"summary": "scripted", "actions": [decision]}
+        return "```json\n" + json.dumps(decision) + "\n```", None
 
-    return lambda config, settings: call
+    factory = lambda config, settings: call  # noqa: E731
+    factory.prompts = prompts  # type: ignore[attr-defined]
+    return factory
+
+
+def add(*jobs):
+    return {"kind": "add_jobs", "jobs": list(jobs)}
+
+
+FINISH = {"kind": "finish", "text": "done"}
 
 
 def _runner(steps: list[dict] = STEPS) -> YamlGraphRunner:
@@ -86,88 +107,225 @@ def _run() -> GraphRun:
                     step_statuses={}, created_at=now, updated_at=now)
 
 
+async def _noop(*a, **k):
+    return None
+
+
+def _patched(meta, execute):
+    return (
+        patch("app.infrastructure.orchestration.dynamic.node.build_llm_call", meta),
+        patch("app.steps.agent_executor.execute_agent_step", new=execute),
+        patch("app.services.agent_cleanup.cleanup_run_agents", new=_noop),
+    )
+
+
+async def _setup(steps=STEPS):
+    runner = _runner(steps)
+    run = _run()
+    repo = _Repo()
+    await repo.create(run)
+    return runner, run, repo
+
+
 def test_dynamic_step_is_a_single_workflow_node():
-    runner = _runner()
-    assert [s["id"] for s in runner.steps] == ["orchestrator", "after"]
+    assert [s["id"] for s in _runner().steps] == ["orchestrator", "after"]
 
 
 @pytest.mark.asyncio
-async def test_dynamic_run_pauses_for_plan_then_runs_jobs_as_child_runs():
-    plan = {"summary": "split", "jobs": [
-        {"id": "code-a", "category": "execution", "agent_id": "coder", "prompt": "A", "owns": ["a/**"]},
-        {"id": "code-b", "category": "execution", "agent_id": "coder", "prompt": "B", "owns": ["b/**"]},
-        {"id": "test", "category": "validation", "agent_id": "tester", "prompt": "test", "depends_on": ["code-a", "code-b"]},
-    ]}
-    executed: list[tuple[str, str]] = []
+async def test_plan_gate_then_jobs_run_as_child_runs_with_granted_data_sources():
+    meta = _meta_llm(
+        add(_job("code-a", "execution", "coder", owns=["a/**"], datasources=["crm"]),
+            _job("code-b", "execution", "coder", owns=["b/**"]),
+            _job("test", "validation", "tester", ["code-a", "code-b"])),
+        FINISH,
+    )
+    executed: list[tuple[str, str, dict | None]] = []
 
     async def fake_execute(step, state, backend, run_id, cb, **kw):
-        executed.append((step["id"], run_id))
-        assert step["output_mapping"]
-        assert state["task"] in ("A", "B", "test")
+        executed.append((step["id"], run_id, kw.get("datasource_grants")))
+        assert step["output_mapping"] and step["questions_mode"] == "return"
         if step["id"] == "test":
             return {"verdict": "pass", "summary": "green"}
         return {"summary": f"{step['id']} done", "branch": f"b-{step['id']}"}
 
-    runner = _runner()
-    run = _run()
-    repo = _Repo()
-    await repo.create(run)
-
-    with patch("app.infrastructure.orchestration.dynamic.node.build_llm_call", _plan_llm(plan)), \
-         patch("app.steps.agent_executor.execute_agent_step", new=fake_execute), \
-         patch("app.services.agent_cleanup.cleanup_run_agents", new=_noop):
+    runner, run, repo = await _setup()
+    p1, p2, p3 = _patched(meta, fake_execute)
+    with p1, p2, p3:
         await stream_graph_to_pause(runner, run, repo, {"request": "add A and B"})
-        assert run.status == "waiting_approval"
-        assert run.current_step == "orchestrator"
+        assert run.status == "waiting_approval" and run.current_step == "orchestrator"
         dag = repo.runs[run.id].dynamic["orchestrator"]
-        assert dag["status"] == "waiting_approval"
-        assert [d["kind"] for d in dag["decisions"]] == ["plan"]
+        assert dag["status"] == "waiting_approval" and [d["kind"] for d in dag["decisions"]] == ["plan"]
         assert executed == []
-
         await stream_graph_to_pause(runner, run, repo, Command(resume={"approved": True}))
 
     assert run.status == "completed", run.state.get("error")
     assert sorted(e[0] for e in executed) == ["code-a", "code-b", "test"]
-    # Every attempt ran under its own child run id, recorded as a job run.
+    grants = {e[0]: e[2] for e in executed}
+    assert grants == {"code-a": {"crm": ["get_account", "list_accounts"]}, "code-b": None, "test": None}
     child_ids = {e[1] for e in executed}
     assert len(child_ids) == 3 and run.id not in child_ids
     for cid in child_ids:
         child = repo.runs[cid]
         assert child.kind == "job" and child.parent_run_id == run.id and child.status == "completed"
-    dag = repo.runs[run.id].dynamic["orchestrator"]
-    assert dag["status"] == "completed"
+    assert repo.runs[run.id].dynamic["orchestrator"]["status"] == "completed"
     assert run.state["outcome"]["jobs"]["code-a"]["output"]["branch"] == "b-code-a"
     assert run.state["after_out"] == "after done"
     assert run.state["approval_history"][0]["approved"] is True
 
 
 @pytest.mark.asyncio
-async def test_rejected_plan_replans_without_ending_the_run():
-    first = {"jobs": [{"id": "code", "category": "execution", "agent_id": "coder", "prompt": "x"}]}
-    second = {"jobs": [{"id": "code2", "category": "execution", "agent_id": "coder", "prompt": "y"}]}
+async def test_rejected_plan_goes_back_to_the_meta_agent():
+    meta = _meta_llm(add(_job("code", "execution", "coder")), add(_job("code2", "execution", "coder")), FINISH)
 
     async def fake_execute(step, state, backend, run_id, cb, **kw):
         return {"summary": "ok"}
 
-    runner = _runner()
-    run = _run()
-    repo = _Repo()
-    await repo.create(run)
-    with patch("app.infrastructure.orchestration.dynamic.node.build_llm_call", _plan_llm(first, second)), \
-         patch("app.steps.agent_executor.execute_agent_step", new=fake_execute), \
-         patch("app.services.agent_cleanup.cleanup_run_agents", new=_noop):
+    runner, run, repo = await _setup()
+    p1, p2, p3 = _patched(meta, fake_execute)
+    with p1, p2, p3:
         await stream_graph_to_pause(runner, run, repo, {"request": "r"})
         await stream_graph_to_pause(runner, run, repo, Command(resume={"approved": False, "reason": "smaller"}))
         assert run.status == "waiting_approval"
-        dag = repo.runs[run.id].dynamic["orchestrator"]
-        assert dag["replans"] == 1
+        assert repo.runs[run.id].dynamic["orchestrator"]["replans"] == 1
+        assert "smaller" in meta.prompts[1]
         await stream_graph_to_pause(runner, run, repo, Command(resume={"approved": True}))
     assert run.status == "completed"
     assert list(run.state["outcome"]["jobs"]) == ["code2"]
 
 
-async def _noop(*a, **k):
-    return None
+@pytest.mark.asyncio
+async def test_running_agent_asks_and_the_meta_agent_answers_it_live():
+    """agent -> /agent/question -> meta-agent -> answer channel -> the same running agent."""
+    from app.infrastructure.orchestration.dynamic.hub import route_live_question
+    from app.services import agent_inbox
+
+    meta = _meta_llm(add(_job("code", "execution", "coder")), {"kind": "answer", "job_id": "code", "text": "spaces"}, FINISH)
+
+    async def fake_execute(step, state, backend, run_id, cb, **kw):
+        assert route_live_question("parent-run-0001", run_id, "tabs or spaces?")
+        await asyncio.wait_for(agent_inbox.event_for(run_id).wait(), 5)
+        return {"summary": f"used {agent_inbox.answers.pop(run_id)}"}
+
+    runner, run, repo = await _setup([{**STEPS[0], "automation": "auto"}, STEPS[1]])
+    p1, p2, p3 = _patched(meta, fake_execute)
+    with p1, p2, p3:
+        await stream_graph_to_pause(runner, run, repo, {"request": "r"})
+    assert run.status == "completed", run.state.get("error")
+    assert run.state["outcome"]["jobs"]["code"]["output"]["summary"] == "used spaces"
+    assert "tabs or spaces?" in meta.prompts[1]
+    child_id = repo.runs[run.id].dynamic["orchestrator"]["jobs"][0]["attempts"][0]["child_run_id"]
+    assert repo.runs[child_id].state["_pending_answer"] == "spaces"
+
+
+@pytest.mark.asyncio
+async def test_agent_questions_in_its_result_go_to_the_meta_agent_not_a_human():
+    from app.steps.agent_executor import AgentNeedsInput
+
+    meta = _meta_llm(add(_job("code", "execution", "coder")), {"kind": "answer", "job_id": "code", "text": "postgres"}, FINISH)
+    asked = {"n": 0}
+
+    async def fake_execute(step, state, backend, run_id, cb, **kw):
+        asked["n"] += 1
+        if asked["n"] == 1:
+            raise AgentNeedsInput(["which db?"])
+        assert state["_clarification_answers"] == {"which db?": "postgres"}
+        return {"summary": "done"}
+
+    runner, run, repo = await _setup([{**STEPS[0], "automation": "auto"}, STEPS[1]])
+    p1, p2, p3 = _patched(meta, fake_execute)
+    with p1, p2, p3:
+        await stream_graph_to_pause(runner, run, repo, {"request": "r"})
+    assert run.status == "completed", run.state.get("error")
+    assert "which db?" in meta.prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_validator_change_request_rewinds_to_the_researcher_across_child_runs():
+    meta = _meta_llm(
+        add(_job("research", "planning", "researcher"), _job("code", "execution", "coder", ["research"]),
+            _job("review", "validation", "tester", ["code"])),
+        {"kind": "rewind", "job_ids": ["research"], "text": "find the streaming API"},
+        FINISH,
+    )
+    seen: list[tuple[str, int]] = []
+    reviews = iter([{"verdict": "fail", "feedback": "batch is wrong"}, {"verdict": "pass"}])
+
+    async def fake_execute(step, state, backend, run_id, cb, **kw):
+        seen.append((step["id"], state["job"]["attempt"]))
+        return next(reviews) if step["id"] == "review" else {"summary": f"{step['id']} done"}
+
+    runner, run, repo = await _setup([{**STEPS[0], "automation": "auto"}, STEPS[1]])
+    p1, p2, p3 = _patched(meta, fake_execute)
+    with p1, p2, p3:
+        await stream_graph_to_pause(runner, run, repo, {"request": "r"})
+    assert run.status == "completed", run.state.get("error")
+    assert seen == [("research", 1), ("code", 1), ("review", 1), ("research", 2), ("code", 2), ("review", 2)]
+    assert "batch is wrong" in meta.prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_authored_job_chain_longer_than_the_default_recursion_limit():
+    """15 sequential jobs are 30+ supersteps of the job subgraph: more than LangGraph's default 25."""
+    chain = [
+        _job(f"part-{i}", "execution", "coder", [f"part-{i - 1}"] if i else [])
+        for i in range(15)
+    ]
+    steps = [{**STEPS[0], "automation": "auto", "plan": chain, "jobs": {"execution": {"max": 15}}, "next": "END"}]
+    executed: list[str] = []
+
+    async def fake_execute(step, state, backend, run_id, cb, **kw):
+        executed.append(step["id"])
+        return {"summary": f"{step['id']} done"}
+
+    runner, run, repo = await _setup(steps)
+    p1, p2, p3 = _patched(_meta_llm(), fake_execute)
+    with p1, p2, p3:
+        await stream_graph_to_pause(runner, run, repo, {"request": "build it"})
+    assert run.status == "completed", run.state.get("error")
+    assert executed == [f"part-{i}" for i in range(15)]
+    dag = repo.runs[run.id].dynamic["orchestrator"]
+    assert dag["status"] == "completed" and all(j["created_by"] == "author" for j in dag["jobs"])
+    first = dag["jobs"][0]["attempts"][0]
+    assert first["child_run_id"] and first["status"] == "finished"
+
+
+@pytest.mark.asyncio
+async def test_interrupted_run_resumes_without_rerunning_finished_jobs():
+    """The workflow task dies mid-run; resuming from the checkpoint reruns only the unfinished job."""
+    from app.infrastructure.orchestration.dynamic import hub as hubs
+
+    meta = _meta_llm(add(_job("code-a", "execution", "coder"), _job("code-b", "execution", "coder")), FINISH)
+    executed: list[str] = []
+    b_started = asyncio.Event()
+    first_b = {"held": True}
+
+    async def fake_execute(step, state, backend, run_id, cb, **kw):
+        executed.append(step["id"])
+        if step["id"] == "code-b" and first_b["held"]:
+            first_b["held"] = False
+            b_started.set()
+            await asyncio.sleep(3600)
+        return {"summary": f"{step['id']} done"}
+
+    runner, run, repo = await _setup([{**STEPS[0], "automation": "auto"}, STEPS[1]])
+    p1, p2, p3 = _patched(meta, fake_execute)
+    with p1, p2, p3:
+        task = asyncio.create_task(stream_graph_to_pause(runner, run, repo, {"request": "r"}))
+        await asyncio.wait_for(b_started.wait(), 5)
+        for _ in range(100):  # code-a reported
+            jobs = (repo.runs[run.id].dynamic.get("orchestrator") or {}).get("jobs") or []
+            if any(j["id"] == "code-a" and j["status"] == "finished" for j in jobs):
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not hubs._HUBS  # the step's attempts were stopped with it
+        await stream_graph_to_pause(runner, run, repo, None)
+    assert run.status == "completed", run.state.get("error")
+    assert sorted(executed) == ["code-a", "code-b", "code-b"]
+    b = next(j for j in repo.runs[run.id].dynamic["orchestrator"]["jobs"] if j["id"] == "code-b")
+    assert [a["reason"] for a in b["attempts"]] == ["initial", "restart"]
 
 
 def test_validate_dynamic_steps_reports_config_problems():
@@ -181,15 +339,16 @@ def test_validate_dynamic_steps_reports_config_problems():
         {"id": "c", "type": "dynamic", "automation": "sometimes", "agent_pool": [{"agent_id": "x"}]},
         {"id": "d", "type": "dynamic", "agent_pool": [{"agent_id": "t", "categories": ["validation"]}],
          "plan": [{"id": "code", "category": "execution", "agent_id": "t", "prompt": "p"},
-                  {"id": "review", "category": "validation", "agent_id": "t", "prompt": "p", "depends_on": ["ghost"]}]},
+                  {"id": "review", "category": "validation", "agent_id": "t", "prompt": "p",
+                   "depends_on": ["ghost"], "datasources": ["billing"]}]},
     ])
     text = " | ".join(errors)
     assert "agent_pool is empty" in text
     assert "no agent in the pool may fill execution jobs (jobs.execution.min is 1)" in text
     assert "step 'c': automation" in text
     assert "step 'd': plan: job 'code': agent 't' may only fill" in text
-    assert "depends on unknown job 'ghost'" in text
-    # Every category is optional: a validator-only pool is fine without a minimum.
+    assert "depends on unknown or removed job 'ghost'" in text
+    assert "data source 'billing' is not enabled" in text
     assert validate_dynamic_steps([{"id": "e", "type": "dynamic", "agent_pool": [{"agent_id": "t", "categories": ["validation"]}]}]) == []
 
 
@@ -213,110 +372,3 @@ def test_roster_carries_description_and_addons():
     assert "MCP: blender" in roster and "jira" not in roster
     assert "tools: gh" in roster
     assert "datasource survey (get_points)" in roster
-
-
-@pytest.mark.asyncio
-async def test_authored_job_chain_longer_than_the_default_recursion_limit():
-    """15 sequential jobs are 30+ supersteps of the job subgraph: more than LangGraph's default 25."""
-    chain = [
-        {"id": f"part-{i}", "category": "execution", "agent_id": "coder", "prompt": f"part {i}",
-         "depends_on": [f"part-{i - 1}"] if i else []}
-        for i in range(15)
-    ]
-    steps = [{**STEPS[0], "automation": "auto", "plan": chain, "jobs": {"execution": {"max": 15}}, "next": "END"}]
-    executed: list[str] = []
-
-    async def fake_execute(step, state, backend, run_id, cb, **kw):
-        executed.append(step["id"])
-        return {"summary": f"{step['id']} done"}
-
-    runner = _runner(steps)
-    run = _run()
-    repo = _Repo()
-    await repo.create(run)
-    with patch("app.steps.agent_executor.execute_agent_step", new=fake_execute), \
-         patch("app.services.agent_cleanup.cleanup_run_agents", new=_noop):
-        await stream_graph_to_pause(runner, run, repo, {"request": "build it"})
-    assert run.status == "completed", run.state.get("error")
-    assert executed == [f"part-{i}" for i in range(15)]
-    dag = repo.runs[run.id].dynamic["orchestrator"]
-    assert dag["status"] == "completed" and all(j["created_by"] == "author" for j in dag["jobs"])
-    # The mirrored DAG carries every attempt's child run and result for the UI.
-    first = dag["jobs"][0]["attempts"][0]
-    assert first["child_run_id"] and first["status"] == "finished"
-
-
-@pytest.mark.asyncio
-async def test_question_gate_pauses_the_workflow_at_the_dynamic_step():
-    from langgraph.errors import GraphInterrupt
-    from langgraph.types import Interrupt
-
-    plan = {"jobs": [{"id": "code", "category": "execution", "agent_id": "coder", "prompt": "x"}]}
-    asked = {"n": 0}
-
-    async def fake_execute(step, state, backend, run_id, cb, **kw):
-        asked["n"] += 1
-        if asked["n"] == 1:
-            raise GraphInterrupt([Interrupt(value={"questions": ["which db?"]})])
-        assert state["_clarification_answers"] == {"which db?": "postgres"}
-        return {"summary": "done"}
-
-    runner = _runner()
-    run = _run()
-    repo = _Repo()
-    await repo.create(run)
-    with patch("app.infrastructure.orchestration.dynamic.node.build_llm_call", _plan_llm(plan)), \
-         patch("app.steps.agent_executor.execute_agent_step", new=fake_execute), \
-         patch("app.services.agent_cleanup.cleanup_run_agents", new=_noop):
-        await stream_graph_to_pause(runner, run, repo, {"request": "r"})
-        assert run.status == "waiting_approval" and run.current_step == "orchestrator"
-        await stream_graph_to_pause(runner, run, repo, Command(resume={"approved": True}))  # the plan
-        assert run.status == "waiting_approval"
-        dag = repo.runs[run.id].dynamic["orchestrator"]
-        assert [d["kind"] for d in dag["decisions"] if not d["resolved"]] == ["question"]
-        await stream_graph_to_pause(
-            runner, run, repo,
-            Command(resume={"approved": True, "corrections": {"answers": {"which db?": "postgres"}}}),
-        )
-    assert run.status == "completed", run.state.get("error")
-    assert [h["approved"] for h in run.state["approval_history"]] == [True, True]
-
-
-class _Crash(BaseException):
-    """Stands in for the process dying mid-wave: nothing in the job runner catches it."""
-
-
-@pytest.mark.asyncio
-async def test_crash_mid_wave_reruns_only_the_part_that_had_not_finished():
-    plan = {"jobs": [
-        {"id": "code-a", "category": "execution", "agent_id": "coder", "prompt": "A", "owns": ["a/**"]},
-        {"id": "code-b", "category": "execution", "agent_id": "coder", "prompt": "B", "owns": ["b/**"]},
-    ]}
-    executed: list[str] = []
-    crash = {"armed": True}
-
-    async def fake_execute(step, state, backend, run_id, cb, **kw):
-        executed.append(step["id"])
-        if step["id"] == "code-b":
-            await asyncio.sleep(0.02)  # code-a reports first
-            if crash["armed"]:
-                crash["armed"] = False
-                raise _Crash()
-        return {"summary": f"{step['id']} done"}
-
-    runner = _runner([{**STEPS[0], "automation": "auto"}, STEPS[1]])
-    run = _run()
-    repo = _Repo()
-    await repo.create(run)
-    with patch("app.infrastructure.orchestration.dynamic.node.build_llm_call", _plan_llm(plan)), \
-         patch("app.steps.agent_executor.execute_agent_step", new=fake_execute), \
-         patch("app.services.agent_cleanup.cleanup_run_agents", new=_noop):
-        with pytest.raises(_Crash):
-            await stream_graph_to_pause(runner, run, repo, {"request": "add A and B"})
-        mirrored = repo.runs[run.id].dynamic["orchestrator"]
-        a = next(j for j in mirrored["jobs"] if j["id"] == "code-a")
-        assert a["attempts"][0]["status"] == "finished"  # reported before the crash
-        # Resume the workflow from its checkpoint, as a restart does.
-        await stream_graph_to_pause(runner, run, repo, None)
-    assert run.status == "completed", run.state.get("error")
-    assert sorted(executed) == ["code-a", "code-b", "code-b"]

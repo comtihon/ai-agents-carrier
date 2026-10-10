@@ -302,6 +302,26 @@ class TestGrantMinting:
             "hubspot-crm": ["list_contacts"],
         }
 
+    def test_job_grants_from_a_dynamic_step_join_the_agents_own_addons(self):
+        """The meta-agent's per-job grant is added to, not substituted for, the addons."""
+        cfg = _build_agent_config(
+            _agent(_datasource_addon("afp-projects", ["get_project"])),
+            _settings(),
+            datasource_grants={"hubspot-crm": ["list_contacts"], "afp-projects": ["deliver_project"]},
+        )
+        grant = verify_grant(_ds_entry(cfg)["api_key"], SIGNING_KEY)
+        assert grant.grants == {
+            "afp-projects": ["get_project", "deliver_project"],
+            "hubspot-crm": ["list_contacts"],
+        }
+
+    def test_a_step_dict_cannot_grant_data_sources(self):
+        """Only the job runner's explicit argument grants: a workflow's YAML cannot."""
+        cfg = _build_agent_config(
+            _agent(), _settings(), step={"id": "s", "datasource_grants": {"hubspot-crm": ["list_contacts"]}},
+        )
+        assert _ds_entry(cfg) is None
+
     def test_an_addon_with_no_ticked_operations_produces_no_entry(self):
         """Empty allowed_operations is a deny, so there is nothing to grant."""
         cfg = _build_agent_config(
