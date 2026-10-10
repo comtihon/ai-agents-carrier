@@ -1,13 +1,23 @@
-"""Dynamic workflows: configuration and run-time DAG models.
+"""Job workflows: configuration and run-time DAG models.
 
-A *dynamic* step does not have its graph drawn by the author. The author
-declares which agents may take part (the agent pool), how many jobs of each
-category the run may hold, and how much of it a human signs off (the
-automation mode). At run time the dispatcher — the meta-LLM — reads the
-request and the pool's descriptions, and fills job slots with agents. Jobs may
-hand work back (a validator returning a task to the coder that produced it) or
-delegate (a planner asking for a researcher), so the logical flow loops while
-the persisted record stays an append-only list of job attempts.
+A ``type: dynamic`` step runs a DAG of jobs. Each job is one agent working on
+one part of the work: planning, execution, validation or integration. The DAG
+comes from one of two places:
+
+- *dynamic*: the author declares which agents may take part (the agent pool)
+  and how many jobs of each category the run may hold; at run time the
+  dispatcher — the meta-LLM — reads the request and the pool's descriptions and
+  fills job slots with agents, splitting a big job into parts across several
+  agents of the same category;
+- *static*: the author writes the jobs into the step (``plan``); the
+  dispatcher is only consulted when a job delegates.
+
+Every category is optional: a run may have no executor (research only) or no
+validator. Jobs may hand work back (a validator returning a part to the coder
+that produced it — the next iteration) or delegate (a planner asking for a
+researcher), so the logical flow loops while the persisted record stays an
+append-only list of job attempts. Only the jobs that failed or were handed
+back run again; finished parts keep their results.
 
 The config is stored as an ordinary workflow step (``type: dynamic``), so a
 workflow can be entirely dynamic (the designer shows only this config) or embed
@@ -65,7 +75,7 @@ class JobSlot(BaseModel):
 def _default_slots() -> dict[str, JobSlot]:
     return {
         "planning": JobSlot(min=0, max=3),
-        "execution": JobSlot(min=1, max=8),
+        "execution": JobSlot(min=0, max=8),
         "validation": JobSlot(min=0, max=3),
         "integration": JobSlot(min=0, max=1),
     }
@@ -98,11 +108,26 @@ class RepoConfig(BaseModel):
     verify: list[str] = Field(default_factory=list)
 
 
+class JobSpec(BaseModel):
+    """One job as planned: by the dispatcher, a planner's expansion, or the author."""
+
+    id: str
+    category: JobCategory
+    agent_id: str
+    title: str = ""
+    prompt: str
+    depends_on: list[str] = Field(default_factory=list)
+    # What the job may change: file globs, or named parts of an artifact.
+    owns: list[str] = Field(default_factory=list)
+
+
 class DynamicConfig(BaseModel):
     """The ``type: dynamic`` step's own fields (everything but id/type/next)."""
 
     agent_pool: list[PoolAgent] = Field(default_factory=list)
     jobs: dict[JobCategory, JobSlot] = Field(default_factory=_default_slots)
+    # An authored job DAG. When set the dispatcher does not plan the run.
+    plan: list[JobSpec] | None = None
     automation: AutomationMode = "plan"
     limits: DynamicLimits = Field(default_factory=DynamicLimits)
     # Dispatcher (meta-LLM) overrides; fall back to META_LLM_* settings.
@@ -129,8 +154,8 @@ class DynamicConfig(BaseModel):
         dup = {i for i in ids if ids.count(i) > 1}
         if dup:
             raise ValueError(f"agent_pool lists {sorted(dup)} more than once")
-        if self.jobs["execution"].min < 1:
-            raise ValueError("a dynamic workflow needs at least one execution job (jobs.execution.min >= 1)")
+        if self.plan is not None and not self.plan:
+            raise ValueError("plan is empty: list the jobs, or leave plan out to let the dispatcher plan")
         return self
 
     @classmethod
@@ -165,6 +190,8 @@ class JobAttempt(BaseModel):
     feedback: str | None = None
     output: dict[str, Any] | None = None
     error: str | None = None
+    # What the agent asked when the attempt ended in needs_input.
+    questions: list[str] = Field(default_factory=list)
 
 
 class Job(BaseModel):
@@ -187,7 +214,7 @@ class Job(BaseModel):
     pending_feedback: str | None = None
     pending_reason: str | None = None
     pending_answers: dict[str, Any] | None = None
-    created_by: Literal["dispatcher", "planner", "delegation", "human"] = "dispatcher"
+    created_by: Literal["dispatcher", "planner", "delegation", "human", "author"] = "dispatcher"
 
     @property
     def last(self) -> JobAttempt | None:

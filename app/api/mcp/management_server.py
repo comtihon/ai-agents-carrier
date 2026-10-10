@@ -272,12 +272,16 @@ def register_management_tools(
                 execute (OpenHands code execution), workflow (child workflow),
                 http_call (outbound HTTP), langgraph-agent, claude-agent,
                 data_source (invoke a DataSourceDefinition operation),
-                dynamic (the dispatcher picks agents from `agent_pool` into
-                planning/execution/validation/integration jobs at run time;
-                fields: agent_pool [{agent_id, max_instances, categories}],
-                jobs {category: {min, max}}, automation ask|plan|auto|bypass,
-                limits, repo {url, base_branch, verify}, shared_volume,
-                dispatcher_instructions, output_key).
+                dynamic (a DAG of jobs run on LangGraph: the dispatcher splits
+                the work into planning/execution/validation/integration jobs
+                from `agent_pool`, several agents per category on different
+                parts; every category is optional; a failed review hands work
+                back for another iteration; or set `plan` to author the job
+                DAG yourself; fields: agent_pool [{agent_id, max_instances,
+                categories}], jobs {category: {min, max}}, plan [{id,
+                category, agent_id, prompt, depends_on, owns}], automation
+                ask|plan|auto|bypass, limits, repo {url, base_branch, verify},
+                shared_volume, dispatcher_instructions, output_key).
                 Example: [{"id": "trigger", "type": "http"}, {"id": "classify", "type": "llm", "system_prompt": "...", "user_template": "...", "output_key": "verdict"}]
                 Also available: storage (this workflow's own key/value state),
                 slack (post/reply/read/DM/delete via a messaging provider),
