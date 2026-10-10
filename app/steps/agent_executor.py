@@ -52,6 +52,15 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 
+class AgentNeedsInput(RuntimeError):
+    """The agent ended asking questions and the step asked for them back
+    (``questions_mode: return``) instead of pausing the graph on an interrupt."""
+
+    def __init__(self, questions: list[str]) -> None:
+        super().__init__("; ".join(questions))
+        self.questions = questions
+
+
 class MetaLLMRejectionError(RuntimeError):
     """Raised when meta-LLM quality gate rejects a step's output.
 
@@ -166,6 +175,7 @@ def _build_agent_config(
     step: dict[str, Any] | None = None,
     run_id: str | None = None,
     state: dict[str, Any] | None = None,
+    datasource_grants: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     """Build the ``agent_config`` payload to forward in ``POST /start``.
 
@@ -324,6 +334,15 @@ def _build_agent_config(
             continue
         operations = granted_operations.setdefault(source_id, [])
         for operation in ds_addon.allowed_operations:
+            name = (operation or "").strip()
+            if name and name not in operations:
+                operations.append(name)
+    # A dynamic workflow's meta-agent may grant a job sources enabled for its
+    # step on top of the agent's own addons (validated against the step's list
+    # before they reach here).
+    for source_id, operations_granted in (datasource_grants or {}).items():
+        operations = granted_operations.setdefault(str(source_id).strip(), [])
+        for operation in operations_granted or []:
             name = (operation or "").strip()
             if name and name not in operations:
                 operations.append(name)
@@ -645,6 +664,7 @@ async def execute_agent_step(
     agent_task_repository: Any = None,
     warm_pod_repository: Any = None,
     use_meta_llm: bool = True,
+    datasource_grants: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     """Execute a ``langgraph-agent`` or ``claude-agent`` step.
 
@@ -675,6 +695,11 @@ async def execute_agent_step(
         uses this to call back with its output.
     settings:
         App ``Settings`` instance.  Resolved lazily if not provided.
+    datasource_grants:
+        ``{source_id: [operation, ...]}`` granted on top of the agent's own
+        ``datasource`` addons. Only the dynamic-workflow job runner passes it,
+        after checking the sources against those enabled for its step; a
+        workflow's YAML cannot set it.
 
     Returns
     -------
@@ -742,7 +767,9 @@ async def execute_agent_step(
         local_agent_dir=settings.local_agent_dir,
         local_agent_command=settings.local_agent_command,
     )
-    agent_config_payload = _build_agent_config(agent_def, settings, step=step, run_id=run_id, state=state)
+    agent_config_payload = _build_agent_config(
+        agent_def, settings, step=step, run_id=run_id, state=state, datasource_grants=datasource_grants,
+    )
     resolved_env_vars: dict[str, str] = agent_config_payload.get("env_vars") or {}
 
     # ACP agents (behind acp-web-proxy) are driven over a WebSocket instead of
@@ -1183,6 +1210,17 @@ async def execute_agent_step(
 
 
 
+async def _clear_pending_question(run_repository: Any, run_id: str) -> None:
+    try:
+        run = await run_repository.get(run_id)
+        if run and "_pending_question" in (run.state or {}):
+            run.state = {k: v for k, v in run.state.items() if k != "_pending_question"}
+            run.touch()
+            await run_repository.update(run)
+    except Exception:
+        logger.debug("clearing the pending question of run %s failed", run_id, exc_info=True)
+
+
 async def _finalize_agent_output(
     step: dict[str, Any],
     raw_output: dict[str, Any],
@@ -1283,6 +1321,8 @@ async def _finalize_agent_output(
                 "the clarify tool instead of exiting; surfacing %d question(s): %s",
                 step_id, len(questions), questions,
             )
+            if step.get("questions_mode") == "return":
+                raise AgentNeedsInput([str(q) for q in questions])
             answers = interrupt({"type": "ask_context", "questions": questions})
             if isinstance(answers, dict) and answers:
                 raw_output = {**raw_output, "_clarification_answers": answers}
@@ -1303,6 +1343,9 @@ async def _finalize_agent_output(
                 "[step '%s'] unanswered clarify question detected — surfacing as ask_context",
                 step_id,
             )
+            if step.get("questions_mode") == "return":
+                await _clear_pending_question(run_repository, run_id)
+                raise AgentNeedsInput([question_text])
             answers = interrupt({"type": "ask_context", "questions": [question_text]})
             if isinstance(answers, dict) and answers:
                 raw_output = {**raw_output, "_clarification_answers": answers}
