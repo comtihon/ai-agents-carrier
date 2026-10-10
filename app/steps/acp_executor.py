@@ -28,6 +28,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from app.infrastructure.acp.client import AcpConnection, AcpError, to_ws_url
+from app.services import agent_inbox
 
 if TYPE_CHECKING:  # pragma: no cover
     from app.core.config import Settings
@@ -305,8 +306,26 @@ async def run_acp_agent(
                 "prompt": [{"type": "text", "text": build_prompt_text(input_data)}],
             }, req_id=prompt_id))
 
-        result = await prompt_future
+        result = await _await_turn(conn, session_id, prompt_future, run_id, sink)
         final_text, meta_out = _turn_result(result, turn_text, chunks)
+
+        # Messages that reached the agent while it worked are its next turns,
+        # in the same session: it keeps everything it did so far.
+        for _ in range(MAX_MESSAGE_TURNS):
+            queued = agent_inbox.take_messages(run_id)
+            if not queued:
+                break
+            sink.add(f"passing {len(queued)} message(s) from the orchestrator to the agent")
+            turn_text.clear()
+            follow = asyncio.ensure_future(conn.request("session/prompt", {
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": message_prompt(queued)}],
+            }))
+            result = await _await_turn(conn, session_id, follow, run_id, sink)
+            follow_text, follow_meta = _turn_result(result, turn_text, chunks)
+            if follow_text:
+                final_text = follow_text
+            meta_out = _merge_meta(meta_out, follow_meta)
 
         # The output protocol was not met: ask once more in the same session.
         expected = list((step.get("output_mapping") or {}).keys())
@@ -447,6 +466,54 @@ def _merge_meta(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+MAX_MESSAGE_TURNS = 10
+
+
+def message_prompt(queued: list[dict[str, Any]]) -> str:
+    lines = "\n\n".join(m["text"] for m in queued)
+    return (
+        f"Message from the orchestrator:\n{lines}\n\n"
+        "Take it into account and continue the task. End with the required output, as before."
+    )
+
+
+async def _await_turn(conn: Any, session_id: str, turn: "asyncio.Future", run_id: str, sink: "_ProgressSink") -> Any:
+    """Wait for a prompt turn; an urgent message cancels it so the next turn can carry the message."""
+    while True:
+        if agent_inbox.has_urgent_message(run_id) and not turn.done():
+            sink.add("urgent message from the orchestrator: interrupting the current turn")
+            try:
+                await asyncio.wait_for(conn.notify("session/cancel", {"sessionId": session_id}), 5)
+            except Exception:
+                logger.debug("session/cancel failed", exc_info=True)
+            result = await turn
+            return {**(result or {}), "stopReason": "end_turn"} if (result or {}).get("stopReason") == "cancelled" else result
+        waiter = asyncio.ensure_future(agent_inbox.message_event(run_id).wait())
+        try:
+            await asyncio.wait({turn, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            waiter.cancel()
+        if turn.done():
+            return turn.result()
+        if not agent_inbox.has_urgent_message(run_id):
+            # A queued (not urgent) message: it waits for the turn to end.
+            await turn
+            return turn.result()
+
+
+async def _notify_slack(run_repository: Any, run_id: str, question: str) -> None:
+    try:
+        from app.core.config import get_settings
+        from app.infrastructure.notifications.webhook_notifier import post_slack_ask_context
+
+        s = get_settings()
+        if s.slack_bot_token and s.slack_approvals_channel and run_repository is not None:
+            run = await run_repository.get(run_id)
+            await post_slack_ask_context(s.slack_bot_token, s.slack_approvals_channel, [question], run_id, (run.state if run else {}) or {})
+    except Exception:
+        logger.debug("slack notification for ACP question failed", exc_info=True)
+
+
 async def _ask_human(run_repository: Any, run_id: str, question: str, options: Any) -> str | None:
     """Surface an agent's free-text question the way /agent/question does, and wait.
 
@@ -468,16 +535,16 @@ async def _ask_human(run_repository: Any, run_id: str, question: str, options: A
             run.state["_pending_question"] = {"question": question, "options": opts}
             run.touch()
             await run_repository.update(run)
-    try:
-        from app.core.config import get_settings
-        from app.infrastructure.notifications.webhook_notifier import post_slack_ask_context
+    routed = False
+    if run_repository is not None:
+        # A dynamic-workflow job: its meta-agent answers (or asks a human itself).
+        run = await run_repository.get(run_id)
+        if run is not None and run.kind == "job" and run.parent_run_id:
+            from app.infrastructure.orchestration.dynamic.hub import route_live_question
 
-        s = get_settings()
-        if s.slack_bot_token and s.slack_approvals_channel and run_repository is not None:
-            run = await run_repository.get(run_id)
-            await post_slack_ask_context(s.slack_bot_token, s.slack_approvals_channel, [question], run_id, (run.state if run else {}) or {})
-    except Exception:
-        logger.debug("slack notification for ACP question failed", exc_info=True)
+            routed = route_live_question(run.parent_run_id, run_id, question)
+    if not routed:
+        await _notify_slack(run_repository, run_id, question)
 
     deadline = time.monotonic() + ANSWER_TIMEOUT_S
     while time.monotonic() < deadline:

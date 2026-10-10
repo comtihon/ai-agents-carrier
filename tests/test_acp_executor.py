@@ -341,3 +341,72 @@ async def test_execute_agent_step_routes_acp_agents(monkeypatch):
     )
     assert out["summary"] == "ok"
     assert captured["run_id"] == "run-9" and captured["agent_config"]["mcp_servers"] is not None
+
+
+# ─── messages from the orchestrator ──────────────────────────────────────────
+
+
+class HangingProxy(FakeProxy):
+    """The first turn runs until the client cancels it; later turns answer at once."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.first_prompt = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.prompt_texts: list[str] = []
+
+    async def _on_client(self, msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            self.prompts += 1
+            self.prompt_texts.append(msg["params"]["prompt"][0]["text"])
+            reply = lambda result: self.emit({"jsonrpc": "2.0", "id": msg["id"], "result": result})  # noqa: E731
+            if self.prompts == 1:
+                self.first_prompt.set()
+                await self.cancelled.wait()
+                await reply({"stopReason": "cancelled"})
+                return
+            await self.emit(_chunk('{"summary": "switched approach"}'))
+            await reply({"stopReason": "end_turn"})
+            return
+        if msg.get("method") == "session/cancel":
+            self.cancelled.set()
+            return
+        await super()._on_client(msg)
+
+
+@pytest.mark.asyncio
+async def test_a_queued_message_becomes_the_agents_next_turn_in_the_same_session():
+    from app.services import agent_inbox
+
+    proxy = FakeProxy()
+    await proxy.start()
+    agent_inbox.push_message("run-1", "also cover the B case")
+    try:
+        out, _, _ = await _run(proxy)
+    finally:
+        await proxy.stop()
+        agent_inbox.discard("run-1")
+    prompts = [m for m in proxy.received if m.get("method") == "session/prompt"]
+    assert len(prompts) == 2 and prompts[1]["params"]["sessionId"] == "sess-1"
+    assert "also cover the B case" in prompts[1]["params"]["prompt"][0]["text"]
+    assert out["result"] == '{"summary": "fixed"}'
+    assert agent_inbox.take_messages("run-1") == []
+
+
+@pytest.mark.asyncio
+async def test_an_urgent_message_cancels_the_running_turn_and_takes_its_place():
+    from app.services import agent_inbox
+
+    proxy = HangingProxy()
+    await proxy.start()
+    try:
+        task = asyncio.create_task(_run(proxy))
+        await asyncio.wait_for(proxy.first_prompt.wait(), 5)
+        agent_inbox.push_message("run-1", "stop: use the streaming API instead", interrupt=True)
+        out, _, _ = await asyncio.wait_for(task, 5)
+    finally:
+        await proxy.stop()
+        agent_inbox.discard("run-1")
+    assert proxy.cancelled.is_set()
+    assert proxy.prompts == 2 and "use the streaming API" in proxy.prompt_texts[1]
+    assert out["result"] == '{"summary": "switched approach"}'

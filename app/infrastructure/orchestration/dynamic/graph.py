@@ -104,6 +104,8 @@ def build_job_graph(
             hub.cancel(ref.job_id, ref.attempt)
         for delivery in step.deliveries:
             await hub.deliver(delivery)
+        for message in step.messages:
+            hub.send_message(message)
         for launch in step.launches:
             hub.launch(launch)
         update: dict[str, Any] = {"dag": dag_state.model_dump(mode="json"), "events": None, "resolution": None}

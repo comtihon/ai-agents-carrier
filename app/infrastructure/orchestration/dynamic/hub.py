@@ -23,7 +23,10 @@ from typing import Any
 
 from langchain_core.runnables.config import var_child_runnable_config
 
+from app.services import agent_inbox
+
 from app.infrastructure.orchestration.dynamic.engine import (
+    AgentMessage,
     AttemptResult,
     Delivery,
     JobOutcome,
@@ -50,6 +53,8 @@ class JobHub:
         # Attempts whose result is queued but not yet taken by the graph.
         self._queued: set[tuple[str, int]] = set()
         self._children: dict[str, tuple[str, int]] = {}
+        # Messages for attempts whose agent has no child run yet.
+        self._early: dict[tuple[str, int], list[AgentMessage]] = {}
         self.job_runner: JobRunner | None = None
         self.on_attempt: OnAttempt | None = None
         self.recorded: Recorded | None = None
@@ -105,6 +110,8 @@ class JobHub:
         async def started(child_run_id: str) -> None:
             child["id"] = child_run_id
             self._children[child_run_id] = (job.id, attempt.n)
+            for early in self._early.pop((job.id, attempt.n), []):
+                agent_inbox.push_message(child_run_id, early.text, interrupt=early.interrupt)
             if self.on_attempt is not None:
                 await self.on_attempt(job.id, attempt.n, child_run_id, None)
 
@@ -120,6 +127,12 @@ class JobHub:
         except BaseException as exc:  # still report, so the graph is not left waiting
             fatal = exc
             outcome = JobOutcome(status="failed", error=f"{type(exc).__name__}: {exc}")
+        unread = [m["text"] for m in agent_inbox.take_messages(child["id"])] if child.get("id") else []
+        unread += [m.text for m in self._early.pop((job.id, attempt.n), [])]
+        if child.get("id"):
+            agent_inbox.discard(child["id"])
+        if unread and outcome.status == "finished":
+            outcome = outcome.model_copy(update={"unread_messages": unread})
         result = AttemptResult(**outcome.model_dump(), job_id=job.id, attempt=attempt.n, child_run_id=child.get("id"))
         if self.on_attempt is not None:
             try:
@@ -148,6 +161,14 @@ class JobHub:
         job_id, n = found
         self._queue.put_nowait(LiveQuestion(job_id=job_id, attempt=n, child_run_id=child_run_id, question=question).model_dump(mode="json"))
         return True
+
+    def send_message(self, message: AgentMessage) -> None:
+        """Queue *message* for the running agent of its attempt."""
+        child = next((c for c, key in self._children.items() if key == (message.job_id, message.attempt)), None)
+        if child is None:
+            self._early.setdefault((message.job_id, message.attempt), []).append(message)
+            return
+        agent_inbox.push_message(child, message.text, interrupt=message.interrupt)
 
     async def deliver(self, delivery: Delivery) -> None:
         if self.deliver_answer is None or not delivery.child_run_id:
@@ -183,7 +204,10 @@ class JobHub:
                 task.cancel()
         self._tasks.clear()
         self._queued.clear()
+        for child in self._children:
+            agent_inbox.discard(child)
         self._children.clear()
+        self._early.clear()
 
 
 # ─── registry ────────────────────────────────────────────────────────────────

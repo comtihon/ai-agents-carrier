@@ -60,6 +60,9 @@ class JobOutcome(BaseModel):
     output: dict[str, Any] | None = None
     error: str | None = None
     questions: list[str] = Field(default_factory=list)
+    # Messages sent to the running agent that it never took (it cannot take
+    # messages mid-run, or finished first): the job runs again with them.
+    unread_messages: list[str] = Field(default_factory=list)
 
 
 class AttemptResult(JobOutcome):
@@ -123,11 +126,22 @@ class Delivery(BaseModel):
     text: str
 
 
+class AgentMessage(BaseModel):
+    """Something the meta-agent tells a running agent, unasked."""
+
+    job_id: str
+    attempt: int
+    text: str
+    # Cut the agent's current turn short instead of waiting for it to end.
+    interrupt: bool = False
+
+
 class Step(BaseModel):
     status: StepStatus
     launches: list[Launch] = Field(default_factory=list)
     cancels: list[AttemptRef] = Field(default_factory=list)
     deliveries: list[Delivery] = Field(default_factory=list)
+    messages: list[AgentMessage] = Field(default_factory=list)
 
 
 JobRunner = Callable[[Job, JobAttempt, dict[str, Any], Callable[[str], Awaitable[None]]], Awaitable[JobOutcome]]
@@ -375,6 +389,12 @@ class JobDag:
 
         job.status = "finished"
         self.state.log("attempt_finished", job.id, str((result.output or {}).get("summary", ""))[:300])
+        if result.unread_messages:
+            # The agent finished before it could take what it was told: run it
+            # again with the messages (they are in its notes).
+            job.status, job.pending_reason = "pending", "message"
+            self.state.log("messages_unread", job.id, " / ".join(result.unread_messages)[:500])
+            return
         ask = _help_request(result.output)
         if ask:
             job.status = "waiting"
@@ -657,11 +677,13 @@ class JobDag:
         job.note("meta", a.text)
         if job.status == "running" and a.restart:
             self._reset(job, "restart")
-        elif job.status == "waiting":
-            job.status, job.pending_reason = "pending", "message"
         elif job.status == "running" and job.id in self._live:
             # The agent is waiting on a question right now: the message is its answer.
             self._deliver(job, a.text)
+        elif job.status == "running" and job.last is not None:
+            self._step.messages.append(AgentMessage(job_id=job.id, attempt=job.last.n, text=a.text, interrupt=a.interrupt))
+        elif job.status == "waiting":
+            job.status, job.pending_reason = "pending", "message"
         self.state.log("message", job.id, a.text)
 
     def _do_ask_human(self, a: MetaAction, created_by: str) -> None:

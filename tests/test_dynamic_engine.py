@@ -630,3 +630,61 @@ def test_a_malformed_update_is_rejected_by_validation():
     dag = JobDag(config=_cfg(), state=state, meta=ScriptedMeta(), roster="", request="", run_id="r")
     errors = dag.validate(MetaDecision(actions=[MetaAction(kind="update_job", job_id="code", changes={"depends_on": 5})]), [])
     assert errors and "depends_on" in errors[0]
+
+
+# ─── messages to running agents ──────────────────────────────────────────────
+
+# While "code" runs, "check" fails on "other": the meta-agent reacts by messaging "code".
+_PARTS = add(_job("code", "execution", "coder"), _job("other", "execution", "coder"), _job("check", "validation", "tester", ["other"]))
+
+
+async def test_an_agent_that_takes_messages_gets_one_mid_run():
+    """An ACP-like agent reads its inbox while it works: no new attempt is needed."""
+    from app.services import agent_inbox
+
+    runner = FakeRunner()
+    release = runner.hold("code")
+    read: list[str] = []
+
+    async def acp_like(job, attempt, payload, started):
+        if job.id != "code":
+            return await runner(job, attempt, payload, started)
+        await started("child-code-1")
+        runner.started["code"].set()
+        await release.wait()
+        read.extend(m["text"] for m in agent_inbox.take_messages("child-code-1"))
+        return F(summary="done with B")
+
+    runner.script["check"] = [F(verdict="fail", feedback="B is missing")]
+    meta = ScriptedMeta(_PARTS, {"kind": "message", "job_id": "code", "text": "also cover B"}, finish())
+    h = Harness(_cfg(), meta, runner)
+    h.hub.configure(job_runner=acp_like, deliver_answer=h.hub.deliver_answer)
+    task = asyncio.create_task(h.advance())
+    await asyncio.wait_for(runner.started["code"].wait(), 5)
+    for _ in range(200):
+        if agent_inbox.messages.get("child-code-1"):
+            break
+        await asyncio.sleep(0.01)
+    release.set()
+    assert await task == "completed"
+    assert read == ["also cover B"]
+    assert len(h.job("code").attempts) == 1
+
+
+async def test_a_message_the_agent_never_read_runs_the_job_again_with_it():
+    runner = FakeRunner({"check": [F(verdict="fail", feedback="B is missing")]})
+    release = runner.hold("code")
+    meta = ScriptedMeta(_PARTS, {"kind": "message", "job_id": "code", "text": "also cover B"}, finish())
+    h = Harness(_cfg(), meta, runner)
+    task = asyncio.create_task(h.advance())
+    await asyncio.wait_for(runner.started["code"].wait(), 5)
+    from app.services import agent_inbox
+    for _ in range(200):
+        if agent_inbox.messages.get("child-code-1"):
+            break
+        await asyncio.sleep(0.01)
+    release.set()
+    assert await task == "completed"
+    assert runner.ran("code") == 2
+    assert h.job("code").attempts[1].reason == "message"
+    assert "also cover B" in runner.payload("code", 2)["feedback"]

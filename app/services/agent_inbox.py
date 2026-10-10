@@ -44,3 +44,42 @@ async def deliver_answer(run_repository: Any, run_id: str, answer: str) -> None:
     run.touch()
     await run_repository.update(run)
     logger.info("run %s: answer stored and event set", run_id)
+
+
+# ─── Messages to a running agent ─────────────────────────────────────────────
+# Unlike answers, nobody asked for these: the orchestrator tells a running agent
+# something new. Agents that hold a session open between turns (ACP) take them
+# as their next turn — or, when urgent, have the current turn cancelled for
+# them. Messages still queued when the attempt ends were never read.
+
+messages: dict[str, list[dict[str, Any]]] = {}
+message_events: dict[str, asyncio.Event] = {}
+
+
+def message_event(run_id: str) -> asyncio.Event:
+    if run_id not in message_events:
+        message_events[run_id] = asyncio.Event()
+    return message_events[run_id]
+
+
+def push_message(run_id: str, text: str, *, interrupt: bool = False) -> None:
+    messages.setdefault(run_id, []).append({"text": text, "interrupt": interrupt})
+    message_event(run_id).set()
+
+
+def has_urgent_message(run_id: str) -> bool:
+    return any(m.get("interrupt") for m in messages.get(run_id, []))
+
+
+def take_messages(run_id: str) -> list[dict[str, Any]]:
+    """Every queued message for *run_id*, oldest first; the queue is emptied."""
+    taken = messages.pop(run_id, [])
+    event = message_events.get(run_id)
+    if event is not None:
+        event.clear()
+    return taken
+
+
+def discard(run_id: str) -> None:
+    messages.pop(run_id, None)
+    message_events.pop(run_id, None)
