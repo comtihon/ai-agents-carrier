@@ -51,10 +51,11 @@ class MetaAction(BaseModel):
     - answer:     ``job_id`` + ``text`` — answer the job's question: live to a
                   running agent that is waiting, or for the next attempt of a job
                   that stopped to ask.
-    - message:    ``job_id`` + ``text`` (+ ``restart``) — tell a job something.
-                  With ``restart`` a running agent is stopped and the job starts
-                  over with the message; without it the agent gets it with its
-                  next answer or attempt.
+    - message:    ``job_id`` + ``text`` (+ ``interrupt``, ``restart``) — tell a
+                  job something. A running agent that keeps a session (ACP)
+                  takes it as its next turn, or at once with ``interrupt``; one
+                  that cannot take messages runs again with it once it ends.
+                  ``restart`` stops the agent and starts the job over.
     - ask_human:  ``text`` (+ ``job_id``) — a question only a human can answer;
                   the answer goes to the job.
     - finish:     ``text`` — the work is done; anything not finished is dropped.
@@ -66,6 +67,7 @@ class MetaAction(BaseModel):
     job_id: str | None = None
     job_ids: list[str] = Field(default_factory=list)
     text: str = ""
+    interrupt: bool = False
     restart: bool = False
     changes: dict[str, Any] = Field(default_factory=dict)
 
@@ -129,7 +131,8 @@ How to orchestrate:
   what follows when the shape of the plan was wrong (update, remove or add jobs). Rewinding keeps every job's
   notes, so say exactly what must change.
 - A running agent that asks a question is waiting for your answer: answer it, or rewind/redirect it.
-- You may message or stop running agents when what they do is no longer needed or must change.
+- You may message running agents (new information, a changed requirement), interrupt them when what they do
+  is going wrong, or stop them when their work is no longer needed.
 - Ask a human only for what no agent and no data can tell you.
 - depends_on must form a DAG. Loops happen by rewinding, never with cycles.
 - Each job prompt is the complete brief for its agent: goal, scope, inputs it will receive, what to output.
@@ -144,7 +147,8 @@ _ACTIONS = """Actions (a decision is a list of them, applied in order):
 - {"kind": "rewind", "job_ids": ["..."], "text": "<what must change and why>"}
 - {"kind": "remove", "job_ids": ["..."], "text": "<why>"}
 - {"kind": "answer", "job_id": "...", "text": "<the answer>"}
-- {"kind": "message", "job_id": "...", "text": "...", "restart": false}
+- {"kind": "message", "job_id": "...", "text": "...", "interrupt": false, "restart": false}
+   (interrupt: the agent stops its current step to read it; restart: the job starts over)
 - {"kind": "ask_human", "job_id": "<optional>", "text": "<the question>"}
 - {"kind": "finish", "text": "<summary of the result>"}
 - {"kind": "fail", "text": "<why the request cannot be done>"}
