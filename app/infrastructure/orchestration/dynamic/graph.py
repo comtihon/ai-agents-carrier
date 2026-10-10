@@ -1,54 +1,49 @@
-"""The job DAG as a LangGraph graph.
+"""The job DAG as a LangGraph graph, driven by events.
 
-    START ─► schedule ─┬─ Send × N ─► run_job ─┐
-               ▲       ├─ gate (interrupt) ─────┤
-               │       └─ END                   │
-               └────────────────────────────────┘
+    START ─► schedule ─┬─► wait ──┐     (attempts running: take the next events)
+               ▲       ├─► gate ──┤     (a decision waits for a human: interrupt)
+               │       └─► END    │     (completed or failed)
+               └──────────────────┘
 
-``schedule`` folds the finished wave's outcomes (and a gate's resolution) into
-the DAG through ``JobDag`` and fans the next wave out with one ``Send`` per job
-attempt, so parallel parts are parallel LangGraph tasks. ``run_job`` runs one
-attempt; ``gate`` pauses on ``interrupt()`` until a human decides. Loops — a
-validator's failed review handing work back, a retry, an answered question —
-are ``schedule`` sending the same job again with its next attempt number.
+``schedule`` folds events and a gate's resolution into the DAG through
+``JobDag`` — which consults the meta-agent whenever something needs a
+decision — and carries out the result: it launches attempts on the step's
+``JobHub``, stops the ones the meta-agent stopped and delivers answers to
+agents waiting on a question. ``wait`` takes the next events from the hub as
+they come, one finished attempt or one question at a time, so nothing waits
+for the slowest agent. Loops — a validator's change request rewinding the DAG,
+an answered question, a retry — are ``schedule`` launching the next attempt of
+the same job.
 
-The DAG lives in the graph's state and is checkpointed after every wave, so a
-paused or restarted run picks up where it stopped. The ``persist`` callback
-mirrors it onto the run document for the UI; ``on_attempt`` records each
-attempt's child run and result as soon as they exist, which is also what keeps
-a finished attempt from running twice when a wave is replayed after a restart.
+The DAG lives in the graph's state and is checkpointed at every step, so a run
+paused at a gate resumes where it stopped. The ``persist`` callback mirrors it
+onto the run document for the UI.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Annotated, Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Command, Send, interrupt
+from langgraph.types import Command, interrupt
 
-from app.domain.models.dynamic import DynamicConfig, DynamicRunState, Job, JobAttempt
-from app.infrastructure.orchestration.dynamic.dispatcher import Dispatcher
-from app.infrastructure.orchestration.dynamic.engine import (
-    AttemptResult,
-    JobDag,
-    JobOutcome,
-    JobRunner,
-)
+from app.domain.models.dynamic import DynamicConfig, DynamicRunState
+from app.infrastructure.orchestration.dynamic.engine import JobDag, LostAttempt, parse_event
+from app.infrastructure.orchestration.dynamic.hub import JobHub
+from app.infrastructure.orchestration.dynamic.meta_agent import MetaAgent
 
 logger = logging.getLogger(__name__)
 
 Persist = Callable[[DynamicRunState], Awaitable[None]]
-# (job_id, attempt n, child run id, result or None while running)
-OnAttempt = Callable[[str, int, str | None, AttemptResult | None], Awaitable[None]]
-# The finished result of an attempt, if one was already recorded (replay after a restart).
-RecordedResult = Callable[[str, int], AttemptResult | None]
+
+# How long ``wait`` sleeps before checking whether the run was stopped.
+WAKE_SECONDS = 30.0
 
 
 def _collect(left: list[dict[str, Any]] | None, right: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    """Parallel run_job tasks append their outcome; ``None`` clears the list."""
+    """Events append; ``None`` clears the list once ``schedule`` took them."""
     if right is None:
         return []
     return [*(left or []), *right]
@@ -60,7 +55,7 @@ def _append(left: list[dict[str, Any]] | None, right: list[dict[str, Any]] | Non
 
 class JobGraphState(TypedDict, total=False):
     dag: dict[str, Any]
-    outcomes: Annotated[list[dict[str, Any]], _collect]
+    events: Annotated[list[dict[str, Any]], _collect]
     resolution: dict[str, Any] | None
     # Every human decision taken at a gate, oldest first.
     approvals: Annotated[list[dict[str, Any]], _append]
@@ -79,17 +74,16 @@ def gate_payload(state: DynamicRunState, config: DynamicConfig) -> dict[str, Any
 def build_job_graph(
     *,
     config: DynamicConfig,
-    dispatcher: Dispatcher,
+    meta: MetaAgent,
     roster: str,
     request: str,
     run_id: str,
-    job_runner: JobRunner,
+    hub: JobHub,
     persist: Persist | None = None,
-    on_attempt: OnAttempt | None = None,
-    recorded: RecordedResult | None = None,
     stop_check: Callable[[], Awaitable[bool]] | None = None,
     workspace: dict[str, Any] | None = None,
     checkpointer: Any = None,
+    wake_seconds: float = WAKE_SECONDS,
 ):
     """Compile the job graph for one dynamic step.
 
@@ -100,56 +94,44 @@ def build_job_graph(
 
     async def schedule(state: JobGraphState) -> Command:
         dag_state = DynamicRunState.model_validate(state["dag"])
-        dag = JobDag(
-            config=config,
-            state=dag_state,
-            dispatcher=dispatcher,
-            roster=roster,
-            request=request,
-            run_id=run_id,
-            workspace=workspace,
-        )
-        outcomes = [AttemptResult.model_validate(o) for o in state.get("outcomes") or []]
+        dag = JobDag(config=config, state=dag_state, meta=meta, roster=roster, request=request, run_id=run_id, workspace=workspace)
+        events = [parse_event(e) for e in state.get("events") or []]
         stopped = bool(stop_check is not None and await stop_check())
-        wave = await dag.schedule(outcomes=outcomes, resolution=state.get("resolution"), stopped=stopped)
+        step = await dag.schedule(events=events, resolution=state.get("resolution"), stopped=stopped)
         if persist is not None:
             await persist(dag_state)
-        update: dict[str, Any] = {"dag": dag_state.model_dump(mode="json"), "outcomes": None, "resolution": None}
-        if wave.status == "dispatch":
-            return Command(
-                update=update,
-                goto=[Send("run_job", launch.model_dump(mode="json")) for launch in wave.launches],
-            )
-        if wave.status == "gate":
+        for ref in step.cancels:
+            hub.cancel(ref.job_id, ref.attempt)
+        for delivery in step.deliveries:
+            await hub.deliver(delivery)
+        for launch in step.launches:
+            hub.launch(launch)
+        update: dict[str, Any] = {"dag": dag_state.model_dump(mode="json"), "events": None, "resolution": None}
+        if step.status == "gate":
             return Command(update=update, goto="gate")
+        if step.status == "run":
+            return Command(update=update, goto="wait")
         return Command(update=update, goto=END)
 
-    async def run_job(launch: dict[str, Any]) -> dict[str, Any]:
-        job = Job.model_validate(launch["job"])
-        attempt = JobAttempt.model_validate(launch["attempt"])
-        done = recorded(job.id, attempt.n) if recorded is not None else None
-        if done is not None:
-            logger.info("dynamic job %s attempt %d already finished; not running it again", job.id, attempt.n)
-            return {"outcomes": [done.model_dump(mode="json")]}
-
-        child: dict[str, str] = {}
-
-        async def started(child_run_id: str) -> None:
-            child["id"] = child_run_id
-            if on_attempt is not None:
-                await on_attempt(job.id, attempt.n, child_run_id, None)
-
-        try:
-            outcome = await job_runner(job, attempt, launch["payload"], started)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # the runner should not raise, but a crash is just a failed attempt
-            logger.exception("dynamic job %s crashed", job.id)
-            outcome = JobOutcome(status="failed", error=f"{type(exc).__name__}: {exc}")
-        result = AttemptResult(**outcome.model_dump(), job_id=job.id, attempt=attempt.n, child_run_id=child.get("id"))
-        if on_attempt is not None:
-            await on_attempt(job.id, attempt.n, child.get("id"), result)
-        return {"outcomes": [result.model_dump(mode="json")]}
+    async def wait(state: JobGraphState) -> dict[str, Any]:
+        dag_state = DynamicRunState.model_validate(state["dag"])
+        running = [(j.id, j.last.n) for j in dag_state.running() if j.last is not None]
+        # Attempts without a live task (the process restarted): adopt what they
+        # recorded before the restart, or report them lost so they run again.
+        orphans: list[dict[str, Any]] = []
+        for job_id, n in running:
+            if hub.alive(job_id, n):
+                continue
+            done = hub.recorded_result(job_id, n)
+            orphans.append(done.model_dump(mode="json") if done is not None else LostAttempt(job_id=job_id, attempt=n).model_dump(mode="json"))
+        if orphans or not running:
+            return {"events": orphans}
+        while True:
+            events = await hub.next_events(timeout=wake_seconds)
+            if events:
+                return {"events": events}
+            if stop_check is not None and await stop_check():
+                return {"events": []}
 
     def gate(state: JobGraphState) -> dict[str, Any]:
         dag_state = DynamicRunState.model_validate(state["dag"])
@@ -170,14 +152,14 @@ def build_job_graph(
         return {"resolution": decision, "approvals": [record]}
 
     sg = StateGraph(JobGraphState)
-    sg.add_node("schedule", schedule, destinations=("run_job", "gate", END))
-    sg.add_node("run_job", run_job)
+    sg.add_node("schedule", schedule, destinations=("wait", "gate", END))
+    sg.add_node("wait", wait)
     sg.add_node("gate", gate)
     sg.add_edge(START, "schedule")
-    sg.add_edge("run_job", "schedule")
+    sg.add_edge("wait", "schedule")
     sg.add_edge("gate", "schedule")
     return sg.compile(checkpointer=checkpointer)
 
 
 def initial_input(dag: DynamicRunState) -> JobGraphState:
-    return {"dag": dag.model_dump(mode="json"), "outcomes": [], "resolution": None, "approvals": []}
+    return {"dag": dag.model_dump(mode="json"), "events": [], "resolution": None, "approvals": []}

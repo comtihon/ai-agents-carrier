@@ -191,6 +191,9 @@ async def terminate_run(
         raise RunControlError(409, f"Run is not active (status: {run.status})")
     from app.services.agent_cleanup import cleanup_run_agents
     await cleanup_run_agents(run_id, container.settings)
+    # Dynamic job attempts run in the background of their step: stop them.
+    from app.infrastructure.orchestration.dynamic.hub import close_hubs
+    close_hubs(run_id)
     # Dynamic job attempts run under child run ids with agents of their own.
     list_children = getattr(container.run_repository, "list_children", None)
     if list_children is not None:
