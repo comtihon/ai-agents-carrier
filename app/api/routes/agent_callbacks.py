@@ -30,6 +30,7 @@ from pydantic import BaseModel
 from app.api.dependencies import get_container
 from app.core.container import ApplicationContainer
 from app.infrastructure.orchestration.yaml_graph import stream_graph_to_pause
+from app.services import agent_inbox
 
 logger = logging.getLogger(__name__)
 
@@ -41,17 +42,15 @@ router = APIRouter(prefix="/runs", tags=["agent-callbacks"])
 # These are intentionally module-level (not per-request) so all coroutines
 # sharing the same process can communicate via them.  They are keyed by run_id.
 
-_answer_events: dict[str, asyncio.Event] = {}
-_answers: dict[str, str] = {}
-_questions: dict[str, dict[str, Any]] = {}
+_answer_events = agent_inbox.answer_events
+_answers = agent_inbox.answers
+_questions = agent_inbox.questions
 
 _LONG_POLL_TIMEOUT = 600.0  # 10 minutes
 
 
 def _get_or_create_event(run_id: str) -> asyncio.Event:
-    if run_id not in _answer_events:
-        _answer_events[run_id] = asyncio.Event()
-    return _answer_events[run_id]
+    return agent_inbox.event_for(run_id)
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +199,14 @@ async def agent_question(
     run.touch()
     await container.run_repository.update(run)
 
+    # A dynamic-workflow job: its meta-agent answers (or asks a human itself).
+    if run.kind == "job" and run.parent_run_id:
+        from app.infrastructure.orchestration.dynamic.hub import route_live_question
+
+        if route_live_question(run.parent_run_id, run.id, body.question):
+            logger.info("run %s: job agent's question routed to the meta-agent", run_id)
+            return {"run_id": run_id, "status": "question_stored"}
+
     # Send Slack notification so the user can answer from Slack (thread reply)
     # or from the UI popup. Only fires once per question (first ask).
     try:
@@ -286,20 +293,7 @@ async def agent_reply(
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    _answers[run_id] = body.answer
-    event = _get_or_create_event(run_id)
-    event.set()
-
-    run = await container.run_repository.get(run_id)
-    if run:
-        run.state = {
-            **{k: v for k, v in (run.state or {}).items() if k != "_pending_question"},
-            "_pending_answer": body.answer,
-        }
-        run.touch()
-        await container.run_repository.update(run)
-
-    logger.info("run %s: answer stored and event set", run_id)
+    await agent_inbox.deliver_answer(container.run_repository, run_id, body.answer)
     return {"run_id": run_id, "status": "answer_delivered"}
 
 
