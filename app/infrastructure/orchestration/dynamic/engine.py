@@ -1,26 +1,23 @@
-"""The dynamic engine: schedules jobs, applies handbacks/delegations, gates on approvals.
+"""The job DAG's rules: planning, scheduling waves, handbacks, delegations, gates.
 
-The engine is deliberately free of LangGraph and Mongo. It is handed:
+``JobDag`` holds no tasks and no loop of its own. The LangGraph job graph
+(``graph.py``) drives it one wave at a time: the ``schedule`` node calls
+``JobDag.schedule()`` with the outcomes of the wave that just finished and,
+after a gate, the human's resolution. ``schedule()`` folds them into the DAG and
+answers with the next wave — the jobs to launch now — or with ``gate``,
+``completed`` or ``failed``.
 
-- a ``Dispatcher`` (the meta-LLM),
-- a ``job_runner`` that executes one job attempt and returns its outcome,
-- a ``persist`` callback that stores ``DynamicRunState`` wherever the caller keeps it.
-
-``advance()`` runs until the work is done, failed, or needs a human. In the
-last case it stops dispatching, lets in-flight jobs finish (their results may
-add decisions of their own), persists, and returns ``"gate"``. The caller then
-pauses the run; when a human decides, ``advance(resolution)`` is called again
-on a freshly loaded state — every pass starts from the persisted record, which
-is why a backend restart mid-run loses nothing but the attempts in flight.
+A wave is every job whose dependencies are done, capped by ``max_parallel`` and
+each agent's ``max_instances``. A job split into parts is several jobs, so its
+parts run side by side and each is retried, handed back or kept on its own.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -43,7 +40,7 @@ from app.infrastructure.orchestration.dynamic.dispatcher import (
 
 logger = logging.getLogger(__name__)
 
-AdvanceResult = Literal["completed", "gate", "failed"]
+WaveStatus = Literal["dispatch", "gate", "completed", "failed"]
 
 
 class JobOutcome(BaseModel):
@@ -53,8 +50,28 @@ class JobOutcome(BaseModel):
     questions: list[str] = Field(default_factory=list)
 
 
+class AttemptResult(JobOutcome):
+    """A job attempt's outcome, addressed to the attempt that produced it."""
+
+    job_id: str
+    attempt: int
+    child_run_id: str | None = None
+
+
+class Launch(BaseModel):
+    """One job attempt the graph runs in the current wave."""
+
+    job: Job
+    attempt: JobAttempt
+    payload: dict[str, Any]
+
+
+class Wave(BaseModel):
+    status: WaveStatus
+    launches: list[Launch] = Field(default_factory=list)
+
+
 JobRunner = Callable[[Job, JobAttempt, dict[str, Any], Callable[[str], Awaitable[None]]], Awaitable[JobOutcome]]
-Persist = Callable[[DynamicRunState], Awaitable[None]]
 
 
 # Fields each category's agent is asked to return. execute_agent_step needs at
@@ -133,7 +150,7 @@ def _delegate_request(output: dict[str, Any] | None) -> str | None:
     return str(raw)
 
 
-class DynamicEngine:
+class JobDag:
     def __init__(
         self,
         *,
@@ -142,32 +159,126 @@ class DynamicEngine:
         dispatcher: Dispatcher,
         roster: str,
         request: str,
-        job_runner: JobRunner,
-        persist: Persist,
         run_id: str,
         workspace: dict[str, Any] | None = None,
-        stop_check: Callable[[], Awaitable[bool]] | None = None,
     ) -> None:
         self.config = config
         self.state = state
         self.dispatcher = dispatcher
         self.roster = roster
         self.request = request
-        self.job_runner = job_runner
-        self._persist = persist
         self.run_id = run_id
         self.workspace = workspace or {}
-        # Asked between scheduling rounds: True when the run was stopped from
-        # outside (terminate), so no further job is dispatched.
-        self._stop_check = stop_check
-        self._tasks: dict[asyncio.Task, str] = {}
 
-    # ── persistence ─────────────────────────────────────────────────────────
+    # ── entry point ─────────────────────────────────────────────────────────
 
-    async def persist(self) -> None:
+    async def schedule(
+        self,
+        *,
+        outcomes: Iterable[AttemptResult] = (),
+        resolution: dict[str, Any] | None = None,
+        stopped: bool = False,
+    ) -> Wave:
+        """Fold in the last wave and the human's answer; return what happens next."""
+        try:
+            return await self._schedule(list(outcomes), resolution, stopped)
+        finally:
+            self._collect_usage()
+
+    async def _schedule(self, outcomes: list[AttemptResult], resolution: dict[str, Any] | None, stopped: bool) -> Wave:
+        if self.state.status in ("completed", "failed"):
+            return Wave(status=self.state.status)  # type: ignore[arg-type]
+
+        for result in outcomes:
+            await self._record(result)
+        await self._adopt_reported()
+        self._recover_lost()
+
+        if stopped:
+            for job in self.state.jobs:
+                if job.status in ("pending", "waiting"):
+                    job.status = "cancelled"
+            self._fail("run was stopped")
+            return Wave(status="failed")
+
+        if resolution is not None and self.state.open_decisions():
+            await self._resolve(resolution)
+
+        if not self.state.jobs and not self.state.open_decisions() and self.state.status == "planning":
+            await self._start()
+
+        if self.state.status != "failed" and not self.state.open_decisions():
+            await self._maybe_expand()
+
+        if self.state.status == "failed":
+            return Wave(status="failed")
+        if self.state.open_decisions():
+            self.state.status = "waiting_approval"
+            return Wave(status="gate")
+
+        launches = self._launch_ready()
+        if launches:
+            return Wave(status="dispatch", launches=launches)
+        return self._finish_or_fail()
+
+    def _collect_usage(self) -> None:
         for k, v in self.dispatcher.usage.items():
-            self.state.usage[k] = v
-        await self._persist(self.state)
+            self.state.usage[k] = self.state.usage.get(k, 0) + v
+        self.dispatcher.usage = {}
+
+    async def _adopt_reported(self) -> None:
+        """Fold in attempts that reported a result the DAG never saw (restart mid-wave)."""
+        for job in self.state.jobs:
+            attempt = job.last
+            if job.status != "running" or attempt is None or attempt.finished_at is None:
+                continue
+            if attempt.status not in ("finished", "failed", "needs_input"):
+                continue
+            self.state.log("attempt_adopted", job.id, f"attempt {attempt.n} finished before the restart")
+            await self._record(AttemptResult(
+                status=attempt.status, output=attempt.output, error=attempt.error, questions=attempt.questions,
+                job_id=job.id, attempt=attempt.n, child_run_id=attempt.child_run_id,
+            ))
+
+    def _recover_lost(self) -> None:
+        """Attempts that never reported back (restart, cancellation) run again."""
+        for job in self.state.jobs:
+            if job.status != "running":
+                continue
+            if job.last is not None and job.last.status == "running":
+                job.last.status = "cancelled"
+                job.last.finished_at = _now()
+            job.status = "pending"
+            job.pending_reason = job.pending_reason or "retry"
+            self.state.log("attempt_lost", job.id, "attempt was in flight when the run paused or restarted")
+
+    async def _start(self) -> None:
+        if self.config.plan is not None:
+            self._start_authored()
+            return
+        try:
+            plan = await self.dispatcher.plan(self.request, self.config, self.roster)
+        except DispatcherError as exc:
+            self._fail(str(exc))
+            return
+        await self._propose(
+            "plan",
+            plan.summary or "initial plan",
+            {"jobs": [j.model_dump() for j in plan.jobs], "summary": plan.summary, "expansion": False},
+        )
+
+    def _start_authored(self) -> None:
+        """The author wrote the DAG: it is checked, not approved."""
+        jobs = list(self.config.plan or [])
+        errors = validate_jobs(jobs, self.config, []) + check_minimums(jobs, self.config)
+        if errors:
+            self._fail("the authored plan is invalid: " + "; ".join(errors))
+            return
+        self._add_jobs(jobs, created_by="author")
+        # The authored DAG is complete: planners' output is not expanded into more jobs.
+        self.state.expanded = True
+        self.state.status = "running"
+        self.state.log("plan_authored", None, f"{len(jobs)} job(s)")
 
     # ── decisions ───────────────────────────────────────────────────────────
 
@@ -371,12 +482,6 @@ class DynamicEngine:
                 ready.append(job)
         return ready
 
-    def _running_count(self, agent_id: str | None = None) -> int:
-        return sum(
-            1 for job_id in self._tasks.values()
-            if agent_id is None or (self.state.job(job_id) and self.state.job(job_id).agent_id == agent_id)  # type: ignore[union-attr]
-        )
-
     def _blocked(self) -> list[Job]:
         """Pending jobs that can never become ready because a dependency failed."""
         blocked = []
@@ -442,101 +547,6 @@ class DynamicEngine:
             payload["workspace"] = ws
         return payload
 
-    # ── main loop ───────────────────────────────────────────────────────────
-
-    async def advance(self, resolution: dict[str, Any] | None = None) -> AdvanceResult:
-        if self.state.status in ("completed", "failed"):
-            return self.state.status  # type: ignore[return-value]
-
-        # Attempts that were in flight when the previous pass ended (restart,
-        # cancellation) never reported back: retry them.
-        for job in self.state.jobs:
-            if job.status == "running":
-                if job.last is not None and job.last.status == "running":
-                    job.last.status = "cancelled"
-                    job.last.finished_at = _now()
-                job.status = "pending"
-                job.pending_reason = job.pending_reason or "retry"
-                self.state.log("attempt_lost", job.id, "attempt was in flight when the run paused or restarted")
-
-        if resolution is not None and self.state.open_decisions():
-            await self._resolve(resolution)
-            await self.persist()
-
-        if not self.state.jobs and not self.state.open_decisions() and self.state.status == "planning":
-            try:
-                plan = await self.dispatcher.plan(self.request, self.config, self.roster)
-            except DispatcherError as exc:
-                self._fail(str(exc))
-                await self.persist()
-                return "failed"
-            await self._propose(
-                "plan",
-                plan.summary or "initial plan",
-                {"jobs": [j.model_dump() for j in plan.jobs], "summary": plan.summary, "expansion": False},
-            )
-            await self.persist()
-
-        try:
-            return await self._loop()
-        except asyncio.CancelledError:
-            for task in list(self._tasks):
-                task.cancel()
-            raise
-
-    async def _loop(self) -> AdvanceResult:
-        while True:
-            if self._stop_check is not None and await self._stop_check():
-                for task in list(self._tasks):
-                    task.cancel()
-                if self._tasks:
-                    await asyncio.wait(list(self._tasks))
-                    self._tasks.clear()
-                for job in self.state.jobs:
-                    if job.status == "running":
-                        job.status = "cancelled"
-                        if job.last is not None:
-                            job.last.status = "cancelled"
-                self._fail("run was stopped")
-                await self.persist()
-                return "failed"
-            if self.state.status == "failed":
-                await self._drain()
-                await self.persist()
-                return "failed"
-
-            gated = bool(self.state.open_decisions())
-
-            if not gated:
-                await self._maybe_expand()
-                gated = bool(self.state.open_decisions())
-                if self.state.status == "failed":
-                    continue
-
-            if not gated:
-                self._dispatch_ready()
-
-            if not self._tasks:
-                if gated:
-                    self.state.status = "waiting_approval"
-                    await self.persist()
-                    return "gate"
-                return await self._finish_or_fail()
-
-            done, _ = await asyncio.wait(list(self._tasks), return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                job_id = self._tasks.pop(task)
-                await self._on_done(job_id, task)
-            await self.persist()
-
-    async def _drain(self) -> None:
-        if not self._tasks:
-            return
-        done, _ = await asyncio.wait(list(self._tasks))
-        for task in done:
-            job_id = self._tasks.pop(task)
-            await self._on_done(job_id, task)
-
     async def _maybe_expand(self) -> None:
         if self.state.expanded:
             return
@@ -554,20 +564,28 @@ class DynamicEngine:
         except DispatcherError as exc:
             self._fail(str(exc))
             return
+        if not plan.jobs:
+            # The planners' output needs no further work (e.g. a research-only request).
+            self.state.expanded = True
+            self.state.log("expansion_empty", None, plan.summary or "")
+            return
         await self._propose(
             "plan",
             plan.summary or "jobs from the planners' output",
             {"jobs": [j.model_dump() for j in plan.jobs], "summary": plan.summary, "expansion": True},
         )
 
-    def _dispatch_ready(self) -> None:
+    def _launch_ready(self) -> list[Launch]:
+        launches: list[Launch] = []
+        per_agent: dict[str, int] = {}
         for job in self._ready():
-            if self._running_count() >= self.config.limits.max_parallel:
+            if len(launches) >= self.config.limits.max_parallel:
                 break
             entry = self.config.pool_entry(job.agent_id)
             cap = entry.max_instances if entry else 1
-            if self._running_count(job.agent_id) >= cap:
+            if per_agent.get(job.agent_id, 0) >= cap:
                 continue
+            per_agent[job.agent_id] = per_agent.get(job.agent_id, 0) + 1
             attempt = JobAttempt(
                 n=len(job.attempts) + 1,
                 reason=job.pending_reason or "initial",
@@ -583,37 +601,22 @@ class DynamicEngine:
             job.pending_answers = None
             self.state.status = "running"
             self.state.log("attempt_started", job.id, f"attempt {attempt.n} ({attempt.reason})")
+            launches.append(Launch(job=job.model_copy(deep=True), attempt=attempt.model_copy(), payload=payload))
+        return launches
 
-            async def _started(child_run_id: str, _a: JobAttempt = attempt) -> None:
-                _a.child_run_id = child_run_id
-                await self.persist()
-
-            task = asyncio.create_task(self._run_job(job, attempt, payload, _started))
-            self._tasks[task] = job.id
-
-    async def _run_job(self, job: Job, attempt: JobAttempt, payload: dict[str, Any], started) -> JobOutcome:
-        try:
-            return await self.job_runner(job, attempt, payload, started)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # the runner should not raise, but a crash is just a failed attempt
-            logger.exception("dynamic job %s crashed", job.id)
-            return JobOutcome(status="failed", error=f"{type(exc).__name__}: {exc}")
-
-    async def _on_done(self, job_id: str, task: asyncio.Task) -> None:
-        job = self.state.job(job_id)
-        if job is None:
+    async def _record(self, result: AttemptResult) -> None:
+        job = self.state.job(result.job_id)
+        attempt = job.last if job is not None else None
+        if job is None or attempt is None or attempt.n != result.attempt:
+            logger.warning("dynamic: outcome for unknown attempt %s #%s ignored", result.job_id, result.attempt)
             return
-        attempt = job.last
-        try:
-            outcome: JobOutcome = task.result()
-        except asyncio.CancelledError:
-            outcome = JobOutcome(status="failed", error="cancelled")
-        if attempt is not None:
-            attempt.finished_at = _now()
-            attempt.output = outcome.output
-            attempt.error = outcome.error
-            attempt.status = {"finished": "finished", "failed": "failed", "needs_input": "needs_input"}[outcome.status]  # type: ignore[assignment]
+        attempt.finished_at = _now()
+        attempt.child_run_id = result.child_run_id or attempt.child_run_id
+        attempt.output = result.output
+        attempt.error = result.error
+        attempt.questions = result.questions
+        attempt.status = result.status  # type: ignore[assignment]
+        outcome = JobOutcome(status=result.status, output=result.output, error=result.error, questions=result.questions)
 
         if outcome.status == "needs_input":
             job.status = "waiting"
@@ -706,7 +709,7 @@ class DynamicEngine:
             {"job_id": job.id, "request": ask, "agent_id": proposal.agent_id, "title": proposal.title, "prompt": proposal.prompt, "category": category},
         )
 
-    async def _finish_or_fail(self) -> AdvanceResult:
+    def _finish_or_fail(self) -> Wave:
         blocked = self._blocked()
         for job in blocked:
             job.status = "skipped"
@@ -718,19 +721,16 @@ class DynamicEngine:
                 "unfinished jobs: "
                 + ", ".join(f"{j.id} ({j.status})" for j in failed + stuck)
             )
-            await self.persist()
-            return "failed"
+            return Wave(status="failed")
         missing = check_minimums(self.state.jobs, self.config)
         if missing:
             self._fail("; ".join(missing))
-            await self.persist()
-            return "failed"
+            return Wave(status="failed")
         self.state.status = "completed"
         lines = [f"- {j.id} ({j.category}, {j.agent_id}): {str((j.output or {}).get('summary', '')).strip()[:500]}" for j in self.state.jobs]
         self.state.summary = "\n".join(lines)
         self.state.log("completed")
-        await self.persist()
-        return "completed"
+        return Wave(status="completed")
 
     def result(self) -> dict[str, Any]:
         """What the dynamic step writes into workflow state."""

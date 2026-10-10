@@ -20,7 +20,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
 
-from app.domain.models.dynamic import JOB_CATEGORIES, DynamicConfig, Job, JobCategory
+from app.domain.models.dynamic import JOB_CATEGORIES, DynamicConfig, Job, JobSpec
 
 logger = logging.getLogger(__name__)
 
@@ -33,14 +33,7 @@ class DispatcherError(RuntimeError):
     pass
 
 
-class ProposedJob(BaseModel):
-    id: str
-    category: JobCategory
-    agent_id: str
-    title: str = ""
-    prompt: str
-    depends_on: list[str] = Field(default_factory=list)
-    owns: list[str] = Field(default_factory=list)
+ProposedJob = JobSpec
 
 
 class ProposedPlan(BaseModel):
@@ -182,19 +175,25 @@ def check_minimums(jobs: list[Job] | list[ProposedJob], config: DynamicConfig) -
 _SYSTEM = """You are the dispatcher of a multi-agent workflow. You never do the work yourself.
 You read a request and a roster of available agents, and you decide which agents fill which jobs.
 
-Job categories:
-- planning: research / design / break the work down. Optional. A planning chain is fine (e.g. researcher -> planner).
-- execution: does the actual work (code, modelling, data changes). At least one is required overall.
-- validation: checks the executors' results (tests, review, geometry checks). Its output carries a verdict.
-- integration: merges the results of parallel executors when they must be combined. Optional.
+Job categories (every one is optional; use only those the request needs and the job slots require):
+- planning: research / design / break the work down. A planning chain is fine (e.g. researcher -> planner).
+- execution: does the actual work (code, modelling, data changes). Leave it out when nothing has to change
+  (e.g. a pure research or review request).
+- validation: checks the executors' results (tests, review, geometry checks). Its output carries a verdict;
+  a failing verdict sends the work back to the executors it names for another iteration.
+- integration: merges the results of parallel executors when they must be combined.
 
 Rules:
 - Only use agent_ids from the roster, in the categories the roster allows them.
 - Pick agents by their description and capabilities: give a job to an agent that can reach what the job needs.
-- The same agent may fill several jobs (e.g. three coders on three features) up to its max parallel instances.
+- Split a big piece of work into parts and give each part its own job: several researchers on different
+  questions, several coders on different features, several validators each checking one part. The same agent
+  may fill several jobs up to its max parallel instances. A part that fails is retried on its own; the others
+  keep their results.
 - Parallelise only when the jobs touch disjoint parts. Give every execution job an "owns" list naming what it
   may change (file globs like "src/billing/**", or named parts like "collection:Roof"). If two parts are
-  tightly coupled, make them sequential with depends_on instead.
+  tightly coupled, make them sequential with depends_on instead. A validator of one part depends on that
+  part's executor only.
 - depends_on must form a DAG. Do not create loops: feedback loops happen at run time through handbacks.
 - Each prompt is the complete brief for that agent: goal, scope, inputs it will receive, what to output.
 - Keep it lean: the fewest jobs that do the work well.
@@ -334,7 +333,8 @@ class Dispatcher:
             + _truncate(planning, 20000)
             + "\n\nNow create the execution jobs (and validation / integration jobs if useful) that carry the "
             "plan out. New jobs may depend on the planning jobs and on each other. Follow the planners' split "
-            "of the work when it is sound; you decide which agents take each part.\n\n"
+            "of the work when it is sound; you decide which agents take each part. If the planners' output "
+            "already answers the request and nothing needs to be done, return an empty jobs list.\n\n"
             + _FORMAT
         )
         allowed = ("execution", "validation", "integration")

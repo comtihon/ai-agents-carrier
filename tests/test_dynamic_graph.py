@@ -1,7 +1,8 @@
-"""A dynamic step inside a real LangGraph run: gate, resume, child job runs."""
+"""A dynamic step inside a real LangGraph run: job subgraph, gate, resume, child job runs."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -70,11 +71,11 @@ def _plan_llm(*answers):
     return lambda config, settings: call
 
 
-def _runner() -> YamlGraphRunner:
+def _runner(steps: list[dict] = STEPS) -> YamlGraphRunner:
     llm = FakeMessagesListChatModel(responses=[AIMessage(content="after done")])
     mcp = MagicMock(spec=McpToolsProvider)
     mcp.get_tool = MagicMock(return_value=None)
-    runner = YamlGraphRunner({"id": "dyn", "steps": STEPS}, llm=llm, mcp_tools_provider=mcp)
+    runner = YamlGraphRunner({"id": "dyn", "steps": steps}, llm=llm, mcp_tools_provider=mcp)
     runner._agent_backend = _Agents()
     return runner
 
@@ -85,12 +86,9 @@ def _run() -> GraphRun:
                     step_statuses={}, created_at=now, updated_at=now)
 
 
-def test_gate_step_is_inserted_and_routed():
+def test_dynamic_step_is_a_single_workflow_node():
     runner = _runner()
-    ids = [s["id"] for s in runner.steps]
-    assert ids == ["orchestrator", "orchestrator__gate", "after"]
-    gate = runner.steps[1]
-    assert gate["type"] == "dynamic_gate" and gate["next"] == "orchestrator"
+    assert [s["id"] for s in runner.steps] == ["orchestrator", "after"]
 
 
 @pytest.mark.asyncio
@@ -120,7 +118,7 @@ async def test_dynamic_run_pauses_for_plan_then_runs_jobs_as_child_runs():
          patch("app.services.agent_cleanup.cleanup_run_agents", new=_noop):
         await stream_graph_to_pause(runner, run, repo, {"request": "add A and B"})
         assert run.status == "waiting_approval"
-        assert run.current_step == "orchestrator__gate"
+        assert run.current_step == "orchestrator"
         dag = repo.runs[run.id].dynamic["orchestrator"]
         assert dag["status"] == "waiting_approval"
         assert [d["kind"] for d in dag["decisions"]] == ["plan"]
@@ -178,13 +176,21 @@ def test_validate_dynamic_steps_reports_config_problems():
     assert validate_dynamic_steps(STEPS) == []
     errors = validate_dynamic_steps([
         {"id": "a", "type": "dynamic", "agent_pool": []},
-        {"id": "b", "type": "dynamic", "agent_pool": [{"agent_id": "t", "categories": ["validation"]}]},
+        {"id": "b", "type": "dynamic", "agent_pool": [{"agent_id": "t", "categories": ["validation"]}],
+         "jobs": {"execution": {"min": 1, "max": 2}}},
         {"id": "c", "type": "dynamic", "automation": "sometimes", "agent_pool": [{"agent_id": "x"}]},
+        {"id": "d", "type": "dynamic", "agent_pool": [{"agent_id": "t", "categories": ["validation"]}],
+         "plan": [{"id": "code", "category": "execution", "agent_id": "t", "prompt": "p"},
+                  {"id": "review", "category": "validation", "agent_id": "t", "prompt": "p", "depends_on": ["ghost"]}]},
     ])
     text = " | ".join(errors)
     assert "agent_pool is empty" in text
-    assert "no agent in the pool may fill execution" in text
+    assert "no agent in the pool may fill execution jobs (jobs.execution.min is 1)" in text
     assert "step 'c': automation" in text
+    assert "step 'd': plan: job 'code': agent 't' may only fill" in text
+    assert "depends on unknown job 'ghost'" in text
+    # Every category is optional: a validator-only pool is fine without a minimum.
+    assert validate_dynamic_steps([{"id": "e", "type": "dynamic", "agent_pool": [{"agent_id": "t", "categories": ["validation"]}]}]) == []
 
 
 def test_roster_carries_description_and_addons():
@@ -207,3 +213,110 @@ def test_roster_carries_description_and_addons():
     assert "MCP: blender" in roster and "jira" not in roster
     assert "tools: gh" in roster
     assert "datasource survey (get_points)" in roster
+
+
+@pytest.mark.asyncio
+async def test_authored_job_chain_longer_than_the_default_recursion_limit():
+    """15 sequential jobs are 30+ supersteps of the job subgraph: more than LangGraph's default 25."""
+    chain = [
+        {"id": f"part-{i}", "category": "execution", "agent_id": "coder", "prompt": f"part {i}",
+         "depends_on": [f"part-{i - 1}"] if i else []}
+        for i in range(15)
+    ]
+    steps = [{**STEPS[0], "automation": "auto", "plan": chain, "jobs": {"execution": {"max": 15}}, "next": "END"}]
+    executed: list[str] = []
+
+    async def fake_execute(step, state, backend, run_id, cb, **kw):
+        executed.append(step["id"])
+        return {"summary": f"{step['id']} done"}
+
+    runner = _runner(steps)
+    run = _run()
+    repo = _Repo()
+    await repo.create(run)
+    with patch("app.steps.agent_executor.execute_agent_step", new=fake_execute), \
+         patch("app.services.agent_cleanup.cleanup_run_agents", new=_noop):
+        await stream_graph_to_pause(runner, run, repo, {"request": "build it"})
+    assert run.status == "completed", run.state.get("error")
+    assert executed == [f"part-{i}" for i in range(15)]
+    dag = repo.runs[run.id].dynamic["orchestrator"]
+    assert dag["status"] == "completed" and all(j["created_by"] == "author" for j in dag["jobs"])
+    # The mirrored DAG carries every attempt's child run and result for the UI.
+    first = dag["jobs"][0]["attempts"][0]
+    assert first["child_run_id"] and first["status"] == "finished"
+
+
+@pytest.mark.asyncio
+async def test_question_gate_pauses_the_workflow_at_the_dynamic_step():
+    from langgraph.errors import GraphInterrupt
+    from langgraph.types import Interrupt
+
+    plan = {"jobs": [{"id": "code", "category": "execution", "agent_id": "coder", "prompt": "x"}]}
+    asked = {"n": 0}
+
+    async def fake_execute(step, state, backend, run_id, cb, **kw):
+        asked["n"] += 1
+        if asked["n"] == 1:
+            raise GraphInterrupt([Interrupt(value={"questions": ["which db?"]})])
+        assert state["_clarification_answers"] == {"which db?": "postgres"}
+        return {"summary": "done"}
+
+    runner = _runner()
+    run = _run()
+    repo = _Repo()
+    await repo.create(run)
+    with patch("app.infrastructure.orchestration.dynamic.node.build_llm_call", _plan_llm(plan)), \
+         patch("app.steps.agent_executor.execute_agent_step", new=fake_execute), \
+         patch("app.services.agent_cleanup.cleanup_run_agents", new=_noop):
+        await stream_graph_to_pause(runner, run, repo, {"request": "r"})
+        assert run.status == "waiting_approval" and run.current_step == "orchestrator"
+        await stream_graph_to_pause(runner, run, repo, Command(resume={"approved": True}))  # the plan
+        assert run.status == "waiting_approval"
+        dag = repo.runs[run.id].dynamic["orchestrator"]
+        assert [d["kind"] for d in dag["decisions"] if not d["resolved"]] == ["question"]
+        await stream_graph_to_pause(
+            runner, run, repo,
+            Command(resume={"approved": True, "corrections": {"answers": {"which db?": "postgres"}}}),
+        )
+    assert run.status == "completed", run.state.get("error")
+    assert [h["approved"] for h in run.state["approval_history"]] == [True, True]
+
+
+class _Crash(BaseException):
+    """Stands in for the process dying mid-wave: nothing in the job runner catches it."""
+
+
+@pytest.mark.asyncio
+async def test_crash_mid_wave_reruns_only_the_part_that_had_not_finished():
+    plan = {"jobs": [
+        {"id": "code-a", "category": "execution", "agent_id": "coder", "prompt": "A", "owns": ["a/**"]},
+        {"id": "code-b", "category": "execution", "agent_id": "coder", "prompt": "B", "owns": ["b/**"]},
+    ]}
+    executed: list[str] = []
+    crash = {"armed": True}
+
+    async def fake_execute(step, state, backend, run_id, cb, **kw):
+        executed.append(step["id"])
+        if step["id"] == "code-b":
+            await asyncio.sleep(0.02)  # code-a reports first
+            if crash["armed"]:
+                crash["armed"] = False
+                raise _Crash()
+        return {"summary": f"{step['id']} done"}
+
+    runner = _runner([{**STEPS[0], "automation": "auto"}, STEPS[1]])
+    run = _run()
+    repo = _Repo()
+    await repo.create(run)
+    with patch("app.infrastructure.orchestration.dynamic.node.build_llm_call", _plan_llm(plan)), \
+         patch("app.steps.agent_executor.execute_agent_step", new=fake_execute), \
+         patch("app.services.agent_cleanup.cleanup_run_agents", new=_noop):
+        with pytest.raises(_Crash):
+            await stream_graph_to_pause(runner, run, repo, {"request": "add A and B"})
+        mirrored = repo.runs[run.id].dynamic["orchestrator"]
+        a = next(j for j in mirrored["jobs"] if j["id"] == "code-a")
+        assert a["attempts"][0]["status"] == "finished"  # reported before the crash
+        # Resume the workflow from its checkpoint, as a restart does.
+        await stream_graph_to_pause(runner, run, repo, None)
+    assert run.status == "completed", run.state.get("error")
+    assert sorted(executed) == ["code-a", "code-b", "code-b"]

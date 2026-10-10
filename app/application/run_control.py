@@ -327,7 +327,7 @@ async def _resume_rejected(
     # handback, …), not the end of the run: a run that goes on to complete has
     # completed, not been rejected.
     paused_at = next((s for s in runner.steps if s.get("id") == run.current_step), None)
-    rejection_continues = bool(paused_at and paused_at.get("type") == "dynamic_gate")
+    rejection_continues = bool(paused_at and paused_at.get("type") == "dynamic")
     await _stream_graph(
         runner, run, container,
         Command(resume={

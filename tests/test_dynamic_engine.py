@@ -1,4 +1,8 @@
-"""Dynamic workflow engine: planning, scheduling, handbacks, delegation, approval gates."""
+"""The job graph: planning, waves of parallel parts, handbacks, delegation, approval gates.
+
+Every test drives the real LangGraph job graph (``build_job_graph``) with a
+MemorySaver, a scripted dispatcher and a scripted job runner.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +11,8 @@ import json
 from typing import Any
 
 import pytest
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command
 
 from app.domain.models.dynamic import DynamicConfig, DynamicRunState, Job, JobAttempt
 from app.infrastructure.orchestration.dynamic.dispatcher import (
@@ -14,16 +20,17 @@ from app.infrastructure.orchestration.dynamic.dispatcher import (
     ProposedJob,
     validate_jobs,
 )
-from app.infrastructure.orchestration.dynamic.engine import DynamicEngine, JobOutcome
+from app.infrastructure.orchestration.dynamic.engine import AttemptResult, JobOutcome
+from app.infrastructure.orchestration.dynamic.graph import build_job_graph, initial_input
 
 
 def _cfg(**over: Any) -> DynamicConfig:
     base = {
         "agent_pool": [
             {"agent_id": "planner", "categories": ["planning"]},
-            {"agent_id": "researcher", "categories": ["planning"]},
+            {"agent_id": "researcher", "max_instances": 2, "categories": ["planning"]},
             {"agent_id": "coder", "max_instances": 3, "categories": ["execution", "integration"]},
-            {"agent_id": "tester", "categories": ["validation"]},
+            {"agent_id": "tester", "max_instances": 2, "categories": ["validation"]},
         ],
         "automation": "auto",
     }
@@ -78,24 +85,57 @@ class FakeRunner:
             return queue.pop(0)
         return JobOutcome(status="finished", output={"summary": f"{job.id} done"})
 
+    def ran(self, job_id: str) -> int:
+        return sum(1 for c in self.calls if c[0] == job_id)
 
-def _engine(cfg: DynamicConfig, llm: ScriptedLLM, runner: FakeRunner, state: DynamicRunState | None = None):
-    persisted: list[dict] = []
 
-    async def persist(s: DynamicRunState) -> None:
-        persisted.append(s.model_dump(mode="json"))
+class Harness:
+    """One dynamic step's job graph on its own thread; ``advance`` runs it to the next pause."""
 
-    eng = DynamicEngine(
-        config=cfg,
-        state=state or DynamicRunState(step_id="orchestrator"),
-        dispatcher=Dispatcher(llm),
-        roster="(roster)",
-        request="build features A and B",
-        job_runner=runner,
-        persist=persist,
-        run_id="12345678-run",
-    )
-    return eng, persisted
+    def __init__(self, cfg: DynamicConfig, llm: ScriptedLLM, runner: FakeRunner, state: DynamicRunState | None = None, **kw: Any) -> None:
+        self.persisted: list[dict] = []
+        self.attempt_events: list[tuple[str, int, str | None, str | None]] = []
+
+        async def persist(s: DynamicRunState) -> None:
+            self.persisted.append(s.model_dump(mode="json"))
+
+        async def on_attempt(job_id: str, n: int, child: str | None, result: AttemptResult | None) -> None:
+            self.attempt_events.append((job_id, n, child, result.status if result else None))
+
+        self.graph = build_job_graph(
+            config=cfg,
+            dispatcher=Dispatcher(llm),
+            roster="(roster)",
+            request="build features A and B",
+            run_id="12345678-run",
+            job_runner=runner,
+            persist=persist,
+            on_attempt=on_attempt,
+            checkpointer=MemorySaver(),
+            **kw,
+        )
+        self.config = {"configurable": {"thread_id": "t"}, "recursion_limit": 1000}
+        self.initial = state or DynamicRunState(step_id="orchestrator")
+        self.started = False
+        self.state = self.initial
+        self.approvals: list[dict] = []
+
+    async def advance(self, resolution: dict[str, Any] | None = None) -> str:
+        if not self.started:
+            self.started = True
+            out = await self.graph.ainvoke(initial_input(self.initial), self.config)
+        else:
+            out = await self.graph.ainvoke(Command(resume=resolution), self.config)
+        self.state = DynamicRunState.model_validate(out["dag"])
+        self.approvals = out.get("approvals") or []
+        if out.get("__interrupt__"):
+            return "gate"
+        return self.state.status
+
+
+def _engine(cfg: DynamicConfig, llm: ScriptedLLM, runner: FakeRunner, state: DynamicRunState | None = None, **kw: Any):
+    h = Harness(cfg, llm, runner, state, **kw)
+    return h, h.persisted
 
 
 # ─── config ──────────────────────────────────────────────────────────────────
@@ -103,12 +143,14 @@ def _engine(cfg: DynamicConfig, llm: ScriptedLLM, runner: FakeRunner, state: Dyn
 
 def test_config_from_step_fills_default_slots_and_rejects_duplicates():
     cfg = DynamicConfig.from_step({"id": "x", "type": "dynamic", "next": "END", "agent_pool": [{"agent_id": "a"}], "jobs": {"validation": {"min": 1, "max": 2}}})
-    assert cfg.jobs["execution"].min == 1
+    assert cfg.jobs["execution"].min == 0 and cfg.jobs["execution"].max == 8
     assert cfg.jobs["validation"].min == 1
     with pytest.raises(ValueError):
         DynamicConfig.model_validate({"agent_pool": [{"agent_id": "a"}, {"agent_id": "a"}]})
+    # Every category is optional, execution included.
+    assert DynamicConfig.model_validate({"jobs": {"execution": {"min": 0, "max": 3}}}).jobs["execution"].min == 0
     with pytest.raises(ValueError):
-        DynamicConfig.model_validate({"jobs": {"execution": {"min": 0, "max": 3}}})
+        DynamicConfig.model_validate({"plan": []})
 
 
 def test_approval_policy_by_mode():
@@ -253,12 +295,12 @@ async def test_plan_mode_gates_initial_plan_and_resumes_after_approval():
     assert await eng.advance() == "gate"
     assert runner.calls == []
     assert eng.state.status == "waiting_approval"
+    assert persisted[-1]["status"] == "waiting_approval"
 
-    # Resume from the persisted record, as the LangGraph node does after the gate.
-    state = DynamicRunState.model_validate(persisted[-1])
-    eng2, _ = _engine(cfg, ScriptedLLM(), runner, state=state)
-    assert await eng2.advance({"approved": True}) == "completed"
+    # The gate's interrupt resumes the graph from its checkpoint.
+    assert await eng.advance({"approved": True, "approver_name": "ann"}) == "completed"
     assert [c[0] for c in runner.calls] == ["code"]
+    assert eng.approvals[0]["approved"] is True and eng.approvals[0]["approver_name"] == "ann"
 
 
 async def test_rejected_plan_is_replanned_with_reason_and_edited_plan_is_honoured():
@@ -361,17 +403,130 @@ async def test_reset_for_retry_keeps_finished_jobs_and_grants_an_attempt():
     assert [c[0] for c in runner.calls] .count("a") == 1
 
 
-async def test_stop_check_cancels_in_flight_jobs_and_fails():
+async def test_stop_check_ends_the_run_before_the_next_wave():
     plan = {"jobs": [_job("a", "execution", "coder"), _job("b", "execution", "coder", ["a"])]}
-    runner = FakeRunner(delay=0.05)
+    runner = FakeRunner()
     calls = {"n": 0}
 
     async def stop() -> bool:
         calls["n"] += 1
-        return calls["n"] > 1  # stop after the first scheduling round
+        return calls["n"] > 1  # stop after the first wave
 
-    eng, _ = _engine(_cfg(), ScriptedLLM(plan), runner)
-    eng._stop_check = stop
+    eng, _ = _engine(_cfg(), ScriptedLLM(plan), runner, stop_check=stop)
     assert await eng.advance() == "failed"
     assert eng.state.error == "run was stopped"
     assert [c[0] for c in runner.calls] == ["a"]
+    assert eng.state.job("b").status == "cancelled"
+
+
+# ─── parts, optional categories, authored DAGs ──────────────────────────────
+
+
+async def test_only_the_failed_part_runs_again():
+    plan = {"jobs": [_job(f"code-{p}", "execution", "coder", owns=[f"src/{p}/**"]) for p in "abc"]}
+    runner = FakeRunner({"code-b": [JobOutcome(status="failed", error="pod crashed")]})
+    eng, _ = _engine(_cfg(), ScriptedLLM(plan), runner)
+    assert await eng.advance() == "completed"
+    assert (runner.ran("code-a"), runner.ran("code-b"), runner.ran("code-c")) == (1, 2, 1)
+    assert runner.max_concurrent == 3
+    assert [a.status for a in eng.state.job("code-b").attempts] == ["failed", "finished"]
+
+
+async def test_validator_per_part_hands_back_only_its_part():
+    plan = {"jobs": [
+        _job("code-a", "execution", "coder", owns=["a/**"]),
+        _job("code-b", "execution", "coder", owns=["b/**"]),
+        _job("check-a", "validation", "tester", ["code-a"]),
+        _job("check-b", "validation", "tester", ["code-b"]),
+        _job("merge", "integration", "coder", ["check-a", "check-b"]),
+    ]}
+    runner = FakeRunner({"check-b": [
+        JobOutcome(status="finished", output={"verdict": "fail", "feedback": "b is wrong"}),
+        JobOutcome(status="finished", output={"verdict": "pass"}),
+    ]})
+    eng, _ = _engine(_cfg(), ScriptedLLM(plan), runner)
+    assert await eng.advance() == "completed"
+    assert {j: runner.ran(j) for j in ("code-a", "check-a", "code-b", "check-b", "merge")} == {
+        "code-a": 1, "check-a": 1, "code-b": 2, "check-b": 2, "merge": 1,
+    }
+    second_b = [c for c in runner.calls if c[0] == "code-b"][1][2]
+    assert "b is wrong" in second_b["feedback"]
+
+
+async def test_several_researchers_split_the_research_and_no_executor_is_needed():
+    llm = ScriptedLLM(
+        {"jobs": [_job("q1", "planning", "researcher"), _job("q2", "planning", "researcher"), _job("sum", "planning", "planner", ["q1", "q2"])]},
+        {"summary": "the research answers the request", "jobs": []},
+    )
+    runner = FakeRunner(delay=0.01)
+    eng, _ = _engine(_cfg(), llm, runner)
+    assert await eng.advance() == "completed"
+    assert [c[0] for c in runner.calls][2] == "sum" and runner.max_concurrent == 2
+    assert all(j.category == "planning" for j in eng.state.jobs)
+    assert eng.state.expanded
+
+
+async def test_authored_plan_runs_without_asking_the_dispatcher():
+    cfg = _cfg(automation="plan", plan=[
+        _job("code", "execution", "coder"),
+        _job("review", "validation", "tester", ["code"]),
+    ])
+    runner = FakeRunner({"review": [
+        JobOutcome(status="finished", output={"verdict": "fail", "feedback": "rename it"}),
+        JobOutcome(status="finished", output={"verdict": "pass"}),
+    ]})
+    llm = ScriptedLLM()  # any dispatcher call would fail the test
+    eng, _ = _engine(cfg, llm, runner)
+    assert await eng.advance() == "completed"  # the authored DAG needs no plan approval
+    assert [c[0] for c in runner.calls] == ["code", "review", "code", "review"]
+    assert {j.created_by for j in eng.state.jobs} == {"author"}
+    assert llm.prompts == []
+
+
+async def test_invalid_authored_plan_fails_the_run():
+    cfg = _cfg(plan=[_job("code", "execution", "tester")])
+    eng, _ = _engine(cfg, ScriptedLLM(), FakeRunner())
+    assert await eng.advance() == "failed"
+    assert "authored plan is invalid" in eng.state.error and "may only fill" in eng.state.error
+
+
+async def test_a_finished_attempt_is_not_run_again_when_a_wave_is_replayed():
+    plan = {"jobs": [_job("a", "execution", "coder"), _job("b", "execution", "coder")]}
+    done = AttemptResult(status="finished", output={"summary": "a from before the restart"}, job_id="a", attempt=1, child_run_id="old")
+
+    def recorded(job_id: str, n: int) -> AttemptResult | None:
+        return done if (job_id, n) == ("a", 1) else None
+
+    runner = FakeRunner()
+    eng, _ = _engine(_cfg(), ScriptedLLM(plan), runner, recorded=recorded)
+    assert await eng.advance() == "completed"
+    assert [c[0] for c in runner.calls] == ["b"]
+    assert eng.state.job("a").output == {"summary": "a from before the restart"}
+    assert eng.state.job("a").attempts[0].child_run_id == "old"
+
+
+async def test_attempts_are_reported_as_they_start_and_finish():
+    eng, _ = _engine(_cfg(), ScriptedLLM({"jobs": [_job("code", "execution", "coder")]}), FakeRunner())
+    assert await eng.advance() == "completed"
+    assert eng.attempt_events == [("code", 1, "child-code-1", None), ("code", 1, "child-code-1", "finished")]
+    assert eng.state.job("code").attempts[0].child_run_id == "child-code-1"
+
+
+async def test_a_pass_from_the_mirrored_dag_keeps_attempts_that_reported_before_a_restart():
+    """Recovery re-seeds the workflow, so the step starts from the mirror the attempts wrote to."""
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    state = DynamicRunState(step_id="orchestrator", status="running", expanded=True, jobs=[
+        Job(id="a", category="execution", agent_id="coder", prompt="p", status="running",
+            attempts=[JobAttempt(n=1, child_run_id="c-a", status="finished", finished_at=now, output={"summary": "a ok"})]),
+        Job(id="b", category="execution", agent_id="coder", prompt="p", status="running",
+            attempts=[JobAttempt(n=1, child_run_id="c-b")]),
+        Job(id="check", category="validation", agent_id="tester", prompt="p", depends_on=["a", "b"]),
+    ])
+    runner = FakeRunner()
+    eng, _ = _engine(_cfg(), ScriptedLLM(), runner, state=state)
+    assert await eng.advance() == "completed"
+    assert [(c[0], c[1]) for c in runner.calls] == [("b", 2), ("check", 1)]
+    assert eng.state.job("a").output == {"summary": "a ok"} and len(eng.state.job("a").attempts) == 1
+    assert eng.state.job("b").attempts[0].status == "cancelled"
