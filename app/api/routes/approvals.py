@@ -20,6 +20,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from app.api.dependencies import get_container
+from app.application.visibility import approval_case_visible, approval_exclusions
 from app.core.container import ApplicationContainer
 from app.domain.models.approval_case import ApprovalCase, history_key_for
 
@@ -109,6 +110,8 @@ async def list_approvals(
     assert container.approval_backend is not None
     limit = max(1, min(limit, 200))
     summary = view == "summary"
+    # Cases of a workflow or data source the caller cannot see are theirs too.
+    hidden = await approval_exclusions(container)
     cases = await container.approval_backend.list(
         status=status,
         workflow_id=workflow_id,
@@ -117,12 +120,14 @@ async def list_approvals(
         limit=limit,
         offset=offset,
         summary=summary,
+        **hidden,
     )
     total = await container.approval_backend.count(
         status=status,
         workflow_id=workflow_id,
         datasource_id=datasource_id,
         run_id=run_id,
+        **hidden,
     )
     return {
         "items": [_case_json(c, summary=summary) for c in cases],
@@ -137,7 +142,11 @@ async def pending_count(container: ApplicationContainer = Depends(get_container)
     """Badge count for the dock rail. Cheap enough to poll."""
     if container.approval_backend is None:
         return {"count": 0}
-    return {"count": await container.approval_backend.count(status="pending")}
+    return {
+        "count": await container.approval_backend.count(
+            status="pending", **await approval_exclusions(container)
+        )
+    }
 
 
 @router.get("/history")
@@ -157,6 +166,11 @@ async def decision_history(
     """
     _require_backend(container)
     assert container.approval_backend is not None
+    hidden = await approval_exclusions(container)
+    if workflow_id in hidden.get("exclude_workflow_ids", []) or datasource_id in hidden.get(
+        "exclude_datasource_ids", []
+    ):
+        raise HTTPException(status_code=404, detail="Approval history not found")
     key = history_key_for(workflow_id, datasource_id, operation)
     summary = view == "summary"
     cases = await container.approval_backend.history(
@@ -195,7 +209,7 @@ async def get_approval(
     _require_backend(container)
     assert container.approval_backend is not None
     case = await container.approval_backend.get(case_id)
-    if case is None:
+    if case is None or not await approval_case_visible(container, case):
         raise HTTPException(status_code=404, detail="Approval case not found")
     return _case_json(case)
 
@@ -219,7 +233,7 @@ async def decide_approval(
     _require_backend(container)
     assert container.approval_backend is not None
     case = await container.approval_backend.get(case_id)
-    if case is None:
+    if case is None or not await approval_case_visible(container, case):
         raise HTTPException(status_code=404, detail="Approval case not found")
     if case.decided:
         raise HTTPException(
@@ -264,6 +278,10 @@ async def veto_approval(
 ):
     """Cancel an autonomous decision before its veto window closes."""
     _require_backend(container)
+    assert container.approval_backend is not None
+    existing = await container.approval_backend.get(case_id)
+    if existing is not None and not await approval_case_visible(container, existing):
+        raise HTTPException(status_code=404, detail="Approval case not found")
     name, _ = _principal(request)
     by = (body.by if body else None) or name or "a reviewer"
     case = await container.approval_service.veto(case_id, by=by)

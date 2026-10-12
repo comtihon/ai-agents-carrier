@@ -36,6 +36,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse, StreamingResponse
 
 from app.api.dependencies import get_container
+from app.application.visibility import ensure_run_visible, workflow_visible
 from app.application.data_artifacts import (
     DataArtifactError,
     find_run_artifact,
@@ -79,6 +80,7 @@ async def list_run_data(
     run = await container.run_repository.get(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
+    await ensure_run_visible(container.workflow_backend, run)
 
     artifacts = await list_run_artifacts(
         getattr(container, "data_artifact_backend", None),
@@ -157,6 +159,8 @@ async def download_run_data(
     # Resolved through the run, which is what makes a data source result
     # exactly as accessible as the run that produced it -- and no more.
     run = await container.run_repository.get(run_id)
+    if run is not None and not await workflow_visible(container.workflow_backend, run.graph_id):
+        run = None
     artifact = None if run is None else await find_run_artifact(
         getattr(container, "data_artifact_backend", None),
         run,

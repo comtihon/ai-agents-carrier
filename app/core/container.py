@@ -27,6 +27,7 @@ from app.infrastructure.integrations.openhands import OpenHandsAdapter
 from app.infrastructure.orchestration.checkpointer import MongoDBCheckpointSaver
 from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner, stream_graph_to_pause
 from app.infrastructure.persistence.mongo import MongoClientProvider, MongoGraphRunRepository, MongoPvcLeaseRepository, MongoAgentTaskRepository, MongoWarmPodRepository
+from app.application.visibility import ReferenceGuard, VisibilityScopedBackend, unwrap
 from app.infrastructure.persistence.agent_backend import (
     AgentDefinitionBackend,
     MongoAgentBackend,
@@ -71,6 +72,15 @@ from app.infrastructure.triggers.pubsub_subscriber import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Container attribute -> visibility kind, for the backends that are scoped.
+_SCOPED_BACKENDS: dict[str, str] = {
+    "workflow_backend": "workflow",
+    "agent_backend": "agent",
+    "data_source_backend": "datasource",
+    "script_backend": "script",
+}
 
 
 @dataclass
@@ -138,6 +148,28 @@ class ApplicationContainer:
     _recover_task: asyncio.Task | None = field(default=None, init=False, repr=False, compare=False)
     _datasources_mcp_task: asyncio.Task | None = field(default=None, init=False, repr=False, compare=False)
     _stream_housekeeping_task: asyncio.Task | None = field(default=None, init=False, repr=False, compare=False)
+
+    # The four definition backends are always held behind a visibility scope
+    # (app.application.visibility): every reader — REST routes, management and
+    # chat tools, the dispatcher's roster, run-time lookups — goes through it,
+    # so no surface can show a private resource the others hide. Done on
+    # assignment rather than in __post_init__ so a backend swapped in later (as
+    # tests do) is wrapped too.
+    def __setattr__(self, name: str, value: Any) -> None:
+        kind = _SCOPED_BACKENDS.get(name)
+        if kind is not None and value is not None and not isinstance(value, VisibilityScopedBackend):
+            value = VisibilityScopedBackend(value, kind, self._visibility_guard())
+        object.__setattr__(self, name, value)
+
+    def _visibility_guard(self) -> ReferenceGuard:
+        guard = self.__dict__.get("_reference_guard")
+        if guard is None:
+            fields = {kind: name for name, kind in _SCOPED_BACKENDS.items()}
+            guard = ReferenceGuard(
+                lambda kind: unwrap(self.__dict__.get(fields[kind]))
+            )
+            object.__setattr__(self, "_reference_guard", guard)
+        return guard
 
     async def startup(self) -> None:
         # Fail fast on an enabled-but-incomplete outbound auth configuration.
@@ -306,7 +338,7 @@ class ApplicationContainer:
             await asyncio.sleep(delay)
             try:
                 await rebuild_datasource_tools(
-                    get_datasources_mcp(), self.data_source_backend, lambda: self
+                    get_datasources_mcp(), unwrap(self.data_source_backend), lambda: self
                 )
                 await self.mcp_tools_provider.refresh_server("datasources")
                 logger.info("datasources MCP tools loaded")
@@ -323,7 +355,7 @@ class ApplicationContainer:
         """Populate yaml_graph_registry from the configured backend."""
         assert self.workflow_backend is not None
         try:
-            definitions = await self.workflow_backend.list()
+            definitions = await unwrap(self.workflow_backend).list()
         except Exception:
             logger.exception("Failed to load workflow definitions from backend — registry will be empty")
             return
@@ -688,7 +720,9 @@ class ApplicationContainer:
         # definition still wants. _register_pubsub_steps syncs instead, and the
         # deleted-workflow branch below unregisters explicitly.
         self.cron_scheduler.unregister_workflow(workflow_id)
-        defn = await self.workflow_backend.get(workflow_id)
+        # The registry is global: rebuilt from the stored definition whoever's
+        # request triggered the refresh, never from what that caller can see.
+        defn = await unwrap(self.workflow_backend).get(workflow_id)
         if defn is not None:
             runner = build_runner_from_definition(
                 defn,
@@ -995,12 +1029,12 @@ class ApplicationContainer:
         await self.mongo_provider.close()
         if self.checkpointer is not None:
             self.checkpointer.close()
-        if isinstance(self.workflow_backend, MongoWorkflowBackend):
-            await self.workflow_backend.close()
-        if isinstance(self.agent_backend, MongoAgentBackend):
-            await self.agent_backend.close()
-        if isinstance(self.data_source_backend, MongoDataSourceBackend):
-            await self.data_source_backend.close()
+        if isinstance(unwrap(self.workflow_backend), MongoWorkflowBackend):
+            await unwrap(self.workflow_backend).close()
+        if isinstance(unwrap(self.agent_backend), MongoAgentBackend):
+            await unwrap(self.agent_backend).close()
+        if isinstance(unwrap(self.data_source_backend), MongoDataSourceBackend):
+            await unwrap(self.data_source_backend).close()
         if isinstance(self.approval_backend, MongoApprovalBackend):
             await self.approval_backend.close()
         if isinstance(self.event_backend, MongoEventBackend):

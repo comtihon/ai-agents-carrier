@@ -82,7 +82,7 @@ class MongoDataSourceBackend(DataSourceDefinitionBackend):
 
     @staticmethod
     def _to_doc(defn: DataSourceDefinition) -> dict[str, Any]:
-        data = defn.model_dump(mode="python")
+        data = defn.model_dump(mode="python", exclude={"can_edit"})
         data["_id"] = data.pop("id")
         return data
 

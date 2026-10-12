@@ -969,7 +969,45 @@ POST   /api/v1/webhooks/{workflow-id}         HTTP webhook trigger
 # Approval callbacks (no auth)
 POST   /api/v1/callbacks/{run-id}/approve
 POST   /api/v1/callbacks/{run-id}/reject
+
+# Caller
+GET    /api/v1/me                             {sub, name, is_admin, auth_enabled}
 ```
+
+### Ownership and visibility
+
+Agents, data sources, library scripts and workflows are each `public` or
+`private`, and owned by the user who created them (the token's `sub`). Every
+response object — full and `view=summary` alike, and the workflow list —
+carries `visibility`, `owner_id`, `owner_name` and `can_edit` (computed for the
+caller). Create and update bodies accept an optional `visibility`; omitted on
+create it defaults to `private` for a user, omitted on update it is kept.
+
+- **Private** resources are visible to their owner and to admins only. To
+  anyone else they do not exist: not listed, `404` by id, not offered to the
+  chat agent or the management MCP tools, absent from the dynamic dispatcher's
+  roster. A private workflow's runs, traces, run data and approval cases follow
+  it — filtered in the Mongo query, so pages and totals count visible runs only.
+- **Editing** (and deleting, and changing visibility) is for the owner or an
+  admin: `403` otherwise. Documents stored before ownership existed load as
+  public and unowned, and stay editable by anyone with `WRITE`; making one
+  private makes the caller its owner.
+- **References** are checked on save (`422`): you can only use resources you can
+  see, a public resource may only use public ones, and a private one only public
+  ones or its own owner's private ones. Making a resource private is refused
+  (`409`) while a public resource, or another user's, still uses it.
+- **Admins** are callers holding a role in `AUTH_ADMIN_ROLES`, evaluated even
+  when `AUTH_ENFORCE_PERMISSIONS` is off (in shadow mode every caller is
+  *granted* ADMIN, which must not make every private resource visible).
+- **The management MCP static key** is nobody in particular: it sees and
+  creates public resources only.
+- **Without authentication** (`OAUTH_ENABLED=false`) there is no owner and all
+  of this is a no-op. The platform itself — cron, Pub/Sub, webhooks, agent
+  callbacks, the data sources MCP — likewise sees everything, so a triggered run
+  of a private workflow resolves its owner's private resources.
+- **Script names** are unique within what one caller can see; ids stay global,
+  so saving a name whose id belongs to a script you cannot see answers `409`
+  ("id already taken") without saying whose.
 
 ---
 
