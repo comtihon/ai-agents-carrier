@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
@@ -12,6 +12,13 @@ from pydantic import BaseModel, Field
 
 from app.api.dependencies import get_container
 from app.application.script_capture import capture_inline_scripts
+from app.application.visibility import (
+    can_see,
+    ensure_run_visible,
+    hidden_workflow_ids,
+    ownership_fields,
+    visibility_kwargs,
+)
 from app.application.step_normalization import declared_edges, implicit_edges, normalize_edges
 from app.application import run_control
 # _config is defined in run_control (the shared run-control layer); imported here
@@ -74,6 +81,8 @@ class WorkflowDefinitionRequest(BaseModel):
     use_meta_llm: bool = True
     use_storage: bool = False
     enabled: bool = True
+    # None = the default: private when a user creates it, public without auth.
+    visibility: Literal["public", "private"] | None = None
 
 
 class WorkflowDefinitionUpdateRequest(BaseModel):
@@ -92,6 +101,7 @@ class WorkflowDefinitionUpdateRequest(BaseModel):
     use_meta_llm: bool | None = None
     use_storage: bool | None = None
     enabled: bool | None = None
+    visibility: Literal["public", "private"] | None = None
 
 
 class RestartFromStepRequest(BaseModel):
@@ -558,8 +568,12 @@ async def _execute_graph(
 
 @router.get("")
 async def list_workflows(container: ApplicationContainer = Depends(get_container)):
-    """List all workflows (summary view from the registry)."""
-    return container.yaml_graph_registry.list_definitions()
+    """List the workflows the caller can see (summary view from the registry)."""
+    return [
+        {**entry, **ownership_fields(entry)}
+        for entry in container.yaml_graph_registry.list_definitions()
+        if can_see(entry)
+    ]
 
 
 def _refuse_if_disabled(workflow: object) -> None:
@@ -630,6 +644,7 @@ async def create_workflow(
         use_meta_llm=body.use_meta_llm,
         use_storage=body.use_storage,
         enabled=body.enabled,
+        **visibility_kwargs(body.visibility),
     )
     saved = await container.workflow_backend.create(defn)
     await container.refresh_runner(body.id)
@@ -657,7 +672,15 @@ async def list_runs(
     exclude_workflow_ids (exclude runs belonging to these workflow IDs).
     Supports offset-based pagination via offset + limit.
     Returns {runs, total}.
+
+    Runs of workflows the caller cannot see are left out (a private workflow's
+    runs are its owner's).
     """
+    hidden = await hidden_workflow_ids(container.workflow_backend)
+    if hidden:
+        if workflow_id in hidden:
+            return {"runs": [], "total": 0}
+        exclude_workflow_ids = list(exclude_workflow_ids or []) + hidden
     runs, total = await asyncio.gather(
         container.run_repository.list_recent(
             limit=limit, offset=offset, workflow_id=workflow_id,
@@ -766,6 +789,7 @@ async def get_run_trace(
     run = await container.run_repository.get(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
+    await ensure_run_visible(container.workflow_backend, run)
 
     langsmith_url: str | None = None
     if run.langsmith_run_id:
@@ -796,6 +820,7 @@ async def get_run(
     run = await container.run_repository.get(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
+    await ensure_run_visible(container.workflow_backend, run)
     runner = _get_runner_for_run(run, container)
     return await _run_response(run, runner, run_repository=container.run_repository)
 
@@ -863,6 +888,7 @@ async def delete_run(
     run = await container.run_repository.get(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
+    await ensure_run_visible(container.workflow_backend, run)
     from app.services.agent_cleanup import cleanup_run_agents
     await cleanup_run_agents(run_id, container.settings)
     # Drop the run's download manifest and unpin the streams it held. Without
@@ -1026,6 +1052,7 @@ async def update_workflow(
         ),
         enabled=existing.enabled if body.enabled is None else body.enabled,
         created_at=existing.created_at,
+        **visibility_kwargs(body.visibility),
     )
     saved = await container.workflow_backend.update(workflow_id, defn)
     await container.refresh_runner(workflow_id)

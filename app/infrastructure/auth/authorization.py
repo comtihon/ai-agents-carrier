@@ -297,3 +297,59 @@ def missing_permission(required: Permission) -> Permission | None:
     if permissions is None:
         return None
     return None if required in permissions else required
+
+
+# ── Ambient subject ──────────────────────────────────────────────────────────
+# Permissions say what a caller may do in general; resource visibility needs to
+# know *who* it is, because a private agent, data source, script or workflow is
+# visible to its owner and to admins only. Bound in the same two places as the
+# permissions above (OAuthMiddleware and the management MCP wrapper), for the
+# same reason: the chat agent and the management tools get no request object.
+#
+# Three states, deliberately distinct:
+#   unbound (None)      — no authentication ran: OAuth disabled, a test, or the
+#                         platform itself (cron, Pub/Sub, webhook, agent
+#                         callbacks). Sees and may edit everything, exactly as
+#                         before visibility existed.
+#   Subject(id=None)    — authenticated but unattributable: the management MCP
+#                         static API key. Sees public resources only.
+#   Subject(id="<sub>") — a user. Sees public resources and their own.
+
+
+@dataclass(frozen=True)
+class Subject:
+    """The identity behind a request, for ownership and visibility."""
+
+    id: str | None = None
+    name: str | None = None
+    # Admin for visibility purposes: holds a role mapped to ADMIN, evaluated
+    # strictly — with enforcement off every caller is *granted* ADMIN, and that
+    # must not make every private resource visible to everyone.
+    is_admin: bool = False
+
+
+_current_subject: "ContextVar[Subject | None]" = ContextVar("current_subject", default=None)
+
+
+def subject_from_claims(claims: dict[str, Any], is_admin: bool = False) -> Subject:
+    """The subject a validated token describes. ``sub`` is the owner id."""
+    sub = claims.get("sub")
+    name = claims.get("name") or claims.get("preferred_username") or claims.get("email")
+    return Subject(
+        id=str(sub) if sub else None,
+        name=str(name) if name else None,
+        is_admin=is_admin,
+    )
+
+
+def set_current_subject(subject: Subject | None) -> "Token":
+    return _current_subject.set(subject)
+
+
+def reset_current_subject(token: "Token") -> None:
+    _current_subject.reset(token)
+
+
+def get_current_subject() -> Subject | None:
+    """The bound subject, or ``None`` when nothing authenticated this task."""
+    return _current_subject.get()

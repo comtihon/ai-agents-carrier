@@ -120,6 +120,11 @@ async def test_summary_view_omits_agent_input_and_addons(client):
         "name": "Researcher",
         "description": None,
         "default_runtime": "local",
+        # Ownership travels with every list entry (auth off: public, unowned).
+        "visibility": "public",
+        "owner_id": None,
+        "owner_name": None,
+        "can_edit": True,
     }]
     # Default view is unchanged.
     full = (await c.get("/api/v1/agents")).json()[0]

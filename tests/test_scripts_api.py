@@ -122,7 +122,11 @@ async def test_summary_view_omits_the_code(client):
 
     summary = (await c.get("/api/v1/scripts", params={"view": "summary"})).json()
 
-    assert summary == [{"id": "sum-items", "name": "Sum Items", "description": "adds them up"}]
+    assert summary == [{
+        "id": "sum-items", "name": "Sum Items", "description": "adds them up",
+        # Ownership travels with every list entry (auth off: public, unowned).
+        "visibility": "public", "owner_id": None, "owner_name": None, "can_edit": True,
+    }]
     # The default is unchanged, so nothing that relied on the full list breaks.
     assert (await c.get("/api/v1/scripts")).json()[0]["code"] == "output = 1"
 

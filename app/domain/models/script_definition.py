@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel
+from app.domain.models.ownership import OwnedResource
 
 
-class ScriptDefinition(BaseModel):
+class ScriptDefinition(OwnedResource):
     """A reusable Python script stored in the script library.
 
     Scripts are referenced by ``python`` workflow steps through ``script_id``.
