@@ -557,3 +557,38 @@ async def test_empty_api_key_counts_as_unset_and_fails_closed(key):
         none = await c.post("/management")
     assert bare.status_code == 401
     assert none.status_code == 401
+
+
+# ── Subject binding (ownership / visibility) ─────────────────────────────────
+
+def _subject_app() -> Starlette:
+    from app.infrastructure.auth.authorization import get_current_subject
+
+    async def who(request):
+        subject = get_current_subject()
+        return PlainTextResponse(json.dumps(
+            None if subject is None else {"id": subject.id, "name": subject.name}
+        ))
+
+    return Starlette(routes=[Route("/mcp/management/", who)])
+
+
+@pytest.mark.asyncio
+async def test_api_key_binds_an_anonymous_subject() -> None:
+    """The shared key is nobody in particular: it sees public resources only."""
+    wrapper = _ManagementAuthWrapper(_subject_app(), api_key="secret", oauth_enabled=False)
+    async with AsyncClient(transport=ASGITransport(app=wrapper), base_url="http://t") as c:
+        resp = await c.get("/mcp/management/", headers={"Authorization": "Bearer secret"})
+    assert resp.json() == {"id": None, "name": None}
+
+
+@pytest.mark.asyncio
+async def test_oauth_bearer_binds_the_user() -> None:
+    auth = MagicMock(spec=AuthService)
+    auth.validate_token = AsyncMock(return_value={"sub": "u-1", "email": "a@example.com"})
+    wrapper = _ManagementAuthWrapper(
+        _subject_app(), api_key=None, oauth_enabled=True, auth_service=auth
+    )
+    async with AsyncClient(transport=ASGITransport(app=wrapper), base_url="http://t") as c:
+        resp = await c.get("/mcp/management/", headers={"Authorization": "Bearer tok"})
+    assert resp.json() == {"id": "u-1", "name": "a@example.com"}

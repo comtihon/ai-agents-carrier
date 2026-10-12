@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 from app.domain.models.agent_addon import (
     AnyAgentAddon,
@@ -12,9 +12,10 @@ from app.domain.models.agent_addon import (
     S3Addon,
     ToolsAddon,
 )
+from app.domain.models.ownership import OwnedResource
 
 
-class AgentDefinition(BaseModel):
+class AgentDefinition(OwnedResource):
     """Persistent definition of a registered agent.
 
     Agents are invoked by ``langgraph-agent`` and ``claude-agent`` workflow

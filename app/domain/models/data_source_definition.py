@@ -20,6 +20,7 @@ from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, Field
 
+from app.domain.models.ownership import OwnedResource
 from app.domain.models.sheet_binding import SheetBinding
 
 
@@ -319,7 +320,7 @@ class BigQuerySpec(BaseModel):
     max_rows: int = 0
 
 
-class DataSourceDefinition(BaseModel):
+class DataSourceDefinition(OwnedResource):
     """Persistent definition of one remote API exposed as named operations."""
 
     id: str

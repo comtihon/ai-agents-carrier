@@ -44,8 +44,13 @@ class ApprovalCaseBackend(ABC):
         limit: int = 50,
         offset: int = 0,
         summary: bool = False,
+        exclude_workflow_ids: list[str] | None = None,
+        exclude_datasource_ids: list[str] | None = None,
     ) -> list[ApprovalCase]:
         """Cases newest first.
+
+        ``exclude_*`` leave out cases of workflows / data sources the caller
+        cannot see (see app.application.visibility).
 
         ``summary`` drops the bulky fields — the inputs, the resolved targets,
         the affected sample and the details map. A queue row shows none of
@@ -63,6 +68,8 @@ class ApprovalCaseBackend(ABC):
         datasource_id: str | None = None,
         run_id: str | None = None,
         operation: str | None = None,
+        exclude_workflow_ids: list[str] | None = None,
+        exclude_datasource_ids: list[str] | None = None,
     ) -> int: ...
 
     @abstractmethod
@@ -170,6 +177,8 @@ class MongoApprovalBackend(ApprovalCaseBackend):
         datasource_id: str | None,
         run_id: str | None,
         operation: str | None = None,
+        exclude_workflow_ids: list[str] | None = None,
+        exclude_datasource_ids: list[str] | None = None,
     ) -> dict:
         query: dict[str, Any] = {}
         if status:
@@ -182,6 +191,14 @@ class MongoApprovalBackend(ApprovalCaseBackend):
             query["run_id"] = run_id
         if operation:
             query["operation"] = operation
+        if exclude_workflow_ids:
+            query.setdefault("$and", []).append(
+                {"workflow_id": {"$nin": list(exclude_workflow_ids)}}
+            )
+        if exclude_datasource_ids:
+            query.setdefault("$and", []).append(
+                {"datasource_id": {"$nin": list(exclude_datasource_ids)}}
+            )
         return query
 
     async def list(
@@ -194,10 +211,16 @@ class MongoApprovalBackend(ApprovalCaseBackend):
         limit: int = 50,
         offset: int = 0,
         summary: bool = False,
+        exclude_workflow_ids: list[str] | None = None,
+        exclude_datasource_ids: list[str] | None = None,
     ) -> list[ApprovalCase]:
         cursor = (
             self._col.find(
-                self._query(status, workflow_id, datasource_id, run_id),
+                self._query(
+                    status, workflow_id, datasource_id, run_id,
+                    exclude_workflow_ids=exclude_workflow_ids,
+                    exclude_datasource_ids=exclude_datasource_ids,
+                ),
                 projection=self._SUMMARY_PROJECTION if summary else None,
             )
             .sort("created_at", -1)
@@ -214,9 +237,15 @@ class MongoApprovalBackend(ApprovalCaseBackend):
         datasource_id: str | None = None,
         run_id: str | None = None,
         operation: str | None = None,
+        exclude_workflow_ids: list[str] | None = None,
+        exclude_datasource_ids: list[str] | None = None,
     ) -> int:
         return await self._col.count_documents(
-            self._query(status, workflow_id, datasource_id, run_id, operation)
+            self._query(
+                status, workflow_id, datasource_id, run_id, operation,
+                exclude_workflow_ids=exclude_workflow_ids,
+                exclude_datasource_ids=exclude_datasource_ids,
+            )
         )
 
     async def history(
@@ -318,10 +347,12 @@ class InMemoryApprovalBackend(ApprovalCaseBackend):
     async def list(
         self, *, status=None, workflow_id=None, datasource_id=None, run_id=None,
         limit: int = 50, offset: int = 0, summary: bool = False,
+        exclude_workflow_ids=None, exclude_datasource_ids=None,
     ) -> list[ApprovalCase]:
         rows = [
             c for c in self._cases.values()
             if self._match(c, status, workflow_id, datasource_id, run_id)
+            and self._not_excluded(c, exclude_workflow_ids, exclude_datasource_ids)
         ]
         rows.sort(key=lambda c: c.created_at, reverse=True)
         page = rows[offset: offset + limit]
@@ -329,12 +360,20 @@ class InMemoryApprovalBackend(ApprovalCaseBackend):
 
     async def count(
         self, *, status=None, workflow_id=None, datasource_id=None, run_id=None,
-        operation=None,
+        operation=None, exclude_workflow_ids=None, exclude_datasource_ids=None,
     ) -> int:
         return sum(
             1 for c in self._cases.values()
             if self._match(c, status, workflow_id, datasource_id, run_id)
             and (not operation or c.operation == operation)
+            and self._not_excluded(c, exclude_workflow_ids, exclude_datasource_ids)
+        )
+
+    @staticmethod
+    def _not_excluded(case: ApprovalCase, workflow_ids, datasource_ids) -> bool:
+        return (
+            not (workflow_ids and case.workflow_id in workflow_ids)
+            and not (datasource_ids and case.datasource_id in datasource_ids)
         )
 
     async def history(
