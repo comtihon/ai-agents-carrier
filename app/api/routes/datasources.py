@@ -37,6 +37,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from app.api.dependencies import get_container
+from app.application.visibility import ownership_fields, unwrap
 from app.core.config import Settings, get_settings
 from app.core.container import ApplicationContainer
 from app.domain.models.data_source_definition import (
@@ -109,6 +110,8 @@ class CreateDataSourceRequest(BaseModel):
     cache: dict | None = None
     timeout_seconds: float = 30
     retries: dict | None = None
+    # None = the default: private when a user creates it, public without auth.
+    visibility: Literal["public", "private"] | None = None
 
 
 class UpdateDataSourceRequest(BaseModel):
@@ -127,6 +130,8 @@ class UpdateDataSourceRequest(BaseModel):
     cache: dict | None = None
     timeout_seconds: float | None = None
     retries: dict | None = None
+    # None = keep the stored visibility.
+    visibility: Literal["public", "private"] | None = None
 
 
 class ProbeDataSourceRequest(BaseModel):
@@ -345,8 +350,10 @@ async def _refresh_datasource_tools(container: ApplicationContainer) -> None:
             get_datasources_mcp,
             rebuild_datasource_tools,
         )
+        # The tool list is global — every agent container reads it — so it is
+        # built from every source, not from what the saving user can see.
         await rebuild_datasource_tools(
-            get_datasources_mcp(), container.data_source_backend, lambda: container
+            get_datasources_mcp(), unwrap(container.data_source_backend), lambda: container
         )
     except Exception:
         logger.exception("failed to rebuild datasources MCP tools")
@@ -388,6 +395,7 @@ async def list_datasources(
                 "operations": [
                     {"name": op.name, "method": op.method} for op in s.operations
                 ],
+                **ownership_fields(s),
             }
             for s in sources
         ]

@@ -17,6 +17,7 @@ from google.cloud import storage
 from pydantic import BaseModel, Field
 
 from app.api.dependencies import get_container
+from app.application.visibility import ensure_run_visible, ownership_fields, visibility_kwargs
 from app.core.config import get_settings
 from app.core.container import ApplicationContainer
 from app.domain.models.agent_addon import AnyAgentAddon
@@ -44,6 +45,8 @@ class AgentDefinitionRequest(BaseModel):
     addons: list[dict] = Field(default_factory=list)
     protocol: Literal["http-poll", "acp"] = "http-poll"
     acp_agent: str | None = None
+    # None = the default: private when a user creates it, public without auth.
+    visibility: Literal["public", "private"] | None = None
 
 
 class AgentDefinitionUpdateRequest(BaseModel):
@@ -61,6 +64,8 @@ class AgentDefinitionUpdateRequest(BaseModel):
     # not silently switch an ACP agent back to the poll protocol).
     protocol: Literal["http-poll", "acp"] | None = None
     acp_agent: str | None = None
+    # None = keep the stored visibility.
+    visibility: Literal["public", "private"] | None = None
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -137,6 +142,7 @@ async def list_agents(
                 "name": a.name,
                 "description": a.description,
                 "default_runtime": a.default_runtime,
+                **ownership_fields(a),
             }
             for a in agents
         ]
@@ -170,6 +176,7 @@ async def create_agent(
         addons=_addon_adapter.validate_python(body.addons),
         protocol=body.protocol,
         acp_agent=body.acp_agent or None,
+        **visibility_kwargs(body.visibility),
     )
     saved = await container.agent_backend.create(defn)
     return saved.model_dump(mode="json")
@@ -230,6 +237,7 @@ async def update_agent(
         addons=addons,
         protocol=existing.protocol if body.protocol is None else body.protocol,
         acp_agent=(existing.acp_agent if body.protocol is None else (body.acp_agent or None)),
+        **visibility_kwargs(body.visibility),
     )
     saved = await container.agent_backend.update(agent_id, defn)
     return saved.model_dump(mode="json")
@@ -316,6 +324,7 @@ async def _resolve_s3_addon(
     run = await container.run_repository.get(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
+    await ensure_run_visible(container.workflow_backend, run)
 
     path = addon.path.replace("{workflow_id}", run.id or "")
     path = path.replace("{project_id}", (run.state or {}).get("project_id", ""))

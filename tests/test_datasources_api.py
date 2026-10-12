@@ -172,6 +172,11 @@ async def test_summary_view_keeps_operation_methods_and_drops_the_rest(client):
         "kind": "http",
         "base_url": "https://api.github.com",
         "operations": [{"name": "list_repos", "method": "GET"}],
+        # Ownership travels with every list entry (auth off: public, unowned).
+        "visibility": "public",
+        "owner_id": None,
+        "owner_name": None,
+        "can_edit": True,
     }]
     # Default view is unchanged, secrets still redacted.
     full = (await c.get("/api/v1/datasources")).json()[0]

@@ -13,7 +13,10 @@ from app.infrastructure.auth.authorization import (
     Permission,
     permission_for_method,
     reset_current_permissions,
+    reset_current_subject,
     set_current_permissions,
+    set_current_subject,
+    subject_from_claims,
 )
 
 logger = logging.getLogger(__name__)
@@ -140,7 +143,7 @@ class OAuthMiddleware(BaseHTTPMiddleware):
                     claims.get("sub"), required_if_enforced.value,
                     sorted(self.policy.roles_of(claims)), request.method, path,
                 )
-            return await self._call_with_principal(permissions, request, call_next)
+            return await self._call_with_principal(permissions, claims, request, call_next)
 
         # ACCESS is the tenancy gate: an identity the provider issued a valid token
         # for, but which is not entitled to this API at all (a customer, on an
@@ -166,9 +169,9 @@ class OAuthMiddleware(BaseHTTPMiddleware):
                 content={"detail": f"Missing '{required.value}' permission"},
             )
 
-        return await self._call_with_principal(permissions, request, call_next)
+        return await self._call_with_principal(permissions, claims, request, call_next)
 
-    async def _call_with_principal(self, permissions, request: Request, call_next):
+    async def _call_with_principal(self, permissions, claims, request: Request, call_next):
         """Serve the request with *permissions* bound as the ambient principal.
 
         The HTTP method is not the whole story. A single authenticated request can
@@ -185,7 +188,12 @@ class OAuthMiddleware(BaseHTTPMiddleware):
         returned and reset its own copy.
         """
         token = set_current_permissions(permissions)
+        # Strict evaluation: in shadow mode `permissions` holds ADMIN for
+        # everyone, which must not make every private resource visible.
+        is_admin = Permission.ADMIN in self.policy.evaluate_shadow(claims)
+        subject_token = set_current_subject(subject_from_claims(claims, is_admin))
         try:
             return await call_next(request)
         finally:
+            reset_current_subject(subject_token)
             reset_current_permissions(token)

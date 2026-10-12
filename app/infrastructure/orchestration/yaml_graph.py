@@ -1117,6 +1117,12 @@ class YamlGraphRunner:
         # Read off the definition (not post-construction like readonly) so runners
         # built straight from a YAML dict carry the flag too. Absent means enabled.
         self.enabled: bool = bool(definition.get("enabled", True))
+        # Ownership, so registry listings can be filtered by visibility without
+        # a store round-trip (see app.application.visibility). Set from the
+        # stored definition by the loaders; absent means public, unowned.
+        self.visibility: str = definition.get("visibility", "public")
+        self.owner_id: str | None = definition.get("owner_id")
+        self.owner_name: str | None = definition.get("owner_name")
         # Resolve implicit fall-through into an explicit `next`/`targets` up
         # front, so array position stops being load-bearing below this line.
         # Every construction path — stored definition, on-disk YAML, a raw dict

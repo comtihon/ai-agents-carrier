@@ -12,6 +12,7 @@ from copilotkit.integrations.fastapi import add_fastapi_endpoint
 from copilotkit.integrations.fastapi import handler as _ck_handler
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from langgraph.types import Command
 from starlette.routing import get_route_path
 
@@ -26,9 +27,15 @@ from app.api.middleware.auth import OAuthMiddleware
 from app.infrastructure.auth.authorization import (
     AuthorizationPolicy,
     Permission,
+    Subject,
     reset_current_permissions,
+    reset_current_subject,
     set_current_permissions,
+    set_current_subject,
+    subject_from_claims,
 )
+from app.application.visibility import VisibilityError, can_see, unwrap, workflow_visible
+from app.api.routes.me import router as me_router
 from app.api.routes.agent_callbacks import router as agent_callbacks_router
 from app.api.routes.agents import router as agents_router
 from app.api.routes.approvals import router as approvals_router
@@ -224,8 +231,9 @@ class _ManagementAuthWrapper:
         ):
             # The static key is capped below ADMIN, so tools guarded on ADMIN
             # (unsandboxed python steps) refuse it regardless of role config.
+            # A shared key is nobody in particular: it sees public resources only.
             await self._call_with_principal(
-                self._policy.permissions_for_api_key(), scope, receive, send
+                self._policy.permissions_for_api_key(), Subject(), scope, receive, send
             )
             return
 
@@ -248,13 +256,16 @@ class _ManagementAuthWrapper:
                 )
                 await _send_403(send)
                 return
-            await self._call_with_principal(permissions, scope, receive, send)
+            subject = subject_from_claims(
+                claims, Permission.ADMIN in self._policy.evaluate_shadow(claims)
+            )
+            await self._call_with_principal(permissions, subject, scope, receive, send)
             return
 
         await _send_401(send)
 
 
-    async def _call_with_principal(self, permissions, scope, receive, send) -> None:
+    async def _call_with_principal(self, permissions, subject, scope, receive, send) -> None:
         """Run the inner app with *permissions* bound for this request's task.
 
         FastMCP passes no request object to tool bodies, so a tool cannot ask who
@@ -262,9 +273,11 @@ class _ManagementAuthWrapper:
         the call so nothing leaks between requests.
         """
         token = set_current_permissions(permissions)
+        subject_token = set_current_subject(subject)
         try:
             await self._app(scope, receive, send)
         finally:
+            reset_current_subject(subject_token)
             reset_current_permissions(token)
 
 
@@ -342,8 +355,16 @@ def _config(thread_id: str) -> dict:
 def _build_actions(container: ApplicationContainer) -> list[Action]:
     """Create CopilotKit backend actions backed by the application container."""
 
+    def _visible_runner(graph_id: str):
+        # A private workflow does not exist for anyone but its owner and admins
+        # (app.application.visibility); runners carry the ownership fields.
+        runner = container.yaml_graph_registry.get(graph_id)
+        return runner if runner is not None and can_see(runner) else None
+
     async def list_graphs_handler() -> dict:
-        runners = container.yaml_graph_registry.list_ids()
+        runners = [
+            gid for gid in container.yaml_graph_registry.list_ids() if _visible_runner(gid)
+        ]
         return {
             "graphs": [
                 {
@@ -356,7 +377,7 @@ def _build_actions(container: ApplicationContainer) -> list[Action]:
         }
 
     async def start_graph_run_handler(graph_id: str, request: str) -> dict:
-        runner = container.yaml_graph_registry.get(graph_id)
+        runner = _visible_runner(graph_id)
         if runner is None:
             return {"error": f"Graph '{graph_id}' not found"}
         thread_id = str(uuid4())
@@ -376,16 +397,16 @@ def _build_actions(container: ApplicationContainer) -> list[Action]:
 
     async def get_graph_run_handler(graph_id: str, thread_id: str) -> dict:
         run = await container.run_repository.get(thread_id)
-        if run is None:
+        if run is None or not await workflow_visible(container.workflow_backend, run.graph_id):
             return {"error": "Run not found"}
         return {"graph_id": run.graph_id, "thread_id": run.id, "status": run.status}
 
     async def approve_graph_run_handler(graph_id: str, thread_id: str) -> dict:
-        runner = container.yaml_graph_registry.get(graph_id)
+        runner = _visible_runner(graph_id)
         if runner is None:
             return {"error": f"Graph '{graph_id}' not found"}
         run = await container.run_repository.get(thread_id)
-        if run is None:
+        if run is None or not await workflow_visible(container.workflow_backend, run.graph_id):
             return {"error": "Run not found"}
         await runner.graph.ainvoke(Command(resume={"approved": True}), _config(thread_id))
         snap = await runner.graph.aget_state(_config(thread_id))
@@ -397,11 +418,11 @@ def _build_actions(container: ApplicationContainer) -> list[Action]:
     async def reject_graph_run_handler(
         graph_id: str, thread_id: str, reason: str = ""
     ) -> dict:
-        runner = container.yaml_graph_registry.get(graph_id)
+        runner = _visible_runner(graph_id)
         if runner is None:
             return {"error": f"Graph '{graph_id}' not found"}
         run = await container.run_repository.get(thread_id)
-        if run is None:
+        if run is None or not await workflow_visible(container.workflow_backend, run.graph_id):
             return {"error": "Run not found"}
         await runner.graph.ainvoke(
             Command(resume={"approved": False, "reason": reason or None}),
@@ -482,7 +503,7 @@ async def lifespan(app: FastAPI):
     datasources_mcp = get_datasources_mcp()
     try:
         await rebuild_datasource_tools(
-            datasources_mcp, container.data_source_backend, lambda: app.state.container
+            datasources_mcp, unwrap(container.data_source_backend), lambda: app.state.container
         )
     except Exception:
         logger.exception("failed to build initial datasources MCP tools")
@@ -574,6 +595,10 @@ async def lifespan(app: FastAPI):
     await container.shutdown()
 
 
+async def _visibility_error_response(request: Request, exc: VisibilityError) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(title=settings.app_name, debug=settings.debug, lifespan=lifespan)
@@ -590,6 +615,9 @@ def create_app() -> FastAPI:
             audience=settings.oauth_audience,
         )
         app.add_middleware(OAuthMiddleware, auth_service=auth_service, policy=authz_policy)
+    # Ownership/visibility refusals are raised from the scoped backends, below
+    # every route; this turns them into the status each one names.
+    app.add_exception_handler(VisibilityError, _visibility_error_response)
     # CORSMiddleware must be outermost — added after OAuthMiddleware so it wraps it
     app.add_middleware(
         CORSMiddleware,
@@ -599,6 +627,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.include_router(health_router)
+    app.include_router(me_router, prefix=settings.api_prefix)
     app.include_router(workflows_router, prefix=settings.api_prefix)
     app.include_router(agents_router, prefix=settings.api_prefix)
     app.include_router(datasources_router, prefix=settings.api_prefix)

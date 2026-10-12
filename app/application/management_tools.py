@@ -24,6 +24,14 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from app.domain.models.graph_run import GraphRun
+from app.application.visibility import (
+    VisibilityError,
+    approval_case_visible,
+    approval_exclusions,
+    can_see,
+    hidden_ids,
+    workflow_visible,
+)
 from app.infrastructure.auth.authorization import Permission, missing_permission
 from app.infrastructure.orchestration.yaml_graph import stream_graph_to_pause
 
@@ -74,7 +82,9 @@ def requires(permission: Permission):
 
     Refusals are returned as text, not raised. These are tool bodies whose return
     value is what the model sees, and every other failure here (unknown id,
-    invalid JSON) is reported the same way.
+    invalid JSON) is reported the same way — including the ownership and
+    visibility refusals the scoped backends raise (not the owner, a public
+    workflow using a private agent, ...).
     """
     def decorator(fn):
         if inspect.iscoroutinefunction(fn):
@@ -85,7 +95,10 @@ def requires(permission: Permission):
                         "tool %s refused: caller lacks %s", fn.__name__, permission.value
                     )
                     return _refusal(permission)
-                return await fn(*args, **kwargs)
+                try:
+                    return await fn(*args, **kwargs)
+                except VisibilityError as exc:
+                    return f"Refused: {exc.detail}"
             async_gate.required_permission = permission
             return async_gate
 
@@ -220,7 +233,7 @@ async def _resolve_workflow_id(deps: ManagementDeps, query: str):
     `update_workflow` — the two tools needed to diagnose and fix it. The
     definition was never gone, only unresolvable.
     """
-    defs = deps.registry.list_definitions()
+    defs = [d for d in deps.registry.list_definitions() if can_see(d)]
     for d in defs:
         if d["id"] == query:
             return d["id"], None
@@ -360,7 +373,7 @@ async def _publish_datasources(deps: ManagementDeps) -> None:
 
 @requires(Permission.READ)
 def list_workflows(deps: ManagementDeps) -> str:
-    defs = deps.registry.list_definitions()
+    defs = [d for d in deps.registry.list_definitions() if can_see(d)]
     if not defs:
         return "No workflows are currently configured."
     # DISABLED is called out inline so a workflow that refuses to start is
@@ -429,9 +442,13 @@ async def run_workflow(
 async def list_runs(
     deps: ManagementDeps, workflow_id: str | None = None, limit: int = 10
 ) -> str:
+    hidden = await hidden_ids(deps.workflow_backend)
+    if workflow_id and workflow_id in hidden:
+        return "No runs found."
     runs = await deps.run_repository.list_recent(
         limit=min(limit, 20),
         workflow_id=workflow_id,
+        **({"exclude_workflow_ids": hidden} if hidden else {}),
     )
 
     if not runs:
@@ -464,7 +481,7 @@ def _compact(value: Any) -> str:
 @requires(Permission.READ)
 async def get_run(deps: ManagementDeps, run_id: str) -> str:
     run = await deps.run_repository.get(run_id)
-    if run is None:
+    if run is None or not await workflow_visible(deps.workflow_backend, getattr(run, "graph_id", None)):
         return f"Run '{run_id}' not found."
     parts = [
         f"Run: {run.id}",
@@ -582,7 +599,7 @@ async def list_run_data(
     from app.application.data_artifacts import list_run_artifacts
 
     run = await deps.run_repository.get(run_id)
-    if run is None:
+    if run is None or not await workflow_visible(deps.workflow_backend, getattr(run, "graph_id", None)):
         return f"Run '{run_id}' not found."
     rows = await list_run_artifacts(
         deps.data_artifact_backend,
@@ -616,7 +633,7 @@ async def get_run_data_artifact(
     from app.application.data_artifacts import find_run_artifact
 
     run = await deps.run_repository.get(run_id)
-    if run is None:
+    if run is None or not await workflow_visible(deps.workflow_backend, getattr(run, "graph_id", None)):
         return f"Run '{run_id}' not found."
     artifact = await find_run_artifact(
         deps.data_artifact_backend,
@@ -704,7 +721,7 @@ async def read_run_data_artifact(
     from app.infrastructure.datasources.datastream import StreamGone
 
     run = await deps.run_repository.get(run_id)
-    if run is None:
+    if run is None or not await workflow_visible(deps.workflow_backend, getattr(run, "graph_id", None)):
         return f"Run '{run_id}' not found."
     artifact = await find_run_artifact(
         deps.data_artifact_backend,
@@ -834,7 +851,8 @@ async def list_pending_approvals(deps: ManagementDeps, limit: int = 20) -> str:
     # get_approval is what carries those, which the tool tells the caller to
     # use before deciding anything.
     cases = await deps.approval_backend.list(
-        status="pending", limit=max(1, min(limit, _APPROVAL_LIST_MAX)), summary=True
+        status="pending", limit=max(1, min(limit, _APPROVAL_LIST_MAX)), summary=True,
+        **await approval_exclusions(deps),
     )
     if not cases:
         return "No approvals are waiting."
@@ -853,7 +871,7 @@ async def get_approval(deps: ManagementDeps, case_id: str) -> str:
             "configured, so destructive operations run ungated."
         )
     case = await deps.approval_backend.get(case_id)
-    if case is None:
+    if case is None or not await approval_case_visible(deps, case):
         return f"Approval case '{case_id}' not found."
 
     parts = [

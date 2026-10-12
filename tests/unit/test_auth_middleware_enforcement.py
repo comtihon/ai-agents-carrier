@@ -211,3 +211,35 @@ def test_shadow_stays_quiet_for_a_caller_that_would_be_allowed(
 def test_shadow_still_rejects_an_invalid_token(shadow: TestClient) -> None:
     """Shadow mode is about *authorization*; authentication is unchanged."""
     assert shadow.get("/api/v1/thing", headers=_auth("bad")).status_code == 401
+
+
+# ── Subject (ownership / visibility) ──────────────────────────────────────────
+
+def _subject_client(enforce: bool) -> TestClient:
+    from app.infrastructure.auth.authorization import get_current_subject
+
+    app = FastAPI()
+
+    @app.get("/api/v1/who")
+    async def who() -> dict:
+        subject = get_current_subject()
+        return {"id": subject.id, "is_admin": subject.is_admin}
+
+    app.add_middleware(
+        OAuthMiddleware,
+        auth_service=_FakeAuthService(TOKENS),
+        policy=AuthorizationPolicy(enforce=enforce, **POLICY_ROLES),
+    )
+    return TestClient(app)
+
+
+@pytest.mark.parametrize("enforce", [True, False])
+def test_the_subject_is_bound_and_admin_is_evaluated_strictly(enforce: bool) -> None:
+    """Shadow mode grants every caller ADMIN; visibility must not follow that."""
+    client = _subject_client(enforce)
+    assert client.get("/api/v1/who", headers=_auth("staff")).json() == {
+        "id": "user-of-staff", "is_admin": False,
+    }
+    assert client.get("/api/v1/who", headers=_auth("admin")).json() == {
+        "id": "user-of-admin", "is_admin": True,
+    }
