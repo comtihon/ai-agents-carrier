@@ -278,3 +278,87 @@ async def test_startup_recover_incomplete_runs() -> None:
             assert get_resp.json()["status"] == "completed"
     finally:
         await mongo_provider.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_counter_repo_methods() -> None:
+    """Crash-loop guard primitives, against real Mongo: projection-only
+    candidate list, atomic $inc before resume, in-place fail."""
+    from app.domain.models.graph_run import GraphRun
+
+    mongo_provider = MongoClientProvider(Settings(
+        mongodb_uri=_MONGO_URI, mongodb_database=_TEST_DB, environment="test",
+    ))
+    repo = mongo_provider.get_repository()
+    try:
+        await repo._collection.delete_many({})
+        await repo.create(GraphRun(
+            id="cl-1", graph_id="wf", status="running",
+            step_outputs={"big": {"blob": "x" * 1000}},
+        ))
+        await repo.create(GraphRun(id="cl-done", graph_id="wf", status="completed"))
+        # A legacy document written before the counter existed.
+        await repo._collection.insert_one({"_id": "cl-legacy", "graph_id": "wf", "status": "waiting_approval"})
+
+        candidates = {c.id: c for c in await repo.list_recovery_candidates()}
+        assert set(candidates) == {"cl-1", "cl-legacy"}
+        assert candidates["cl-1"].recovery_attempts == 0
+        assert candidates["cl-legacy"].recovery_attempts == 0
+
+        for expected in (1, 2, 3):
+            run = await repo.begin_recovery("cl-1")
+            assert run is not None and run.recovery_attempts == expected
+            assert run.step_outputs["big"]["blob"] == "x" * 1000  # full doc returned
+            raw = await repo._collection.find_one({"_id": "cl-1"}, {"recovery_attempts": 1})
+            assert raw["recovery_attempts"] == expected
+        assert (await repo.begin_recovery("cl-done")) is None
+
+        await repo.reset_recovery_attempts("cl-1")
+        assert (await repo.get("cl-1")).recovery_attempts == 0
+
+        assert await repo.fail_incomplete("cl-1", "auto-failed: test") is True
+        failed = await repo.get("cl-1")
+        assert failed.status == "failed"
+        assert failed.state["error"] == "auto-failed: test"
+        assert failed.step_outputs["big"]["blob"] == "x" * 1000  # untouched
+        assert await repo.fail_incomplete("cl-1", "again") is False
+        assert {c.id for c in await repo.list_recovery_candidates()} == {"cl-legacy"}
+    finally:
+        await mongo_provider.close()
+
+
+@pytest.mark.asyncio
+async def test_crash_looping_run_is_failed_on_fourth_startup() -> None:
+    """End to end with real Mongo: a running run that never makes progress is
+    resumed on three startups, and the fourth fails it instead."""
+    from unittest.mock import AsyncMock
+
+    from app.domain.models.graph_run import GraphRun
+
+    llm = make_mock_llm(text_responses=[])
+    mcp = _fresh_mcp()
+    mongo_provider = MongoClientProvider(Settings(
+        mongodb_uri=_MONGO_URI, mongodb_database=_TEST_DB,
+        openhands_mock_mode=True, environment="test",
+    ))
+    repo = mongo_provider.get_repository()
+    try:
+        await repo._collection.delete_many({})
+        await repo.create(GraphRun(id="loop-1", graph_id="restart-simple", status="running"))
+        container = _make_container(_SIMPLE_GRAPH, llm, mcp, mongo_provider)
+        # Each "startup" dies mid-resume: the resume never completes a step.
+        container._recover_run = AsyncMock()
+
+        for _ in range(3):
+            await container._recover_incomplete_runs()
+        assert container._recover_run.await_count == 3
+        assert (await repo.get("loop-1")).recovery_attempts == 3
+
+        await container._recover_incomplete_runs()
+        assert container._recover_run.await_count == 3
+        run = await repo.get("loop-1")
+        assert run.status == "failed"
+        assert "crashed the server on 3 consecutive recoveries" in run.state["error"]
+        assert container.yaml_graph_registry.get("restart-simple").enabled is False
+    finally:
+        await mongo_provider.close()

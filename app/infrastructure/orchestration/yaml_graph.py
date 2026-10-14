@@ -471,6 +471,11 @@ async def stream_graph_to_pause(
                         current_state.update(output)
                 logger.info("run %s: step '%s' → %s", run.id, node_name, status)
                 last_processed = node_name
+                # A step completed: the run is making progress, so it is not
+                # crash-looping the server. Persisted together with the step
+                # (if that write itself fails — e.g. DocumentTooLarge — the
+                # reset is lost too, which is exactly what we want).
+                run.recovery_attempts = 0
                 run.touch()
                 await run_repository.update(run)
                 if _probe_enabled:

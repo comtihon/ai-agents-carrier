@@ -245,6 +245,12 @@ class Settings(BaseSettings):
     # --- Public base URL (used to build callback URLs in approval notifications) ---
     base_url: str = Field(default="http://localhost:8000", alias="BASE_URL")
 
+    # --- Startup run recovery crash-loop guard ---
+    # A run resumed on startup this many times in a row without completing a
+    # single step (i.e. the server died each time) is not resumed again: it is
+    # marked failed and its workflow disabled. 0 turns the guard off.
+    run_recovery_max_attempts: int = Field(default=3, alias="RUN_RECOVERY_MAX_ATTEMPTS")
+
     # --- Webhook / HTTP trigger ---
     webhook_secret: str | None = Field(default=None, alias="WEBHOOK_SECRET")
 
