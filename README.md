@@ -617,6 +617,43 @@ ADMIN a formality that any WRITE holder walks around by leaving a field unset.
 Sandbox defaults come from `SCRIPT_SANDBOX_IMAGE`, `SCRIPT_SANDBOX_TIMEOUT` and
 `SCRIPT_SANDBOX_MEMORY_MB`; a step can override the first two.
 
+### `combined_datasource` — fetch and filter in one step
+
+Ordered `parts`, each a `data_source` part, a `python` part, or a nested
+`combined_datasource`. Parts run in the order listed; any mix is allowed.
+
+```yaml
+- id: invoice_candidates
+  type: combined_datasource
+  output_key: invoice_candidates
+  output: get_classification        # optional; default = last part
+  parts:
+    - {id: fetch_at, type: data_source, source: afp-projects,
+       operation: list_projects_operations, params: {status: [10], page_size: 50}}
+    - {id: sel_at, type: python, script_id: einzelrechnung-sel, stream: fetch_at}
+    - {id: cand, type: python,
+       code: "output = {'project_ids': sorted(set(parts['sel_at']['ids']))}"}
+    - {id: get_classification, type: data_source, source: afp-project-classification,
+       operation: get_project_classification, params: {id: "{cand[project_ids]}"}}
+```
+
+- A part sees workflow state plus every earlier part's output by id:
+  `{cand[project_ids]}` in params, `parts["sel_at"]` in python (a data source
+  output named that way is loaded as a list; `stream: <part id>` gives
+  `records()` instead).
+- A data source param that resolves to a list (or a whole `{part}` naming a
+  list stream) where the operation does not declare that param `array` is a
+  loop: one call per element (`concurrency`, default the executor fan-out),
+  results collected into one stream of `{"<param>": element, "result": ...}`.
+  Per-element errors are collected in the trace; `fail_on_error: true` makes
+  them fatal, `include_errors: true` keeps `{param, error}` records.
+- Every part's output is written to `runs/<run_id>/<step>.<part>.md`; only the
+  chosen output becomes the step output. The run API's step entry carries
+  `parts` (status, `duration_ms`, `records`, `calls`, `error_count`, `errors`).
+- Validated on save (REST and management MCP): unknown / forward / self part
+  references, missing `source` / `operation` / script, unknown data sources,
+  operations or scripts, destructive operations (use a `data_source` step).
+
 ### Script library
 
 Reusable scripts live in MongoDB (`script_definitions`) and are referenced by

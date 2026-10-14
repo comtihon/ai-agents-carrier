@@ -1,0 +1,159 @@
+[
+  {
+    "id": "mode",
+    "type": "python",
+    "script_id": "lexoffice-einzelprojekt-rechnungen-mode",
+    "output_key": "mode",
+    "next": "invoice_candidates"
+  },
+  {
+    "id": "invoice_candidates",
+    "type": "combined_datasource",
+    "name": "Invoice candidates",
+    "output_key": "invoice_candidates",
+    "output": "bundle",
+    "parts": [
+      {
+        "id": "fetch_at",
+        "type": "data_source",
+        "source": "afp-projects",
+        "operation": "list_projects_operations",
+        "params": {
+          "status": [
+            10
+          ],
+          "self_piloted": false,
+          "page_size": 50
+        }
+      },
+      {
+        "id": "sel_at",
+        "type": "python",
+        "script_id": "einzelrechnung-sel",
+        "stream": "fetch_at"
+      },
+      {
+        "id": "fetch_ati",
+        "type": "data_source",
+        "source": "afp-projects",
+        "operation": "list_projects_operations",
+        "params": {
+          "status": [
+            10
+          ],
+          "self_piloted": false,
+          "is_individual": true,
+          "page_size": 50
+        }
+      },
+      {
+        "id": "sel_ati",
+        "type": "python",
+        "script_id": "einzelrechnung-sel",
+        "stream": "fetch_ati"
+      },
+      {
+        "id": "fetch_cp",
+        "type": "data_source",
+        "source": "afp-projects",
+        "operation": "list_projects_operations",
+        "params": {
+          "status": [
+            10
+          ],
+          "self_piloted": true,
+          "is_individual": true
+        }
+      },
+      {
+        "id": "sel_cp",
+        "type": "python",
+        "script_id": "einzelrechnung-sel",
+        "stream": "fetch_cp"
+      },
+      {
+        "id": "cand",
+        "type": "python",
+        "code": "# combined_datasource part `cand` of lexoffice-einzelprojekt-rechnungen (v2).\n#\n# Union of the project ids selected by `sel_ati` (airteam-piloted, individual)\n# and `sel_cp` (customer-piloted, individual), excluding projects on hold.\n# Replaces the 80 copy-pasted classification \"slot\" steps: the next part,\n# `get_classification`, loops over `project_ids` itself, so there is no cap.\n#\n# In scope: `parts` (outputs of earlier parts of the combined step).\n\n\ndef _rows(value):\n    \"\"\"The selected rows, whatever envelope the sel script wraps them in.\"\"\"\n    if isinstance(value, list):\n        return value\n    if isinstance(value, dict):\n        for key in (\"rows\", \"projects\", \"selected\", \"items\"):\n            if isinstance(value.get(key), list):\n                return value[key]\n    return []\n\n\nseen = set()\nproject_ids = []\non_hold = []\nfor part_id in (\"sel_ati\", \"sel_cp\"):\n    for row in _rows(parts.get(part_id)):\n        pid = row.get(\"id\") if isinstance(row, dict) else row\n        if pid is None or pid in seen:\n            continue\n        seen.add(pid)\n        if isinstance(row, dict) and row.get(\"hold\"):\n            on_hold.append(pid)\n            continue\n        project_ids.append(pid)\n\noutput = {\"project_ids\": project_ids, \"excluded_on_hold\": on_hold}\n"
+      },
+      {
+        "id": "get_classification",
+        "type": "data_source",
+        "source": "afp-project-classification",
+        "operation": "get_project_classification",
+        "params": {
+          "id": "{cand[project_ids]}"
+        }
+      },
+      {
+        "id": "bundle",
+        "type": "python",
+        "code": "def _rows(v):\n    if isinstance(v, list):\n        return v\n    if isinstance(v, dict):\n        for k in (\"rows\", \"projects\", \"selected\", \"items\"):\n            if isinstance(v.get(k), list):\n                return v[k]\n    return []\n\noutput = {\n    \"at\": _rows(parts[\"sel_at\"]),\n    \"ati\": _rows(parts[\"sel_ati\"]),\n    \"cp\": _rows(parts[\"sel_cp\"]),\n    \"project_ids\": parts[\"cand\"][\"project_ids\"],\n    \"classification\": {str(r[\"id\"]): r.get(\"result\") for r in parts[\"get_classification\"]},\n}\n"
+      }
+    ],
+    "next": "articles"
+  },
+  {
+    "id": "articles",
+    "type": "data_source",
+    "source": "lexoffice",
+    "operation": "list_articles",
+    "params": {
+      "page": 0,
+      "size": 250
+    },
+    "output_key": "articles",
+    "next": "plan"
+  },
+  {
+    "id": "plan",
+    "type": "python",
+    "stream": "articles",
+    "code": "# `plan` step of lexoffice-einzelprojekt-rechnungen (v2) -- dry-run planning only.\n#\n# Inputs\n#   state[\"invoice_candidates\"]  output of the combined_datasource step (its\n#                                `bundle` part): {\"at\": [...], \"ati\": [...],\n#                                \"cp\": [...], \"classification\": {id: {...}},\n#                                \"project_ids\": [...]}\n#   records()                    lexoffice articles (step `stream: articles`)\n#   state[\"mode\"]                {\"dry_run\": bool, ...}\n#\n# Row fields: id, sp (self piloted), adr (address), cid (company id), cname,\n# lex (company lexofficeId), hold, inv, del, nick, status.\n#\n# Output: counts, unmapped_reasons, packages_seen, articles_relevant, invoices,\n# special, unmapped, on_hold, airteam_not_individual. Nothing is written\n# anywhere: this workflow has no write steps.\nimport re\n\nbundle = state.get(\"invoice_candidates\") or {}\nclassification = {str(k): v for k, v in (bundle.get(\"classification\") or {}).items()}\n\nPILOT_RE = {\n    \"airteam\": re.compile(r\"airteam\\s*-?\\s*pilotiert\", re.I),\n    \"kunde\": re.compile(r\"kunden\\s*-?\\s*pilotiert\", re.I),\n}\nPACKAGE_RE = re.compile(r\"\\bpaket\\s+(xxl|xl|s|m|l)\\b\", re.I)\n\n\ndef _price(article):\n    price = article.get(\"price\") or {}\n    if isinstance(price, dict):\n        for key in (\"netPrice\", \"net_price\", \"netAmount\"):\n            if price.get(key) is not None:\n                return float(price[key])\n    try:\n        return float(article.get(\"netPrice\") or 0)\n    except (TypeError, ValueError):\n        return 0.0\n\n\n# --- lexoffice articles: title/desc/price, archived skipped ----------------\narticles = []\nfor art in records():\n    if not isinstance(art, dict) or art.get(\"archived\"):\n        continue\n    title = art.get(\"title\") or \"\"\n    desc = art.get(\"description\") or art.get(\"desc\") or \"\"\n    text = f\"{title}\\n{desc}\"\n    pilot = next((p for p, rx in PILOT_RE.items() if rx.search(text)), None)\n    pkg = PACKAGE_RE.search(text)\n    if pilot is None or pkg is None:\n        continue\n    articles.append({\n        \"id\": art.get(\"id\"), \"title\": title, \"desc\": desc,\n        \"price\": _price(art), \"pilot\": pilot, \"package\": pkg.group(1).lower(),\n    })\n\n# --- project rows from the three selections --------------------------------\nrows = {}\nfor bucket in (\"at\", \"ati\", \"cp\"):\n    for row in bundle.get(bucket) or []:\n        if isinstance(row, dict) and row.get(\"id\") is not None:\n            rows.setdefault(str(row[\"id\"]), {**row, \"_bucket\": bucket})\n\ninvoices = {}\nspecial, unmapped, on_hold, airteam_not_individual = [], [], [], []\nunmapped_reasons = {}\npackages_seen = {}\n\n\ndef _unmapped(row, reason, **extra):\n    unmapped_reasons[reason] = unmapped_reasons.get(reason, 0) + 1\n    unmapped.append({\"id\": row.get(\"id\"), \"company\": row.get(\"cname\"), \"reason\": reason, **extra})\n\n\nfor pid, row in rows.items():\n    cls = classification.get(pid) or {}\n    if isinstance(cls.get(\"result\"), dict):          # loop record {\"id\":..,\"result\":{..}}\n        cls = cls[\"result\"]\n    name = str(cls.get(\"name\") or \"\")\n    is_individual = bool(cls.get(\"isIndividual\") or cls.get(\"is_individual\") or row[\"_bucket\"] in (\"ati\", \"cp\"))\n    if row.get(\"hold\"):\n        on_hold.append({\"id\": row.get(\"id\"), \"company\": row.get(\"cname\")})\n        continue\n    if \"special\" in name.lower():\n        special.append({\"id\": row.get(\"id\"), \"company\": row.get(\"cname\"), \"classification\": name})\n        continue\n    if not row.get(\"sp\") and not is_individual:\n        airteam_not_individual.append({\"id\": row.get(\"id\"), \"company\": row.get(\"cname\")})\n        continue\n    pkg = PACKAGE_RE.search(name)\n    if pkg is None:\n        _unmapped(row, \"no_package_in_classification\", classification=name)\n        continue\n    size = pkg.group(1).lower()\n    packages_seen[size] = packages_seen.get(size, 0) + 1\n    pilot = \"kunde\" if row.get(\"sp\") else \"airteam\"\n    matches = [a for a in articles if a[\"pilot\"] == pilot and a[\"package\"] == size]\n    if not matches:\n        _unmapped(row, \"no_article_match\", package=size, pilot=pilot)\n        continue\n    if len(matches) > 1:\n        _unmapped(row, \"ambiguous_article_match\", package=size, pilot=pilot,\n                  articles=[a[\"id\"] for a in matches])\n        continue\n    if not row.get(\"lex\"):\n        _unmapped(row, \"company_without_lexoffice_id\")\n        continue\n    art = matches[0]\n    line_desc = art[\"desc\"].replace(\"XXX\", f\"{row.get('adr') or ''}, Projekt-ID {row.get('id')}\")\n    price = art[\"price\"] or float(cls.get(\"price\") or 0)\n    inv = invoices.setdefault(str(row.get(\"cid\")), {\n        \"company_id\": row.get(\"cid\"), \"company\": row.get(\"cname\"),\n        \"lexoffice_id\": row.get(\"lex\"), \"lines\": [], \"net_total\": 0.0,\n    })\n    inv[\"lines\"].append({\n        \"project_id\": row.get(\"id\"), \"article_id\": art[\"id\"], \"title\": art[\"title\"],\n        \"description\": line_desc, \"net_price\": price, \"package\": size, \"pilot\": pilot,\n    })\n    inv[\"net_total\"] = round(inv[\"net_total\"] + price, 2)\n\ninvoice_list = sorted(invoices.values(), key=lambda i: str(i[\"company\"] or \"\"))\noutput = {\n    \"dry_run\": bool((state.get(\"mode\") or {}).get(\"dry_run\", True)),\n    \"counts\": {\n        \"projects\": len(rows),\n        \"invoices\": len(invoice_list),\n        \"invoice_lines\": sum(len(i[\"lines\"]) for i in invoice_list),\n        \"special\": len(special),\n        \"unmapped\": len(unmapped),\n        \"on_hold\": len(on_hold),\n        \"airteam_not_individual\": len(airteam_not_individual),\n        \"net_total\": round(sum(i[\"net_total\"] for i in invoice_list), 2),\n    },\n    \"unmapped_reasons\": unmapped_reasons,\n    \"packages_seen\": packages_seen,\n    \"articles_relevant\": [{k: a[k] for k in (\"id\", \"title\", \"pilot\", \"package\", \"price\")} for a in articles],\n    \"invoices\": invoice_list,\n    \"special\": special,\n    \"unmapped\": unmapped,\n    \"on_hold\": on_hold,\n    \"airteam_not_individual\": airteam_not_individual,\n}\n",
+    "output_key": "plan",
+    "next": "export"
+  },
+  {
+    "id": "export",
+    "type": "data",
+    "selections": [
+      {
+        "name": "einzelrechnung-plan",
+        "from": "plan",
+        "format": "json"
+      },
+      {
+        "name": "invoice-candidates",
+        "from": "invoice_candidates",
+        "format": "json"
+      }
+    ],
+    "next": "gate_write"
+  },
+  {
+    "id": "gate_write",
+    "type": "switch",
+    "routes": [
+      {
+        "when": "mode.get('dry_run', True)",
+        "next": "done"
+      },
+      {
+        "next": "writes_not_available"
+      }
+    ]
+  },
+  {
+    "id": "writes_not_available",
+    "type": "python",
+    "code": "output = {'status': 'writes_not_available', 'message': 'This workflow only plans invoices; no lexoffice/AFP write steps exist. Review the exported plan and create invoices manually.'}",
+    "output_key": "write_result",
+    "next": "done"
+  },
+  {
+    "id": "done",
+    "type": "python",
+    "code": "p = state.get('plan') or {}\noutput = {'dry_run': p.get('dry_run'), 'counts': p.get('counts'), 'unmapped_reasons': p.get('unmapped_reasons')}",
+    "output_key": "summary"
+  }
+]

@@ -140,6 +140,10 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
         # same superstep as another key cannot blank the counter.
         if step.get("type") == "proceed_or":
             fields[f"_proceed_or_{step['id']}"] = Annotated[Any, _merge_dicts]  # type: ignore[assignment]
+        # combined_datasource keeps its per-part trace (status, timing, counts)
+        # next to its output; declared or LangGraph drops it.
+        if step.get("type") == "combined_datasource":
+            fields[f"_combined_{step['id']}"] = Any  # type: ignore[assignment]
         # Regular output nodes store their result under output_key
         if "output_key" in step:
             fields[step["output_key"]] = Any  # type: ignore[assignment]
@@ -1453,6 +1457,8 @@ class YamlGraphRunner:
             fn = self._http_call_node(step)
         elif t == "data_source":
             fn = self._data_source_node(step)
+        elif t == "combined_datasource":
+            fn = self._combined_datasource_node(step)
         elif t == "data":
             fn = self._data_node(step)
         elif t == "python":
@@ -2451,6 +2457,48 @@ class YamlGraphRunner:
 
         return node
 
+    def _combined_datasource_node(self, step: dict[str, Any]):
+        """Run an ordered pipeline of data source / python / nested parts.
+
+        See ``app.infrastructure.orchestration.combined_datasource``. The chosen
+        part's output (``output``, default the last part) is stored under
+        ``output_key`` (default the step id); every part's output goes to the
+        run's folder in the store, and ``_combined_<step id>`` carries the
+        per-part trace. A failing part fails the step (``__failed_step__``),
+        with the trace up to the failure kept.
+        """
+        from app.infrastructure.orchestration.combined_datasource import (
+            CombinedExecutor,
+            CombinedPartError,
+        )
+
+        graph_id = self.id
+        step_id = step["id"]
+        output_key = step.get("output_key") or step_id
+        trace_key = f"_combined_{step_id}"
+
+        async def node(state: dict) -> dict:
+            run = self._current_run
+            run_id = str(getattr(run, "id", "") or "")
+            iteration = self._output_iteration(step_id, run_id, state) if run_id else 1
+            executor = CombinedExecutor(self, step, run_id=run_id, iteration=iteration)
+            logger.info("[%s] step '%s' running (combined_datasource, %d part(s))",
+                        graph_id, step_id, len(step.get("parts") or []))
+            try:
+                output, trace = await executor.run(state)
+            except CombinedPartError as exc:
+                logger.exception("[%s] step '%s' combined_datasource failed", graph_id, step_id)
+                return {
+                    output_key: {"error": str(exc), "part": exc.path},
+                    trace_key: getattr(exc, "trace", None),
+                    "__failed_step__": step_id,
+                    "error": f"[step '{step_id}'] {exc}",
+                }
+            logger.info("[%s] step '%s' finished", graph_id, step_id)
+            return {output_key: output, trace_key: trace}
+
+        return node
+
     async def _gate_destructive(
         self,
         step: dict[str, Any],
@@ -2663,6 +2711,72 @@ class YamlGraphRunner:
             raise ValueError(f"Script '{script_id}' not found in the library")
         return script.code
 
+    async def _run_python(
+        self, step: dict[str, Any], code: str, script_state: dict[str, Any], ref: Any,
+    ) -> Any:
+        """Run *code* the way *step* asks (sandboxed or in-process); return ``output``.
+
+        Shared by the ``python`` step and the python parts of a
+        ``combined_datasource`` step. Raises on failure.
+        """
+        graph_id = self.id
+        step_id = step["id"]
+        sandbox = step.get("sandbox", True)
+        sandbox_runtime = step.get("sandbox_runtime") or "local"
+        if sandbox:
+            from app.core.config import get_settings
+            from app.infrastructure.orchestration.script_sandbox import run_script
+
+            settings = get_settings()
+            delivery = await self._stream_delivery(ref, sandbox_runtime, step_id)
+            # Popped rather than passed on: run_script knows nothing
+            # about it, and it must be removed whether the script
+            # succeeds or fails.
+            tmp_stream = delivery.pop("_tempfile", None)
+            try:
+                result = await run_script(
+                    code,
+                    script_state,
+                    runtime=sandbox_runtime,
+                    timeout=float(step.get("timeout_seconds") or settings.script_sandbox_timeout),
+                    image=step.get("sandbox_image") or settings.script_sandbox_image,
+                    memory_mb=settings.script_sandbox_memory_mb,
+                    namespace=settings.agent_namespace,
+                    **delivery,
+                )
+            finally:
+                # A failing script must not leave the materialised copy
+                # behind: these are whole data source results, and the
+                # pod has a 4Gi ephemeral-storage limit.
+                if tmp_stream:
+                    with contextlib.suppress(OSError):
+                        os.unlink(tmp_stream)
+        else:
+            # Single namespace for globals and locals -- see the same
+            # fix in script_sandbox's bootstrap. Two namespaces make a
+            # top-level `def` invisible to another function's body, so
+            # any script with helpers fails on NameError.
+            local_vars: dict[str, Any] = {
+                "__builtins__": __builtins__,
+                "state": script_state,
+                # Same contract as the sandbox: the data arrives as a
+                # generator over the stream, never as a value.
+                "records": self._records_callable(ref),
+                "stream_records": ref.items if ref is not None else 0,
+                "stream_truncated": bool(ref is not None and ref.truncated),
+                "output": None,
+            }
+            compiled = compile(code, f"<workflow:{graph_id}:{step_id}>", "exec")
+
+            def _run() -> None:
+                exec(compiled, local_vars, local_vars)  # noqa: S102
+
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, _run)
+            result = local_vars.get("output")
+
+        return result
+
     def _python_node(self, step: dict[str, Any]):
         """Execute a Python script, inline or from the script library.
 
@@ -2709,57 +2823,7 @@ class YamlGraphRunner:
                         f"result reference"
                     )
 
-                if sandbox:
-                    from app.core.config import get_settings
-                    from app.infrastructure.orchestration.script_sandbox import run_script
-
-                    settings = get_settings()
-                    delivery = await self._stream_delivery(ref, sandbox_runtime, step_id)
-                    # Popped rather than passed on: run_script knows nothing
-                    # about it, and it must be removed whether the script
-                    # succeeds or fails.
-                    tmp_stream = delivery.pop("_tempfile", None)
-                    try:
-                        result = await run_script(
-                            code,
-                            dict(state),
-                            runtime=sandbox_runtime,
-                            timeout=float(step.get("timeout_seconds") or settings.script_sandbox_timeout),
-                            image=step.get("sandbox_image") or settings.script_sandbox_image,
-                            memory_mb=settings.script_sandbox_memory_mb,
-                            namespace=settings.agent_namespace,
-                            **delivery,
-                        )
-                    finally:
-                        # A failing script must not leave the materialised copy
-                        # behind: these are whole data source results, and the
-                        # pod has a 4Gi ephemeral-storage limit.
-                        if tmp_stream:
-                            with contextlib.suppress(OSError):
-                                os.unlink(tmp_stream)
-                else:
-                    # Single namespace for globals and locals -- see the same
-                    # fix in script_sandbox's bootstrap. Two namespaces make a
-                    # top-level `def` invisible to another function's body, so
-                    # any script with helpers fails on NameError.
-                    local_vars: dict[str, Any] = {
-                        "__builtins__": __builtins__,
-                        "state": dict(state),
-                        # Same contract as the sandbox: the data arrives as a
-                        # generator over the stream, never as a value.
-                        "records": self._records_callable(ref),
-                        "stream_records": ref.items if ref is not None else 0,
-                        "stream_truncated": bool(ref is not None and ref.truncated),
-                        "output": None,
-                    }
-                    compiled = compile(code, f"<workflow:{graph_id}:{step_id}>", "exec")
-
-                    def _run() -> None:
-                        exec(compiled, local_vars, local_vars)  # noqa: S102
-
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(None, _run)
-                    result = local_vars.get("output")
+                result = await self._run_python(step, code, dict(state), ref)
 
                 logger.info("[%s] step '%s' finished", graph_id, step_id)
                 return {output_key: result}
