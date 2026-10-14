@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import replace
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.infrastructure.auth.auth_service import AuthError, AuthService
-from app.application.login import LoginService, effective_roles, login_decision, with_profile
+from app.application.login import (
+    LoginService,
+    effective_roles,
+    login_decision,
+    login_script_store_of,
+    with_profile,
+)
 from app.application.teams import directory_of, resolve_subject
 from app.infrastructure.auth.authorization import (
     AuthorizationPolicy,
@@ -123,16 +130,22 @@ class OAuthMiddleware(BaseHTTPMiddleware):
 
         request.state.jwt_claims = claims
 
-        directory = directory_of(getattr(request.app.state, "container", None))
-        decision = await login_decision(self.login_service, token, claims, directory)
+        container = getattr(request.app.state, "container", None)
+        directory = directory_of(container)
+        decision = await login_decision(
+            self.login_service, token, claims, directory, login_script_store_of(container)
+        )
         roles = effective_roles(self.policy, claims, decision)
         permissions = self.policy.permissions_for_roles(roles)
         request.state.permissions = permissions
         # Strict evaluation: in shadow mode `permissions` holds everything for
         # everyone, which must not make every private resource visible.
         would_grant = self.policy.permissions_for_roles_strict(roles)
-        subject = with_profile(
-            subject_from_claims(claims, Permission.SUPER_ADMIN in would_grant), decision
+        subject = replace(
+            with_profile(
+                subject_from_claims(claims, Permission.SUPER_ADMIN in would_grant), decision
+            ),
+            roles=frozenset(roles),
         )
 
         # Shadow mode. With enforcement off the policy grants everything, so the

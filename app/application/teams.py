@@ -91,7 +91,9 @@ async def resolve_subject(directory: Any, subject: Subject) -> Subject:
     if directory is None or not subject.id:
         return subject
     try:
-        await directory.touch_user(subject.id, subject.name, subject.email)
+        await directory.touch_user(
+            subject.id, subject.name, subject.email, subject.roles, subject.is_super_admin
+        )
         user = await directory.get_user(subject.id)
         await _refresh_names(directory)
     except Exception:
@@ -131,14 +133,26 @@ def require_team_manager(team_id: str) -> None:
 # ─── Team management ──────────────────────────────────────────────────────────
 
 def _user_dict(user: Any) -> dict[str, Any]:
+    team = None
+    if user.team_id:
+        team = {
+            "id": user.team_id,
+            "name": team_name(user.team_id),
+            "role": user.team_role or "member",
+        }
     return {
         "sub": user.sub,
         "name": user.name,
         "email": user.email,
+        "team": team,
+        # As of the user's most recent recorded request (after the login script).
+        "is_super_admin": bool(user.is_super_admin),
+        "roles": sorted(user.roles or []),
+        "last_seen": user.last_seen.isoformat() if user.last_seen else None,
+        # Flat forms of `team`, kept for existing clients.
         "team_id": user.team_id,
         "team_name": team_name(user.team_id),
         "team_role": user.team_role,
-        "last_seen": user.last_seen,
     }
 
 
@@ -292,6 +306,47 @@ async def list_users(directory: Any) -> list[dict[str, Any]]:
         users = [u for u in users if not u.team_id or u.team_id == subject.team_id]
     users.sort(key=lambda u: (u.name or u.email or u.sub).lower())
     return [_user_dict(u) for u in users]
+
+
+async def _user_or_404(directory: Any, sub: str) -> Any:
+    user = await directory.get_user(sub)
+    if user is None:
+        raise ResourceNotFound(f"User '{sub}' not found")
+    return user
+
+
+async def set_user_team(
+    directory: Any, sub: str, team_id: str | None, role: str | None
+) -> dict[str, Any]:
+    """Super admin: put *sub* in *team_id* with *role*, or in no team (None).
+
+    Not bound by the team-admin rules (a team keeps an admin): a super admin
+    may leave a team without one. A login script that assigns teams overrides
+    this on that user's next login.
+    """
+    require_super_admin("change a user's team")
+    await _user_or_404(directory, sub)
+    if team_id:
+        await _team_or_404(directory, team_id)
+        role = role or "member"
+        if role not in ROLES:
+            raise TeamInvalid(f"Unknown role '{role}'; expected one of {', '.join(ROLES)}")
+        await directory.set_membership(sub, team_id, role)
+    else:
+        await directory.set_membership(sub, None, None)
+    await _refresh_names(directory)
+    return _user_dict(await directory.get_user(sub))
+
+
+async def delete_user(directory: Any, sub: str) -> None:
+    """Super admin: forget *sub*, membership included.
+
+    Their resources keep their owner id. A user who calls again is recorded
+    again, in no team (unless a login script assigns one).
+    """
+    require_super_admin("delete users")
+    if not await directory.delete_user(sub):
+        raise ResourceNotFound(f"User '{sub}' not found")
 
 
 async def team_of(directory: Any, sub: str | None) -> str | None:
