@@ -28,6 +28,10 @@ from app.infrastructure.orchestration.checkpointer import MongoDBCheckpointSaver
 from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner, stream_graph_to_pause
 from app.infrastructure.persistence.mongo import MongoClientProvider, MongoGraphRunRepository, MongoPvcLeaseRepository, MongoAgentTaskRepository, MongoWarmPodRepository
 from app.application.visibility import ReferenceGuard, VisibilityScopedBackend, unwrap
+from app.infrastructure.persistence.login_script_store import (
+    LoginScriptStore,
+    MongoLoginScriptStore,
+)
 from app.infrastructure.persistence.team_directory import MongoTeamDirectory, TeamDirectory
 from app.infrastructure.persistence.agent_backend import (
     AgentDefinitionBackend,
@@ -147,6 +151,9 @@ class ApplicationContainer:
     # Carrier's users and teams (app.application.teams). None in legacy test
     # setups: nobody is in a team, and team management answers 503.
     team_directory: TeamDirectory | None = None
+    # The login script a super admin edits at runtime (app.application.login_admin).
+    # None: only a deployment-configured script can be used.
+    login_script_store: LoginScriptStore | None = None
     # References to background tasks created in startup() — held so they
     # can't be garbage-collected mid-flight, and cancelled on shutdown().
     _recover_task: asyncio.Task | None = field(default=None, init=False, repr=False, compare=False)
@@ -1233,6 +1240,7 @@ def build_container(settings: Settings) -> ApplicationContainer:
         MongoClient(settings.mongodb_uri),
         db_name=settings.mongodb_database,
     )
+    team_directory = MongoTeamDirectory(settings.mongodb_uri, settings.mongodb_database)
     # Registry starts empty; populated asynchronously in startup().
     return ApplicationContainer(
         settings=settings,
@@ -1261,5 +1269,6 @@ def build_container(settings: Settings) -> ApplicationContainer:
         pvc_lease_repository=pvc_lease_repository,
         agent_task_repository=agent_task_repository,
         warm_pod_repository=warm_pod_repository,
-        team_directory=MongoTeamDirectory(settings.mongodb_uri, settings.mongodb_database),
+        team_directory=team_directory,
+        login_script_store=MongoLoginScriptStore(team_directory.database),
     )

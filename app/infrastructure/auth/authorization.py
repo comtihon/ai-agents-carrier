@@ -350,6 +350,9 @@ class Subject:
     # The caller's team and role in it ("member" | "admin"), or None.
     team_id: str | None = None
     team_role: str | None = None
+    # The effective roles this request was authorized with (after the login
+    # script), recorded on the user directory for display. None: not a user.
+    roles: frozenset[str] | None = None
 
 
 _current_subject: "ContextVar[Subject | None]" = ContextVar("current_subject", default=None)
