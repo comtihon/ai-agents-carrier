@@ -68,7 +68,7 @@ class MemoryBackend:
 def _subject(user: str) -> Subject:
     if user == "apikey":
         return Subject()
-    return Subject(id=user, name=user.title(), is_admin=user == "admin")
+    return Subject(id=user, name=user.title(), is_super_admin=user == "admin")
 
 
 def _with_test_subject(app):
@@ -331,7 +331,7 @@ async def test_making_a_used_resource_private_is_refused(env):
     resp = await as_("alice").put("/api/v1/agents/shared", json={"visibility": "private"})
     assert resp.status_code == 409
     # Bob's workflow is private: it is not named to Alice.
-    assert "another user" in resp.json()["detail"]
+    assert "a workflow you cannot see" in resp.json()["detail"]
     assert "bobs-wf" not in resp.json()["detail"]
 
 
@@ -402,9 +402,10 @@ async def test_starting_a_hidden_workflow_is_404(env):
 async def test_me(env):
     as_, _ = env
     assert (await as_("alice").get("/api/v1/me")).json() == {
-        "sub": "alice", "name": "Alice", "is_admin": False, "auth_enabled": False,
+        "sub": "alice", "name": "Alice", "is_admin": False, "is_super_admin": False,
+        "auth_enabled": False, "team": None,
     }
-    assert (await as_("admin").get("/api/v1/me")).json()["is_admin"] is True
+    assert (await as_("admin").get("/api/v1/me")).json()["is_super_admin"] is True
     assert (await as_(None).get("/api/v1/me")).json()["sub"] is None
 
 

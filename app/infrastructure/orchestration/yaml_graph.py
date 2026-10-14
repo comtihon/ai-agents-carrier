@@ -1123,6 +1123,7 @@ class YamlGraphRunner:
         self.visibility: str = definition.get("visibility", "public")
         self.owner_id: str | None = definition.get("owner_id")
         self.owner_name: str | None = definition.get("owner_name")
+        self.team_id: str | None = definition.get("team_id")
         # Resolve implicit fall-through into an explicit `next`/`targets` up
         # front, so array position stops being load-bearing below this line.
         # Every construction path — stored definition, on-disk YAML, a raw dict

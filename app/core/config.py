@@ -297,6 +297,12 @@ class Settings(BaseSettings):
     auth_write_roles: list[str] = Field(default_factory=list, alias="AUTH_WRITE_ROLES")
     auth_delete_roles: list[str] = Field(default_factory=list, alias="AUTH_DELETE_ROLES")
     auth_admin_roles: list[str] = Field(default_factory=list, alias="AUTH_ADMIN_ROLES")
+    # System-wide visibility and team management (see app.application.teams).
+    # Empty falls back to AUTH_ADMIN_ROLES, so a single admin role is enough
+    # for a small deployment; set it where ADMIN is a broad operations role.
+    auth_super_admin_roles: list[str] = Field(
+        default_factory=list, alias="AUTH_SUPER_ADMIN_ROLES"
+    )
 
     # --- Outbound service identity (OAuth2 JWT bearer grant, RFC 7523) ---
     # When enabled, the backend mints its own access tokens from an OAuth2

@@ -37,6 +37,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from app.api.dependencies import get_container
+from app.domain.models.ownership import Visibility
 from app.application.visibility import ownership_fields, unwrap
 from app.core.config import Settings, get_settings
 from app.core.container import ApplicationContainer
@@ -111,7 +112,10 @@ class CreateDataSourceRequest(BaseModel):
     timeout_seconds: float = 30
     retries: dict | None = None
     # None = the default: private when a user creates it, public without auth.
-    visibility: Literal["public", "private"] | None = None
+    visibility: Visibility | None = None
+    # With visibility "team": which team. Omitted = the caller's own (a
+    # super admin may name any team; anyone else only their own).
+    team_id: str | None = None
 
 
 class UpdateDataSourceRequest(BaseModel):
@@ -131,7 +135,10 @@ class UpdateDataSourceRequest(BaseModel):
     timeout_seconds: float | None = None
     retries: dict | None = None
     # None = keep the stored visibility.
-    visibility: Literal["public", "private"] | None = None
+    visibility: Visibility | None = None
+    # With visibility "team": which team. Omitted = the caller's own (a
+    # super admin may name any team; anyone else only their own).
+    team_id: str | None = None
 
 
 class ProbeDataSourceRequest(BaseModel):

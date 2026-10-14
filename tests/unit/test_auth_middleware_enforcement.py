@@ -19,6 +19,7 @@ from app.api.middleware.auth import OAuthMiddleware
 from app.infrastructure.auth.auth_service import AuthError
 from app.infrastructure.auth.authorization import (
     AuthorizationPolicy,
+    Permission,
     get_current_permissions,
     get_current_permissions_or_none,
 )
@@ -161,7 +162,9 @@ def test_deleter_may_delete(enforcing: TestClient) -> None:
 
 def test_principal_is_bound_for_the_request(enforcing: TestClient) -> None:
     resp = enforcing.get("/api/v1/thing", headers=_auth("admin"))
-    assert resp.json()["permissions"] == ["access", "admin", "delete", "read", "write"]
+    assert resp.json()["permissions"] == [
+        "access", "admin", "delete", "read", "super_admin", "write",
+    ]
 
 
 def test_principal_does_not_outlive_the_request(enforcing: TestClient) -> None:
@@ -173,7 +176,9 @@ def test_shadow_mode_binds_the_full_principal(shadow: TestClient) -> None:
     """With enforcement off the policy grants everything, tools included."""
     resp = shadow.get("/api/v1/thing", headers=_auth("customer"))
     assert resp.status_code == 200
-    assert resp.json()["permissions"] == ["access", "admin", "delete", "read", "write"]
+    assert resp.json()["permissions"] == [
+        "access", "admin", "delete", "read", "super_admin", "write",
+    ]
 
 
 # ── Shadow reporting ──────────────────────────────────────────────────────────
@@ -215,7 +220,7 @@ def test_shadow_still_rejects_an_invalid_token(shadow: TestClient) -> None:
 
 # ── Subject (ownership / visibility) ──────────────────────────────────────────
 
-def _subject_client(enforce: bool) -> TestClient:
+def _subject_client(enforce: bool, **policy_overrides) -> TestClient:
     from app.infrastructure.auth.authorization import get_current_subject
 
     app = FastAPI()
@@ -223,12 +228,12 @@ def _subject_client(enforce: bool) -> TestClient:
     @app.get("/api/v1/who")
     async def who() -> dict:
         subject = get_current_subject()
-        return {"id": subject.id, "is_admin": subject.is_admin}
+        return {"id": subject.id, "is_super_admin": subject.is_super_admin}
 
     app.add_middleware(
         OAuthMiddleware,
         auth_service=_FakeAuthService(TOKENS),
-        policy=AuthorizationPolicy(enforce=enforce, **POLICY_ROLES),
+        policy=AuthorizationPolicy(enforce=enforce, **{**POLICY_ROLES, **policy_overrides}),
     )
     return TestClient(app)
 
@@ -238,8 +243,33 @@ def test_the_subject_is_bound_and_admin_is_evaluated_strictly(enforce: bool) -> 
     """Shadow mode grants every caller ADMIN; visibility must not follow that."""
     client = _subject_client(enforce)
     assert client.get("/api/v1/who", headers=_auth("staff")).json() == {
-        "id": "user-of-staff", "is_admin": False,
+        "id": "user-of-staff", "is_super_admin": False,
     }
     assert client.get("/api/v1/who", headers=_auth("admin")).json() == {
-        "id": "user-of-admin", "is_admin": True,
+        "id": "user-of-admin", "is_super_admin": True,
     }
+
+
+@pytest.mark.parametrize("enforce", [True, False])
+def test_super_admin_falls_back_to_the_admin_roles_when_unset(enforce: bool) -> None:
+    """No AUTH_SUPER_ADMIN_ROLES: the ADMIN roles are the super admins."""
+    client = _subject_client(enforce)
+    assert client.get("/api/v1/who", headers=_auth("admin")).json()["is_super_admin"] is True
+
+
+@pytest.mark.parametrize("enforce", [True, False])
+def test_a_distinct_super_admin_role_is_not_granted_by_admin(enforce: bool) -> None:
+    """With AUTH_SUPER_ADMIN_ROLES set, ADMIN (unsandboxed steps) is not super admin."""
+    client = _subject_client(enforce, super_admin_roles=frozenset({"root"}))
+    assert client.get("/api/v1/who", headers=_auth("admin")).json()["is_super_admin"] is False
+
+
+def test_super_admin_is_its_own_permission_and_never_the_api_keys() -> None:
+    policy = AuthorizationPolicy(
+        enforce=True, **{**POLICY_ROLES, "super_admin_roles": frozenset({"root"})}
+    )
+    assert Permission.SUPER_ADMIN in policy.permissions_for_roles({"staff", "root"})
+    assert Permission.SUPER_ADMIN not in policy.permissions_for_roles({"staff", "admin-role"})
+    assert Permission.ADMIN in policy.permissions_for_roles({"staff", "admin-role"})
+    assert Permission.SUPER_ADMIN not in policy.permissions_for_api_key()
+    assert Permission.SUPER_ADMIN not in AuthorizationPolicy().permissions_for_api_key()

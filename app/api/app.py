@@ -34,8 +34,10 @@ from app.infrastructure.auth.authorization import (
     set_current_subject,
     subject_from_claims,
 )
+from app.application.teams import directory_of, resolve_subject
 from app.application.visibility import VisibilityError, can_see, unwrap, workflow_visible
 from app.api.routes.me import router as me_router
+from app.api.routes.teams import router as teams_router
 from app.api.routes.agent_callbacks import router as agent_callbacks_router
 from app.api.routes.agents import router as agents_router
 from app.api.routes.approvals import router as approvals_router
@@ -256,8 +258,12 @@ class _ManagementAuthWrapper:
                 )
                 await _send_403(send)
                 return
-            subject = subject_from_claims(
-                claims, Permission.ADMIN in self._policy.evaluate_shadow(claims)
+            app = scope.get("app")
+            subject = await resolve_subject(
+                directory_of(getattr(getattr(app, "state", None), "container", None)),
+                subject_from_claims(
+                    claims, Permission.SUPER_ADMIN in self._policy.evaluate_shadow(claims)
+                ),
             )
             await self._call_with_principal(permissions, subject, scope, receive, send)
             return
@@ -628,6 +634,7 @@ def create_app() -> FastAPI:
     )
     app.include_router(health_router)
     app.include_router(me_router, prefix=settings.api_prefix)
+    app.include_router(teams_router, prefix=settings.api_prefix)
     app.include_router(workflows_router, prefix=settings.api_prefix)
     app.include_router(agents_router, prefix=settings.api_prefix)
     app.include_router(datasources_router, prefix=settings.api_prefix)

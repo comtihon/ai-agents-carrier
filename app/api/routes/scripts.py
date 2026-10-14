@@ -22,6 +22,7 @@ from app.api.dependencies import get_container
 # Shared with the workflow-save capture path so a name-derived id is the same
 # whichever route created it.
 from app.application.script_capture import slugify
+from app.domain.models.ownership import Visibility
 from app.application.visibility import ownership_fields, visibility_kwargs
 from app.core.container import ApplicationContainer
 from app.domain.models.script_definition import ScriptDefinition
@@ -44,7 +45,10 @@ class ScriptRequest(BaseModel):
     overwrite: bool = False
     # None = the default (private when a user creates it); on an overwrite,
     # None keeps the stored visibility.
-    visibility: Literal["public", "private"] | None = None
+    visibility: Visibility | None = None
+    # With visibility "team": which team. Omitted = the caller's own (a
+    # super admin may name any team; anyone else only their own).
+    team_id: str | None = None
 
 
 class ScriptUpdateRequest(BaseModel):
@@ -52,7 +56,10 @@ class ScriptUpdateRequest(BaseModel):
     description: str | None = None
     code: str = ""
     # None = keep the stored visibility.
-    visibility: Literal["public", "private"] | None = None
+    visibility: Visibility | None = None
+    # With visibility "team": which team. Omitted = the caller's own (a
+    # super admin may name any team; anyone else only their own).
+    team_id: str | None = None
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -122,7 +129,7 @@ async def create_script(
         description=body.description,
         code=body.code,
         created_at=existing.created_at if existing else None,
-        **visibility_kwargs(body.visibility),
+        **visibility_kwargs(body.visibility, body.team_id),
     )
     saved = await container.script_backend.create(defn)
     return saved.model_dump(mode="json")
@@ -171,6 +178,8 @@ async def update_script(
     existing.code = body.code
     if body.visibility is not None:
         existing.visibility = body.visibility
+    if body.team_id is not None:
+        existing.team_id = body.team_id
     saved = await container.script_backend.update(script_id, existing)
     return saved.model_dump(mode="json")
 
