@@ -1,9 +1,15 @@
 """Who may see and change an agent, data source, script or workflow.
 
-Every one of the four is ``public`` (visible to and usable by every user) or
-``private`` (visible to its owner and to admins only — to anyone else it does
-not exist: absent from lists, 404 by id, never offered in a picker or to the
-chat agent). Only the owner or an admin may change or delete one, public or not.
+Every one of the four is ``public`` (visible to and usable by every user),
+``team`` (visible to and usable by the members of one team — see
+app.application.teams) or ``private`` (its owner's alone). To anyone outside a
+resource's scope it does not exist: absent from lists, 404 by id, never offered
+in a picker or to the chat agent.
+
+Changing a resource is its owner's, with one widening: members of a *team
+workflow*'s team may edit it too (``OwnedResource.team_editable``). Deleting a
+resource or changing its visibility or team stays with the owner. A super admin
+sees and manages everything, whatever team they are in.
 
 Enforcement lives in one place, :class:`VisibilityScopedBackend`, which the
 container wraps around each of the four backends. Every surface — the REST
@@ -18,20 +24,24 @@ check here is a no-op, so a deployment without authentication behaves exactly
 as it did before visibility existed, and a triggered run of a private workflow
 can still resolve its owner's private resources.
 
-References follow two rules, checked on save:
+References are checked on save. Scopes rank public > team > private, and a
+resource may only use what is (a) visible to the caller and (b) at least as
+widely visible as itself — otherwise someone who can see (and run) the
+referrer would run something they cannot see:
 
-* you can only reference what you can see;
-* a public resource may only use public ones, and a private one only public
-  ones or its own owner's private ones — otherwise a user who can see (and
-  run) the referrer would run something they cannot see.
+* a public resource uses public ones only;
+* a team resource uses public ones and its own team's;
+* a private resource uses public ones, its owner's team's, and its owner's
+  private ones.
 
-The converse is checked when a resource turns private: refused while a public
-resource, or another user's resource, still uses it.
+The converse is checked when a resource narrows (public → team → private, or
+moves to another team): refused while a resource that uses it would break the
+rule.
 
 Legacy documents, stored before these fields existed, load as public with no
 owner. An ownerless resource stays editable by any caller with WRITE, as it
-always was; turning one private makes the caller its owner, since a private
-resource nobody owns would be visible to admins only.
+always was; narrowing one makes the caller its owner, since a private resource
+nobody owns would be visible to super admins only.
 """
 from __future__ import annotations
 
@@ -98,26 +108,58 @@ def _owner(resource: Any) -> str | None:
     return _field(resource, "owner_id")
 
 
+def _team(resource: Any) -> str | None:
+    return _field(resource, "team_id") if _visibility(resource) == "team" else None
+
+
+_RANK = {"private": 0, "team": 1, "public": 2}
+
+
+def _rank(visibility: str) -> int:
+    return _RANK.get(visibility, 2)
+
+
+def _in_team(subject: Any, resource: Any) -> bool:
+    team = _team(resource)
+    return team is not None and subject.team_id == team
+
+
 def can_see(resource: Any) -> bool:
     subject = get_current_subject()
     if subject is None:
         return True
-    if _visibility(resource) == "public" or subject.is_admin:
+    if _visibility(resource) == "public" or subject.is_super_admin:
         return True
-    return subject.id is not None and _owner(resource) == subject.id
+    if subject.id is not None and _owner(resource) == subject.id:
+        return True
+    return _in_team(subject, resource)
 
 
-def can_edit(resource: Any) -> bool:
-    """Owner or admin; anyone with WRITE for a legacy, ownerless resource."""
+def can_manage(resource: Any) -> bool:
+    """Delete it or change its visibility/team: owner or super admin.
+
+    A legacy, ownerless public resource: anyone with WRITE, as before.
+    """
     subject = get_current_subject()
-    if subject is None or subject.is_admin:
+    if subject is None or subject.is_super_admin:
         return True
     owner = _owner(resource)
     if owner is None:
-        # An ownerless private resource is admin-only (it cannot normally
-        # arise: turning a resource private assigns an owner).
+        # An ownerless non-public resource is admin-only (it cannot normally
+        # arise: narrowing a resource assigns an owner).
         return _visibility(resource) == "public"
     return subject.id is not None and owner == subject.id
+
+
+def can_edit(resource: Any, team_editable: bool | None = None) -> bool:
+    """Change its content: whoever may manage it, plus — for a kind whose team
+    members may edit (workflows) — the members of its team."""
+    if can_manage(resource):
+        return True
+    if team_editable is None:
+        team_editable = bool(getattr(resource, "team_editable", False))
+    subject = get_current_subject()
+    return team_editable and subject is not None and _in_team(subject, resource)
 
 
 def default_visibility() -> str:
@@ -162,14 +204,46 @@ class ReferenceGuard:
     one is private", and to find referrers the caller cannot see.
     """
 
-    def __init__(self, resolve: Callable[[str], Any]) -> None:
+    def __init__(
+        self,
+        resolve: Callable[[str], Any],
+        directory: Callable[[], Any] | None = None,
+    ) -> None:
         # kind -> raw backend (or None), looked up per call so a backend
         # swapped in after construction is still the one consulted.
         self._resolve = resolve
+        self._directory = directory or (lambda: None)
+
+    async def _owner_team(self, resource: Any) -> str | None:
+        from app.application.teams import team_of
+        return await team_of(self._directory(), _owner(resource))
+
+    async def _violation(self, user: Any, user_kind: str, used: Any, used_kind: str) -> str | None:
+        """Why *user* may not use *used*, or None. Scope rules only."""
+        own, label = _LABEL[user_kind], _LABEL[used_kind]
+        uid = getattr(used, "id", None)
+        user_vis, used_vis = _visibility(user), _visibility(used)
+        if _rank(used_vis) < _rank(user_vis):
+            return (
+                f"A {user_vis} {own} cannot use {used_vis} {label} '{uid}'. "
+                f"Widen the {label}, or narrow this {own}."
+            )
+        if used_vis == "team":
+            if user_vis == "team":
+                if _team(user) != _team(used):
+                    return f"This {own} cannot use {label} '{uid}': it belongs to another team."
+            elif user_vis == "private":
+                if await self._owner_team(user) != _team(used):
+                    return (
+                        f"This {own} cannot use {label} '{uid}': it belongs to a team "
+                        f"its owner is not in."
+                    )
+        elif used_vis == "private":
+            if _owner(used) != _owner(user):
+                return f"This {own} cannot use {label} '{uid}': it is private to another user."
+        return None
 
     async def check_references(self, kind: str, resource: Any) -> None:
-        own_label = _LABEL[kind]
-        is_public = _visibility(resource) == "public"
         for ref_kind, ref_id in dict.fromkeys(references(kind, resource)):
             if ref_kind == kind and ref_id == getattr(resource, "id", None):
                 continue
@@ -181,26 +255,15 @@ class ReferenceGuard:
                 # Dangling references are not this module's concern: they fail
                 # at run time exactly as they did before.
                 continue
-            label = _LABEL[ref_kind]
             if not can_see(target):
-                raise InvalidReference(f"{label.capitalize()} '{ref_id}' not found")
-            if _visibility(target) != "private":
-                continue
-            if is_public:
-                raise InvalidReference(
-                    f"A public {own_label} cannot use private {label} '{ref_id}'. "
-                    f"Make the {label} public, or keep this {own_label} private."
-                )
-            if _owner(target) != _owner(resource):
-                raise InvalidReference(
-                    f"This {own_label} cannot use {label} '{ref_id}': it is private "
-                    f"to another user."
-                )
+                raise InvalidReference(f"{_LABEL[ref_kind].capitalize()} '{ref_id}' not found")
+            problem = await self._violation(resource, kind, target, ref_kind)
+            if problem:
+                raise InvalidReference(problem)
 
-    async def check_turning_private(self, kind: str, resource: Any) -> None:
-        """Refuse to hide a resource that public or foreign resources use."""
+    async def check_narrowing(self, kind: str, resource: Any) -> None:
+        """Refuse to narrow a resource that something wider still uses."""
         rid = getattr(resource, "id", None)
-        owner = _owner(resource)
         referrer_kinds = ["workflow"] + (["agent"] if kind == "datasource" else [])
         for referrer_kind in referrer_kinds:
             backend = self._resolve(referrer_kind)
@@ -211,16 +274,16 @@ class ReferenceGuard:
                     continue
                 if (kind, rid) not in references(referrer_kind, referrer):
                     continue
-                if _visibility(referrer) == "private" and _owner(referrer) == owner:
+                if await self._violation(referrer, referrer_kind, resource, kind) is None:
                     continue
                 label = _LABEL[referrer_kind]
                 who = (
-                    f"public {label} '{referrer.id}'"
-                    if _visibility(referrer) == "public"
-                    else f"a {label} of another user"
+                    f"{_visibility(referrer)} {label} '{referrer.id}'"
+                    if can_see(referrer)
+                    else f"a {label} you cannot see"
                 )
                 raise StillReferenced(
-                    f"Cannot make {_LABEL[kind]} '{rid}' private: {who} uses it."
+                    f"Cannot make {_LABEL[kind]} '{rid}' {_visibility(resource)}: {who} uses it."
                 )
 
 
@@ -277,6 +340,40 @@ class VisibilityScopedBackend:
         return None
 
     # ── writes ──
+    async def _resolve_team(self, resource: Any, existing: Any | None) -> str | None:
+        """The team a resource saved as "team" belongs to.
+
+        A requested ``team_id`` equal to the stored one is no change. Otherwise
+        a super admin may name any existing team (defaulting to their own, if
+        they are in one); anyone else gets their own team, and naming another
+        is refused.
+        """
+        from app.application.teams import TeamInvalid
+        subject = get_current_subject()
+        requested = resource.team_id if "team_id" in resource.model_fields_set else None
+        stored = _team(existing) if existing is not None else None
+        if requested and requested == stored:
+            return stored
+        if subject is None:
+            return requested or stored
+        if subject.is_super_admin:
+            team = requested or stored or subject.team_id
+            if not team:
+                raise TeamInvalid('team_id required: say which team to share with')
+            directory = self._guard._directory()
+            if directory is not None and await directory.get_team(team) is None:
+                raise TeamInvalid(f"Team '{team}' not found")
+            return team
+        if requested and requested != subject.team_id:
+            raise NotOwner("You can only share with your own team")
+        if stored and not requested:
+            # Re-saving a team resource (e.g. a member editing a team workflow)
+            # keeps its team; moving it is the owner's, below.
+            return stored
+        if not subject.team_id:
+            raise TeamInvalid("You are not in a team, so you cannot share with one")
+        return subject.team_id
+
     async def _prepare(self, resource: Any, existing: Any | None) -> None:
         subject = get_current_subject()
         if existing is None:
@@ -294,27 +391,43 @@ class VisibilityScopedBackend:
             if "visibility" not in resource.model_fields_set:
                 resource.visibility = _visibility(existing)
             if (
-                resource.visibility == "private"
+                resource.visibility != "public"
                 and resource.owner_id is None
                 and subject is not None
                 and subject.id
             ):
                 resource.owner_id = subject.id
                 resource.owner_name = subject.name
+        resource.team_id = (
+            await self._resolve_team(resource, existing) if resource.visibility == "team" else None
+        )
+        if existing is not None and (
+            resource.visibility != _visibility(existing) or resource.team_id != _team(existing)
+        ):
+            if not can_manage(existing):
+                raise NotOwner(
+                    f"Only the owner of {self._label} '{resource.id}' (or a super admin) "
+                    f"may change who can see it"
+                )
         if subject is None:
             return
         await self._guard.check_references(self.kind, resource)
-        if resource.visibility == "private" and (
-            existing is None or _visibility(existing) != "private"
-        ):
-            await self._guard.check_turning_private(self.kind, resource)
+        narrowed = existing is None and resource.visibility != "public" or (
+            existing is not None
+            and (
+                _rank(resource.visibility) < _rank(_visibility(existing))
+                or (resource.visibility == "team" and resource.team_id != _team(existing))
+            )
+        )
+        if narrowed:
+            await self._guard.check_narrowing(self.kind, resource)
 
     def _check_editable(self, existing: Any, resource_id: str) -> None:
         if not can_see(existing):
             raise ResourceNotFound(f"{self._label.capitalize()} '{resource_id}' not found")
         if not can_edit(existing):
             raise NotOwner(
-                f"Only the owner of {self._label} '{resource_id}' (or an admin) may change it"
+                f"Only the owner of {self._label} '{resource_id}' (or a super admin) may change it"
             )
 
     async def create(self, resource: Any) -> Any:
@@ -340,7 +453,13 @@ class VisibilityScopedBackend:
     async def delete(self, resource_id: str) -> None:
         existing = await self.inner.get(resource_id)
         if existing is not None:
-            self._check_editable(existing, resource_id)
+            if not can_see(existing):
+                raise ResourceNotFound(f"{self._label.capitalize()} '{resource_id}' not found")
+            if not can_manage(existing):
+                raise NotOwner(
+                    f"Only the owner of {self._label} '{resource_id}' (or a super admin) "
+                    f"may delete it"
+                )
         await self.inner.delete(resource_id)
 
 
@@ -408,24 +527,33 @@ async def ensure_run_visible(workflow_backend: Any, run: Any) -> None:
         raise ResourceNotFound("Run not found")
 
 
-def ownership_fields(resource: Any) -> dict[str, Any]:
-    """The four fields every list/summary entry carries."""
+def ownership_fields(resource: Any, team_editable: bool | None = None) -> dict[str, Any]:
+    """The fields every list/summary entry carries."""
+    from app.application.teams import team_name
+    team_id = _team(resource)
     return {
         "visibility": _visibility(resource),
         "owner_id": _owner(resource),
         "owner_name": _field(resource, "owner_name"),
-        "can_edit": can_edit(resource),
+        "team_id": team_id,
+        "team_name": team_name(team_id),
+        "can_edit": can_edit(resource, team_editable),
     }
 
 
-def visibility_kwargs(visibility: str | None) -> dict[str, Any]:
-    """Model kwargs for an optional requested visibility.
+def visibility_kwargs(visibility: str | None, team_id: str | None = None) -> dict[str, Any]:
+    """Model kwargs for an optional requested visibility (and team).
 
     Omitted (None) must stay *unset* on the model rather than become a value:
     the scoped backend tells "keep the stored one" / "use the default" apart
     from an explicit choice by whether the field was set.
     """
-    return {"visibility": visibility} if visibility is not None else {}
+    kwargs: dict[str, Any] = {}
+    if visibility is not None:
+        kwargs["visibility"] = visibility
+    if team_id is not None:
+        kwargs["team_id"] = team_id
+    return kwargs
 
 
 def filter_visible(resources: Iterable[Any]) -> list[Any]:

@@ -42,7 +42,7 @@ def _with_test_subject(app):
         if not user:
             return await app(scope, receive, send)
         name = user.decode()
-        token = set_current_subject(Subject(id=name, name=name, is_admin=name == "admin"))
+        token = set_current_subject(Subject(id=name, name=name, is_super_admin=name == "admin"))
         try:
             return await app(scope, receive, send)
         finally:

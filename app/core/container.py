@@ -28,6 +28,7 @@ from app.infrastructure.orchestration.checkpointer import MongoDBCheckpointSaver
 from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner, stream_graph_to_pause
 from app.infrastructure.persistence.mongo import MongoClientProvider, MongoGraphRunRepository, MongoPvcLeaseRepository, MongoAgentTaskRepository, MongoWarmPodRepository
 from app.application.visibility import ReferenceGuard, VisibilityScopedBackend, unwrap
+from app.infrastructure.persistence.team_directory import MongoTeamDirectory, TeamDirectory
 from app.infrastructure.persistence.agent_backend import (
     AgentDefinitionBackend,
     MongoAgentBackend,
@@ -143,6 +144,9 @@ class ApplicationContainer:
     pvc_lease_repository: MongoPvcLeaseRepository | None = None
     agent_task_repository: MongoAgentTaskRepository | None = None
     warm_pod_repository: MongoWarmPodRepository | None = None
+    # Carrier's users and teams (app.application.teams). None in legacy test
+    # setups: nobody is in a team, and team management answers 503.
+    team_directory: TeamDirectory | None = None
     # References to background tasks created in startup() — held so they
     # can't be garbage-collected mid-flight, and cancelled on shutdown().
     _recover_task: asyncio.Task | None = field(default=None, init=False, repr=False, compare=False)
@@ -166,7 +170,8 @@ class ApplicationContainer:
         if guard is None:
             fields = {kind: name for name, kind in _SCOPED_BACKENDS.items()}
             guard = ReferenceGuard(
-                lambda kind: unwrap(self.__dict__.get(fields[kind]))
+                lambda kind: unwrap(self.__dict__.get(fields[kind])),
+                lambda: self.__dict__.get("team_directory"),
             )
             object.__setattr__(self, "_reference_guard", guard)
         return guard
@@ -182,6 +187,11 @@ class ApplicationContainer:
             await self.run_repository.ensure_indexes()
         except Exception:
             logger.exception("failed to ensure graph_runs indexes; run list may be slow")
+        if self.team_directory is not None and hasattr(self.team_directory, "ensure_indexes"):
+            try:
+                await self.team_directory.ensure_indexes()
+            except Exception:
+                logger.exception("failed to ensure users/teams indexes")
         await self.mcp_tools_provider.start()
         self.cron_scheduler.start()
         if self.settings.pubsub_enabled and self.pubsub_subscriber is None:
@@ -1251,4 +1261,5 @@ def build_container(settings: Settings) -> ApplicationContainer:
         pvc_lease_repository=pvc_lease_repository,
         agent_task_repository=agent_task_repository,
         warm_pod_repository=warm_pod_repository,
+        team_directory=MongoTeamDirectory(settings.mongodb_uri, settings.mongodb_database),
     )

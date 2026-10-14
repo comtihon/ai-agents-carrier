@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from app.api.dependencies import get_container
 from app.application.script_capture import capture_inline_scripts
+from app.domain.models.ownership import Visibility
 from app.application.visibility import (
     can_see,
     ensure_run_visible,
@@ -82,7 +83,10 @@ class WorkflowDefinitionRequest(BaseModel):
     use_storage: bool = False
     enabled: bool = True
     # None = the default: private when a user creates it, public without auth.
-    visibility: Literal["public", "private"] | None = None
+    visibility: Visibility | None = None
+    # With visibility "team": which team. Omitted = the caller's own (a
+    # super admin may name any team; anyone else only their own).
+    team_id: str | None = None
 
 
 class WorkflowDefinitionUpdateRequest(BaseModel):
@@ -101,7 +105,10 @@ class WorkflowDefinitionUpdateRequest(BaseModel):
     use_meta_llm: bool | None = None
     use_storage: bool | None = None
     enabled: bool | None = None
-    visibility: Literal["public", "private"] | None = None
+    visibility: Visibility | None = None
+    # With visibility "team": which team. Omitted = the caller's own (a
+    # super admin may name any team; anyone else only their own).
+    team_id: str | None = None
 
 
 class RestartFromStepRequest(BaseModel):
@@ -570,7 +577,7 @@ async def _execute_graph(
 async def list_workflows(container: ApplicationContainer = Depends(get_container)):
     """List the workflows the caller can see (summary view from the registry)."""
     return [
-        {**entry, **ownership_fields(entry)}
+        {**entry, **ownership_fields(entry, team_editable=True)}
         for entry in container.yaml_graph_registry.list_definitions()
         if can_see(entry)
     ]
@@ -644,7 +651,7 @@ async def create_workflow(
         use_meta_llm=body.use_meta_llm,
         use_storage=body.use_storage,
         enabled=body.enabled,
-        **visibility_kwargs(body.visibility),
+        **visibility_kwargs(body.visibility, body.team_id),
     )
     saved = await container.workflow_backend.create(defn)
     await container.refresh_runner(body.id)
@@ -1052,7 +1059,7 @@ async def update_workflow(
         ),
         enabled=existing.enabled if body.enabled is None else body.enabled,
         created_at=existing.created_at,
-        **visibility_kwargs(body.visibility),
+        **visibility_kwargs(body.visibility, body.team_id),
     )
     saved = await container.workflow_backend.update(workflow_id, defn)
     await container.refresh_runner(workflow_id)
