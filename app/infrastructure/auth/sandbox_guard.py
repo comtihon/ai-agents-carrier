@@ -93,6 +93,20 @@ def _steps_of(definition: Any) -> Iterable[dict]:
     for step in raw:
         if isinstance(step, dict):
             yield step
+            # combined_datasource parts are steps in their own right: a python
+            # part with `sandbox: false` needs ADMIN exactly like a python step.
+            if step.get("type") == "combined_datasource":
+                yield from _nested_parts(step.get("parts"), 0)
+
+
+def _nested_parts(parts: Any, depth: int) -> Iterable[dict]:
+    if depth > 16 or not isinstance(parts, list):
+        return
+    for part in parts:
+        if isinstance(part, dict):
+            yield part
+            if part.get("type") == "combined_datasource":
+                yield from _nested_parts(part.get("parts"), depth + 1)
 
 
 def _step_id(step: dict) -> str:
