@@ -5,6 +5,7 @@ import app.compat  # noqa: F401 — must be first, patches langgraph.graph.graph
 import logging
 import secrets
 from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import replace
 from uuid import uuid4
 
 from copilotkit import Action, CopilotKitRemoteEndpoint, LangGraphAGUIAgent
@@ -34,11 +35,18 @@ from app.infrastructure.auth.authorization import (
     set_current_subject,
     subject_from_claims,
 )
-from app.application.login import LoginService, effective_roles, login_decision, with_profile
+from app.application.login import (
+    LoginService,
+    effective_roles,
+    login_decision,
+    login_script_store_of,
+    with_profile,
+)
 from app.application.teams import directory_of, resolve_subject
 from app.application.visibility import VisibilityError, can_see, unwrap, workflow_visible
 from app.api.routes.me import router as me_router
 from app.api.routes.teams import router as teams_router
+from app.api.routes.login_script import router as login_script_router
 from app.api.routes.agent_callbacks import router as agent_callbacks_router
 from app.api.routes.agents import router as agents_router
 from app.api.routes.approvals import router as approvals_router
@@ -254,8 +262,11 @@ class _ManagementAuthWrapper:
                 await _send_401(send)
                 return
             app = scope.get("app")
-            directory = directory_of(getattr(getattr(app, "state", None), "container", None))
-            decision = await login_decision(self._login_service, token, claims, directory)
+            container = getattr(getattr(app, "state", None), "container", None)
+            directory = directory_of(container)
+            decision = await login_decision(
+                self._login_service, token, claims, directory, login_script_store_of(container)
+            )
             roles = effective_roles(self._policy, claims, decision)
             permissions = self._policy.permissions_for_roles(roles)
             if Permission.ACCESS not in permissions:
@@ -271,7 +282,10 @@ class _ManagementAuthWrapper:
             )
             subject = await resolve_subject(
                 directory,
-                with_profile(subject_from_claims(claims, is_super_admin), decision),
+                replace(
+                    with_profile(subject_from_claims(claims, is_super_admin), decision),
+                    roles=frozenset(roles),
+                ),
             )
             await self._call_with_principal(permissions, subject, scope, receive, send)
             return
@@ -629,10 +643,14 @@ def create_app() -> FastAPI:
             algorithms=settings.oauth_algorithms,
             audience=settings.oauth_audience,
         )
-        # Fails startup on a configured but unusable script.
-        login_script = load_login_script(settings)
-        if login_script is not None:
-            login_service = LoginService(login_script, policy=authz_policy)
+        # Fails startup on a configured but unusable script. Without one, the
+        # service still runs whatever script a super admin stores at runtime
+        # (none until then: roles come from the token).
+        login_service = LoginService(
+            load_login_script(settings),
+            policy=authz_policy,
+            timeout_ms=settings.auth_login_script_timeout_ms,
+        )
         app.add_middleware(
             OAuthMiddleware,
             auth_service=auth_service,
@@ -656,6 +674,7 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(me_router, prefix=settings.api_prefix)
     app.include_router(teams_router, prefix=settings.api_prefix)
+    app.include_router(login_script_router, prefix=settings.api_prefix)
     app.include_router(workflows_router, prefix=settings.api_prefix)
     app.include_router(agents_router, prefix=settings.api_prefix)
     app.include_router(datasources_router, prefix=settings.api_prefix)

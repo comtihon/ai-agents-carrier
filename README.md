@@ -1064,6 +1064,19 @@ read on every request, so a change applies on their next one.
 Membership can also be set automatically from the token by a
 [login script](#login-script).
 
+**User management** (for an admin screen):
+
+| endpoint | who | what |
+|---|---|---|
+| `GET /users` | super admin: everyone; team admin: their team plus users in no team | `[{sub, name, email, team: {id, name, role} \| null, is_super_admin, roles, last_seen}]` (also the flat `team_id`, `team_name`, `team_role`) |
+| `PUT /users/{sub}/team` | super admin | body `{team_id: string \| null, role: "member" \| "admin"}`: put the user in that team, or (`team_id: null`) in none. `404` for an unknown user or team. Not bound by the team-admin rules |
+| `DELETE /users/{sub}` | super admin | `204`: forget the stored user and their membership. Their resources keep their owner id; if they call again they are recorded again, in no team |
+
+`roles` and `is_super_admin` are what the user's most recent request was
+authorized with — the effective roles, after any login script — recorded with
+`last_seen` (at most once a minute per replica, at once when they change).
+They are for display: every request is authorized from its own token.
+
 ### Login script
 
 A deployment can supply a JavaScript function that the backend runs when a user
@@ -1091,7 +1104,8 @@ function onLogin(ctx) {
 Configure it inline with `AUTH_LOGIN_SCRIPT`, or as a file with
 `AUTH_LOGIN_SCRIPT_PATH` (the Helm chart mounts `auth.loginScript` for you, see
 [Deployment](#login-script-in-helm)). It only runs with `OAUTH_ENABLED=true`.
-With no script configured nothing changes: roles come from the token.
+With no script configured (and none [stored](#editing-the-login-script-at-runtime))
+nothing changes: roles come from the token.
 
 **Input.** `onLogin(ctx)` receives:
 
@@ -1142,6 +1156,31 @@ startup.
 **Sandbox.** The script runs in an embedded V8 isolate (`mini-racer`): no
 network, filesystem, process or module access, a fresh isolate for every run so nothing carries over between logins, and
 `onLogin` must return synchronously (a promise is an error).
+
+#### Editing the login script at runtime
+
+Without `AUTH_LOGIN_SCRIPT` / `AUTH_LOGIN_SCRIPT_PATH`, a super admin can store
+the script in MongoDB (`auth_settings` collection) and change it without a
+redeploy. A configured script always wins and is read-only through the API.
+
+| endpoint | what |
+|---|---|
+| `GET /auth/login-script` | `{source: "config" \| "db" \| "none", editable, script, timeout_ms, updated_at, updated_by, active, version}`. `active` is whether scripts run at all (`OAUTH_ENABLED`) |
+| `PUT /auth/login-script` | body `{script: string \| null}`. The script must load and define `onLogin` (`400 {detail}` otherwise; at most 256 KiB). `null` or `""` disables it. `409` when `source` is `config`. Answers like `GET` |
+| `POST /auth/login-script/test` | body `{script?, claims, sub?}`. A dry run that writes nothing: runs `script` (default: the active one) with `ctx.claims = claims`, `ctx.user` = the stored user `sub` (or `null`), `ctx.teams` = the real teams. Answers `{ok, result, error, duration_ms}` |
+
+All three are for super admins only (`403`). The dry run's `result` is the
+validated output — `roles`, `name`, `email`, `team` (`{id, name, role}` or
+`null`) — plus `team_action` (`keep`, `clear`, `assign`, `create` for a team
+named but not existing yet, `unknown_team` for an id that does not exist), and
+what the caller would get: `effective_roles`, `permissions`, `is_super_admin`,
+`admitted`.
+
+Saving bumps a version on the stored document. The replica that saved drops
+its cached login decisions at once; every other replica reads that version at
+most every 3 seconds and recompiles only when it changed. Cached decisions are
+keyed by version, so after a change every token's next request runs the new
+script.
 
 ---
 
