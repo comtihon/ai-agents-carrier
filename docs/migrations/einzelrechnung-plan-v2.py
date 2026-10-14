@@ -57,7 +57,7 @@ for art in records():
 
 # --- project rows from the three selections --------------------------------
 rows = {}
-for bucket in ("at", "ati", "cp"):
+for bucket in ("ati", "cp", "at"):  # individual buckets first so setdefault keeps them
     for row in bundle.get(bucket) or []:
         if isinstance(row, dict) and row.get("id") is not None:
             rows.setdefault(str(row["id"]), {**row, "_bucket": bucket})
@@ -77,7 +77,10 @@ for pid, row in rows.items():
     cls = classification.get(pid) or {}
     if isinstance(cls.get("result"), dict):          # loop record {"id":..,"result":{..}}
         cls = cls["result"]
-    name = str(cls.get("name") or "")
+    # get_project_classification returns the project; package lives in classification.name (s/m/l/xl/special)
+    cobj = cls.get("classification") if isinstance(cls.get("classification"), dict) else cls
+    name = str(cobj.get("name") or "")
+    cls_price = cobj.get("price")
     is_individual = bool(cls.get("isIndividual") or cls.get("is_individual") or row["_bucket"] in ("ati", "cp"))
     if row.get("hold"):
         on_hold.append({"id": row.get("id"), "company": row.get("cname")})
@@ -88,7 +91,7 @@ for pid, row in rows.items():
     if not row.get("sp") and not is_individual:
         airteam_not_individual.append({"id": row.get("id"), "company": row.get("cname")})
         continue
-    pkg = PACKAGE_RE.search(name)
+    pkg = re.fullmatch(r"\s*(?:paket\s+)?(xxl|xl|s|m|l)\s*", name, re.I)
     if pkg is None:
         _unmapped(row, "no_package_in_classification", classification=name)
         continue
@@ -108,7 +111,7 @@ for pid, row in rows.items():
         continue
     art = matches[0]
     line_desc = art["desc"].replace("XXX", f"{row.get('adr') or ''}, Projekt-ID {row.get('id')}")
-    price = art["price"] or float(cls.get("price") or 0)
+    price = art["price"] or float(cls_price or 0)
     inv = invoices.setdefault(str(row.get("cid")), {
         "company_id": row.get("cid"), "company": row.get("cname"),
         "lexoffice_id": row.get("lex"), "lines": [], "net_total": 0.0,
