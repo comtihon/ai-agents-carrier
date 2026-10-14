@@ -124,6 +124,8 @@ async def test_summary_view_omits_agent_input_and_addons(client):
         "visibility": "public",
         "owner_id": None,
         "owner_name": None,
+        "team_id": None,
+        "team_name": None,
         "can_edit": True,
     }]
     # Default view is unchanged.

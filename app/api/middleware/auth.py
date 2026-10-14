@@ -8,6 +8,8 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.infrastructure.auth.auth_service import AuthError, AuthService
+from app.application.login import LoginService, effective_roles, login_decision, with_profile
+from app.application.teams import directory_of, resolve_subject
 from app.infrastructure.auth.authorization import (
     AuthorizationPolicy,
     Permission,
@@ -87,12 +89,15 @@ class OAuthMiddleware(BaseHTTPMiddleware):
         app,
         auth_service: AuthService,
         policy: AuthorizationPolicy | None = None,
+        login_service: LoginService | None = None,
     ) -> None:
         super().__init__(app)
         self.auth_service = auth_service
         # No policy configured behaves as authentication-only, which is what every
         # deployment did before permissions existed.
         self.policy = policy or AuthorizationPolicy()
+        # The login script, if one is configured (app.application.login).
+        self.login_service = login_service
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
@@ -118,8 +123,17 @@ class OAuthMiddleware(BaseHTTPMiddleware):
 
         request.state.jwt_claims = claims
 
-        permissions = self.policy.permissions_for_claims(claims)
+        directory = directory_of(getattr(request.app.state, "container", None))
+        decision = await login_decision(self.login_service, token, claims, directory)
+        roles = effective_roles(self.policy, claims, decision)
+        permissions = self.policy.permissions_for_roles(roles)
         request.state.permissions = permissions
+        # Strict evaluation: in shadow mode `permissions` holds everything for
+        # everyone, which must not make every private resource visible.
+        would_grant = self.policy.permissions_for_roles_strict(roles)
+        subject = with_profile(
+            subject_from_claims(claims, Permission.SUPER_ADMIN in would_grant), decision
+        )
 
         # Shadow mode. With enforcement off the policy grants everything, so the
         # checks below never fire — but the mapping can still be evaluated and
@@ -128,22 +142,20 @@ class OAuthMiddleware(BaseHTTPMiddleware):
         # (most likely one holding an opaque token whose userinfo response carries
         # no project roles) shows up in logs first, while still being served.
         if not self.policy.enforce:
-            would_grant = self.policy.evaluate_shadow(claims)
             required_if_enforced = permission_for_method(request.method)
             if Permission.ACCESS not in would_grant:
                 logger.warning(
                     "RBAC shadow: subject %s would be DENIED access (no matching role); "
                     "roles=%s path=%s %s",
-                    claims.get("sub"), sorted(self.policy.roles_of(claims)),
-                    request.method, path,
+                    claims.get("sub"), sorted(roles), request.method, path,
                 )
             elif required_if_enforced not in would_grant:
                 logger.warning(
                     "RBAC shadow: subject %s would be DENIED %s; roles=%s path=%s %s",
                     claims.get("sub"), required_if_enforced.value,
-                    sorted(self.policy.roles_of(claims)), request.method, path,
+                    sorted(roles), request.method, path,
                 )
-            return await self._call_with_principal(permissions, claims, request, call_next)
+            return await self._call_with_principal(permissions, subject, directory, call_next, request)
 
         # ACCESS is the tenancy gate: an identity the provider issued a valid token
         # for, but which is not entitled to this API at all (a customer, on an
@@ -169,9 +181,9 @@ class OAuthMiddleware(BaseHTTPMiddleware):
                 content={"detail": f"Missing '{required.value}' permission"},
             )
 
-        return await self._call_with_principal(permissions, claims, request, call_next)
+        return await self._call_with_principal(permissions, subject, directory, call_next, request)
 
-    async def _call_with_principal(self, permissions, claims, request: Request, call_next):
+    async def _call_with_principal(self, permissions, subject, directory, call_next, request: Request):
         """Serve the request with *permissions* bound as the ambient principal.
 
         The HTTP method is not the whole story. A single authenticated request can
@@ -188,10 +200,10 @@ class OAuthMiddleware(BaseHTTPMiddleware):
         returned and reset its own copy.
         """
         token = set_current_permissions(permissions)
-        # Strict evaluation: in shadow mode `permissions` holds ADMIN for
-        # everyone, which must not make every private resource visible.
-        is_admin = Permission.ADMIN in self.policy.evaluate_shadow(claims)
-        subject_token = set_current_subject(subject_from_claims(claims, is_admin))
+        # The caller's team comes from carrier's own directory, read per
+        # request so a membership change applies at once on every replica.
+        subject = await resolve_subject(directory, subject)
+        subject_token = set_current_subject(subject)
         try:
             return await call_next(request)
         finally:

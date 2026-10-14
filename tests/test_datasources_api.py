@@ -176,6 +176,8 @@ async def test_summary_view_keeps_operation_methods_and_drops_the_rest(client):
         "visibility": "public",
         "owner_id": None,
         "owner_name": None,
+        "team_id": None,
+        "team_name": None,
         "can_edit": True,
     }]
     # Default view is unchanged, secrets still redacted.

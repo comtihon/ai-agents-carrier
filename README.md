@@ -50,6 +50,10 @@ API at `http://localhost:8000`. Health check: `GET /health`.
 | `AUTH_WRITE_ROLES` | `[]` | Roles granted WRITE (`POST`/`PUT`/`PATCH`, creates, updates, run control) |
 | `AUTH_DELETE_ROLES` | `[]` | Roles granted DELETE (`DELETE`, and the `delete_*` tools) |
 | `AUTH_ADMIN_ROLES` | `[]` | Roles granted ADMIN — `python` steps with `sandbox: false`, which run inside the backend process. Keep this narrowest |
+| `AUTH_SUPER_ADMIN_ROLES` | `[]` → `AUTH_ADMIN_ROLES` | Roles granted SUPER_ADMIN — system-wide visibility (every private and team resource, every run) and team management. Empty falls back to `AUTH_ADMIN_ROLES`; set it when ADMIN is a broad operations role |
+| `AUTH_LOGIN_SCRIPT` | — | JavaScript run when a user logs in, to derive their roles, profile and team from the token (see [Login script](#login-script)) |
+| `AUTH_LOGIN_SCRIPT_PATH` | — | Path to a file holding the login script, e.g. a mounted ConfigMap. Set this or `AUTH_LOGIN_SCRIPT`, not both: startup fails if both are set |
+| `AUTH_LOGIN_SCRIPT_TIMEOUT_MS` | `1000` | Wall-clock budget for one run of the login script |
 | `MANAGEMENT_MCP_API_KEY` | — | Static key for `/mcp/management`. Capped below ADMIN: a shared secret cannot be attributed to a person |
 | `OPENHANDS_BASE_URL` | `http://openhands:3000` | OpenHands service URL |
 | `OPENHANDS_API_KEY` | — | OpenHands auth token |
@@ -971,43 +975,173 @@ POST   /api/v1/callbacks/{run-id}/approve
 POST   /api/v1/callbacks/{run-id}/reject
 
 # Caller
-GET    /api/v1/me                             {sub, name, is_admin, auth_enabled}
+GET    /api/v1/me                             {sub, name, is_admin, is_super_admin, auth_enabled,
+                                               team: {id, name, role} | null}
+
+# Teams and users (see "Teams" below for who may call what)
+GET    /api/v1/teams                          super admin: all; others: own team or []
+POST   /api/v1/teams                          {name}                      super admin
+PUT    /api/v1/teams/{id}                     {name}                      super admin
+DELETE /api/v1/teams/{id}                     409 while resources are shared with it
+PUT    /api/v1/teams/{id}/members/{sub}       optional {role: member|admin}
+DELETE /api/v1/teams/{id}/members/{sub}
+GET    /api/v1/users                          super admin: all; team admin: own team + users in no team
 ```
 
 ### Ownership and visibility
 
-Agents, data sources, library scripts and workflows are each `public` or
-`private`, and owned by the user who created them (the token's `sub`). Every
+Agents, data sources, library scripts and workflows are each `public`, `team`
+or `private`, and owned by the user who created them (the token's `sub`). Every
 response object — full and `view=summary` alike, and the workflow list —
-carries `visibility`, `owner_id`, `owner_name` and `can_edit` (computed for the
-caller). Create and update bodies accept an optional `visibility`; omitted on
-create it defaults to `private` for a user, omitted on update it is kept.
+carries `visibility`, `owner_id`, `owner_name`, `team_id`, `team_name` and
+`can_edit` (computed for the caller). Create and update bodies accept an
+optional `visibility` and, with `"team"`, an optional `team_id`; omitted on
+create visibility defaults to `private` for a user, omitted on update it is
+kept.
 
-- **Private** resources are visible to their owner and to admins only. To
-  anyone else they do not exist: not listed, `404` by id, not offered to the
+- **Private** resources are visible to their owner and to super admins only.
+  To anyone else they do not exist: not listed, `404` by id, not offered to the
   chat agent or the management MCP tools, absent from the dynamic dispatcher's
-  roster. A private workflow's runs, traces, run data and approval cases follow
-  it — filtered in the Mongo query, so pages and totals count visible runs only.
-- **Editing** (and deleting, and changing visibility) is for the owner or an
-  admin: `403` otherwise. Documents stored before ownership existed load as
-  public and unowned, and stay editable by anyone with `WRITE`; making one
-  private makes the caller its owner.
-- **References** are checked on save (`422`): you can only use resources you can
-  see, a public resource may only use public ones, and a private one only public
-  ones or its own owner's private ones. Making a resource private is refused
-  (`409`) while a public resource, or another user's, still uses it.
-- **Admins** are callers holding a role in `AUTH_ADMIN_ROLES`, evaluated even
-  when `AUTH_ENFORCE_PERMISSIONS` is off (in shadow mode every caller is
-  *granted* ADMIN, which must not make every private resource visible).
+  roster. A workflow's runs, traces, run data and approval cases follow the
+  workflow's visibility — filtered in the Mongo query, so pages and totals count
+  visible runs only, and a visibility or membership change applies at once.
+- **Team** resources are visible to the members of one team (see below) as
+  well. Members may *use* team agents, data sources and scripts in their
+  workflows, and may *edit and run* team workflows. A team resource keeps its
+  team when its owner leaves it; the owner still sees it, other leavers do not.
+  `team_id` defaults to the caller's team (`422` without one); naming another
+  team is `403` — except for a super admin, who may name any existing team
+  (`422` if unknown, and `422` "team_id required" when they are in no team).
+- **Editing** content is for the owner, a super admin, or — for team
+  workflows — the team's members: `403` otherwise. **Deleting** and **changing
+  visibility or team** is for the owner or a super admin only. Documents stored
+  before ownership existed load as public and unowned, and stay editable by
+  anyone with `WRITE`; narrowing one makes the caller its owner.
+- **References** are checked on save (`422`). Scopes rank public > team >
+  private, and a resource may only use what the caller can see and what is at
+  least as widely visible as itself: a public resource uses public ones; a team
+  resource uses public ones and its own team's; a private one uses public ones,
+  its owner's team's, and its owner's private ones. Agent data source add-ons
+  follow the same rules. Narrowing a resource (public → team → private, or to
+  another team) is refused (`409`) while something it would break still uses
+  it; a referrer the caller cannot see is not named.
+- **Super admins** are callers holding a role in `AUTH_SUPER_ADMIN_ROLES`
+  (or, when that is empty, `AUTH_ADMIN_ROLES`), evaluated even when
+  `AUTH_ENFORCE_PERMISSIONS` is off (in shadow mode every caller is *granted*
+  every permission, which must not make every private resource visible). They
+  work system-wide: every resource, team and run, whatever team they are in.
+  ADMIN on its own (unsandboxed `python` steps) confers no visibility once
+  `AUTH_SUPER_ADMIN_ROLES` is set. `/me` reports both: `is_admin` (ADMIN) and
+  `is_super_admin`.
 - **The management MCP static key** is nobody in particular: it sees and
   creates public resources only.
 - **Without authentication** (`OAUTH_ENABLED=false`) there is no owner and all
   of this is a no-op. The platform itself — cron, Pub/Sub, webhooks, agent
   callbacks, the data sources MCP — likewise sees everything, so a triggered run
-  of a private workflow resolves its owner's private resources.
+  of a private or team workflow resolves the resources it was saved with.
 - **Script names** are unique within what one caller can see; ids stay global,
   so saving a name whose id belongs to a script you cannot see answers `409`
   ("id already taken") without saying whose.
+
+### Teams
+
+Teams live in carrier's own MongoDB (`teams`; membership on `users`), so they
+work with any OIDC provider. Every authenticated caller is recorded in `users`
+(name, email, last seen) — that is the list membership is managed from. A user
+is in at most one team, or none, as a `member` or an `admin`; their team is
+read on every request, so a change applies on their next one.
+
+- **Super admin**: creates, renames and deletes teams (a team with resources
+  shared with it cannot be deleted: `409`), and adds, moves (between teams),
+  promotes and removes anyone.
+- **Team admin** (`role: admin` in a team): adds users who are in *no* team to
+  their team (`409` for a user in another team — moving users between teams is
+  a super admin's), removes members, and promotes or demotes them. A team that
+  has members keeps at least one admin (`409`). A team admin has no extra rights
+  over the team's resources.
+- Everyone else: `GET /teams` shows their own team and its members.
+
+Membership can also be set automatically from the token by a
+[login script](#login-script).
+
+### Login script
+
+A deployment can supply a JavaScript function that the backend runs when a user
+logs in, to turn whatever its identity provider puts in a token — groups,
+custom claims, an email domain — into carrier's roles, profile and team. No
+code change, and nothing provider-specific in this repository.
+
+```js
+// Example: groups claim -> roles, department claim -> team.
+function onLogin(ctx) {
+  const groups = ctx.claims.groups || [];
+  const result = {
+    roles: groups.filter((g) => g.startsWith("carrier-")),
+  };
+  if (ctx.claims.department) {
+    result.team = {
+      name: ctx.claims.department,
+      role: groups.includes("carrier-team-leads") ? "admin" : "member",
+    };
+  }
+  return result;
+}
+```
+
+Configure it inline with `AUTH_LOGIN_SCRIPT`, or as a file with
+`AUTH_LOGIN_SCRIPT_PATH` (the Helm chart mounts `auth.loginScript` for you, see
+[Deployment](#login-script-in-helm)). It only runs with `OAUTH_ENABLED=true`.
+With no script configured nothing changes: roles come from the token.
+
+**Input.** `onLogin(ctx)` receives:
+
+| field | value |
+|---|---|
+| `ctx.claims` | the validated token's claims (or the userinfo response, for opaque tokens) |
+| `ctx.user` | the stored user — `{sub, name, email, team}` with `team` `{id, name, role}` or `null` — or `null` on a first login |
+| `ctx.teams` | every existing team, `[{id, name}]` |
+
+**Output.** An object; every field is optional. Returning nothing, `null` or
+`{}` changes nothing.
+
+| field | effect |
+|---|---|
+| `roles` | array of strings. *Replaces* the roles read from the token for the role mapping, so `AUTH_ACCESS_ROLES` … `AUTH_SUPER_ADMIN_ROLES` apply to these. `[]` means no roles; leave it out (or `null`) to keep the token's roles |
+| `name`, `email` | non-empty strings. Replace the stored profile and what `/me` reports |
+| `team` | `null`: in no team. `{name, role}` or `{id, role}`: in that team, `role` `"member"` (default) or `"admin"`. Leave it out to keep the stored membership, so teams can still be managed by hand |
+
+A team named by `name` (exact match) that does not exist yet is created: the
+script is configuration written by whoever deploys carrier, as trusted as the
+role settings themselves. A team named by an `id` that does not exist is
+logged and leaves the membership unchanged. A script that returns `team`
+*owns* membership: a manual change holds only until that user's next login.
+The team-admin rules of the API (a team keeps at least one admin) do not bind
+the script.
+
+**When it runs.** There is no login endpoint; a "login" is the first request
+with a token this replica has not seen. The script runs then, its profile and
+team changes are written, and its decision is cached (keyed by a hash of the
+token, bounded in size) until the token expires — or for five minutes for
+tokens with no `exp`. Every later request with that token reuses the cached
+roles; a new token (a refresh) is a new login. A caller whose resulting roles
+grant no access is refused and nothing is written for them. The management MCP
+static API key never runs the script and keeps its fixed permissions (never
+ADMIN or SUPER_ADMIN).
+
+**Failure.** If the script throws, exceeds `AUTH_LOGIN_SCRIPT_TIMEOUT_MS` or a
+64 MiB heap, or returns anything outside the contract above (an unknown field
+included, so a typo cannot silently do nothing), the error is logged and that
+login proceeds exactly as with no script: the token's own roles, profile and
+membership untouched. Nothing is granted that the token itself would not grant,
+and nobody is locked out by a broken script — unless the token carries no
+usable roles, in which case they get none. A failure is retried after 30
+seconds rather than cached until the token expires. A script that cannot be
+loaded at all (unreadable file, syntax error, no `onLogin` function) fails
+startup.
+
+**Sandbox.** The script runs in an embedded V8 isolate (`mini-racer`): no
+network, filesystem, process or module access, a fresh isolate for every run so nothing carries over between logins, and
+`onLogin` must return synchronously (a promise is an error).
 
 ---
 
@@ -1064,3 +1198,20 @@ serviceAccount:
 ```
 
 Either way the chart's Role and RoleBinding keep their release-derived names, so the agent-manager permissions follow whichever account the pod actually uses.
+
+### Login script in Helm
+
+Set `auth.loginScript` to the script's source. The chart renders it into a
+ConfigMap, mounts it read-only at `/etc/carrier/auth/login.js`, points
+`AUTH_LOGIN_SCRIPT_PATH` at it, and rolls the pods when it changes (the script
+is loaded at startup). Empty (the default) renders nothing.
+
+```yaml
+auth:
+  loginScript: |
+    function onLogin(ctx) {
+      return { roles: ctx.claims.groups || [] };
+    }
+config:
+  AUTH_LOGIN_SCRIPT_TIMEOUT_MS: "500"   # optional
+```

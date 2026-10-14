@@ -34,8 +34,11 @@ from app.infrastructure.auth.authorization import (
     set_current_subject,
     subject_from_claims,
 )
+from app.application.login import LoginService, effective_roles, login_decision, with_profile
+from app.application.teams import directory_of, resolve_subject
 from app.application.visibility import VisibilityError, can_see, unwrap, workflow_visible
 from app.api.routes.me import router as me_router
+from app.api.routes.teams import router as teams_router
 from app.api.routes.agent_callbacks import router as agent_callbacks_router
 from app.api.routes.agents import router as agents_router
 from app.api.routes.approvals import router as approvals_router
@@ -53,6 +56,7 @@ from app.core.config import get_settings
 from app.core.container import ApplicationContainer, build_container
 from app.domain.models.graph_run import GraphRun
 from app.infrastructure.auth.auth_service import AuthError, AuthService
+from app.infrastructure.auth.login_script import load_login_script
 from app.infrastructure.auth.datasource_grant import (
     DatasourceGrant,
     looks_like_grant,
@@ -204,9 +208,11 @@ class _ManagementAuthWrapper:
         oauth_enabled: bool,
         auth_service: AuthService | None = None,
         policy: AuthorizationPolicy | None = None,
+        login_service: LoginService | None = None,
     ) -> None:
         self._app = app
         self._policy = policy or AuthorizationPolicy()
+        self._login_service = login_service
         # Strip surrounding whitespace (a Secret Manager value often carries a
         # trailing newline, which no HTTP header value can hold, so an unstripped
         # key could never match); empty / whitespace-only counts as unset.
@@ -247,7 +253,11 @@ class _ManagementAuthWrapper:
                 logger.warning("management MCP auth rejected: %s", exc.message)
                 await _send_401(send)
                 return
-            permissions = self._policy.permissions_for_claims(claims)
+            app = scope.get("app")
+            directory = directory_of(getattr(getattr(app, "state", None), "container", None))
+            decision = await login_decision(self._login_service, token, claims, directory)
+            roles = effective_roles(self._policy, claims, decision)
+            permissions = self._policy.permissions_for_roles(roles)
             if Permission.ACCESS not in permissions:
                 logger.warning(
                     "management MCP authorization rejected: subject %s holds no role "
@@ -256,8 +266,12 @@ class _ManagementAuthWrapper:
                 )
                 await _send_403(send)
                 return
-            subject = subject_from_claims(
-                claims, Permission.ADMIN in self._policy.evaluate_shadow(claims)
+            is_super_admin = (
+                Permission.SUPER_ADMIN in self._policy.permissions_for_roles_strict(roles)
+            )
+            subject = await resolve_subject(
+                directory,
+                with_profile(subject_from_claims(claims, is_super_admin), decision),
             )
             await self._call_with_principal(permissions, subject, scope, receive, send)
             return
@@ -607,6 +621,7 @@ def create_app() -> FastAPI:
     authz_policy = AuthorizationPolicy.from_settings(settings)
     app.state.authz_policy = authz_policy
     auth_service: AuthService | None = None
+    login_service: LoginService | None = None
     if settings.oauth_enabled:
         auth_service = AuthService(
             jwks_url=settings.oauth_jwks_url,
@@ -614,7 +629,19 @@ def create_app() -> FastAPI:
             algorithms=settings.oauth_algorithms,
             audience=settings.oauth_audience,
         )
-        app.add_middleware(OAuthMiddleware, auth_service=auth_service, policy=authz_policy)
+        # Fails startup on a configured but unusable script.
+        login_script = load_login_script(settings)
+        if login_script is not None:
+            login_service = LoginService(login_script, policy=authz_policy)
+        app.add_middleware(
+            OAuthMiddleware,
+            auth_service=auth_service,
+            policy=authz_policy,
+            login_service=login_service,
+        )
+    elif settings.auth_login_script or settings.auth_login_script_path:
+        logger.warning("A login script is configured but OAUTH_ENABLED is false; it never runs")
+    app.state.login_service = login_service
     # Ownership/visibility refusals are raised from the scoped backends, below
     # every route; this turns them into the status each one names.
     app.add_exception_handler(VisibilityError, _visibility_error_response)
@@ -628,6 +655,7 @@ def create_app() -> FastAPI:
     )
     app.include_router(health_router)
     app.include_router(me_router, prefix=settings.api_prefix)
+    app.include_router(teams_router, prefix=settings.api_prefix)
     app.include_router(workflows_router, prefix=settings.api_prefix)
     app.include_router(agents_router, prefix=settings.api_prefix)
     app.include_router(datasources_router, prefix=settings.api_prefix)
@@ -694,6 +722,7 @@ def create_app() -> FastAPI:
             oauth_enabled=settings.oauth_enabled,
             auth_service=auth_service,
             policy=authz_policy,
+            login_service=login_service,
         )
     app.mount("/mcp", _McpDispatcher(mcp_routes))
     return app
