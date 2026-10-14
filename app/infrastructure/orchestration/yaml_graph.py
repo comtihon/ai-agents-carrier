@@ -29,6 +29,7 @@ from langgraph.errors import GraphBubbleUp
 from langgraph.types import interrupt
 
 from app.application import data_artifacts
+from app.infrastructure.orchestration import step_outputs as _step_outputs
 from app.application.step_normalization import normalize_edges
 from app.domain.models.graph_run import GraphRun
 from app.infrastructure.tools.mcp_client import McpToolsProvider
@@ -445,7 +446,10 @@ async def stream_graph_to_pause(
                 # step_statuses (it would show up as a phantom "done" step in the UI).
                 if node_name == "__interrupt__":
                     _stream_interrupt_output = output
-                    run.step_inputs[node_name] = dict(current_state)
+                    # No state snapshot: step_inputs used to hold a full copy of
+                    # state per entry, which is what grew the run document to
+                    # steps x state. The interrupt payload is in step_outputs.
+                    run.step_inputs[node_name] = {}
                     if output:
                         run.step_outputs[node_name] = output
                     run.touch()
@@ -462,11 +466,13 @@ async def stream_graph_to_pause(
                     # that the node body actually executed.
                     ran=run.step_statuses.get(node_name) == "running",
                 )
-                run.step_inputs[node_name] = dict(current_state)
+                run.step_inputs[node_name] = _step_outputs.step_input_snapshot(
+                    _node_def, current_state
+                )
                 run.step_statuses[node_name] = status
                 run.current_step = node_name
                 if output:
-                    run.step_outputs[node_name] = output
+                    run.step_outputs[node_name] = _step_outputs.step_output_record(output)
                     if isinstance(output, dict):
                         current_state.update(output)
                 logger.info("run %s: step '%s' → %s", run.id, node_name, status)
@@ -497,13 +503,17 @@ async def stream_graph_to_pause(
             None,
         )
         if running_sid is not None:
-            run.step_inputs[running_sid] = dict(current_state)
+            run.step_inputs[running_sid] = _step_outputs.step_input_snapshot(
+                runner.step_by_id(running_sid), current_state
+            )
             run.step_statuses[running_sid] = "failed"
             run.step_outputs[running_sid] = {"error": error_msg}
         else:
             failed_sid = current_state.get("__failed_step__") if isinstance(current_state, dict) else None
             if isinstance(failed_sid, str) and failed_sid in run.step_statuses:
-                run.step_inputs[failed_sid] = dict(current_state)
+                run.step_inputs[failed_sid] = _step_outputs.step_input_snapshot(
+                    runner.step_by_id(failed_sid), current_state
+                )
                 run.step_statuses[failed_sid] = "failed"
                 if not run.step_outputs.get(failed_sid):
                     run.step_outputs[failed_sid] = {"error": error_msg}
@@ -665,6 +675,9 @@ async def stream_graph_to_pause(
 
     if run.status == "waiting_approval" and base_url and run.current_step:
         step = next((s for s in runner.steps if s["id"] == run.current_step), None)
+        # Notification templates render against state outside any node, so the
+        # stored outputs they name are resolved here, as the node wrapper would.
+        _notify_values = await runner.hydrate_for_step(step, dict(snap.values or {}))
         # Fire Slack notification for explicit ask_context steps AND for agent steps
         # that raised an ask_context interrupt internally via meta-LLM — but only
         # when a Slack addon (slack_notifications) is attached to the agent step.
@@ -706,7 +719,7 @@ async def stream_graph_to_pause(
                             bot_token=effective_token,
                             payload_template=step["slack_payload"],
                             run_id=run.id,
-                            state={**(snap.values or {}), **extra},
+                            state={**_notify_values, **extra},
                             questions=questions,
                         )
                     elif existing_ts and existing_channel:
@@ -718,7 +731,7 @@ async def stream_graph_to_pause(
                         # First interrupt: open a new root message
                         notif_resp = await post_slack_ask_context(
                             effective_token, effective_channel,
-                            questions, run.id, snap.values,
+                            questions, run.id, _notify_values,
                         )
                         if notif_resp and notif_resp.get("ok"):
                             ts = notif_resp.get("ts")
@@ -734,7 +747,7 @@ async def stream_graph_to_pause(
                                 await run_repository.update(run)
 
         elif step and step.get("notify"):
-            notif_resp = await send_approval_notification(step["notify"], run.id, snap.values, base_url)
+            notif_resp = await send_approval_notification(step["notify"], run.id, _notify_values, base_url)
             if notif_resp and notif_resp.get("ok"):
                 ts = notif_resp.get("ts")
                 channel = notif_resp.get("channel")
@@ -1171,6 +1184,11 @@ class YamlGraphRunner:
         # `data_source` step still runs, it just cannot spill, so an oversized
         # result fails the step instead.
         self._stream_store: Any = None
+        # Injected post-construction: writes every step's output to the stream
+        # store under the run's folder and leaves a reference in state (see
+        # app.infrastructure.orchestration.step_outputs). None = outputs stay
+        # inline, the pre-offload behaviour (and what bare test runners get).
+        self._step_output_store: Any = None
         # Injected post-construction for `data` steps: the run download
         # manifest.  Optional -- without it a `data` step still runs and still
         # returns state unchanged, it simply records nothing (and says so).
@@ -1197,6 +1215,97 @@ class YamlGraphRunner:
     @property
     def steps(self) -> list[dict[str, Any]]:
         return self._steps
+
+    def step_by_id(self, step_id: str | None) -> dict[str, Any] | None:
+        return next((s for s in self._steps if s.get("id") == step_id), None)
+
+    # ------------------------------------------------------------------
+    # Stored step outputs (references in state, values in the store)
+    # ------------------------------------------------------------------
+
+    async def hydrate_for_step(self, step: dict[str, Any] | None, state: Any) -> Any:
+        """*state* with the stored outputs *step* references resolved.
+
+        Best-effort for callers outside a node (notification templates): a
+        failure to read leaves the references in place rather than raising.
+        """
+        store = self._step_output_store
+        if store is None or not isinstance(state, dict) or step is None:
+            return state
+        try:
+            return await store.hydrate(
+                state, _step_outputs.referenced_keys(step), step_id=step.get("id", "")
+            )
+        except Exception:  # noqa: BLE001 — a notification must not fail the run
+            logger.warning("[%s] could not hydrate state for step '%s'", self.id,
+                           step.get("id"), exc_info=True)
+            return state
+
+    def _run_id_from(self, config: Any) -> str:
+        try:
+            thread_id = ((config or {}).get("configurable") or {}).get("thread_id")
+        except AttributeError:
+            thread_id = None
+        if thread_id:
+            return str(thread_id)
+        run = self._current_run
+        return str(getattr(run, "id", "") or "")
+
+    def _output_iteration(self, step_id: str, run_id: str, state: dict) -> int:
+        """How many times *step_id* has started in this run (>= 1).
+
+        Read off the routing journal when this runner is driving that run --
+        it records every node start, loop-guard-exempt types included -- and
+        off the loop guard's visit counter otherwise.
+        """
+        run = self._current_run
+        if run is not None and getattr(run, "id", None) == run_id:
+            starts = sum(
+                1 for e in (run.routing_log or [])
+                if getattr(e, "event", None) == "node_start" and getattr(e, "node", None) == step_id
+            )
+            if starts:
+                return starts
+        return int(((state or {}).get("_visit_counts") or {}).get(step_id, 0)) + 1
+
+    def _wrap_with_step_io(self, step: dict[str, Any], fn: Callable) -> Callable:
+        """Resolve the stored outputs a step reads; store the outputs it writes.
+
+        Outermost wrapper, so the ``when`` guard, every template, a switch's
+        conditions and a python step's ``state`` all see values, and so what
+        LangGraph checkpoints -- and the run document copies -- is references.
+        """
+        step_id = step["id"]
+        step_type = str(step.get("type") or "")
+        needed = _step_outputs.referenced_keys(step)
+        is_async = asyncio.iscoroutinefunction(fn)
+
+        async def _io(state: dict, config=None) -> dict:
+            store = self._step_output_store
+            if store is None:
+                return (await fn(state)) if is_async else fn(state)
+            run_id = self._run_id_from(config)
+            try:
+                hydrated = await store.hydrate(state, needed, step_id=step_id)
+            except Exception:
+                # Attribute the failure to this step: nothing inside has had
+                # the chance to mark it running.
+                run = self._current_run
+                if run is not None and getattr(run, "id", None) == run_id:
+                    run.step_statuses[step_id] = "running"
+                raise
+            result = (await fn(hydrated)) if is_async else fn(hydrated)
+            if not run_id or not isinstance(result, dict) or not result:
+                return result
+            return await store.offload(
+                run_id=run_id,
+                step_id=step_id,
+                step_type=step_type,
+                iteration=self._output_iteration(step_id, run_id, state),
+                update=result,
+            )
+
+        return _io
 
     # ------------------------------------------------------------------
     # Graph construction
@@ -1370,7 +1479,7 @@ class YamlGraphRunner:
             raise ValueError(f"Unknown step type '{t}' in graph '{self.id}'")
         wrapped = self._wrap_with_status_running(self._wrap_with_loop_guard(step, fn), step)
         wrapped = self._wrap_with_when(step, wrapped)
-        return self._wrap_with_fail_guard(step, wrapped)
+        return self._wrap_with_step_io(step, self._wrap_with_fail_guard(step, wrapped))
 
     _NO_LOOP_GUARD_TYPES: frozenset = frozenset({"ask_context", "human_approval", "cron", "http", "pubsub", "parallel", "join", "proceed_or", "switch", "langgraph-agent", "claude-agent", "dynamic", "dynamic_gate"})
     # join handles __failed_step__ itself via failure_policy; all others must abort when
@@ -1616,8 +1725,14 @@ class YamlGraphRunner:
             )
 
         runner = self
+        cond_keys = _step_outputs.condition_keys(r.get("when") for r in routes)
 
         async def router(state: dict) -> str:
+            store = runner._step_output_store
+            if store is not None and cond_keys:
+                # Route conditions are evaluated outside the node, against the
+                # checkpointed state -- resolve the stored outputs they name.
+                state = await store.hydrate(state, cond_keys, step_id=source_id)
             chosen = _select(state)
             logger.info(
                 "[%s] router '%s' → '%s' (condition: %r)",

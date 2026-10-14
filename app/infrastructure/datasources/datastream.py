@@ -79,6 +79,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import time
 import uuid
@@ -227,6 +228,53 @@ class DataStreamStore(ABC):
         keeps them indefinitely, which is what a caller sweeping only the
         ordinary backlog wants.
         """
+
+
+    # -- named objects (step outputs) -----------------------------------
+    #
+    # Not streams: a step output is one small-to-medium document written once
+    # under a name the engine chooses (``runs/<run_id>/<step>.md``), read back
+    # whole when a later step needs it, and deleted with its run.  It shares
+    # the store -- and therefore the bucket, the credentials and the
+    # local/test backends -- with the streams, but none of the stream
+    # machinery: no TTL sweep (the sweep only walks ``ds_*``), no pinning, no
+    # record framing.  Concrete stores override these; the defaults refuse
+    # loudly so a store that cannot hold objects is never silently skipped.
+
+    async def put_object(
+        self, key: str, data: bytes, *, content_type: str = "text/markdown"
+    ) -> str:
+        """Write *data* under *key*, replacing any previous object; returns its uri."""
+        raise NotImplementedError(f"{type(self).__name__} cannot store named objects")
+
+    async def get_object(self, key: str) -> bytes:
+        """The bytes stored under *key*; raises :class:`StreamGone` when absent."""
+        raise NotImplementedError(f"{type(self).__name__} cannot store named objects")
+
+    async def delete_objects(self, prefix: str) -> int:
+        """Delete every object under *prefix*; returns how many went."""
+        return 0
+
+    def object_uri(self, key: str) -> str:
+        """Human-facing location of *key* (``gs://...``, ``file://...``)."""
+        return key
+
+
+_OBJECT_KEY_RE = re.compile(r"^runs/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*/?$")
+
+
+def validate_object_key(key: str) -> str:
+    """Refuse any object key that is not a plain ``runs/...`` path.
+
+    The key becomes a filesystem path or an object name, so ``..``, a leading
+    dot, a backslash or an absolute path must never get through -- a ref that
+    reached us altered must not be able to name another file.
+    """
+    if not isinstance(key, str) or not _OBJECT_KEY_RE.match(key):
+        raise ValueError(f"invalid object key {key!r}")
+    if any(seg in ("", ".", "..") or seg.startswith(".") for seg in key.rstrip("/").split("/")):
+        raise ValueError(f"invalid object key {key!r}")
+    return key
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +600,52 @@ class LocalDiskStreamStore(DataStreamStore):
         if removed:
             logger.info("data stream store: purged %d expired stream(s)", removed)
         return removed
+
+    # -- named objects ---------------------------------------------------
+    def _object_path(self, key: str) -> Path:
+        return self._dir / validate_object_key(key)
+
+    async def put_object(
+        self, key: str, data: bytes, *, content_type: str = "text/markdown"
+    ) -> str:
+        path = self._object_path(key)
+
+        def _write() -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+            tmp.write_bytes(data)
+            os.replace(tmp, path)
+
+        await asyncio.to_thread(_write)
+        return self.object_uri(key)
+
+    async def get_object(self, key: str) -> bytes:
+        path = self._object_path(key)
+        try:
+            return await asyncio.to_thread(path.read_bytes)
+        except FileNotFoundError as exc:
+            raise StreamGone(
+                f"stored step output '{key}' is gone. A local-disk store does "
+                f"not survive a pod restart; re-run the step that produced it."
+            ) from exc
+
+    async def delete_objects(self, prefix: str) -> int:
+        root = self._object_path(prefix)
+
+        def _delete() -> int:
+            if root.is_file():
+                root.unlink()
+                return 1
+            if not root.is_dir():
+                return 0
+            count = sum(1 for p in root.rglob("*") if p.is_file())
+            shutil.rmtree(root, ignore_errors=True)
+            return count
+
+        return await asyncio.to_thread(_delete)
+
+    def object_uri(self, key: str) -> str:
+        return self._object_path(key).resolve().as_uri()
 
     async def free_bytes(self) -> int:
         """Space left on the stream filesystem, for a pre-flight check."""
