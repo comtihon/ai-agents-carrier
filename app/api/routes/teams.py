@@ -21,6 +21,12 @@ class MemberRequest(BaseModel):
     role: Literal["member", "admin"] = "member"
 
 
+class UserTeamRequest(BaseModel):
+    # None: in no team.
+    team_id: str | None = None
+    role: Literal["member", "admin"] = "member"
+
+
 def _directory(container: ApplicationContainer):
     directory = teams.directory_of(container)
     if directory is None:
@@ -89,3 +95,20 @@ async def remove_member(
 async def list_users(container: ApplicationContainer = Depends(get_container)) -> list[dict]:
     """Super admin: everyone. Team admin: users in no team plus their own team."""
     return await teams.list_users(_directory(container))
+
+
+@router.put("/users/{sub}/team")
+async def set_user_team(
+    sub: str, body: UserTeamRequest, container: ApplicationContainer = Depends(get_container)
+) -> dict:
+    """Super admin: set (or with ``team_id: null`` clear) a user's team."""
+    return await teams.set_user_team(_directory(container), sub, body.team_id, body.role)
+
+
+@router.delete("/users/{sub}", status_code=204)
+async def delete_user(
+    sub: str, container: ApplicationContainer = Depends(get_container)
+) -> Response:
+    """Super admin: remove the stored user record (and membership)."""
+    await teams.delete_user(_directory(container), sub)
+    return Response(status_code=204)
