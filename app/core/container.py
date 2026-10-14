@@ -757,20 +757,88 @@ class ApplicationContainer:
             logger.info("Registry runner removed for workflow '%s'", workflow_id)
 
     async def _recover_incomplete_runs(self) -> None:
-        """On startup, find runs still marked running/waiting_approval and restore them."""
+        """On startup, find runs still marked running/waiting_* and restore them.
+
+        Crash-loop guard: each resume is counted on the run document
+        (``recovery_attempts``, atomic ``$inc``) *before* it starts, so the
+        count survives the process being killed by the very run it resumed.
+        The counter is zeroed whenever the run completes a step (see
+        ``stream_graph_to_pause``) or is parked again in a waiting state, so
+        it only measures consecutive recoveries without progress. A run found
+        with ``recovery_attempts >= run_recovery_max_attempts`` crashed the
+        server that many times in a row: it is failed instead of resumed and
+        its workflow is disabled.
+
+        One run failing to recover never stops the others.
+        """
         try:
-            incomplete = await self.run_repository.list_incomplete()
+            candidates = await self.run_repository.list_recovery_candidates()
         except Exception:
             logger.exception("Failed to query incomplete runs for recovery")
             return
-        if not incomplete:
+        if not candidates:
             return
-        logger.info("Recovering %d incomplete run(s) after restart", len(incomplete))
-        for run in incomplete:
+        logger.info("Recovering %d incomplete run(s) after restart", len(candidates))
+        max_attempts = self.settings.run_recovery_max_attempts
+        for candidate in candidates:
             try:
+                if candidate.kind == "job":
+                    # Not executed on recovery (just closed), so never counted.
+                    run = await self.run_repository.get(candidate.id)
+                    if run is not None:
+                        await self._recover_run(run)
+                    continue
+                if max_attempts > 0 and candidate.recovery_attempts >= max_attempts:
+                    await self._quarantine_crash_looping_run(candidate.id, candidate.graph_id, candidate.recovery_attempts)
+                    continue
+                run = await self.run_repository.begin_recovery(candidate.id)
+                if run is None:
+                    continue  # finished or failed since the candidate list was read
                 await self._recover_run(run)
+                if run.status in ("waiting_approval", "waiting_agent"):
+                    # Re-parked without executing anything: the recovery itself
+                    # survived, so this is not a crash loop.
+                    run.recovery_attempts = 0
+                    await self.run_repository.reset_recovery_attempts(run.id)
             except Exception:
-                logger.exception("Failed to recover run %s", run.id)
+                logger.exception("Failed to recover run %s", candidate.id)
+
+    async def _quarantine_crash_looping_run(self, run_id: str, workflow_id: str, attempts: int) -> None:
+        """Fail a run that crashed the server on every recovery, and disable its workflow."""
+        error = (
+            f"auto-failed: crashed the server on {attempts} consecutive recoveries "
+            f"(workflow '{workflow_id}' disabled to prevent a restart loop)"
+        )
+        logger.error(
+            "run %s (workflow '%s'): resumed %d times on startup without progress and the server "
+            "went down each time — NOT resuming it; marking failed and disabling the workflow",
+            run_id, workflow_id, attempts,
+        )
+        await self.run_repository.fail_incomplete(run_id, error)
+        await self._disable_workflow(workflow_id, reason=f"run {run_id} crash-looped the server")
+
+    async def _disable_workflow(self, workflow_id: str, reason: str) -> None:
+        # The in-memory runner first, so nothing can trigger it on this process
+        # even when persisting the flag fails (e.g. a read-only ConfigMap).
+        runner = self.yaml_graph_registry.get(workflow_id)
+        if runner is not None:
+            runner.enabled = False
+        if self.workflow_backend is None:
+            logger.warning("workflow '%s' disabled in memory only (no workflow backend): %s", workflow_id, reason)
+            return
+        try:
+            backend = unwrap(self.workflow_backend)
+            defn = await backend.get(workflow_id)
+            if defn is None:
+                logger.warning("workflow '%s' not found; cannot persist disable (%s)", workflow_id, reason)
+                return
+            if defn.enabled:
+                defn.enabled = False
+                await backend.update(workflow_id, defn)
+            await self.refresh_runner(workflow_id)
+            logger.error("workflow '%s' disabled: %s", workflow_id, reason)
+        except Exception:
+            logger.exception("Failed to persist disable of workflow '%s' (%s)", workflow_id, reason)
 
     async def _recover_run(self, run: GraphRun) -> None:
         if run.kind == "job":

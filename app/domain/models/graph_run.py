@@ -56,6 +56,13 @@ class GraphRun(BaseModel):
     # LangSmith / local tracing
     langsmith_run_id: str | None = None
     trace_data: dict[str, Any] = Field(default_factory=dict)
+    # Crash-loop guard. Startup recovery increments this in Mongo (atomic $inc)
+    # *before* resuming the run, and stream_graph_to_pause zeroes it whenever a
+    # step completes and is persisted. A value that keeps climbing therefore
+    # means "resumed N times on startup and the server died each time before
+    # the run made any progress" — see ApplicationContainer._recover_incomplete_runs.
+    recovery_attempts: int = 0
+    last_recovery_at: datetime | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
