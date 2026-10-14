@@ -44,6 +44,24 @@ service:
 #                                          # empty falls back to AUTH_ADMIN_ROLES
 config: {}
 
+# Login script (README "Login script"): JavaScript defining onLogin(ctx), run
+# when a user logs in to derive their roles, profile and team from the token.
+# Rendered into a ConfigMap, mounted at /etc/carrier/auth/login.js and passed
+# as AUTH_LOGIN_SCRIPT_PATH; pods roll when it changes. Empty: no script.
+# Example:
+#   auth:
+#     loginScript: |
+#       function onLogin(ctx) {
+#         const groups = ctx.claims.groups || [];
+#         return {
+#           roles: groups,
+#           team: ctx.claims.department ? { name: ctx.claims.department } : undefined,
+#         };
+#       }
+# AUTH_LOGIN_SCRIPT_TIMEOUT_MS (default 1000) goes in `config` above.
+auth:
+  loginScript: ""
+
 # Secrets injected as individual env vars.
 # Key becomes the env var name (uppercased if needed by convention).
 # Value must have 'name' (k8s Secret name) and 'key' (Secret data key).
