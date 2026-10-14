@@ -51,6 +51,9 @@ API at `http://localhost:8000`. Health check: `GET /health`.
 | `AUTH_DELETE_ROLES` | `[]` | Roles granted DELETE (`DELETE`, and the `delete_*` tools) |
 | `AUTH_ADMIN_ROLES` | `[]` | Roles granted ADMIN — `python` steps with `sandbox: false`, which run inside the backend process. Keep this narrowest |
 | `AUTH_SUPER_ADMIN_ROLES` | `[]` → `AUTH_ADMIN_ROLES` | Roles granted SUPER_ADMIN — system-wide visibility (every private and team resource, every run) and team management. Empty falls back to `AUTH_ADMIN_ROLES`; set it when ADMIN is a broad operations role |
+| `AUTH_LOGIN_SCRIPT` | — | JavaScript run when a user logs in, to derive their roles, profile and team from the token (see [Login script](#login-script)) |
+| `AUTH_LOGIN_SCRIPT_PATH` | — | Path to a file holding the login script, e.g. a mounted ConfigMap. Set this or `AUTH_LOGIN_SCRIPT`, not both: startup fails if both are set |
+| `AUTH_LOGIN_SCRIPT_TIMEOUT_MS` | `1000` | Wall-clock budget for one run of the login script |
 | `MANAGEMENT_MCP_API_KEY` | — | Static key for `/mcp/management`. Capped below ADMIN: a shared secret cannot be attributed to a person |
 | `OPENHANDS_BASE_URL` | `http://openhands:3000` | OpenHands service URL |
 | `OPENHANDS_API_KEY` | — | OpenHands auth token |
@@ -1058,6 +1061,88 @@ read on every request, so a change applies on their next one.
   over the team's resources.
 - Everyone else: `GET /teams` shows their own team and its members.
 
+Membership can also be set automatically from the token by a
+[login script](#login-script).
+
+### Login script
+
+A deployment can supply a JavaScript function that the backend runs when a user
+logs in, to turn whatever its identity provider puts in a token — groups,
+custom claims, an email domain — into carrier's roles, profile and team. No
+code change, and nothing provider-specific in this repository.
+
+```js
+// Example: groups claim -> roles, department claim -> team.
+function onLogin(ctx) {
+  const groups = ctx.claims.groups || [];
+  const result = {
+    roles: groups.filter((g) => g.startsWith("carrier-")),
+  };
+  if (ctx.claims.department) {
+    result.team = {
+      name: ctx.claims.department,
+      role: groups.includes("carrier-team-leads") ? "admin" : "member",
+    };
+  }
+  return result;
+}
+```
+
+Configure it inline with `AUTH_LOGIN_SCRIPT`, or as a file with
+`AUTH_LOGIN_SCRIPT_PATH` (the Helm chart mounts `auth.loginScript` for you, see
+[Deployment](#login-script-in-helm)). It only runs with `OAUTH_ENABLED=true`.
+With no script configured nothing changes: roles come from the token.
+
+**Input.** `onLogin(ctx)` receives:
+
+| field | value |
+|---|---|
+| `ctx.claims` | the validated token's claims (or the userinfo response, for opaque tokens) |
+| `ctx.user` | the stored user — `{sub, name, email, team}` with `team` `{id, name, role}` or `null` — or `null` on a first login |
+| `ctx.teams` | every existing team, `[{id, name}]` |
+
+**Output.** An object; every field is optional. Returning nothing, `null` or
+`{}` changes nothing.
+
+| field | effect |
+|---|---|
+| `roles` | array of strings. *Replaces* the roles read from the token for the role mapping, so `AUTH_ACCESS_ROLES` … `AUTH_SUPER_ADMIN_ROLES` apply to these. `[]` means no roles; leave it out (or `null`) to keep the token's roles |
+| `name`, `email` | non-empty strings. Replace the stored profile and what `/me` reports |
+| `team` | `null`: in no team. `{name, role}` or `{id, role}`: in that team, `role` `"member"` (default) or `"admin"`. Leave it out to keep the stored membership, so teams can still be managed by hand |
+
+A team named by `name` (exact match) that does not exist yet is created: the
+script is configuration written by whoever deploys carrier, as trusted as the
+role settings themselves. A team named by an `id` that does not exist is
+logged and leaves the membership unchanged. A script that returns `team`
+*owns* membership: a manual change holds only until that user's next login.
+The team-admin rules of the API (a team keeps at least one admin) do not bind
+the script.
+
+**When it runs.** There is no login endpoint; a "login" is the first request
+with a token this replica has not seen. The script runs then, its profile and
+team changes are written, and its decision is cached (keyed by a hash of the
+token, bounded in size) until the token expires — or for five minutes for
+tokens with no `exp`. Every later request with that token reuses the cached
+roles; a new token (a refresh) is a new login. A caller whose resulting roles
+grant no access is refused and nothing is written for them. The management MCP
+static API key never runs the script and keeps its fixed permissions (never
+ADMIN or SUPER_ADMIN).
+
+**Failure.** If the script throws, exceeds `AUTH_LOGIN_SCRIPT_TIMEOUT_MS` or a
+64 MiB heap, or returns anything outside the contract above (an unknown field
+included, so a typo cannot silently do nothing), the error is logged and that
+login proceeds exactly as with no script: the token's own roles, profile and
+membership untouched. Nothing is granted that the token itself would not grant,
+and nobody is locked out by a broken script — unless the token carries no
+usable roles, in which case they get none. A failure is retried after 30
+seconds rather than cached until the token expires. A script that cannot be
+loaded at all (unreadable file, syntax error, no `onLogin` function) fails
+startup.
+
+**Sandbox.** The script runs in an embedded V8 isolate (`mini-racer`): no
+network, filesystem, process or module access, a fresh isolate for every run so nothing carries over between logins, and
+`onLogin` must return synchronously (a promise is an error).
+
 ---
 
 ## Add-ons
@@ -1113,3 +1198,20 @@ serviceAccount:
 ```
 
 Either way the chart's Role and RoleBinding keep their release-derived names, so the agent-manager permissions follow whichever account the pod actually uses.
+
+### Login script in Helm
+
+Set `auth.loginScript` to the script's source. The chart renders it into a
+ConfigMap, mounts it read-only at `/etc/carrier/auth/login.js`, points
+`AUTH_LOGIN_SCRIPT_PATH` at it, and rolls the pods when it changes (the script
+is loaded at startup). Empty (the default) renders nothing.
+
+```yaml
+auth:
+  loginScript: |
+    function onLogin(ctx) {
+      return { roles: ctx.claims.groups || [] };
+    }
+config:
+  AUTH_LOGIN_SCRIPT_TIMEOUT_MS: "500"   # optional
+```

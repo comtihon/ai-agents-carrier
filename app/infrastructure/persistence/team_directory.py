@@ -58,6 +58,11 @@ class TeamDirectory(ABC):
         self._touched[sub] = now
         await self._upsert_seen(sub, name, email, datetime.now(timezone.utc))
 
+    async def record_profile(self, sub: str, name: str | None, email: str | None) -> None:
+        """Record *sub* now, bypassing the touch interval (a login just ran)."""
+        self._touched[sub] = time.monotonic()
+        await self._upsert_seen(sub, name, email, datetime.now(timezone.utc))
+
     @abstractmethod
     async def _upsert_seen(
         self, sub: str, name: str | None, email: str | None, when: datetime

@@ -1,3 +1,4 @@
+{{- $loginScript := (.Values.auth).loginScript }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -13,6 +14,11 @@ spec:
       labels:
         app.kubernetes.io/name: {{ include "ai-agents-carrier.name" . }}
         app.kubernetes.io/instance: {{ .Release.Name }}
+{{- if $loginScript }}
+      annotations:
+        # The login script is read once at startup; roll the pods when it changes.
+        checksum/login-script: {{ $loginScript | sha256sum }}
+{{- end }}
     spec:
       serviceAccountName: {{ include "ai-agents-carrier.serviceAccountName" . }}
       containers:
@@ -27,8 +33,12 @@ spec:
             - configMapRef:
                 name: {{ include "ai-agents-carrier.fullname" . }}-config
 {{- end }}
-{{- if or .Values.secrets .Values.llmIntegrations .Values.mcpIntegrations }}
+{{- if or .Values.secrets .Values.llmIntegrations .Values.mcpIntegrations $loginScript }}
           env:
+{{- if $loginScript }}
+            - name: AUTH_LOGIN_SCRIPT_PATH
+              value: /etc/carrier/auth/login.js
+{{- end }}
 {{- range $envKey, $secret := .Values.secrets }}
             - name: {{ $envKey }}
               valueFrom:
@@ -80,19 +90,33 @@ spec:
               port: http
             initialDelaySeconds: 10
             periodSeconds: 20
-{{- if .Values.graphs }}
+{{- if or .Values.graphs $loginScript }}
           volumeMounts:
+{{- if .Values.graphs }}
             - name: graph-definitions
               mountPath: /app/graphs
               readOnly: true
 {{- end }}
+{{- if $loginScript }}
+            - name: login-script
+              mountPath: /etc/carrier/auth
+              readOnly: true
+{{- end }}
+{{- end }}
           resources:
 {{ toYaml .Values.resources | indent 12 }}
-{{- if .Values.graphs }}
+{{- if or .Values.graphs $loginScript }}
       volumes:
+{{- if .Values.graphs }}
         - name: graph-definitions
           configMap:
             name: {{ include "ai-agents-carrier.fullname" . }}-graphs
+{{- end }}
+{{- if $loginScript }}
+        - name: login-script
+          configMap:
+            name: {{ include "ai-agents-carrier.fullname" . }}-login-script
+{{- end }}
 {{- end }}
       nodeSelector:
 {{ toYaml .Values.nodeSelector | indent 8 }}

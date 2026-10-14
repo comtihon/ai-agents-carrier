@@ -303,6 +303,16 @@ class Settings(BaseSettings):
     auth_super_admin_roles: list[str] = Field(
         default_factory=list, alias="AUTH_SUPER_ADMIN_ROLES"
     )
+    # Login script (see app.infrastructure.auth.login_script): JavaScript run
+    # once per new token to derive the caller's roles, profile and team. Give
+    # the source inline or as a file path, not both (startup fails if both are
+    # set). Unset: roles come from the token as they always have.
+    auth_login_script: str | None = Field(default=None, alias="AUTH_LOGIN_SCRIPT")
+    auth_login_script_path: str | None = Field(default=None, alias="AUTH_LOGIN_SCRIPT_PATH")
+    # Wall-clock budget for one run of the script, in milliseconds.
+    auth_login_script_timeout_ms: int = Field(
+        default=1000, ge=1, le=60_000, alias="AUTH_LOGIN_SCRIPT_TIMEOUT_MS"
+    )
 
     # --- Outbound service identity (OAuth2 JWT bearer grant, RFC 7523) ---
     # When enabled, the backend mints its own access tokens from an OAuth2

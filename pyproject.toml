@@ -46,7 +46,9 @@ dependencies = [
   # Multipart form parsing for specification file uploads
   "python-multipart>=0.0.9,<1.0.0",
   # GraphQL SDL → introspection conversion when importing a schema file
-  "graphql-core>=3.2.3,<4.0.0"
+  "graphql-core>=3.2.3,<4.0.0",
+  # Embedded V8 for the login script (AUTH_LOGIN_SCRIPT); no node binary needed
+  "mini-racer>=0.14.0,<1.0.0"
 ]
 
 [project.optional-dependencies]
