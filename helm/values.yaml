@@ -34,6 +34,14 @@ service:
 #                                        #   waits before the case expires
 # Set SLACK_APPROVALS_CHANNEL for the Slack side; without it the gate still
 # holds every deletion, and copilot_ui is the only place to answer.
+#
+# Rendered into the ConfigMap as environment variables. Role mapping, for
+# example (JSON lists; see README "Configuration"):
+#   AUTH_ENFORCE_PERMISSIONS: "true"
+#   AUTH_ACCESS_ROLES: '["staff"]'
+#   AUTH_ADMIN_ROLES: '["ops"]'            # unsandboxed python steps
+#   AUTH_SUPER_ADMIN_ROLES: '["platform"]' # see/manage everything + teams;
+#                                          # empty falls back to AUTH_ADMIN_ROLES
 config: {}
 
 # Secrets injected as individual env vars.

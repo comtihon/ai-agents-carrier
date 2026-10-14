@@ -50,6 +50,7 @@ API at `http://localhost:8000`. Health check: `GET /health`.
 | `AUTH_WRITE_ROLES` | `[]` | Roles granted WRITE (`POST`/`PUT`/`PATCH`, creates, updates, run control) |
 | `AUTH_DELETE_ROLES` | `[]` | Roles granted DELETE (`DELETE`, and the `delete_*` tools) |
 | `AUTH_ADMIN_ROLES` | `[]` | Roles granted ADMIN — `python` steps with `sandbox: false`, which run inside the backend process. Keep this narrowest |
+| `AUTH_SUPER_ADMIN_ROLES` | `[]` → `AUTH_ADMIN_ROLES` | Roles granted SUPER_ADMIN — system-wide visibility (every private and team resource, every run) and team management. Empty falls back to `AUTH_ADMIN_ROLES`; set it when ADMIN is a broad operations role |
 | `MANAGEMENT_MCP_API_KEY` | — | Static key for `/mcp/management`. Capped below ADMIN: a shared secret cannot be attributed to a person |
 | `OPENHANDS_BASE_URL` | `http://openhands:3000` | OpenHands service URL |
 | `OPENHANDS_API_KEY` | — | OpenHands auth token |
@@ -971,43 +972,91 @@ POST   /api/v1/callbacks/{run-id}/approve
 POST   /api/v1/callbacks/{run-id}/reject
 
 # Caller
-GET    /api/v1/me                             {sub, name, is_admin, auth_enabled}
+GET    /api/v1/me                             {sub, name, is_admin, is_super_admin, auth_enabled,
+                                               team: {id, name, role} | null}
+
+# Teams and users (see "Teams" below for who may call what)
+GET    /api/v1/teams                          super admin: all; others: own team or []
+POST   /api/v1/teams                          {name}                      super admin
+PUT    /api/v1/teams/{id}                     {name}                      super admin
+DELETE /api/v1/teams/{id}                     409 while resources are shared with it
+PUT    /api/v1/teams/{id}/members/{sub}       optional {role: member|admin}
+DELETE /api/v1/teams/{id}/members/{sub}
+GET    /api/v1/users                          super admin: all; team admin: own team + users in no team
 ```
 
 ### Ownership and visibility
 
-Agents, data sources, library scripts and workflows are each `public` or
-`private`, and owned by the user who created them (the token's `sub`). Every
+Agents, data sources, library scripts and workflows are each `public`, `team`
+or `private`, and owned by the user who created them (the token's `sub`). Every
 response object — full and `view=summary` alike, and the workflow list —
-carries `visibility`, `owner_id`, `owner_name` and `can_edit` (computed for the
-caller). Create and update bodies accept an optional `visibility`; omitted on
-create it defaults to `private` for a user, omitted on update it is kept.
+carries `visibility`, `owner_id`, `owner_name`, `team_id`, `team_name` and
+`can_edit` (computed for the caller). Create and update bodies accept an
+optional `visibility` and, with `"team"`, an optional `team_id`; omitted on
+create visibility defaults to `private` for a user, omitted on update it is
+kept.
 
-- **Private** resources are visible to their owner and to admins only. To
-  anyone else they do not exist: not listed, `404` by id, not offered to the
+- **Private** resources are visible to their owner and to super admins only.
+  To anyone else they do not exist: not listed, `404` by id, not offered to the
   chat agent or the management MCP tools, absent from the dynamic dispatcher's
-  roster. A private workflow's runs, traces, run data and approval cases follow
-  it — filtered in the Mongo query, so pages and totals count visible runs only.
-- **Editing** (and deleting, and changing visibility) is for the owner or an
-  admin: `403` otherwise. Documents stored before ownership existed load as
-  public and unowned, and stay editable by anyone with `WRITE`; making one
-  private makes the caller its owner.
-- **References** are checked on save (`422`): you can only use resources you can
-  see, a public resource may only use public ones, and a private one only public
-  ones or its own owner's private ones. Making a resource private is refused
-  (`409`) while a public resource, or another user's, still uses it.
-- **Admins** are callers holding a role in `AUTH_ADMIN_ROLES`, evaluated even
-  when `AUTH_ENFORCE_PERMISSIONS` is off (in shadow mode every caller is
-  *granted* ADMIN, which must not make every private resource visible).
+  roster. A workflow's runs, traces, run data and approval cases follow the
+  workflow's visibility — filtered in the Mongo query, so pages and totals count
+  visible runs only, and a visibility or membership change applies at once.
+- **Team** resources are visible to the members of one team (see below) as
+  well. Members may *use* team agents, data sources and scripts in their
+  workflows, and may *edit and run* team workflows. A team resource keeps its
+  team when its owner leaves it; the owner still sees it, other leavers do not.
+  `team_id` defaults to the caller's team (`422` without one); naming another
+  team is `403` — except for a super admin, who may name any existing team
+  (`422` if unknown, and `422` "team_id required" when they are in no team).
+- **Editing** content is for the owner, a super admin, or — for team
+  workflows — the team's members: `403` otherwise. **Deleting** and **changing
+  visibility or team** is for the owner or a super admin only. Documents stored
+  before ownership existed load as public and unowned, and stay editable by
+  anyone with `WRITE`; narrowing one makes the caller its owner.
+- **References** are checked on save (`422`). Scopes rank public > team >
+  private, and a resource may only use what the caller can see and what is at
+  least as widely visible as itself: a public resource uses public ones; a team
+  resource uses public ones and its own team's; a private one uses public ones,
+  its owner's team's, and its owner's private ones. Agent data source add-ons
+  follow the same rules. Narrowing a resource (public → team → private, or to
+  another team) is refused (`409`) while something it would break still uses
+  it; a referrer the caller cannot see is not named.
+- **Super admins** are callers holding a role in `AUTH_SUPER_ADMIN_ROLES`
+  (or, when that is empty, `AUTH_ADMIN_ROLES`), evaluated even when
+  `AUTH_ENFORCE_PERMISSIONS` is off (in shadow mode every caller is *granted*
+  every permission, which must not make every private resource visible). They
+  work system-wide: every resource, team and run, whatever team they are in.
+  ADMIN on its own (unsandboxed `python` steps) confers no visibility once
+  `AUTH_SUPER_ADMIN_ROLES` is set. `/me` reports both: `is_admin` (ADMIN) and
+  `is_super_admin`.
 - **The management MCP static key** is nobody in particular: it sees and
   creates public resources only.
 - **Without authentication** (`OAUTH_ENABLED=false`) there is no owner and all
   of this is a no-op. The platform itself — cron, Pub/Sub, webhooks, agent
   callbacks, the data sources MCP — likewise sees everything, so a triggered run
-  of a private workflow resolves its owner's private resources.
+  of a private or team workflow resolves the resources it was saved with.
 - **Script names** are unique within what one caller can see; ids stay global,
   so saving a name whose id belongs to a script you cannot see answers `409`
   ("id already taken") without saying whose.
+
+### Teams
+
+Teams live in carrier's own MongoDB (`teams`; membership on `users`), so they
+work with any OIDC provider. Every authenticated caller is recorded in `users`
+(name, email, last seen) — that is the list membership is managed from. A user
+is in at most one team, or none, as a `member` or an `admin`; their team is
+read on every request, so a change applies on their next one.
+
+- **Super admin**: creates, renames and deletes teams (a team with resources
+  shared with it cannot be deleted: `409`), and adds, moves (between teams),
+  promotes and removes anyone.
+- **Team admin** (`role: admin` in a team): adds users who are in *no* team to
+  their team (`409` for a user in another team — moving users between teams is
+  a super admin's), removes members, and promotes or demotes them. A team that
+  has members keeps at least one admin (`409`). A team admin has no extra rights
+  over the team's resources.
+- Everyone else: `GET /teams` shows their own team and its members.
 
 ---
 

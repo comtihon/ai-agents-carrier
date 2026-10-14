@@ -59,6 +59,7 @@ class YamlGraphRegistry:
                 "visibility": getattr(runner, "visibility", "public"),
                 "owner_id": getattr(runner, "owner_id", None),
                 "owner_name": getattr(runner, "owner_name", None),
+                "team_id": getattr(runner, "team_id", None),
                 "steps": [
                     {
                         "id": s["id"],
@@ -76,6 +77,7 @@ def _copy_ownership(runner: YamlGraphRunner, definition: WorkflowDefinition) -> 
     runner.visibility = definition.visibility
     runner.owner_id = definition.owner_id
     runner.owner_name = definition.owner_name
+    runner.team_id = definition.team_id
 
 
 def build_registry_from_definitions(

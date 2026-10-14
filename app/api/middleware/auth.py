@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.infrastructure.auth.auth_service import AuthError, AuthService
+from app.application.teams import directory_of, resolve_subject
 from app.infrastructure.auth.authorization import (
     AuthorizationPolicy,
     Permission,
@@ -188,10 +189,16 @@ class OAuthMiddleware(BaseHTTPMiddleware):
         returned and reset its own copy.
         """
         token = set_current_permissions(permissions)
-        # Strict evaluation: in shadow mode `permissions` holds ADMIN for
+        # Strict evaluation: in shadow mode `permissions` holds everything for
         # everyone, which must not make every private resource visible.
-        is_admin = Permission.ADMIN in self.policy.evaluate_shadow(claims)
-        subject_token = set_current_subject(subject_from_claims(claims, is_admin))
+        is_super_admin = Permission.SUPER_ADMIN in self.policy.evaluate_shadow(claims)
+        # The caller's team comes from carrier's own directory, read per
+        # request so a membership change applies at once on every replica.
+        subject = await resolve_subject(
+            directory_of(getattr(request.app.state, "container", None)),
+            subject_from_claims(claims, is_super_admin),
+        )
+        subject_token = set_current_subject(subject)
         try:
             return await call_next(request)
         finally:

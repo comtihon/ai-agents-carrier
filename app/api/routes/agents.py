@@ -17,6 +17,7 @@ from google.cloud import storage
 from pydantic import BaseModel, Field
 
 from app.api.dependencies import get_container
+from app.domain.models.ownership import Visibility
 from app.application.visibility import ensure_run_visible, ownership_fields, visibility_kwargs
 from app.core.config import get_settings
 from app.core.container import ApplicationContainer
@@ -46,7 +47,10 @@ class AgentDefinitionRequest(BaseModel):
     protocol: Literal["http-poll", "acp"] = "http-poll"
     acp_agent: str | None = None
     # None = the default: private when a user creates it, public without auth.
-    visibility: Literal["public", "private"] | None = None
+    visibility: Visibility | None = None
+    # With visibility "team": which team. Omitted = the caller's own (a
+    # super admin may name any team; anyone else only their own).
+    team_id: str | None = None
 
 
 class AgentDefinitionUpdateRequest(BaseModel):
@@ -65,7 +69,10 @@ class AgentDefinitionUpdateRequest(BaseModel):
     protocol: Literal["http-poll", "acp"] | None = None
     acp_agent: str | None = None
     # None = keep the stored visibility.
-    visibility: Literal["public", "private"] | None = None
+    visibility: Visibility | None = None
+    # With visibility "team": which team. Omitted = the caller's own (a
+    # super admin may name any team; anyone else only their own).
+    team_id: str | None = None
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -176,7 +183,7 @@ async def create_agent(
         addons=_addon_adapter.validate_python(body.addons),
         protocol=body.protocol,
         acp_agent=body.acp_agent or None,
-        **visibility_kwargs(body.visibility),
+        **visibility_kwargs(body.visibility, body.team_id),
     )
     saved = await container.agent_backend.create(defn)
     return saved.model_dump(mode="json")
@@ -237,7 +244,7 @@ async def update_agent(
         addons=addons,
         protocol=existing.protocol if body.protocol is None else body.protocol,
         acp_agent=(existing.acp_agent if body.protocol is None else (body.acp_agent or None)),
-        **visibility_kwargs(body.visibility),
+        **visibility_kwargs(body.visibility, body.team_id),
     )
     saved = await container.agent_backend.update(agent_id, defn)
     return saved.model_dump(mode="json")
