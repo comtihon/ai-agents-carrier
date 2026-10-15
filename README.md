@@ -58,6 +58,10 @@ API at `http://localhost:8000`. Health check: `GET /health`.
 | `OPENHANDS_BASE_URL` | `http://openhands:3000` | OpenHands service URL |
 | `OPENHANDS_API_KEY` | — | OpenHands auth token |
 | `OPENHANDS_MOCK_MODE` | `true` | Return stub results instead of calling OpenHands |
+| `STEP_OUTPUT_OFFLOAD` | `true` | Write every step output to the stream store as `runs/<run_id>/<step_id>[-<n>].md` and keep only references in state, the checkpoint and the run document (see [Step outputs](#step-outputs-in-object-storage)) |
+| `STEP_OUTPUT_INLINE_MAX_BYTES` | `256` | Outputs whose JSON is at most this size also stay inline (they are no bigger than their reference) |
+| `STEP_INPUT_HYDRATE_MAX_BYTES` | `33554432` | Cap on stored outputs resolved into memory for one step before it runs |
+| `STEP_OUTPUT_DISPLAY_MAX_BYTES` | `2097152` | Stored outputs a run API response resolves inline for display; the rest stay references with a `download_url` |
 | `STATE_DIVERGENCE_PROBE` | `false` | Log every key where the runner's hand-merged run state disagrees with the LangGraph checkpoint. Diagnostic only — never writes — and costs one extra checkpoint read per node |
 | `DOCKER_REGISTRY_USERNAME` | — | Registry username for pulling private images (DockerRuntime) |
 | `DOCKER_REGISTRY_PASSWORD` | — | Registry password / token for pulling private images |
@@ -612,6 +616,43 @@ ADMIN a formality that any WRITE holder walks around by leaving a field unset.
 
 Sandbox defaults come from `SCRIPT_SANDBOX_IMAGE`, `SCRIPT_SANDBOX_TIMEOUT` and
 `SCRIPT_SANDBOX_MEMORY_MB`; a step can override the first two.
+
+### `combined_datasource` — fetch and filter in one step
+
+Ordered `parts`, each a `data_source` part, a `python` part, or a nested
+`combined_datasource`. Parts run in the order listed; any mix is allowed.
+
+```yaml
+- id: invoice_candidates
+  type: combined_datasource
+  output_key: invoice_candidates
+  output: get_classification        # optional; default = last part
+  parts:
+    - {id: fetch_at, type: data_source, source: crm-projects,
+       operation: list_projects_operations, params: {status: [10], page_size: 50}}
+    - {id: sel_at, type: python, script_id: invoice-candidates-select, stream: fetch_at}
+    - {id: cand, type: python,
+       code: "output = {'project_ids': sorted(set(parts['sel_at']['ids']))}"}
+    - {id: get_classification, type: data_source, source: crm-order-details,
+       operation: get_order_details, params: {id: "{cand[project_ids]}"}}
+```
+
+- A part sees workflow state plus every earlier part's output by id:
+  `{cand[project_ids]}` in params, `parts["sel_at"]` in python (a data source
+  output named that way is loaded as a list; `stream: <part id>` gives
+  `records()` instead).
+- A data source param that resolves to a list (or a whole `{part}` naming a
+  list stream) where the operation does not declare that param `array` is a
+  loop: one call per element (`concurrency`, default the executor fan-out),
+  results collected into one stream of `{"<param>": element, "result": ...}`.
+  Per-element errors are collected in the trace; `fail_on_error: true` makes
+  them fatal, `include_errors: true` keeps `{param, error}` records.
+- Every part's output is written to `runs/<run_id>/<step>.<part>.md`; only the
+  chosen output becomes the step output. The run API's step entry carries
+  `parts` (status, `duration_ms`, `records`, `calls`, `error_count`, `errors`).
+- Validated on save (REST and management MCP): unknown / forward / self part
+  references, missing `source` / `operation` / script, unknown data sources,
+  operations or scripts, destructive operations (use a `data_source` step).
 
 ### Script library
 
@@ -1254,3 +1295,32 @@ auth:
 config:
   AUTH_LOGIN_SCRIPT_TIMEOUT_MS: "500"   # optional
 ```
+
+---
+
+## Step outputs in object storage
+
+Every step's output is written to the data stream store (GCS when
+`STREAM_BACKEND=gcs`) under the run's folder, `runs/<run_id>/<step_id>[-<n>].md`:
+a short markdown header (step, type, run, iteration, timestamp) followed by the
+values in one fenced ```` ```json ```` block that parses back exactly. Workflow
+state, the LangGraph checkpoint, `run.state` and `run.step_outputs` keep a
+reference instead of the value:
+
+```json
+{"__ref__": true, "uri": "gs://bucket/runs/r1/plan.md", "key": "runs/r1/plan.md",
+ "field": "plan", "bytes": 48213, "sha256": "…", "kind": "dict", "items": 12, "preview": "…"}
+```
+
+Steps never fetch anything themselves: before a node runs, the engine resolves
+the references the step needs (keys named in its templates, `when`, params,
+route conditions; python / agent steps get every reference, up to
+`STEP_INPUT_HYDRATE_MAX_BYTES`) and passes the hydrated state in. `run.step_inputs`
+records only the keys a step referenced, compacted — never a full state
+snapshot. Old runs with inline values load and resume unchanged.
+
+`GET /api/v1/workflows/runs/{id}` resolves small references inline for display;
+`GET /api/v1/runs/{id}/outputs` lists the files and
+`GET /api/v1/runs/{id}/outputs/{file}.md[?field=<key>]` downloads one. Deleting
+a run deletes its folder.
+

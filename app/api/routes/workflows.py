@@ -35,6 +35,11 @@ from app.domain.models.graph_run import GraphRun
 from app.domain.models.workflow_definition import WorkflowDefinition
 from app.infrastructure.config.graph_loader import build_runner_from_definition
 from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner, merge_out_of_band_state
+from app.infrastructure.orchestration import step_outputs as _step_outputs
+from app.infrastructure.orchestration.step_outputs import (
+    resolve_for_display,
+    step_input_snapshot,
+)
 from app.infrastructure.tracing.callback_handler import RunTraceAccumulator
 
 logger = logging.getLogger(__name__)
@@ -157,10 +162,11 @@ def _build_steps(raw_steps: list, run: GraphRun) -> list[dict]:
         step_error = _raw_err if is_failed else None
         # Strip internal sentinel keys from the output exposed to the UI.
         display_out = (
-            {k: v for k, v in step_out.items() if not k.startswith("__")}
+            {k: v for k, v in step_out.items()
+             if not k.startswith("__") and not k.startswith("_combined_")}
             if step_out else step_out
         ) or None
-        result.append({
+        entry: dict[str, Any] = {
             "id": sid,
             "type": _STEP_TYPE_MAP.get(s.get("type", "llm"), s.get("type", "llm")),
             "name": s.get("name", sid),
@@ -169,8 +175,39 @@ def _build_steps(raw_steps: list, run: GraphRun) -> list[dict]:
             "output": display_out,
             "summary": step_out.get("summary"),
             "error": step_error,
-        })
+        }
+        # combined_datasource: the per-part trace (status, timing, records).
+        combined = step_out.get(f"_combined_{sid}") if isinstance(step_out, dict) else None
+        if isinstance(combined, dict):
+            entry["parts"] = combined.get("parts") or []
+            entry["output_part"] = combined.get("output_part")
+        result.append(entry)
     return result
+
+
+def output_download_path(run_id: str, ref: dict) -> str:
+    """API-root-relative download path of a stored step output file."""
+    name = str(ref.get("key") or "").rsplit("/", 1)[-1]
+    return f"/runs/{run_id}/outputs/{name}"
+
+
+async def _resolve_refs_for_display(
+    run: GraphRun, steps: list[dict], state: Any, output_store: Any, budget_bytes: int,
+) -> Any:
+    """Resolve stored-output references in a run response, within a budget.
+
+    The UI renders step outputs and state as JSON; a reference would show as
+    a stub. Small outputs are resolved inline (outputs first -- they are what
+    the run view shows), and anything past the budget stays a reference with a
+    ``download_url`` to the file.
+    """
+    budget = [max(0, int(budget_bytes))]
+    url = lambda ref: output_download_path(run.id, ref)  # noqa: E731
+    for st in steps:
+        st["output"] = await resolve_for_display(output_store, st.get("output"), budget=budget, download_url=url)
+    for st in steps:
+        st["input"] = await resolve_for_display(output_store, st.get("input"), budget=budget, download_url=url)
+    return await resolve_for_display(output_store, state, budget=budget, download_url=url)
 
 
 async def _steps_from_definition(
@@ -250,6 +287,8 @@ async def _run_response(
     runner: YamlGraphRunner | None = None,
     partial: bool = False,
     run_repository: Any = None,
+    output_store: Any = None,
+    display_budget_bytes: int = 2 * 1024 * 1024,
 ) -> dict:
     """Build the run payload the API answers with.
 
@@ -259,6 +298,11 @@ async def _run_response(
     render a run in full re-read it by id.
     """
     workflow_name, steps = await _steps_from_definition(run, runner)
+    intermediate_outputs: Any = run.state
+    if output_store is not None and not partial:
+        intermediate_outputs = await _resolve_refs_for_display(
+            run, steps, run.state, output_store, display_budget_bytes,
+        )
     interrupt_payload = await _get_interrupt_payload(runner, run)
     dynamic_jobs: dict = {}
     if run.dynamic and not partial and run_repository is not None:
@@ -279,7 +323,7 @@ async def _run_response(
         "llm_agent_results": [],
         "action_results": [],
         "execution_results": [],
-        "intermediate_outputs": run.state,
+        "intermediate_outputs": intermediate_outputs,
         "interrupt_payload": interrupt_payload,
         "pending_question": (run.state or {}).get("_pending_question"),
         "waiting_transition": (
@@ -380,11 +424,13 @@ async def _stream_graph(
                 if node_name in ("__start__", "__end__"):
                     continue
                 status = _step_status_for_output(node_name, output, runner, run)
-                run.step_inputs[node_name] = dict(current_state)
+                run.step_inputs[node_name] = step_input_snapshot(
+                    runner.step_by_id(node_name), current_state
+                )
                 run.step_statuses[node_name] = status
                 run.current_step = node_name
                 if output:
-                    run.step_outputs[node_name] = output
+                    run.step_outputs[node_name] = _step_outputs.step_output_record(output)
                     if isinstance(output, dict):
                         current_state.update(output)
                 logger.info("run %s: step '%s' → %s", run.id, node_name, status)
@@ -412,12 +458,16 @@ async def _stream_graph(
             None,
         )
         if running_sid is not None:
-            run.step_inputs[running_sid] = dict(current_state)
+            run.step_inputs[running_sid] = step_input_snapshot(
+                runner.step_by_id(running_sid), current_state
+            )
             run.step_statuses[running_sid] = "failed"
         else:
             failed_sid = current_state.get("__failed_step__") if isinstance(current_state, dict) else None
             if isinstance(failed_sid, str) and failed_sid in run.step_statuses:
-                run.step_inputs[failed_sid] = dict(current_state)
+                run.step_inputs[failed_sid] = step_input_snapshot(
+                    runner.step_by_id(failed_sid), current_state
+                )
                 run.step_statuses[failed_sid] = "failed"
         run.status = "failed"
         # Preserve accumulated step outputs so retry can recover OpenHands conv IDs
@@ -615,6 +665,19 @@ def _guard_sandbox(request: Request, steps: object) -> None:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
+async def _guard_combined(container: ApplicationContainer, steps: object) -> None:
+    """Reject a combined_datasource step whose parts would only fail at run time."""
+    from app.infrastructure.orchestration.combined_datasource import combined_step_errors
+
+    errors = await combined_step_errors(
+        steps if isinstance(steps, list) else [],
+        data_source_backend=getattr(container, "data_source_backend", None),
+        script_backend=getattr(container, "script_backend", None),
+    )
+    if errors:
+        raise HTTPException(status_code=422, detail="; ".join(errors))
+
+
 def _guard_dynamic(steps: object) -> None:
     """Reject a dynamic step whose config would only fail at run time."""
     from app.infrastructure.orchestration.dynamic.node import validate_dynamic_steps
@@ -635,6 +698,7 @@ async def create_workflow(
     assert container.workflow_backend is not None
     _guard_sandbox(request, body.steps)
     _guard_dynamic(body.steps)
+    await _guard_combined(container, body.steps)
 
     existing = await container.workflow_backend.get(body.id)
     if existing is not None:
@@ -829,7 +893,13 @@ async def get_run(
         raise HTTPException(status_code=404, detail="Run not found")
     await ensure_run_visible(container.workflow_backend, run)
     runner = _get_runner_for_run(run, container)
-    return await _run_response(run, runner, run_repository=container.run_repository)
+    return await _run_response(
+        run, runner, run_repository=container.run_repository,
+        output_store=getattr(container, "step_output_store", None),
+        display_budget_bytes=int(getattr(
+            container.settings, "step_output_display_max_bytes", 2 * 1024 * 1024,
+        )),
+    )
 
 
 @router.post("/runs/{run_id}/approve")
@@ -907,6 +977,13 @@ async def delete_run(
         getattr(container, "data_artifact_backend", None),
         run_id,
     )
+    # And the run's stored step outputs (runs/<run_id>/...).
+    _outputs = getattr(container, "step_output_store", None)
+    if _outputs is not None:
+        try:
+            await _outputs.delete_run(run_id)
+        except Exception:  # noqa: BLE001 — deleting a run must not fail on this
+            logger.warning("run %s: could not delete stored step outputs", run_id, exc_info=True)
     container.live_runners.pop(run_id, None)
     await container.run_repository.delete(run_id)
 
@@ -1036,6 +1113,7 @@ async def update_workflow(
     if body.steps is not None:
         _guard_sandbox(request, body.steps)
         _guard_dynamic(body.steps)
+        await _guard_combined(container, body.steps)
 
     existing = await container.workflow_backend.get(workflow_id)
     if existing is None:

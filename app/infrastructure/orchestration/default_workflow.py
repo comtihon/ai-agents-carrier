@@ -328,6 +328,29 @@ def build_default_workflow(
                 execute (OpenHands code execution), workflow (child workflow),
                 http_call (outbound HTTP), langgraph-agent, claude-agent,
                 data_source (invoke a DataSourceDefinition operation),
+                combined_datasource (ONE step that acquires and filters data
+                through ordered `parts`: data_source | python | nested
+                combined_datasource. Use it instead of chains of data_source /
+                python steps and NEVER copy-paste "slot" steps per id: a
+                data_source part whose param resolves to a list (e.g.
+                `"id": "{cand[project_ids]}"`) is called once per element
+                (bounded concurrency, results collected into one stream,
+                per-element errors collected). Parts reference earlier parts by
+                id: `{part_id[field]}` in params; `parts["id"]` in python code;
+                `stream: <part id>` gives python records(). Fields: output_key,
+                parts [{id, type, source, operation, params, limit,
+                concurrency, fail_on_error} | {id, type: python, script_id|code,
+                stream} | {id, type: combined_datasource, parts, output}],
+                optional `output: <part id>` (default last part). Example:
+                {"id": "cands", "type": "combined_datasource", "output_key": "cands",
+                 "parts": [{"id": "fetch", "type": "data_source", "source": "crm",
+                 "operation": "list_projects", "params": {"status": [10]}},
+                 {"id": "sel", "type": "python", "stream": "fetch",
+                 "code": "output = {'ids': [r['id'] for r in records() if r['open']]}"},
+                 {"id": "details", "type": "data_source", "source": "crm",
+                 "operation": "get_project", "params": {"id": "{sel[ids]}"}}]}.
+                Validated on save: unknown/forward part refs, missing sources,
+                operations or scripts, destructive operations),
                 dynamic (the dispatcher picks agents from `agent_pool` into
                 planning/execution/validation/integration jobs at run time;
                 fields: agent_pool [{agent_id, max_instances, categories}],

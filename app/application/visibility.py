@@ -186,6 +186,13 @@ def references(kind: str, resource: Any) -> list[tuple[str, str]]:
                 refs.append(("script", str(step["script_id"])))
             elif t == "workflow" and step.get("workflow_id"):
                 refs.append(("workflow", str(step["workflow_id"])))
+            elif t == "combined_datasource":
+                from app.infrastructure.orchestration.combined_datasource import iter_parts
+                for _path, part in iter_parts(step.get("parts")):
+                    if part.get("type") == "data_source" and part.get("source"):
+                        refs.append(("datasource", str(part["source"])))
+                    elif part.get("type") == "python" and part.get("script_id"):
+                        refs.append(("script", str(part["script_id"])))
             elif t == "dynamic":
                 for entry in step.get("agent_pool") or []:
                     if isinstance(entry, dict) and entry.get("agent_id"):

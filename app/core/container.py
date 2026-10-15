@@ -112,6 +112,9 @@ class ApplicationContainer:
     # Reads back what the executor spilled; the `data_source`, `python` and
     # `llm` steps all go through it.
     stream_store: "DataStreamStore | None" = None
+    # Step outputs written to the stream store; state keeps references. Built
+    # lazily from stream_store + settings (see step_output_store property).
+    _step_output_store: Any = None
     # Run download manifests written by `data` steps and read by
     # GET /runs/{id}/data.  None in legacy test setups, which then run a `data`
     # step as a no-op that records nothing.
@@ -265,6 +268,23 @@ class ApplicationContainer:
             replace_existing=True,
         )
 
+    @property
+    def step_output_store(self) -> Any:
+        """Step-output offload over the stream store, or None when disabled."""
+        if self._step_output_store is None and self.stream_store is not None:
+            settings = getattr(self, "settings", None)
+            if settings is None or getattr(settings, "step_output_offload", True):
+                from app.infrastructure.orchestration.step_outputs import StepOutputStore
+
+                self._step_output_store = StepOutputStore(
+                    self.stream_store,
+                    inline_max_bytes=getattr(settings, "step_output_inline_max_bytes", 256),
+                    hydrate_max_bytes=getattr(
+                        settings, "step_input_hydrate_max_bytes", 32 * 1024 * 1024
+                    ),
+                )
+        return self._step_output_store
+
     def _inject_runner_dependencies(self, runner: YamlGraphRunner) -> None:
         """Inject shared repositories onto a runner instance.
 
@@ -287,6 +307,8 @@ class ApplicationContainer:
             runner._data_source_executor = self.data_source_executor
         if self.stream_store is not None:
             runner._stream_store = self.stream_store
+            if self.step_output_store is not None:
+                runner._step_output_store = self.step_output_store
         if self.data_artifact_backend is not None:
             runner._data_artifact_backend = self.data_artifact_backend
         if self.approval_service is not None:
