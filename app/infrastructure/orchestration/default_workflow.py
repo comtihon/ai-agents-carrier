@@ -132,6 +132,10 @@ def build_default_workflow(
         # Same store the HTTP download route uses, so read_run_data_artifact
         # can return an artifact's bytes here as well.
         stream_store=getattr(container, "stream_store", None),
+        # The script library (set_resource_visibility and delete_team reach
+        # scripts too) and the user/team directory for the team tools.
+        script_backend=getattr(container, "script_backend", None),
+        team_directory=getattr(container, "team_directory", None),
         refresh_runner=refresh_runner,
         refresh_datasources=refresh_datasources,
     )
@@ -1280,6 +1284,140 @@ def build_default_workflow(
         """
         return await core.delete_message(deps, channel, message_id, provider)
 
+    # --- Teams, users and visibility ---
+
+    @tool
+    async def who_am_i() -> str:
+        """Show who you are calling as: user, super-admin status, team and team role.
+
+        Call this first when unsure whether you may manage a team or user:
+        a super admin may manage every team; a team admin only their own team's
+        members (not its admins); anyone else may manage none.
+        """
+        return await core.who_am_i(deps)
+
+    @tool
+    async def list_teams() -> str:
+        """List teams with their members and each member's role (member or admin).
+
+        A super admin sees every team; anyone else sees only their own team.
+        """
+        return await core.list_teams(deps)
+
+    @tool
+    async def list_users(query: str = "") -> str:
+        """List known users with their email, id, team and team role.
+
+        A super admin sees everyone; a team admin sees users in no team plus
+        their own team's members (the users they can add or manage). A user is
+        known only after their first sign-in to the platform.
+
+        Args:
+            query: Optional filter on email, name or id (exact match first,
+                else substring), e.g. "alice@example.com" or "alice".
+        """
+        return await core.list_users(deps, query)
+
+    @tool
+    async def create_team(name: str) -> str:
+        """Create a team. Super admin only. Idempotent: an existing team of that
+        name is reported, not duplicated.
+
+        Args:
+            name: The new team's name, e.g. "Operations".
+        """
+        return await core.create_team(deps, name)
+
+    @tool
+    async def rename_team(team: str, new_name: str) -> str:
+        """Rename a team. Super admin only.
+
+        Args:
+            team: The team's current name or id.
+            new_name: Its new name.
+        """
+        return await core.rename_team(deps, team, new_name)
+
+    @tool
+    async def delete_team(team: str) -> str:
+        """Delete a team; its members end up in no team. Super admin only.
+
+        Refused while any workflow, agent, data source or script is shared with
+        the team: change their visibility (set_resource_visibility) first.
+
+        Args:
+            team: The team's name or id.
+        """
+        return await core.delete_team(deps, team)
+
+    @tool
+    async def set_team_member(user: str, team: str, role: str = "member") -> str:
+        """Add a user to a team, or change their role in it. Idempotent.
+
+        Examples: "add alice@example.com to team Ops" ->
+        set_team_member(user="alice@example.com", team="Ops");
+        "make Bob an admin of team Ops" ->
+        set_team_member(user="Bob", team="Ops", role="admin");
+        "make Bob a regular member again" -> role="member".
+
+        "admin" here means team admin (manages the team's membership). Super
+        admin cannot be granted with this tool: it comes from identity-provider
+        roles.
+
+        Who may: a super admin, for any team, user and role (a user in another
+        team is moved, as a user is in at most one team). A team admin, only
+        for their own team, only for users in no team or already in it, and
+        only with role "member": making, demoting or replacing a team admin is
+        a super admin's call. Anyone else: nobody.
+
+        Args:
+            user: The user's email, name or id (see list_users).
+            team: The team's name or id (see list_teams).
+            role: "member" (default) or "admin".
+        """
+        return await core.set_team_member(deps, user, team, role)
+
+    @tool
+    async def remove_team_member(user: str, team: str) -> str:
+        """Remove a user from a team; they end up in no team. Idempotent.
+
+        Who may: a super admin, or an admin of that team for its non-admin
+        members (only a super admin removes a team admin).
+
+        Args:
+            user: The user's email, name or id.
+            team: The team's name or id.
+        """
+        return await core.remove_team_member(deps, user, team)
+
+    @tool
+    async def set_resource_visibility(kind: str, resource: str, visibility: str, team: str = "") -> str:
+        """Change who can see a workflow, agent, data source or script, and which
+        team owns it.
+
+        Visibility: "public" (every user), "team" (members of one team; for a
+        workflow they may also edit it) or "private" (its owner only). The
+        resource keeps its owner; with "team" it belongs to the team.
+
+        Example: "make workflow Daily report team owned by team Ops with team
+        visibility" -> set_resource_visibility(kind="workflow",
+        resource="Daily report", visibility="team", team="Ops").
+
+        Who may: the resource's owner, an admin of the team it is shared with,
+        or a super admin. Only a super admin may name a team other than their
+        own; anyone else sharing with "team" gets their own team (omit team).
+        Refused when it would break a reference (e.g. a public workflow using
+        an agent being made private).
+
+        Args:
+            kind: "workflow", "agent", "datasource" or "script".
+            resource: The resource's id or name.
+            visibility: "public", "team" or "private".
+            team: With visibility "team": the team's name or id. Omit for your
+                own team.
+        """
+        return await core.set_resource_visibility(deps, kind, resource, visibility, team)
+
     platform_tools = [list_workflows, get_workflow, run_workflow, list_runs, get_run, ask_user,
                       list_run_data, get_run_data_artifact,
                       read_run_data_artifact,
@@ -1301,7 +1439,10 @@ def build_default_workflow(
                       create_datasource_from_schema,
                       add_datasource_operations_from_schema,
                       post_message, read_messages, read_thread,
-                      send_direct_message, delete_message]
+                      send_direct_message, delete_message,
+                      who_am_i, list_teams, list_users, create_team, rename_team,
+                      delete_team, set_team_member, remove_team_member,
+                      set_resource_visibility]
 
     # --- Run control tools ---
     #

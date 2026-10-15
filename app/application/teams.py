@@ -11,10 +11,15 @@ Two kinds of administrator:
   strictly; see ``Subject.is_super_admin``). System-wide: creates, renames and deletes
   teams, moves users between teams, and sees and manages every resource and run
   regardless of any team they happen to be in.
-* **Team admin** — ``team_role == "admin"`` in one team. May add users who are
-  in *no* team to their team, remove members from it, and promote or demote its
-  members. Nothing outside their team, and no extra rights over the team's
-  resources: those follow app.application.visibility like everyone else's.
+* **Team admin** — ``team_role == "admin"`` in one team, a status only a super
+  admin assigns (here, or through the login script a super admin maintains).
+  May add users who are in *no* team to their team as members and remove its
+  (non-admin) members. May not make anyone — themselves included — a team admin,
+  nor demote or remove one: who administers a team is the super admin's call.
+  Nothing outside their team. Over the team's resources one extra right: they
+  may change the visibility of a resource shared with their team (see
+  app.application.visibility.can_change_visibility).
+* **Everyone else** — no user or team management at all.
 
 With nothing bound (authentication off, a test, the platform itself) every
 check here passes, as everywhere else in visibility.
@@ -242,18 +247,12 @@ async def delete_team(directory: Any, team_id: str, backends: Iterable[Any]) -> 
     forget_team(team_id)
 
 
-async def _would_leave_without_admin(directory: Any, team_id: str, sub: str) -> bool:
-    """Whether removing/demoting *sub* leaves members but no admin in the team."""
-    members = await directory.members(team_id)
-    others = [m for m in members if m.sub != sub]
-    return bool(others) and not any(m.team_role == "admin" for m in others)
-
-
 async def set_member(directory: Any, team_id: str, sub: str, role: str | None) -> dict[str, Any]:
     """Add *sub* to the team, or change their role in it.
 
-    A team admin may add only users in no team; moving a user out of another
-    team is a super admin's call.
+    A team admin may add only users in no team, and only as members; moving a
+    user out of another team, and making or unmaking a team admin, is a super
+    admin's call.
     """
     require_team_manager(team_id)
     team = await _team_or_404(directory, team_id)
@@ -266,14 +265,12 @@ async def set_member(directory: Any, team_id: str, sub: str, role: str | None) -
         raise TeamConflict(
             "User is in another team; only a super admin can move users between teams"
         )
-    if (
-        current_team == team_id
-        and user.team_role == "admin"
-        and role != "admin"
-        and not is_super_admin()
-        and await _would_leave_without_admin(directory, team_id, sub)
-    ):
-        raise TeamConflict("A team with members needs at least one admin; promote someone else first")
+    if not is_super_admin():
+        # Team admin status is assigned (and taken away) by a super admin only.
+        if role == "admin":
+            raise NotOwner("Only a super admin may make someone a team admin")
+        if current_team == team_id and user.team_role == "admin":
+            raise NotOwner("Only a super admin may change a team admin's role")
     await directory.set_membership(sub, team_id, role)
     return await team_dict(directory, team)
 
@@ -284,12 +281,8 @@ async def remove_member(directory: Any, team_id: str, sub: str) -> dict[str, Any
     user = await directory.get_user(sub)
     if user is None or user.team_id != team_id:
         raise ResourceNotFound(f"User '{sub}' is not a member of team '{team_id}'")
-    if (
-        user.team_role == "admin"
-        and not is_super_admin()
-        and await _would_leave_without_admin(directory, team_id, sub)
-    ):
-        raise TeamConflict("A team with members needs at least one admin; promote someone else first")
+    if user.team_role == "admin" and not is_super_admin():
+        raise NotOwner("Only a super admin may remove a team admin")
     await directory.set_membership(sub, None, None)
     return await team_dict(directory, team)
 

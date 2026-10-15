@@ -196,23 +196,40 @@ async def test_a_plain_member_cannot_manage_members(env):
     assert (await as_("bob").delete(f"/api/v1/teams/{red}/members/alice")).status_code == 403
 
 
-async def test_team_admin_promotes_demotes_and_removes(env):
+async def test_team_admin_removes_a_member(env):
     as_, _, directory, red, _ = env
-    resp = await as_("alice").put(f"/api/v1/teams/{red}/members/bob", json={"role": "admin"})
-    assert (await directory.get_user("bob")).team_role == "admin"
-    resp = await as_("alice").put(f"/api/v1/teams/{red}/members/bob", json={"role": "member"})
-    assert resp.status_code == 200
-    assert (await directory.get_user("bob")).team_role == "member"
     resp = await as_("alice").delete(f"/api/v1/teams/{red}/members/bob")
     assert resp.status_code == 200
     assert (await directory.get_user("bob")).team_id is None
 
 
-async def test_the_last_admin_of_a_team_with_members_stays(env):
-    as_, _, _, red, _ = env
-    resp = await as_("alice").put(f"/api/v1/teams/{red}/members/alice", json={"role": "member"})
-    assert resp.status_code == 409
-    assert (await as_("alice").delete(f"/api/v1/teams/{red}/members/alice")).status_code == 409
+async def test_only_a_super_admin_makes_or_unmakes_team_admins(env):
+    """Team admin status is assigned by a super admin only: a team admin can
+    neither promote anyone (themselves included) nor demote or remove an admin."""
+    as_, _, directory, red, _ = env
+    resp = await as_("alice").put(f"/api/v1/teams/{red}/members/bob", json={"role": "admin"})
+    assert resp.status_code == 403
+    assert "Only a super admin may make someone a team admin" in resp.json()["detail"]
+    resp = await as_("alice").put(f"/api/v1/teams/{red}/members/dave", json={"role": "admin"})
+    assert resp.status_code == 403
+    assert (await directory.get_user("dave")) is None or (await directory.get_user("dave")).team_id is None
+    assert (await directory.get_user("bob")).team_role == "member"
+    # A second admin, made by the super admin, is out of alice's reach too.
+    resp = await as_("admin").put(f"/api/v1/teams/{red}/members/bob", json={"role": "admin"})
+    assert resp.status_code == 200
+    resp = await as_("alice").put(f"/api/v1/teams/{red}/members/bob", json={"role": "member"})
+    assert resp.status_code == 403
+    assert (await as_("alice").delete(f"/api/v1/teams/{red}/members/bob")).status_code == 403
+    # Nor can she step down or leave.
+    assert (await as_("alice").put(
+        f"/api/v1/teams/{red}/members/alice", json={"role": "member"}
+    )).status_code == 403
+    assert (await as_("alice").delete(f"/api/v1/teams/{red}/members/alice")).status_code == 403
+    # The super admin can.
+    resp = await as_("admin").put(f"/api/v1/teams/{red}/members/bob", json={"role": "member"})
+    assert resp.status_code == 200
+    assert (await directory.get_user("bob")).team_role == "member"
+    assert (await as_("admin").delete(f"/api/v1/teams/{red}/members/alice")).status_code == 200
 
 
 async def test_users_list_is_scoped(env):
@@ -289,6 +306,35 @@ async def test_only_the_owner_deletes_or_changes_visibility_of_a_team_workflow(e
     assert resp.status_code == 403
     assert (await as_("bob").delete("/api/v1/workflows/red-wf")).status_code == 403
     assert (await as_("alice").delete("/api/v1/workflows/red-wf")).status_code in (200, 204)
+
+
+async def test_a_team_admin_rescopes_but_does_not_edit_a_team_resource(env):
+    """The team admin's one right over a resource shared with their team: who
+    sees it. Not its content, not deleting it."""
+    as_, _, _, _, _ = env
+    await as_("bob").post("/api/v1/agents", json=_agent("bobs-red", visibility="team"))
+    resp = await as_("alice").put(
+        "/api/v1/agents/bobs-red", json={"name": "Bobs-Red", "visibility": "public"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["visibility"] == "public" and resp.json()["owner_id"] == "bob"
+    # Back to the team is no longer hers: it is public now, not shared with Red.
+    resp = await as_("alice").put(
+        "/api/v1/agents/bobs-red", json={"name": "Bobs-Red", "visibility": "team"}
+    )
+    assert resp.status_code == 403
+    await as_("bob").put("/api/v1/agents/bobs-red", json={"name": "Bobs-Red", "visibility": "team"})
+    resp = await as_("alice").put(
+        "/api/v1/agents/bobs-red", json={"name": "Renamed", "visibility": "private"}
+    )
+    assert resp.status_code == 403
+    assert (await as_("alice").delete("/api/v1/agents/bobs-red")).status_code == 403
+    # A member who is not an admin has no such right.
+    await as_("alice").post("/api/v1/agents", json=_agent("alices-red", visibility="team"))
+    resp = await as_("bob").put(
+        "/api/v1/agents/alices-red", json={"name": "Alices-Red", "visibility": "public"}
+    )
+    assert resp.status_code == 403
 
 
 async def test_leaving_a_team_removes_access(env):

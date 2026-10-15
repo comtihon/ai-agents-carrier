@@ -8,8 +8,10 @@ in a picker or to the chat agent.
 
 Changing a resource is its owner's, with one widening: members of a *team
 workflow*'s team may edit it too (``OwnedResource.team_editable``). Deleting a
-resource or changing its visibility or team stays with the owner. A super admin
-sees and manages everything, whatever team they are in.
+resource stays with the owner; changing its visibility or team with the owner
+and, for a resource shared with a team, that team's admins
+(:func:`can_change_visibility`). A super admin sees and manages everything,
+whatever team they are in.
 
 Enforcement lives in one place, :class:`VisibilityScopedBackend`, which the
 container wraps around each of the four backends. Every surface — the REST
@@ -160,6 +162,35 @@ def can_edit(resource: Any, team_editable: bool | None = None) -> bool:
         team_editable = bool(getattr(resource, "team_editable", False))
     subject = get_current_subject()
     return team_editable and subject is not None and _in_team(subject, resource)
+
+
+def can_change_visibility(resource: Any) -> bool:
+    """Change who can see it (visibility / team): whoever may manage it, plus
+    an admin of the team it is shared with. That team admin may not delete it
+    or change its content beyond what can_edit allows — only who sees it."""
+    if can_manage(resource):
+        return True
+    subject = get_current_subject()
+    return (
+        subject is not None
+        and subject.team_role == "admin"
+        and _in_team(subject, resource)
+    )
+
+
+# Fields a visibility-only change may differ in (owner fields are restamped
+# from the stored resource, timestamps by the backend, the rest is computed).
+_SCOPE_FIELDS = frozenset(
+    {"visibility", "team_id", "owner_id", "owner_name", "created_at", "updated_at"}
+)
+
+
+def _only_scope_changed(existing: Any, resource: Any) -> bool:
+    try:
+        exclude = set(_SCOPE_FIELDS) | set(getattr(type(existing), "model_computed_fields", {}) or {})
+        return existing.model_dump(exclude=exclude) == resource.model_dump(exclude=exclude)
+    except AttributeError:  # not a model: nothing to compare, so not "only scope"
+        return False
 
 
 def default_visibility() -> str:
@@ -411,10 +442,10 @@ class VisibilityScopedBackend:
         if existing is not None and (
             resource.visibility != _visibility(existing) or resource.team_id != _team(existing)
         ):
-            if not can_manage(existing):
+            if not can_change_visibility(existing):
                 raise NotOwner(
-                    f"Only the owner of {self._label} '{resource.id}' (or a super admin) "
-                    f"may change who can see it"
+                    f"Only the owner of {self._label} '{resource.id}', an admin of its "
+                    f"team, or a super admin may change who can see it"
                 )
         if subject is None:
             return
@@ -453,7 +484,14 @@ class VisibilityScopedBackend:
     async def update(self, resource_id: str, resource: Any) -> Any:
         existing = await self.inner.get(resource_id)
         if existing is not None:
-            self._check_editable(existing, resource_id)
+            if not (
+                can_see(existing)
+                and not can_edit(existing)
+                and can_change_visibility(existing)
+                and _only_scope_changed(existing, resource)
+            ):
+                # Anything but a team admin re-scoping their team's resource.
+                self._check_editable(existing, resource_id)
         await self._prepare(resource, existing)
         return await self.inner.update(resource_id, resource)
 
