@@ -1095,12 +1095,23 @@ read on every request, so a change applies on their next one.
 - **Super admin**: creates, renames and deletes teams (a team with resources
   shared with it cannot be deleted: `409`), and adds, moves (between teams),
   promotes and removes anyone.
-- **Team admin** (`role: admin` in a team): adds users who are in *no* team to
-  their team (`409` for a user in another team — moving users between teams is
-  a super admin's), removes members, and promotes or demotes them. A team that
-  has members keeps at least one admin (`409`). A team admin has no extra rights
-  over the team's resources.
-- Everyone else: `GET /teams` shows their own team and its members.
+- **Team admin** (`role: admin` in a team — a status only a super admin
+  assigns, directly or through the login script): adds users who are in *no*
+  team to their team as members (`409` for a user in another team — moving users
+  between teams is a super admin's) and removes its members. Making, demoting or
+  removing a team admin — themselves included — is a super admin's (`403`). Over
+  the team's resources one extra right: changing the visibility of a resource
+  shared with their team (not editing or deleting it).
+- Everyone else: no user or team management; `GET /teams` shows their own team
+  and its members.
+
+The same operations are management MCP tools (and chat agent tools), with the
+same rules: `who_am_i`, `list_teams`, `list_users`, `create_team`,
+`rename_team`, `delete_team`, `set_team_member` (add a user to a team, or set
+their role), `remove_team_member` and `set_resource_visibility` (public / team /
+private, and which team, for a workflow, agent, data source or script). Users
+are named by email, name or id, teams by name or id; an ambiguous name is
+answered with the candidates.
 
 Membership can also be set automatically from the token by a
 [login script](#login-script).

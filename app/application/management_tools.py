@@ -171,6 +171,10 @@ class ManagementDeps:
     # management caller, who can already read the run and the artifact's
     # metadata, and a run's data is exactly as sensitive as the run.
     stream_store: Any = None
+    # Carrier's user/team directory (app.infrastructure.persistence.team_directory)
+    # for the team and user management tools. None: those tools say teams are
+    # unavailable, exactly as the REST routes answer 503.
+    team_directory: Any = None
 
 
 def deps_from_container(
@@ -197,6 +201,7 @@ def deps_from_container(
         refresh_datasources=refresh_datasources,
         pubsub_subscriber=getattr(container, "pubsub_subscriber", None),
         stream_store=getattr(container, "stream_store", None),
+        team_directory=getattr(container, "team_directory", None),
     )
 
 
@@ -3100,3 +3105,377 @@ async def delete_message(
     except Exception as exc:  # noqa: BLE001
         return f"Could not delete the message: {exc}"
     return f"Message {message_id} deleted from {channel}."
+
+
+# ---------------------------------------------------------------------------
+# Teams, users and who may see a resource
+#
+# Thin layers over app.application.teams and the visibility-scoped backends:
+# every rule (super admin vs team admin, "a team keeps an admin", "only the
+# owner or a super admin changes who can see a resource", "only a super admin
+# shares with a team other than their own") is enforced *there*, the same code
+# the REST routes call, so this surface cannot grant more than the API does.
+# What lives here is only turning "alice@example.com" / "Red" into ids, and
+# saying what changed in words.
+# ---------------------------------------------------------------------------
+
+_NO_DIRECTORY = "Teams are not available: no user directory is configured."
+_TEAM_ROLES = ("member", "admin")
+_VISIBILITIES = ("public", "team", "private")
+_CANDIDATES_SHOWN = 15
+
+
+def _user_label(user: Any) -> str:
+    """'Name <email> (id: sub)' for a UserRecord or a teams._user_dict."""
+    get = user.get if isinstance(user, dict) else (lambda k: getattr(user, k, None))
+    name, email, sub = get("name"), get("email"), get("sub")
+    label = name or email or sub
+    if email and email != label:
+        label += f" <{email}>"
+    return f"{label} (id: {sub})"
+
+
+def _membership_text(team_id: str | None, role: str | None) -> str:
+    from app.application.teams import team_name
+    if not team_id:
+        return "in no team"
+    return f"{role or 'member'} of team '{team_name(team_id) or team_id}'"
+
+
+def _candidates(items: list[Any], render) -> str:
+    shown = ", ".join(render(i) for i in items[:_CANDIDATES_SHOWN])
+    more = len(items) - _CANDIDATES_SHOWN
+    return shown + (f" (and {more} more)" if more > 0 else "")
+
+
+def _best_matches(items: list[Any], query: str, fields: tuple[str, ...]) -> list[Any]:
+    """Exact (case-insensitive) match on any field first, else substring matches."""
+    q = query.strip().lower()
+
+    def values(item: Any) -> list[str]:
+        get = item.get if isinstance(item, dict) else (lambda k: getattr(item, k, None))
+        return [str(get(f)).lower() for f in fields if get(f)]
+
+    exact = [i for i in items if q in values(i)]
+    if exact:
+        return exact
+    return [i for i in items if any(q in v for v in values(i))]
+
+
+async def _resolve_team(deps: ManagementDeps, query: str):
+    """Returns ((team_id, team_name), None) or (None, error_str).
+
+    An exact team id always resolves (it is what the REST routes take, and the
+    authorization that follows is the routes' own). A name is looked up among
+    the teams the caller may see — every team for a super admin, their own
+    otherwise — so this never reveals another team's name.
+    """
+    from app.application import teams
+    directory = deps.team_directory
+    query = (query or "").strip()
+    if not query:
+        return None, "Say which team (its name or id)."
+    team = await directory.get_team(query)
+    if team is not None:
+        return (team.id, team.name), None
+    visible = await teams.list_teams(directory)
+    matches = _best_matches(visible, query, ("name",))
+    if len(matches) == 1:
+        return (matches[0]["id"], matches[0]["name"]), None
+    def render(t: dict) -> str:
+        return f"{t['name']} (id: {t['id']})"
+
+    if matches:
+        return None, f"Ambiguous team '{query}' — matches: {_candidates(matches, render)}"
+    available = _candidates(visible, render) if visible else "none"
+    return None, f"Team '{query}' not found. Teams you can see: {available}"
+
+
+async def _resolve_user(deps: ManagementDeps, query: str):
+    """Returns (UserRecord, None) or (None, error_str).
+
+    Accepts the user's id (token ``sub``), email or display name. An exact id
+    always resolves, as the REST routes take one; an email or a name is looked
+    up among the users the caller may list — everyone for a super admin, users
+    in no team plus their own team for a team admin — so a team admin cannot
+    use this to discover who is in another team.
+    """
+    from app.application import teams
+    directory = deps.team_directory
+    query = (query or "").strip()
+    if not query:
+        return None, "Say which user (their email, name or id)."
+    user = await directory.get_user(query)
+    if user is not None:
+        return user, None
+    visible = await teams.list_users(directory)
+    matches = _best_matches(visible, query, ("email", "name", "sub"))
+    if len(matches) == 1:
+        return await directory.get_user(matches[0]["sub"]), None
+    if matches:
+        return None, (
+            f"Ambiguous user '{query}' — matches: {_candidates(matches, _user_label)}. "
+            "Use the email or id."
+        )
+    return None, (
+        f"User '{query}' not found among the users you can manage. A user is "
+        "known to carrier only after their first sign-in; list_users shows who is."
+    )
+
+
+@requires(Permission.READ)
+async def who_am_i(deps: ManagementDeps) -> str:
+    from app.application.teams import team_name
+    from app.infrastructure.auth.authorization import get_current_subject
+    subject = get_current_subject()
+    if subject is None:
+        return (
+            "No caller identity is bound (authentication is off, or this is the "
+            "platform itself): every team and visibility check passes."
+        )
+    if not subject.id:
+        return (
+            "Calling with the shared management API key: no user identity, not a "
+            "super admin and in no team. Sees public resources only and cannot "
+            "manage teams or users."
+        )
+    lines = [f"You are {_user_label({'sub': subject.id, 'name': subject.name, 'email': subject.email})}."]
+    lines.append(
+        "Super admin: yes — may manage every team, user and resource."
+        if subject.is_super_admin else "Super admin: no."
+    )
+    if subject.team_id:
+        lines.append(
+            f"Team: {team_name(subject.team_id) or subject.team_id} (id: {subject.team_id}), "
+            f"role: {subject.team_role or 'member'}."
+        )
+        if subject.team_role == "admin":
+            lines.append(
+                "As its team admin you may add users who are in no team to it as "
+                "members, remove its members, and change who can see resources "
+                "shared with it. Making or removing a team admin is a super admin's call."
+            )
+    else:
+        lines.append("Team: none.")
+    if not subject.is_super_admin and subject.team_role != "admin":
+        lines.append("You may not manage teams or users.")
+    return "\n".join(lines)
+
+
+@requires(Permission.READ)
+async def list_teams(deps: ManagementDeps) -> str:
+    from app.application import teams
+    if deps.team_directory is None:
+        return _NO_DIRECTORY
+    listed = await teams.list_teams(deps.team_directory)
+    if not listed:
+        return "No teams visible to you."
+    blocks = []
+    for team in listed:
+        members = team["members"]
+        lines = [f"- **{team['name']}** (id: {team['id']}) — {len(members)} member(s)"]
+        for m in members:
+            lines.append(f"  - {_user_label(m)}: {m['role']}")
+        blocks.append("\n".join(lines))
+    return "\n".join(blocks)
+
+
+@requires(Permission.READ)
+async def list_users(deps: ManagementDeps, query: str = "") -> str:
+    from app.application import teams
+    if deps.team_directory is None:
+        return _NO_DIRECTORY
+    users = await teams.list_users(deps.team_directory)
+    if query.strip():
+        users = _best_matches(users, query, ("email", "name", "sub"))
+    if not users:
+        return f"No users match '{query}'." if query.strip() else "No users found."
+    lines = []
+    for u in users:
+        team = u["team"]
+        where = f"{team['role']} of team '{team['name'] or team['id']}'" if team else "in no team"
+        flag = ", super admin" if u["is_super_admin"] else ""
+        lines.append(f"- {_user_label(u)}: {where}{flag}")
+    return "\n".join(lines)
+
+
+@requires(Permission.WRITE)
+async def create_team(deps: ManagementDeps, name: str) -> str:
+    from app.application import teams
+    if deps.team_directory is None:
+        return _NO_DIRECTORY
+    try:
+        team = await teams.create_team(deps.team_directory, name)
+    except teams.TeamConflict:
+        clean = name.strip()
+        existing = next(
+            (t for t in await deps.team_directory.list_teams() if t.name == clean), None
+        )
+        if existing is None:  # pragma: no cover - raced with a delete
+            raise
+        return f"Team '{existing.name}' already exists (id: {existing.id}); nothing changed."
+    return f"Team '{team['name']}' created (id: {team['id']})."
+
+
+@requires(Permission.WRITE)
+async def rename_team(deps: ManagementDeps, team: str, new_name: str) -> str:
+    from app.application import teams
+    if deps.team_directory is None:
+        return _NO_DIRECTORY
+    resolved, err = await _resolve_team(deps, team)
+    if err:
+        return err
+    team_id, old_name = resolved
+    if old_name == (new_name or "").strip():
+        teams.require_super_admin("rename teams")
+        return f"Team '{old_name}' already has that name; nothing changed."
+    renamed = await teams.rename_team(deps.team_directory, team_id, new_name)
+    return f"Team '{old_name}' renamed to '{renamed['name']}' (id: {team_id})."
+
+
+@requires(Permission.DELETE)
+async def delete_team(deps: ManagementDeps, team: str) -> str:
+    from app.application import teams
+    if deps.team_directory is None:
+        return _NO_DIRECTORY
+    resolved, err = await _resolve_team(deps, team)
+    if err:
+        return err
+    team_id, name = resolved
+    await teams.delete_team(
+        deps.team_directory,
+        team_id,
+        [deps.agent_backend, deps.data_source_backend, deps.script_backend, deps.workflow_backend],
+    )
+    return f"Team '{name}' (id: {team_id}) deleted; its members are now in no team."
+
+
+@requires(Permission.WRITE)
+async def set_team_member(
+    deps: ManagementDeps, user: str, team: str, role: str = "member"
+) -> str:
+    from app.application import teams
+    if deps.team_directory is None:
+        return _NO_DIRECTORY
+    role = (role or "member").strip().lower()
+    if role not in _TEAM_ROLES:
+        return f"Unknown role '{role}'; expected one of: {', '.join(_TEAM_ROLES)}."
+    resolved, err = await _resolve_team(deps, team)
+    if err:
+        return err
+    team_id, team_label = resolved
+    # The same check teams.set_member opens with, made before looking the user
+    # up so that a caller who may not manage this team is told exactly that.
+    teams.require_team_manager(team_id)
+    found, err = await _resolve_user(deps, user)
+    if err:
+        return err
+    before = _membership_text(found.team_id, found.team_role)
+    unchanged = found.team_id == team_id and (found.team_role or "member") == role
+    await teams.set_member(deps.team_directory, team_id, found.sub, role)
+    if unchanged:
+        return f"{_user_label(found)} is already {role} of team '{team_label}'; nothing changed."
+    return f"{_user_label(found)} is now {role} of team '{team_label}' (was: {before})."
+
+
+@requires(Permission.DELETE)
+async def remove_team_member(deps: ManagementDeps, user: str, team: str) -> str:
+    from app.application import teams
+    if deps.team_directory is None:
+        return _NO_DIRECTORY
+    resolved, err = await _resolve_team(deps, team)
+    if err:
+        return err
+    team_id, team_label = resolved
+    teams.require_team_manager(team_id)
+    found, err = await _resolve_user(deps, user)
+    if err:
+        return err
+    if found.team_id != team_id:
+        return f"{_user_label(found)} is not a member of team '{team_label}'; nothing changed."
+    await teams.remove_member(deps.team_directory, team_id, found.sub)
+    return f"{_user_label(found)} removed from team '{team_label}'; they are now in no team."
+
+
+async def _owned_resource(deps: ManagementDeps, kind: str, query: str):
+    """(backend, resource, None) or (None, None, error) for a visibility change."""
+    resolvers = {
+        "workflow": (deps.workflow_backend, _resolve_workflow_id),
+        "agent": (deps.agent_backend, _resolve_agent_id),
+        "datasource": (deps.data_source_backend, _resolve_datasource_id),
+        "script": (deps.script_backend, _resolve_script_id),
+    }
+    backend, resolve = resolvers[kind]
+    if backend is None:
+        return None, None, f"No {kind} backend is configured."
+    resource_id, err = await resolve(deps, query)
+    if err:
+        return None, None, err
+    resource = await backend.get(resource_id)
+    if resource is None:
+        return None, None, f"{kind.capitalize()} '{query}' not found."
+    return backend, resource, None
+
+
+@requires(Permission.WRITE)
+async def set_resource_visibility(
+    deps: ManagementDeps, kind: str, resource: str, visibility: str, team: str = ""
+) -> str:
+    from app.application.teams import team_name
+    kind = (kind or "").strip().lower().replace(" ", "").replace("_", "")
+    kind = {"datasources": "datasource", "workflows": "workflow", "agents": "agent",
+            "scripts": "script"}.get(kind, kind)
+    if kind not in ("workflow", "agent", "datasource", "script"):
+        return (
+            f"Unknown kind '{kind}'; expected workflow, agent, datasource or script "
+            "(events have no owner or visibility of their own)."
+        )
+    visibility = (visibility or "").strip().lower()
+    if visibility not in _VISIBILITIES:
+        return f"Unknown visibility '{visibility}'; expected one of: {', '.join(_VISIBILITIES)}."
+    if team.strip() and visibility != "team":
+        return "A team can only be given with visibility 'team'."
+    team_id = None
+    if visibility == "team" and team.strip():
+        if deps.team_directory is None:
+            return _NO_DIRECTORY
+        resolved, err = await _resolve_team(deps, team)
+        if err:
+            return err
+        team_id = resolved[0]
+    backend, existing, err = await _owned_resource(deps, kind, resource)
+    if err:
+        return err
+    if kind == "workflow" and getattr(existing, "readonly", False):
+        return f"Workflow '{existing.id}' is read-only and cannot be modified."
+    before_vis = existing.visibility or "public"
+    before_team = existing.team_id if before_vis == "team" else None
+    # A copy: an in-process backend may hand out its stored object, and the
+    # scoped backend compares the request against what is stored to decide
+    # whether this is a visibility change only the owner may make.
+    updated = existing.model_copy(deep=True)
+    # Assigning marks the fields as explicitly requested, which is how the
+    # scoped backend tells "share with this team" from "keep the stored one".
+    updated.visibility = visibility
+    if team_id is not None:
+        updated.team_id = team_id
+    saved = await backend.update(existing.id, updated)
+    if kind == "workflow" and deps.refresh_runner is not None:
+        await deps.refresh_runner(existing.id)
+    if kind == "datasource":
+        await _publish_datasources(deps)
+    saved = saved if saved is not None else updated
+    after_team = saved.team_id if saved.visibility == "team" else None
+
+    def describe(vis: str, tid: str | None) -> str:
+        return f"team (team '{team_name(tid) or tid}')" if vis == "team" else vis
+
+    label = {"datasource": "Data source"}.get(kind, kind.capitalize())
+    owner = getattr(saved, "owner_name", None) or getattr(saved, "owner_id", None) or "nobody"
+    now = describe(saved.visibility, after_team)
+    if (saved.visibility, after_team) == (before_vis, before_team):
+        return f"{label} '{saved.id}' is already {now}; nothing changed. Owner: {owner}."
+    return (
+        f"{label} '{saved.id}' is now {now} (was: {describe(before_vis, before_team)}). "
+        f"Owner: {owner}."
+    )
