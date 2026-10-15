@@ -39,7 +39,7 @@ async def _counts(steps: list[dict], thread: str) -> dict[str, int]:
 
 
 async def test_explicit_end_stops_a_mid_array_convergence_node() -> None:
-    """The ops deadline-watcher shape with the fix applied to it.
+    """The deadline-watcher shape with the fix applied to it.
 
     ``done`` sits mid-array, immediately before ``branch_a``, which the switch
     already routes to. Declaring ``next: END`` makes its position irrelevant;

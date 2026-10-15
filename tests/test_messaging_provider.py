@@ -163,13 +163,13 @@ async def test_reply_in_thread_carries_thread_ts(transport):
 @pytest.mark.asyncio
 async def test_read_history_passes_the_window_and_maps_messages(transport):
     t = transport({"conversations.history": {"ok": True, "messages": [
-        {"ts": "9.1", "user": "U9", "text": "FRIST 128498: 3"},
+        {"ts": "9.1", "user": "U9", "text": "DEADLINE 1001: 3"},
         {"ts": "9.0", "user": "U8", "text": "noise", "thread_ts": "8.0"},
     ]}})
     messages = await SlackProvider(TOKEN).read_history("C1", oldest="100", limit=200)
 
     assert _form(t.requests[0]) == {"channel": "C1", "oldest": "100", "limit": "200"}
-    assert [m.text for m in messages] == ["FRIST 128498: 3", "noise"]
+    assert [m.text for m in messages] == ["DEADLINE 1001: 3", "noise"]
     assert messages[0].as_dict()["ts"] == "9.1"
     assert messages[1].thread_id == "8.0"
 
@@ -200,11 +200,11 @@ async def test_open_dm_returns_a_channel_id_post_message_can_use(transport):
         "chat.postMessage": {"ok": True, "ts": "3.3", "channel": "D123"},
     })
     provider = SlackProvider(TOKEN)
-    dm = await provider.open_dm("U0987654321")
+    dm = await provider.open_dm("U0456GHIJKL")
     posted = await provider.post_message(dm, "no usable export today")
 
     assert dm == "D123"
-    assert _form(t.requests[0]) == {"users": "U0987654321"}
+    assert _form(t.requests[0]) == {"users": "U0456GHIJKL"}
     assert json.loads(t.requests[1].content)["channel"] == "D123"
     assert posted.channel == "D123"
 

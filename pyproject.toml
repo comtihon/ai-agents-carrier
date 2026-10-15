@@ -9,7 +9,7 @@ description = "AI development orchestration backend built with FastAPI, LangGrap
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 license = { text = "MIT" }
-authors = [{ name = "Acme" }]
+authors = [{ name = "comtihon" }]
 dependencies = [
   "fastapi>=0.115.14,<0.116.0",
   "uvicorn[standard]>=0.44.0,<1.0.0",

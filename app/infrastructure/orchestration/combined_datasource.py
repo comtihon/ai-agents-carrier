@@ -13,20 +13,20 @@ document.  A ``combined_datasource`` step is that whole pipeline as one step:
     - id: invoice_candidates
       type: combined_datasource
       output_key: invoice_candidates
-      output: get_classification          # optional; default = last part
+      output: get_details          # optional; default = last part
       parts:
-        - {id: fetch_at, type: data_source, source: crm-projects,
+        - {id: fetch_orders, type: data_source, source: crm-projects,
            operation: list_projects_operations, params: {status: [10]}}
-        - {id: sel_at, type: python, script_id: invoice-candidates-select, stream: fetch_at}
-        - {id: cand, type: python, code: "output = {'project_ids': parts['sel_at']['ids']}"}
-        - {id: get_classification, type: data_source, source: crm-order-details,
+        - {id: select, type: python, script_id: invoice-candidates-select, stream: fetch_orders}
+        - {id: cand, type: python, code: "output = {'project_ids': parts['select']['ids']}"}
+        - {id: get_details, type: data_source, source: crm-order-details,
            operation: get_order_details, params: {id: "{cand[project_ids]}"}}
 
 Rules
 -----
 * Parts run strictly in the order they are listed.
 * A part sees the workflow state plus every *earlier* part's output, by part
-  id: ``{cand[project_ids]}`` in a data source part's params; ``parts["sel_at"]``
+  id: ``{cand[project_ids]}`` in a data source part's params; ``parts["select"]``
   in a python part (``records()`` reads the part named by ``stream:``).  A data
   source output that a python part names in ``parts[...]`` (other than its
   ``stream``) is loaded for it as a list, so one script can combine several.

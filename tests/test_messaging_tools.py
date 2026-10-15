@@ -85,14 +85,14 @@ async def test_post_message_can_reply_in_a_thread(mcp, provider):
 @pytest.mark.asyncio
 async def test_read_messages_renders_ids_authors_and_text(mcp, provider):
     provider.history = [
-        Message(id="9.1", channel="C1", text="FRIST 128498: 3", author="U9"),
+        Message(id="9.1", channel="C1", text="DEADLINE 1001: 3", author="U9"),
         Message(id="9.0", channel="C1", text="in a thread", author="U8",
                 thread_id="8.0"),
     ]
     result = str(await mcp.call_tool(
         "read_messages", {"channel": "C1", "limit": 5, "provider": FAKE}
     ))
-    assert "9.1 U9: FRIST 128498: 3" in result
+    assert "9.1 U9: DEADLINE 1001: 3" in result
     assert "[thread 8.0]" in result
     assert provider.last_history["limit"] == 5
 

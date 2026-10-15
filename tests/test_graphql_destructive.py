@@ -1,7 +1,7 @@
 """A GraphQL query is a read; only a mutation is a write.
 
 Every GraphQL call is a POST, so reading the HTTP verb classified read-only
-queries as writes. That painted a W badge on billing-api's read-only source
+queries as writes. That painted a W badge on a read-only GraphQL source
 in the canvas, and the classifier's previous answer -- "GraphQL is never
 destructive" -- was the safe result for a query and the wrong one for a
 mutation. The document distinguishes them and it is right there on the
@@ -21,7 +21,7 @@ from app.infrastructure.datasources.destructive import graphql_writes, is_destru
 def _gql(**op) -> tuple[DataSourceDefinition, OperationDefinition]:
     operation = OperationDefinition(**op)
     source = DataSourceDefinition(
-        id="cc", kind="graphql", base_url="https://x/graphql",
+        id="gql", kind="graphql", base_url="https://x/graphql",
         operations=[operation],
     )
     return source, operation
@@ -82,12 +82,12 @@ def test_http_sources_are_unchanged():
         assert is_destructive(op, source) is expected, method
 
 
-def test_the_real_billing_api_operations_read_as_reads():
+def test_typical_query_only_operations_read_as_reads():
     """The source whose description says query-only must classify that way."""
     queries = [
         "query projects($filterBy: ProjectFilterInput) { projects(filterBy: $filterBy) { id } }",
         "query statistics { statistics { received delivered } }",
-        "query machines { machines { id name } }",
+        "query customers { customers { id name } }",
     ]
     for q in queries:
         source, op = _gql(name="op", query=q)

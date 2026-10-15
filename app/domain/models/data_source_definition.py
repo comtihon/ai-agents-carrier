@@ -156,8 +156,8 @@ class Paginate(BaseModel):
     items_path: str | None = None
     # Where the cursor / page number / offset goes. For an HTTP source this is
     # a query-string argument. For a GraphQL source it is a variable, and it
-    # may be a DOTTED PATH into a nested input object -- billing-api takes
-    # ``pagination: PaginationInput{limit, skip}``, so ``pagination.skip``
+    # may be a DOTTED PATH into a nested input object -- e.g. a backend that takes
+    # ``pagination: PaginationInput{limit, skip}``: ``pagination.skip``
     # reaches the right field where a flat name could not.
     param: str
     # Where the page size goes, same dotted-path rules. Declaring it is what

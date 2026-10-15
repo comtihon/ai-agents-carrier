@@ -71,8 +71,8 @@ SIGNING_KEY = "grant-signing-key"
 def _projects_source() -> DataSourceDefinition:
     """A source with a read, a write and a delete — the realistic shape.
 
-    Modelled on the live ``crm-projects`` source, which authenticates as the
-    carrier's own service identity and holds 23 mutating operations.
+    Modelled on a typical project-management source, which authenticates as
+    the carrier's own service identity and holds many mutating operations.
     """
     return DataSourceDefinition.model_validate({
         "id": "crm-projects",

@@ -3321,7 +3321,7 @@ class YamlGraphRunner:
                 logger.exception("[%s] step '%s' messaging failed", graph_id, step_id)
                 if step.get("ignore_errors"):
                     # A provider being unreachable must not be able to take the
-                    # whole run down when the caller said so — the ops watcher
+                    # whole run down when the caller said so — the deadline watcher
                     # reads its override channel this way, because refusing to
                     # compute deadlines because Slack is down would trade a real
                     # alarm for a missing one.
@@ -3351,7 +3351,7 @@ class YamlGraphRunner:
         (``thread_ts`` is accepted as well, since that is what Slack calls it).
         With ``skip_if_replied`` the thread is read first and a reply whose text
         is already present is not posted again — that is what makes "confirm
-        each accepted override" safe to re-run, which the ops watcher does every
+        each accepted override" safe to re-run, which the deadline watcher does every
         morning over an overlapping 26-hour window.
         """
         raw_items = step.get("items")

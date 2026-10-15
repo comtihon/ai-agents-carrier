@@ -91,11 +91,11 @@ async def test_flat_settings_appear_as_the_default_identity(client, monkeypatch)
 async def test_lists_multiple_named_identities(client, monkeypatch):
     _set_env(monkeypatch, {
         "SERVICE_AUTH_ENABLED": "true",
-        "SERVICE_AUTH_IDENTITIES": json.dumps([_identity("crm"), _identity("billing_api")]),
+        "SERVICE_AUTH_IDENTITIES": json.dumps([_identity("crm"), _identity("billing")]),
     })
 
     data = (await client.get("/api/v1/llm/service-identities")).json()
-    assert [i["name"] for i in data["identities"]] == ["crm", "billing_api"]
+    assert [i["name"] for i in data["identities"]] == ["crm", "billing"]
     assert all(i["configured"] for i in data["identities"])
     # Several identities and no designated default — a caller must name one.
     assert data["default_identity"] is None
@@ -104,7 +104,7 @@ async def test_lists_multiple_named_identities(client, monkeypatch):
 async def test_explicit_default_identity_is_reported(client, monkeypatch):
     _set_env(monkeypatch, {
         "SERVICE_AUTH_ENABLED": "true",
-        "SERVICE_AUTH_IDENTITIES": json.dumps([_identity("crm"), _identity("billing_api")]),
+        "SERVICE_AUTH_IDENTITIES": json.dumps([_identity("crm"), _identity("billing")]),
         "SERVICE_AUTH_DEFAULT_IDENTITY": "crm",
     })
 

@@ -626,19 +626,19 @@ Ordered `parts`, each a `data_source` part, a `python` part, or a nested
 - id: invoice_candidates
   type: combined_datasource
   output_key: invoice_candidates
-  output: get_classification        # optional; default = last part
+  output: get_details        # optional; default = last part
   parts:
-    - {id: fetch_at, type: data_source, source: crm-projects,
+    - {id: fetch_orders, type: data_source, source: crm-projects,
        operation: list_projects_operations, params: {status: [10], page_size: 50}}
-    - {id: sel_at, type: python, script_id: invoice-candidates-select, stream: fetch_at}
+    - {id: select, type: python, script_id: invoice-candidates-select, stream: fetch_orders}
     - {id: cand, type: python,
-       code: "output = {'project_ids': sorted(set(parts['sel_at']['ids']))}"}
-    - {id: get_classification, type: data_source, source: crm-order-details,
+       code: "output = {'project_ids': sorted(set(parts['select']['ids']))}"}
+    - {id: get_details, type: data_source, source: crm-order-details,
        operation: get_order_details, params: {id: "{cand[project_ids]}"}}
 ```
 
 - A part sees workflow state plus every earlier part's output by id:
-  `{cand[project_ids]}` in params, `parts["sel_at"]` in python (a data source
+  `{cand[project_ids]}` in params, `parts["select"]` in python (a data source
   output named that way is loaded as a list; `stream: <part id>` gives
   `records()` instead).
 - A data source param that resolves to a list (or a whole `{part}` naming a

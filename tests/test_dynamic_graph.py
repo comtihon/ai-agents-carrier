@@ -194,7 +194,7 @@ def test_roster_carries_description_and_addons():
     from app.infrastructure.orchestration.dynamic.dispatcher import build_roster
 
     agent = AgentDefinition(
-        id="validator", name="Validator", description="Checks roof geometry against the survey",
+        id="validator", name="Validator", description="Checks invoice totals against the ledger",
         addons=[
             MCPAddon(servers={"blender": True, "jira": False}),
             ToolsAddon(tools={"gh": True}),
@@ -203,7 +203,7 @@ def test_roster_carries_description_and_addons():
     )
     cfg = DynamicConfig.model_validate({"agent_pool": [{"agent_id": "validator", "categories": ["validation", "execution"]}]})
     roster = build_roster(cfg, {"validator": agent})
-    assert "Checks roof geometry" in roster
+    assert "Checks invoice totals" in roster
     assert "MCP: blender" in roster and "jira" not in roster
     assert "tools: gh" in roster
     assert "datasource survey (get_points)" in roster

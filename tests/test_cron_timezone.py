@@ -85,7 +85,7 @@ def test_register_passes_step_timezone_through_container() -> None:
             )
 
     class _FakeRunner:
-        id = "csm"
+        id = "deadline"
         steps = [
             {"id": "trigger", "type": "cron",
              "schedule": "0 9 * * 1-5", "timezone": "Europe/Berlin"},

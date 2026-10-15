@@ -193,7 +193,7 @@ Rules:
 - Pick agents by their description and capabilities: give a job to an agent that can reach what the job needs.
 - The same agent may fill several jobs (e.g. three coders on three features) up to its max parallel instances.
 - Parallelise only when the jobs touch disjoint parts. Give every execution job an "owns" list naming what it
-  may change (file globs like "src/billing/**", or named parts like "collection:Roof"). If two parts are
+  may change (file globs like "src/billing/**", or named parts like "collection:Invoices"). If two parts are
   tightly coupled, make them sequential with depends_on instead.
 - depends_on must form a DAG. Do not create loops: feedback loops happen at run time through handbacks.
 - Each prompt is the complete brief for that agent: goal, scope, inputs it will receive, what to output.

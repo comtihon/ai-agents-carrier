@@ -66,7 +66,7 @@ def test_normalisation_is_idempotent(path: str) -> None:
 
 
 def test_a_fall_through_into_a_branch_is_made_visible_not_silent() -> None:
-    """The ops deadline-watcher shape, which the editor used to produce.
+    """The deadline-watcher shape, which the editor used to produce.
 
     ``done`` sits immediately before ``branch_a``, a step the switch already
     routes to, so step order alone wires the tail back into a branch. There is

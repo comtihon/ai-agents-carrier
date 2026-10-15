@@ -1213,7 +1213,7 @@ def _set_path(target: dict[str, Any], path: str, value: Any) -> None:
     """Set ``a.b.c`` inside nested dicts, creating the levels on the way.
 
     Pagination for a GraphQL source has to reach a field of an input object:
-    billing-api's ``pagination`` is ``PaginationInput{limit, skip}``, so the
+    when a backend's ``pagination`` is ``PaginationInput{limit, skip}``, the
     offset belongs at ``pagination.skip``, not at a top-level variable of that
     name. A path with no dots behaves exactly as a plain key assignment did.
 

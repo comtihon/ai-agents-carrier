@@ -52,8 +52,8 @@ def _case(case_id: str = "case_1", **overrides) -> ApprovalCase:
     data: dict = {
         "id": case_id,
         "status": "pending",
-        "workflow_id": "csm-watcher",
-        "workflow_name": "ops Watcher",
+        "workflow_id": "deadline-watcher",
+        "workflow_name": "Deadline Watcher",
         "run_id": "run_abc",
         "step_id": "write_status",
         "datasource_id": "google-sheets",
@@ -91,7 +91,7 @@ async def test_the_pending_queue_names_the_blast_radius(approvals):
     assert "write" in out
     assert "Projects sheet.set_status" in out
     assert "2 row(s)" in out
-    assert "ops Watcher" in out
+    assert "Deadline Watcher" in out
     # The point of the list is to get the caller to read one properly.
     assert "get_approval" in out
 

@@ -3,7 +3,7 @@
 Two faults seen in the Slack channel, from one gated Google Sheets append:
 
     Data deletion awaiting approval — 1 row
-    Workflow: CRM Delivered -> Google Sheet (temp)
+    Workflow: Orders Delivered -> Google Sheet (temp)
     Operation: Google Sheets · append_values
 
 Nothing was going to be deleted, and it was ten rows, not one.

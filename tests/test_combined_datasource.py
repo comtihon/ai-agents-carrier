@@ -27,9 +27,9 @@ _SOURCES = {
         "operations": [
             {"name": "list_projects", "path": "/projects",
              "params": [{"name": "status", "type": "array"}, {"name": "kind", "type": "string"}]},
-            {"name": "get_classification", "path": "/projects/{id}/classification",
+            {"name": "get_details", "path": "/projects/{id}/details",
              "params": [{"name": "id", "type": "number", "required": True}]},
-            {"name": "bulk_classification", "path": "/classifications",
+            {"name": "bulk_details", "path": "/details",
              "params": [{"name": "ids", "type": "array"}]},
             {"name": "delete_project", "path": "/projects/{id}", "method": "DELETE",
              "params": [{"name": "id", "type": "number"}]},
@@ -59,11 +59,11 @@ class _Executor:
             if params.get("kind"):
                 rows = [r for r in rows if r["open"]]
             shape, data = "list", rows
-        elif operation == "get_classification":
+        elif operation == "get_details":
             if params["id"] == 7:
                 raise RuntimeError("404 not found")
-            shape, data = "value", [{"name": f"Paket {'s' if params['id'] < 5 else 'm'}", "price": 100}]
-        elif operation == "bulk_classification":
+            shape, data = "value", [{"name": f"Plan {'s' if params['id'] < 5 else 'm'}", "price": 100}]
+        elif operation == "bulk_details":
             shape, data = "list", [{"id": i} for i in params["ids"]]
         else:
             raise AssertionError(operation)
@@ -142,7 +142,7 @@ async def test_parts_run_in_order_with_cross_part_refs_and_a_loop(store):
         {"id": "fetch", "type": "data_source", "source": "crm", "operation": "list_projects",
          "params": {"status": [10]}},
         _py("sel", "output = {'ids': [r['id'] for r in records() if r['open']]}", stream="fetch"),
-        {"id": "cls", "type": "data_source", "source": "crm", "operation": "get_classification",
+        {"id": "cls", "type": "data_source", "source": "crm", "operation": "get_details",
          "params": {"id": "{sel[ids]}"}},
     ]
     runner = _runner([_step(parts)], store)
@@ -153,7 +153,7 @@ async def test_parts_run_in_order_with_cross_part_refs_and_a_loop(store):
     assert [c[1]["id"] for c in calls[1:]] == [2, 4, 6, 8, 10]
     out = await _value(runner, run.state["cands"])
     assert [r["id"] for r in out] == [2, 4, 6, 8, 10]
-    assert out[0]["result"] == {"name": "Paket s", "price": 100}
+    assert out[0]["result"] == {"name": "Plan s", "price": 100}
     trace = run.step_outputs["cands"]["_combined_cands"]
     assert [p["id"] for p in trace["parts"]] == ["fetch", "sel", "cls"]
     assert all(p["status"] == "finished" for p in trace["parts"])
@@ -165,7 +165,7 @@ async def test_parts_run_in_order_with_cross_part_refs_and_a_loop(store):
 async def test_loop_collects_per_element_errors_without_failing(store):
     parts = [
         _py("ids", "output = [6, 7, 8]"),
-        {"id": "cls", "type": "data_source", "source": "crm", "operation": "get_classification",
+        {"id": "cls", "type": "data_source", "source": "crm", "operation": "get_details",
          "params": {"id": "{ids}"}},
     ]
     runner = _runner([_step(parts)], store)
@@ -179,7 +179,7 @@ async def test_loop_collects_per_element_errors_without_failing(store):
 async def test_fail_on_error_fails_the_step_with_trace(store):
     parts = [
         _py("ids", "output = [6, 7]"),
-        {"id": "cls", "type": "data_source", "source": "crm", "operation": "get_classification",
+        {"id": "cls", "type": "data_source", "source": "crm", "operation": "get_details",
          "params": {"id": "{ids}"}, "fail_on_error": True},
         _py("after", "output = 1"),
     ]
@@ -193,12 +193,12 @@ async def test_fail_on_error_fails_the_step_with_trace(store):
 async def test_array_param_is_called_once_in_bulk(store):
     parts = [
         _py("ids", "output = {'ids': [1, 2, 3]}"),
-        {"id": "bulk", "type": "data_source", "source": "crm", "operation": "bulk_classification",
+        {"id": "bulk", "type": "data_source", "source": "crm", "operation": "bulk_details",
          "params": {"ids": "{ids[ids]}"}},
     ]
     runner = _runner([_step(parts)], store)
     await _go(runner)
-    assert runner._data_source_executor.calls == [("bulk_classification", {"ids": [1, 2, 3]})]
+    assert runner._data_source_executor.calls == [("bulk_details", {"ids": [1, 2, 3]})]
 
 
 async def test_python_part_uses_several_outputs_and_order_matters(store):
@@ -225,7 +225,7 @@ async def test_nested_combined_and_explicit_output(store):
     parts = [
         _py("seed", "output = {'ids': [2, 3]}"),
         {"id": "inner", "type": "combined_datasource", "parts": [
-            {"id": "cls", "type": "data_source", "source": "crm", "operation": "get_classification",
+            {"id": "cls", "type": "data_source", "source": "crm", "operation": "get_details",
              "params": {"id": "{seed[ids]}"}},
             _py("names", "output = [r['result']['name'] for r in parts['cls']]"),
         ]},
@@ -233,7 +233,7 @@ async def test_nested_combined_and_explicit_output(store):
     ]
     runner = _runner([_step(parts, output="inner")], store)
     run = await _go(runner)
-    assert await _value(runner, run.state["cands"]) == ["Paket s", "Paket s"]
+    assert await _value(runner, run.state["cands"]) == ["Plan s", "Plan s"]
     inner = run.step_outputs["cands"]["_combined_cands"]["parts"][1]
     assert [p["id"] for p in inner["parts"]] == ["cls", "names"]
     assert inner["output_part"] == "names"

@@ -117,7 +117,7 @@ async def test_store_fallback_is_exact_id_only():
     """Fuzzy-matching a workflow that could not be built would be guessing."""
     deps = _deps(registered=[], stored=[_wf("organize-crm")])
 
-    resolved, err = await core._resolve_workflow_id(deps, "hubspot")
+    resolved, err = await core._resolve_workflow_id(deps, "crm")
 
     assert resolved is None
     assert err is not None

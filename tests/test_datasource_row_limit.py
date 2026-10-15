@@ -2,7 +2,7 @@
 
 Pagination is the data source's business. Before this, a workflow had to pass
 `pagination: {limit: 50, skip: 0}` itself -- which meant the editor showed
-`[object Object]`, an unpaginated read of billing-api 502'd, and a step
+`[object Object]`, an unpaginated read of a GraphQL backend 502'd, and a step
 could only ever get one page. Now the operation declares how to page and the
 step declares how much it wants, or nothing at all for everything.
 """
@@ -33,9 +33,9 @@ def store(tmp_path) -> LocalDiskStreamStore:
 
 
 def _graphql_source(**kw) -> DataSourceDefinition:
-    """billing-api's shape: pagination is a nested PaginationInput."""
+    """A common GraphQL shape: pagination is a nested PaginationInput."""
     return DataSourceDefinition(
-        id="cc", kind="graphql", base_url="https://cc/graphql",
+        id="gql", kind="graphql", base_url="https://gql.example/graphql",
         operations=[
             OperationDefinition(
                 name="projects",

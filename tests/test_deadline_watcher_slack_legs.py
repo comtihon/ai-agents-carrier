@@ -1,10 +1,10 @@
-"""The ops deadline watcher's Slack legs, expressed with the ``slack`` step.
+"""The deadline watcher's Slack legs, expressed with the ``slack`` step.
 
 The watcher (workflow ``deadline-watcher``, deliberately disabled and
 trigger-less) has three Slack legs in its spec, and until now they were the only
 part of it that had to be written with ``http_call``:
 
-  1. read ~26h of ``#deadline-tracker-agent`` and hand every message
+  1. read ~26h of ``#deadline-tracker`` and hand every message
      verbatim to the library script ``deadline-parse-overrides``,
   2. confirm each accepted override in its own thread, skipping any thread that
      already carries the confirmation,
@@ -30,7 +30,7 @@ from app.infrastructure.messaging.slack import SlackMessage
 from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner
 from tests.test_yaml_graph_messaging import FAKE, FakeProvider
 
-CHANNEL = "C0123456789"  # #deadline-tracker-agent
+CHANNEL = "C0123456789"  # #deadline-tracker
 
 WATCHER_SLACK_LEGS: list[dict] = [
     # 1. Read the override channel.  ``ignore_errors`` on purpose: the deadline
@@ -101,8 +101,8 @@ WATCHER_SLACK_LEGS: list[dict] = [
         "type": "slack",
         "action": "dm",
         "user_id": "{fallback_owner_slack_id}",
-        "text": "ops-Deadline-Watcher: kein brauchbarer Export, keine Meldung im "
-                "Kanal.\n\n{board_warning}",
+        "text": "Deadline watcher: no usable export, nothing posted to the "
+                "channel.\n\n{board_warning}",
         "output_key": "digest_dm",
     },
 ]
@@ -169,8 +169,8 @@ async def test_the_read_leg_hands_the_parser_the_fields_it_reads(provider):
     """deadline-parse-overrides pulls ``text``, ``ts`` and ``user`` off each
     entry of state["slack_messages"].  Those three are the whole contract."""
     provider.history = [
-        SlackMessage(id="1787600001.1", channel=CHANNEL, author="U0123456789",
-                     text="FRIST 128498: 3"),
+        SlackMessage(id="1787600001.1", channel=CHANNEL, author="U0123ABCDEF",
+                     text="DEADLINE 1001: 3"),
     ]
     node = _runner()._messaging_node(_leg("read_deadline_commands"))
 
@@ -179,9 +179,9 @@ async def test_the_read_leg_hands_the_parser_the_fields_it_reads(provider):
     assert provider.last_history == {"channel": CHANNEL, "oldest": "1787513601",
                                      "limit": 200}
     entry = out["slack_messages"][0]
-    assert entry["text"] == "FRIST 128498: 3"
+    assert entry["text"] == "DEADLINE 1001: 3"
     assert entry["ts"] == "1787600001.1"
-    assert entry["user"] == "U0123456789"
+    assert entry["user"] == "U0123ABCDEF"
 
 
 @pytest.mark.asyncio
@@ -214,9 +214,9 @@ def _parsed() -> dict:
         "overrides_parsed": {
             "confirmations": [
                 {"thread_ts": "1787600001.1",
-                 "text": "Frist fuer Projekt 128498 uebernommen: 3 Arbeitstage"},
+                 "text": "Deadline for project 1001 accepted: 3 working days"},
                 {"thread_ts": "1787600002.2",
-                 "text": "Frist fuer Projekt 133170 uebernommen: fix 2026-08-15"},
+                 "text": "Deadline for project 1002 accepted: fixed 2026-08-15"},
             ]
         }
     }
@@ -238,11 +238,11 @@ async def test_an_already_confirmed_override_is_not_confirmed_again(provider):
     """Tomorrow's run sees the same message again — the window overlaps by
     design.  The thread, not a stored marker, is the source of truth."""
     provider.threads["1787600001.1"] = [
-        SlackMessage(id="1787600001.1", channel=CHANNEL, author="U0123456789",
-                     text="FRIST 128498: 3"),
-        SlackMessage(id="1787600055.5", channel=CHANNEL, author="U0987654321",
+        SlackMessage(id="1787600001.1", channel=CHANNEL, author="U0123ABCDEF",
+                     text="DEADLINE 1001: 3"),
+        SlackMessage(id="1787600055.5", channel=CHANNEL, author="U0456GHIJKL",
                      thread_id="1787600001.1",
-                     text="Frist fuer Projekt 128498 uebernommen: 3 Arbeitstage"),
+                     text="Deadline for project 1001 accepted: 3 working days"),
     ]
     node = _runner()._messaging_node(_leg("confirm_overrides"))
 
@@ -301,13 +301,13 @@ def test_the_channel_post_is_only_reachable_through_the_gate():
 async def test_the_dm_leg_dms_the_owner(provider):
     node = _runner()._messaging_node(_leg("dm_owner"))
 
-    out = await node({"fallback_owner_slack_id": "U0123456789",
-                      "board_warning": "Export ist 3 Arbeitstage alt"})
+    out = await node({"fallback_owner_slack_id": "U0123ABCDEF",
+                      "board_warning": "Export is 3 working days old"})
 
-    assert provider.opened == ["U0123456789"]
-    assert provider.posted[0]["channel"] == "D-U0123456789"
-    assert "Export ist 3 Arbeitstage alt" in provider.posted[0]["text"]
-    assert out["digest_dm"]["user_id"] == "U0123456789"
+    assert provider.opened == ["U0123ABCDEF"]
+    assert provider.posted[0]["channel"] == "D-U0123ABCDEF"
+    assert "Export is 3 working days old" in provider.posted[0]["text"]
+    assert out["digest_dm"]["user_id"] == "U0123ABCDEF"
 
 
 @pytest.mark.asyncio
@@ -322,7 +322,7 @@ async def test_a_dm_that_cannot_be_delivered_fails_the_run(provider):
     )
     node = _runner()._messaging_node(_leg("dm_owner"))
 
-    out = await node({"fallback_owner_slack_id": "U0123456789"})
+    out = await node({"fallback_owner_slack_id": "U0123ABCDEF"})
 
     assert out["__failed_step__"] == "dm_owner"
     assert provider.posted == []

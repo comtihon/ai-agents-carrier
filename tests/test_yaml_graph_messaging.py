@@ -147,14 +147,14 @@ async def test_dm_opens_a_channel_then_posts_to_it(provider):
     node = _node({"id": "warn", "action": "dm", "user_id": "{owner}",
                   "text": "no usable export"})
 
-    out = await node({"owner": "U0987654321"})
+    out = await node({"owner": "U0456GHIJKL"})
 
-    assert provider.opened == ["U0987654321"]
+    assert provider.opened == ["U0456GHIJKL"]
     assert provider.posted == [
-        {"channel": "D-U0987654321", "text": "no usable export", "thread_id": None}
+        {"channel": "D-U0456GHIJKL", "text": "no usable export", "thread_id": None}
     ]
-    assert out["warn"] == {"message_id": "99.1", "channel": "D-U0987654321",
-                           "user_id": "U0987654321"}
+    assert out["warn"] == {"message_id": "99.1", "channel": "D-U0456GHIJKL",
+                           "user_id": "U0456GHIJKL"}
 
 
 @pytest.mark.asyncio
@@ -217,7 +217,7 @@ async def test_history_output_feeds_the_override_parser_verbatim(provider):
     ``text``/``ts``/``user`` off each item, so the step's list shape has to carry
     them — that is the whole wiring between the step and the library script."""
     provider.history = [
-        Message(id="9.1", channel="C1", text="FRIST 128498: 3", author="U9"),
+        Message(id="9.1", channel="C1", text="DEADLINE 1001: 3", author="U9"),
     ]
     node = _node({"id": "read", "action": "history", "channel": "C1",
                   "oldest": "{window}", "limit": 200,
@@ -228,7 +228,7 @@ async def test_history_output_feeds_the_override_parser_verbatim(provider):
     assert provider.last_history == {"channel": "C1", "oldest": "1787600000",
                                      "limit": 200}
     assert out["slack_messages"] == [
-        {"id": "9.1", "channel": "C1", "text": "FRIST 128498: 3", "author": "U9",
+        {"id": "9.1", "channel": "C1", "text": "DEADLINE 1001: 3", "author": "U9",
          "thread_id": None}
     ]
 
@@ -260,8 +260,8 @@ def _confirmations_state() -> dict:
     return {
         "parsed": {
             "confirmations": [
-                {"thread_ts": "1.1", "text": "Frist fuer Projekt 128498 uebernommen: 3 Arbeitstage"},
-                {"thread_ts": "2.1", "text": "Frist fuer Projekt 133170 uebernommen: fix 2026-08-15"},
+                {"thread_ts": "1.1", "text": "Deadline for project 1001 accepted: 3 working days"},
+                {"thread_ts": "2.1", "text": "Deadline for project 1002 accepted: fixed 2026-08-15"},
             ]
         }
     }
@@ -284,9 +284,9 @@ async def test_a_thread_that_already_has_the_confirmation_is_not_confirmed_twice
     """The idempotency guard.  The watcher re-reads an overlapping 26-hour
     window every morning, so the same accepted override comes round again."""
     provider.threads["1.1"] = [
-        Message(id="1.1", channel="C1", text="FRIST 128498: 3", author="U9"),
+        Message(id="1.1", channel="C1", text="DEADLINE 1001: 3", author="U9"),
         Message(id="1.5", channel="C1", author="Ubot", thread_id="1.1",
-                text="Frist fuer Projekt 128498 uebernommen: 3 Arbeitstage"),
+                text="Deadline for project 1001 accepted: 3 working days"),
     ]
     node = _node({"id": "confirm", "action": "reply", "channel": "C1",
                   "items": "parsed.confirmations", "skip_if_replied": True})
@@ -303,8 +303,8 @@ async def test_a_thread_that_already_has_the_confirmation_is_not_confirmed_twice
 @pytest.mark.asyncio
 async def test_the_guard_only_looks_at_replies_not_the_root_message(provider):
     """A root message whose text happens to equal the confirmation must not
-    suppress the confirmation — otherwise a ops quoting the bot silences it."""
-    text = "Frist fuer Projekt 128498 uebernommen: 3 Arbeitstage"
+    suppress the confirmation — otherwise a user quoting the bot silences it."""
+    text = "Deadline for project 1001 accepted: 3 working days"
     provider.threads["1.1"] = [Message(id="1.1", channel="C1", text=text, author="U9")]
     node = _node({"id": "confirm", "action": "reply", "channel": "C1",
                   "items": [{"thread_id": "1.1", "text": text}],
@@ -390,7 +390,7 @@ async def test_a_provider_error_fails_the_run_by_default(provider):
 
 @pytest.mark.asyncio
 async def test_ignore_errors_keeps_a_read_leg_from_taking_the_run_down(provider):
-    """The ops watcher must still compute deadlines when Slack is unreachable."""
+    """The deadline watcher must still compute deadlines when Slack is unreachable."""
     provider.fail_with = MessagingError("not_in_channel", code="not_in_channel")
     node = _node({"id": "read", "action": "history", "channel": "C1",
                   "ignore_errors": True, "output_key": "slack_messages"})

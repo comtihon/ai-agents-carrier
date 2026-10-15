@@ -9,7 +9,7 @@ description = "Example agents and utilities for the ai-agents-carrier agent runt
 readme = "../README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
-authors = [{ name = "Acme" }]
+authors = [{ name = "comtihon" }]
 
 # Minimal dependencies shared by all agent examples.
 # Individual agents may require additional packages (e.g. langgraph, anthropic).

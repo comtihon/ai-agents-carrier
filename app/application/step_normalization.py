@@ -105,7 +105,7 @@ def implicit_edges(steps: list[Any]) -> list[tuple[str, str]]:
     """Edges normalisation had to invent because the document did not state them.
 
     Reported back to whoever wrote the definition rather than refused. Refusing
-    is not available: the fall-through that closed a cycle in the ops deadline
+    is not available: the fall-through that closed a cycle in the deadline
     watcher is structurally identical to the one ``code-review-loop`` uses to
     close its revision loop on purpose, so no rule separates them without
     reading intent. Naming them is what is left, and it is enough — an author

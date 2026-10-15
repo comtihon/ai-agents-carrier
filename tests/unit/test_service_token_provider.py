@@ -334,14 +334,14 @@ def _identities_settings(private_key: str, *names: str, **overrides) -> Settings
 
 async def test_each_identity_signs_with_its_own_client_id_and_scopes(keypair, token_endpoint):
     private_key, public_key = keypair
-    provider = ServiceTokenProvider(_identities_settings(private_key, "crm", "billing_api"))
+    provider = ServiceTokenProvider(_identities_settings(private_key, "crm", "billing"))
 
     await provider.get_token("crm")
-    await provider.get_token("billing_api")
+    await provider.get_token("billing")
 
     assert len(token_endpoint.calls) == 2
     by_scope = {call["data"]["scope"]: call for call in token_endpoint.calls}
-    assert set(by_scope) == {"openid crm:aud", "openid billing_api:aud"}
+    assert set(by_scope) == {"openid crm:aud", "openid billing:aud"}
     crm = by_scope["openid crm:aud"]
     assert crm["url"] == f"{TOKEN_URL}?i=crm"
     claims = jwt.decode(
@@ -355,10 +355,10 @@ async def test_each_identity_signs_with_its_own_client_id_and_scopes(keypair, to
 
 async def test_tokens_are_cached_per_identity_never_shared(keypair, token_endpoint):
     private_key, _ = keypair
-    provider = ServiceTokenProvider(_identities_settings(private_key, "crm", "billing_api"))
+    provider = ServiceTokenProvider(_identities_settings(private_key, "crm", "billing"))
 
     first_crm = await provider.get_token("crm")
-    other = await provider.get_token("billing_api")
+    other = await provider.get_token("billing")
     second_crm = await provider.get_token("crm")
 
     # One request per identity; the repeat hits crm's own cache.
@@ -369,20 +369,20 @@ async def test_tokens_are_cached_per_identity_never_shared(keypair, token_endpoi
 
 async def test_unknown_identity_names_the_available_ones(keypair, token_endpoint):
     private_key, _ = keypair
-    provider = ServiceTokenProvider(_identities_settings(private_key, "crm", "billing_api"))
+    provider = ServiceTokenProvider(_identities_settings(private_key, "crm", "billing"))
 
     with pytest.raises(ServiceAuthError) as excinfo:
         await provider.get_token("typo")
     message = str(excinfo.value)
     assert "typo" in message
-    assert "crm" in message and "billing_api" in message
+    assert "crm" in message and "billing" in message
     assert token_endpoint.calls == []
 
 
 async def test_several_identities_without_a_default_refuses_to_guess(keypair, token_endpoint):
     """Picking one silently would sign calls with another service's credentials."""
     private_key, _ = keypair
-    provider = ServiceTokenProvider(_identities_settings(private_key, "crm", "billing_api"))
+    provider = ServiceTokenProvider(_identities_settings(private_key, "crm", "billing"))
 
     with pytest.raises(ServiceAuthError, match="SERVICE_AUTH_DEFAULT_IDENTITY"):
         await provider.get_token()
@@ -393,13 +393,13 @@ async def test_explicit_default_identity_is_used_when_none_is_named(keypair, tok
     private_key, _ = keypair
     provider = ServiceTokenProvider(
         _identities_settings(
-            private_key, "crm", "billing_api", SERVICE_AUTH_DEFAULT_IDENTITY="billing_api"
+            private_key, "crm", "billing", SERVICE_AUTH_DEFAULT_IDENTITY="billing"
         )
     )
 
     await provider.get_token()
 
-    assert token_endpoint.calls[0]["data"]["scope"] == "openid billing_api:aud"
+    assert token_endpoint.calls[0]["data"]["scope"] == "openid billing:aud"
 
 
 async def test_single_identity_is_the_default_without_extra_config(keypair, token_endpoint):
