@@ -523,6 +523,27 @@ class Settings(BaseSettings):
     # number that is a runaway LLM bill, not a workflow.
     stream_max_chunks: int = Field(default=200, alias="STREAM_MAX_CHUNKS")
 
+    # --- Step outputs in object storage (orchestration/step_outputs.py) ---
+    # Every step's output is written to the stream store as
+    # runs/<run_id>/<step_id>[-<n>].md and workflow state / the run document /
+    # the checkpoint keep a small reference instead of the value. Off = the
+    # pre-offload behaviour (values inline in state).
+    step_output_offload: bool = Field(default=True, alias="STEP_OUTPUT_OFFLOAD")
+    # Values whose JSON encoding is at most this many bytes also stay inline
+    # (they are no bigger than their reference); everything larger is a ref.
+    step_output_inline_max_bytes: int = Field(
+        default=256, alias="STEP_OUTPUT_INLINE_MAX_BYTES"
+    )
+    # Ceiling on what one step may have resolved into memory before it runs.
+    step_input_hydrate_max_bytes: int = Field(
+        default=32 * 1024 * 1024, alias="STEP_INPUT_HYDRATE_MAX_BYTES"
+    )
+    # Bytes of stored outputs a run API response resolves inline for display;
+    # the rest stay references carrying a download_url.
+    step_output_display_max_bytes: int = Field(
+        default=2 * 1024 * 1024, alias="STEP_OUTPUT_DISPLAY_MAX_BYTES"
+    )
+
     # --- Run-state divergence probe (see stream_graph_to_pause) ---
     # Diagnostic for the dual-state cleanup: after every streamed chunk,
     # compare the hand-merged `current_state` the runner maintains against the

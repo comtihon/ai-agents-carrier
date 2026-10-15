@@ -939,6 +939,17 @@ def _clip(text: str) -> str:
     return f"{text[:_APPROVAL_VALUE_CHARS]}… [{len(text)} chars total]"
 
 
+async def _combined_errors(deps: "ManagementDeps", steps: Any) -> list[str]:
+    """Save-time problems of combined_datasource steps (parts, refs, sources, scripts)."""
+    from app.infrastructure.orchestration.combined_datasource import combined_step_errors
+
+    return await combined_step_errors(
+        steps,
+        data_source_backend=deps.data_source_backend,
+        script_backend=deps.script_backend,
+    )
+
+
 def _sandbox_denial(steps: Any) -> str | None:
     """Refusal message when the calling principal may not disable the sandbox.
 
@@ -1069,6 +1080,9 @@ async def create_workflow(
     dynamic_errors = validate_dynamic_steps(steps)
     if dynamic_errors:
         return "Invalid dynamic step: " + "; ".join(dynamic_errors)
+    combined_errors = await _combined_errors(deps, steps)
+    if combined_errors:
+        return "Invalid combined_datasource step: " + "; ".join(combined_errors)
 
     existing = await deps.workflow_backend.get(workflow_id)
     if existing is not None:
@@ -1154,6 +1168,9 @@ async def update_workflow(
         dynamic_errors = validate_dynamic_steps(steps)
         if dynamic_errors:
             return "Invalid dynamic step: " + "; ".join(dynamic_errors)
+        combined_errors = await _combined_errors(deps, steps)
+        if combined_errors:
+            return "Invalid combined_datasource step: " + "; ".join(combined_errors)
         from app.application.graph_layout import apply_layout
         from app.application.script_capture import capture_inline_scripts
         from app.application.step_normalization import implicit_edges, normalize_edges
