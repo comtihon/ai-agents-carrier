@@ -394,6 +394,11 @@ def build_default_workflow(
             name: New display name (omit to keep current).
             description: New description (omit to keep current).
             steps_json: JSON array replacing ALL steps (omit to keep current).
+                Same step schema as create_workflow, including
+                combined_datasource: use one combined_datasource step (ordered
+                data_source / python / nested parts, list params looped per
+                element) instead of chains of fetch/filter steps or copy-pasted
+                per-id "slot" steps.
             enabled: False disables the workflow — every trigger and every manual
                 start is refused until it is set back to True. Omit to keep current.
             use_storage: Turn this workflow's private key/value storage on or off.
