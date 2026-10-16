@@ -318,3 +318,56 @@ async def test_mcp_create_workflow_rejects_invalid_combined(monkeypatch):
         json.dumps([_step([{"id": "a", "type": "data_source", "source": "crm", "operation": "nope"}])]),
     )
     assert out.startswith("Invalid combined_datasource step") and "no operation 'nope'" in out
+
+
+async def test_for_each_merges_one_param_set_per_call(store):
+    parts = [
+        _py("prep", "output = {'sets': [{'id': 2, 'kind': 'a'}, {'id': 7, 'kind': 'b'}, {'id': 9}]}"),
+        {"id": "cls", "type": "data_source", "source": "crm", "operation": "get_classification",
+         "params": {"kind": "default"}, "for_each": "{prep[sets]}", "concurrency": 1},
+    ]
+    runner = _runner([_step(parts)], store)
+    run = await _go(runner)
+    calls = runner._data_source_executor.calls
+    assert calls == [
+        ("get_classification", {"kind": "a", "id": 2}),
+        ("get_classification", {"kind": "b", "id": 7}),
+        ("get_classification", {"kind": "default", "id": 9}),
+    ]
+    out = await _value(runner, run.state["cands"])
+    assert [r["params"]["id"] for r in out] == [2, 9]
+    cls = run.step_outputs["cands"]["_combined_cands"]["parts"][1]
+    assert cls["calls"] == 3 and cls["error_count"] == 1
+    assert cls["loop_param"] == "for_each"
+
+
+async def test_for_each_rejects_non_mapping_elements_and_param_loops(store):
+    parts = [
+        _py("prep", "output = {'sets': [5]}"),
+        {"id": "cls", "type": "data_source", "source": "crm", "operation": "get_classification",
+         "params": {}, "for_each": "{prep[sets]}", "fail_on_error": True},
+    ]
+    runner = _runner([_step(parts)], store)
+    run = await _go(runner)
+    assert run.step_statuses["cands"] == "failed"
+    assert runner._data_source_executor.calls == []
+
+    parts = [
+        _py("prep", "output = {'sets': [{'kind': 'a'}], 'ids': [1, 2]}"),
+        {"id": "cls", "type": "data_source", "source": "crm", "operation": "get_classification",
+         "params": {"id": "{prep[ids]}"}, "for_each": "{prep[sets]}"},
+    ]
+    runner = _runner([_step(parts)], store)
+    run = await _go(runner)
+    assert run.step_statuses["cands"] == "failed"
+    assert runner._data_source_executor.calls == []
+
+
+def test_for_each_forward_reference_is_reported():
+    steps = [_step([
+        {"id": "cls", "type": "data_source", "source": "crm", "operation": "get_classification",
+         "for_each": "{prep[sets]}"},
+        _py("prep", "output = {}"),
+    ])]
+    errors = validate_combined_steps(steps)
+    assert any("for_each" in e and "forward reference" in e for e in errors)
