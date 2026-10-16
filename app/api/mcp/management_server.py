@@ -287,11 +287,14 @@ def register_management_tools(
                 data_source part whose param resolves to a list (e.g.
                 `"id": "{cand[project_ids]}"`) is called once per element
                 (bounded concurrency, results collected into one stream,
-                per-element errors collected). Parts reference earlier parts by
+                per-element errors collected). To vary several params per call
+                (e.g. one POST body per element) set `for_each:
+                "{part_id[field]}"` to a list of param mappings, each merged
+                over `params`. Parts reference earlier parts by
                 id: `{part_id[field]}` in params; `parts["id"]` in python code;
                 `stream: <part id>` gives python records(). Fields: output_key,
-                parts [{id, type, source, operation, params, limit,
-                concurrency, fail_on_error} | {id, type: python, script_id|code,
+                parts [{id, type, source, operation, params, for_each,
+                limit, concurrency, fail_on_error} | {id, type: python, script_id|code,
                 stream} | {id, type: combined_datasource, parts, output}],
                 optional `output: <part id>` (default last part). Example:
                 {"id": "cands", "type": "combined_datasource", "output_key": "cands",

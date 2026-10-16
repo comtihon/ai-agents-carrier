@@ -36,6 +36,11 @@ Rules
   ``{"<param>": element, "result": <response>}`` records.  Per-element errors
   are collected in the trace and are not fatal unless the part sets
   ``fail_on_error: true``.
+* ``for_each: "{part[field]}"`` on a data source part loops over a list of
+  *param sets* instead: each element is a mapping merged over ``params`` for
+  that call, so one call can differ in several params at once (one POST body
+  per element).  Records are ``{"params": element, "result": <response>}``.
+  ``for_each`` excludes a param-driven loop in the same part.
 * A part may itself be a ``combined_datasource`` (its own ordered ``parts``);
   its output is its chosen part's output.
 * Every part's output is written to the run's folder in the stream store
@@ -168,6 +173,12 @@ def _validate_parts(
                 errors.append(f"{here}: `params` must be a mapping")
             for head in template_heads(params):
                 _check_ref(head, "params template")
+            for_each = part.get("for_each")
+            if for_each is not None:
+                if not isinstance(for_each, (str, list)):
+                    errors.append(f"{here}: `for_each` must be a template or a list of mappings")
+                for head in template_heads(for_each):
+                    _check_ref(head, "for_each template")
         elif ptype == "python":
             if not part.get("script_id") and not part.get("code"):
                 errors.append(f"{here}: needs `script_id` or `code`")
@@ -398,10 +409,29 @@ class CombinedExecutor:
         params = runner._render_deep(raw_params, ctx)
         from app.infrastructure.orchestration.yaml_graph import _positive_int
         limit = _positive_int(part.get("limit"))
+        array_params = {p.name for p in (op.params if op is not None else []) if p.type == "array"}
+
+        if part.get("for_each") is not None:
+            raw = part["for_each"]
+            match = _WHOLE_REF_RE.match(raw) if isinstance(raw, str) else None
+            handle = as_data_ref(ctx.get(match.group(1))) if match else None
+            elements = handle if handle is not None else runner._render_deep(raw, ctx)
+            if handle is None and not isinstance(elements, list):
+                raise CombinedPartError(
+                    path, f"`for_each` resolved to {type(elements).__name__}, expected a list of mappings"
+                )
+            looped = [n for n, v in params.items() if isinstance(v, list) and n not in array_params]
+            if looped:
+                raise CombinedPartError(
+                    path, f"`for_each` and list param {looped[0]!r} both drive a loop; use one"
+                )
+            entry["loop_param"] = "for_each"
+            return await self._loop(
+                part, path, source, operation, params, None, elements, entry, limit,
+            )
 
         # Loop detection: a list value for a param the operation does not take
         # as an array -- or a whole `{part}` placeholder naming a list stream.
-        array_params = {p.name for p in (op.params if op is not None else []) if p.type == "array"}
         loop_name: str | None = None
         loop_source: Any = None
         for name, value in params.items():
@@ -441,9 +471,11 @@ class CombinedExecutor:
 
     async def _loop(
         self, part: dict[str, Any], path: str, source: Any, operation: str,
-        params: dict[str, Any], name: str, elements: Any, entry: dict[str, Any],
+        params: dict[str, Any], name: str | None, elements: Any, entry: dict[str, Any],
         limit: int | None,
     ) -> Any:
+        # ``name`` is the looping param; ``None`` means a ``for_each`` loop whose
+        # elements are whole param sets merged over ``params``.
         runner = self.runner
         executor = runner._data_source_executor
         store = runner._require_stream_store(path)
@@ -459,20 +491,29 @@ class CombinedExecutor:
             nonlocal error_count, calls
             async with semaphore:
                 calls += 1
+                key = name or "params"
                 try:
-                    result = await executor.execute(source, operation, {**params, name: element}, limit=limit)
+                    if name is None:
+                        if not isinstance(element, dict):
+                            raise TypeError(
+                                f"for_each element is {type(element).__name__}, expected a mapping"
+                            )
+                        call_params = {**params, **element}
+                    else:
+                        call_params = {**params, name: element}
+                    result = await executor.execute(source, operation, call_params, limit=limit)
                     handle = as_data_ref(result)
                     if handle is not None:
                         result = await store.read_all(handle, max_bytes=self.ELEMENT_MAX_BYTES)
-                    return {name: element, "result": result}
+                    return {key: element, "result": result}
                 except Exception as exc:  # noqa: BLE001 — collected, see fail_on_error
                     error_count += 1
-                    message = f"{name}={element!r}: {type(exc).__name__}: {exc}"
+                    message = f"{key}={element!r}: {type(exc).__name__}: {exc}"
                     if len(errors) < _TRACE_ERRORS:
                         errors.append(message)
                     if fail_on_error:
                         raise CombinedPartError(path, message) from exc
-                    return {name: element, "error": str(exc)} if include_errors else None
+                    return {key: element, "error": str(exc)} if include_errors else None
 
         from app.infrastructure.datasources.datastream import StreamBuilder
         builder = StreamBuilder(
