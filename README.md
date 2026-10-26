@@ -1027,6 +1027,12 @@ DELETE /api/v1/teams/{id}                     409 while resources are shared wit
 PUT    /api/v1/teams/{id}/members/{sub}       optional {role: member|admin}
 DELETE /api/v1/teams/{id}/members/{sub}
 GET    /api/v1/users                          super admin: all; team admin: own team + users in no team
+
+# Grants on datasources, agents, workflows (owner, team admin of its team, or super admin)
+GET    /api/v1/{datasources|agents|workflows}/{id}/grants
+GET    /api/v1/{datasources|agents|workflows}/{id}/grants/candidates   {users: [...], workflows: [...]}
+POST   /api/v1/{datasources|agents|workflows}/{id}/grants   {grantee_type: user|workflow, grantee_id, access: read|read_write}
+DELETE /api/v1/{datasources|agents|workflows}/{id}/grants/{grant_id}
 ```
 
 ### Ownership and visibility
@@ -1066,6 +1072,32 @@ kept.
   follow the same rules. Narrowing a resource (public → team → private, or to
   another team) is refused (`409`) while something it would break still uses
   it; a referrer the caller cannot see is not named.
+- **Grants** open a team or private data source, agent or workflow to someone
+  its visibility leaves out. They are stored on the resource (`grants`), so they
+  can be listed and revoked there. A grant goes to a **user** — who then sees the
+  resource and may use it in resources *private to them* (not team or public
+  ones) — or to one **workflow**, which may use it whatever its scope while
+  whoever edits it still cannot pick it anywhere else (e.g. team A's workflow
+  calling team B's workflow or agent). What `access` means depends on the kind:
+  - *data source*: `read` permits only operations that do not write
+    (GET/HEAD/OPTIONS, GraphQL queries, BigQuery, or an operation marked
+    `destructive: false`), `read_write` all of them. Enforced on save (`422`,
+    workflow steps and agent add-ons alike) and when a workflow step runs,
+    triggered runs included. Never lets the grantee edit the source.
+  - *agent* / *workflow*: `read` is see, run and use; `read_write` also lets a
+    user grantee edit it (not delete it, change its visibility or re-share
+    it — it stays its owner's). A workflow grantee is use only (`read`; `422`
+    otherwise).
+
+  The owner, an admin of the resource's team, or a super admin grants and
+  revokes; granting to someone who already holds a grant changes its level; a
+  public resource, its owner, its team's members and a workflow already in
+  scope need none (`409`). Revoking takes effect on the next save or run;
+  deleting a workflow drops grants to it everywhere. Non-sharers never see the
+  grant list — a user grantee sees `granted_access` on the resource. Pass
+  `workflow_id` to `GET /datasources`, `/agents` or `/workflows` (and to
+  `/datasources/{id}`, `/agents/{id}`) to also get what is granted to that
+  workflow, each marked `granted_to_workflow`, when the caller can see it.
 - **Super admins** are callers holding a role in `AUTH_SUPER_ADMIN_ROLES`
   (or, when that is empty, `AUTH_ADMIN_ROLES`), evaluated even when
   `AUTH_ENFORCE_PERMISSIONS` is off (in shadow mode every caller is *granted*
@@ -1109,7 +1141,11 @@ The same operations are management MCP tools (and chat agent tools), with the
 same rules: `who_am_i`, `list_teams`, `list_users`, `create_team`,
 `rename_team`, `delete_team`, `set_team_member` (add a user to a team, or set
 their role), `remove_team_member` and `set_resource_visibility` (public / team /
-private, and which team, for a workflow, agent, data source or script). Users
+private, and which team, for a workflow, agent, data source or script). Grants
+have three more: `list_resource_grants`, `grant_resource_access` (to a user or,
+with `grantee_type="workflow"`, a workflow; `access` `read` or `read_write`;
+granting again changes the level) and `revoke_resource_access` (by grantee or
+grant id) — READ, WRITE and DELETE respectively, like their REST routes. Users
 are named by email, name or id, teams by name or id; an ambiguous name is
 answered with the candidates.
 

@@ -179,6 +179,9 @@ async def test_summary_view_keeps_operation_methods_and_drops_the_rest(client):
         "team_id": None,
         "team_name": None,
         "can_edit": True,
+        # Data sources can be granted beyond their visibility.
+        "granted_access": None,
+        "can_share": True,
     }]
     # Default view is unchanged, secrets still redacted.
     full = (await c.get("/api/v1/datasources")).json()[0]

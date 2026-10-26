@@ -18,7 +18,13 @@ from pydantic import BaseModel, Field
 
 from app.api.dependencies import get_container
 from app.domain.models.ownership import Visibility
-from app.application.visibility import ensure_run_visible, ownership_fields, visibility_kwargs
+from app.api.routes.grants import add_grant_routes, present_sharing
+from app.application.visibility import (
+    ensure_run_visible,
+    granted_for_workflow,
+    ownership_fields,
+    visibility_kwargs,
+)
 from app.core.config import get_settings
 from app.core.container import ApplicationContainer
 from app.domain.models.agent_addon import AnyAgentAddon
@@ -128,9 +134,26 @@ async def list_mcp_integrations():
 
 # ─── Collection routes ────────────────────────────────────────────────────────
 
+def _present(defn: AgentDefinition, workflow_id: str | None = None) -> dict[str, Any]:
+    return present_sharing(defn.model_dump(mode="json"), defn, workflow_id)
+
+
+async def _workflow_agents(
+    container: ApplicationContainer, workflow_id: str | None
+) -> list[AgentDefinition]:
+    """Agents granted to *workflow_id* the caller cannot otherwise see —
+    offered only to someone who can see that workflow."""
+    if not workflow_id or container.workflow_backend is None:
+        return []
+    if await container.workflow_backend.get(workflow_id) is None:
+        return []
+    return await granted_for_workflow(container.agent_backend, workflow_id).granted()
+
+
 @router.get("")
 async def list_agents(
     view: Literal["full", "summary"] = "full",
+    workflow_id: str | None = None,
     container: ApplicationContainer = Depends(get_container),
 ):
     """List all registered agent definitions.
@@ -138,10 +161,16 @@ async def list_agents(
     ``view=summary`` leaves out ``agent_input`` (which carries the system
     prompt), ``helm_values`` and ``addons`` -- everything a list of agents does
     not draw.  Default stays ``full``.
+
+    ``workflow_id`` (the workflow being edited) adds the agents granted to
+    that workflow, each marked ``granted_to_workflow``.
     """
     _require_backend(container)
     assert container.agent_backend is not None
     agents = await container.agent_backend.list()
+    granted = await _workflow_agents(container, workflow_id)
+    granted_ids = {a.id for a in granted}
+    agents += granted
     if view == "summary":
         return [
             {
@@ -150,10 +179,14 @@ async def list_agents(
                 "description": a.description,
                 "default_runtime": a.default_runtime,
                 **ownership_fields(a),
+                **(
+                    {"granted_to_workflow": "read"}
+                    if a.id in granted_ids else {}
+                ),
             }
             for a in agents
         ]
-    return [a.model_dump(mode="json") for a in agents]
+    return [_present(a, workflow_id) for a in agents]
 
 
 @router.post("", status_code=201)
@@ -186,7 +219,7 @@ async def create_agent(
         **visibility_kwargs(body.visibility, body.team_id),
     )
     saved = await container.agent_backend.create(defn)
-    return saved.model_dump(mode="json")
+    return _present(saved)
 
 
 # ─── Item routes (parameterised — must come AFTER literal-segment routes) ─────
@@ -194,16 +227,26 @@ async def create_agent(
 @router.get("/{agent_id}")
 async def get_agent(
     agent_id: str,
+    workflow_id: str | None = None,
     container: ApplicationContainer = Depends(get_container),
 ):
-    """Get a specific agent definition by ID."""
+    """Get a specific agent definition by ID.
+
+    ``workflow_id``: also find an agent granted to that workflow (if the
+    caller can see the workflow).
+    """
     _require_backend(container)
     assert container.agent_backend is not None
 
     defn = await container.agent_backend.get(agent_id)
     if defn is None:
+        defn = next(
+            (a for a in await _workflow_agents(container, workflow_id) if a.id == agent_id),
+            None,
+        )
+    if defn is None:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
-    return defn.model_dump(mode="json")
+    return _present(defn, workflow_id)
 
 
 @router.put("/{agent_id}")
@@ -247,7 +290,7 @@ async def update_agent(
         **visibility_kwargs(body.visibility, body.team_id),
     )
     saved = await container.agent_backend.update(agent_id, defn)
-    return saved.model_dump(mode="json")
+    return _present(saved)
 
 
 @router.delete("/{agent_id}", status_code=204)
@@ -303,7 +346,10 @@ async def update_agent_addons(
     _addon_adapter: TypeAdapter[list[AnyAgentAddon]] = TypeAdapter(list[AnyAgentAddon])
     existing.addons = _addon_adapter.validate_python(body.addons)
     saved = await container.agent_backend.update(agent_id, existing)
-    return saved.model_dump(mode="json")
+    return _present(saved)
+
+
+add_grant_routes(router, "agent")
 
 
 # ─── S3 addon file browser helpers ───────────────────────────────────────────

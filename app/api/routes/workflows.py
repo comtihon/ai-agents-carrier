@@ -13,12 +13,14 @@ from pydantic import BaseModel, Field
 from app.api.dependencies import get_container
 from app.application.script_capture import capture_inline_scripts
 from app.domain.models.ownership import Visibility
+from app.api.routes.grants import add_grant_routes, present_sharing
 from app.application.visibility import (
     can_see,
     ensure_run_visible,
     hidden_workflow_ids,
     ownership_fields,
     visibility_kwargs,
+    workflow_grant,
 )
 from app.application.step_normalization import declared_edges, implicit_edges, normalize_edges
 from app.application import run_control
@@ -624,12 +626,31 @@ async def _execute_graph(
 # ─── Workflow definition list + create (no path param — must come before run routes) ─────
 
 @router.get("")
-async def list_workflows(container: ApplicationContainer = Depends(get_container)):
-    """List the workflows the caller can see (summary view from the registry)."""
+async def list_workflows(
+    workflow_id: str | None = None,
+    container: ApplicationContainer = Depends(get_container),
+):
+    """List the workflows the caller can see (summary view from the registry).
+
+    ``workflow_id`` (the workflow being edited) adds the workflows granted to
+    it — the ones it may call — each marked ``granted_to_workflow``, if the
+    caller can see that workflow.
+    """
+    entries = container.yaml_graph_registry.list_definitions()
+    by_id = {e["id"]: e for e in entries}
+    granted: set[str] = set()
+    if workflow_id and workflow_id in by_id and can_see(by_id[workflow_id]):
+        granted = {
+            e["id"] for e in entries if not can_see(e) and workflow_grant(e, workflow_id)
+        }
     return [
-        {**entry, **ownership_fields(entry, team_editable=True)}
-        for entry in container.yaml_graph_registry.list_definitions()
-        if can_see(entry)
+        present_sharing(
+            {**entry, **ownership_fields(entry, team_editable=True, grant_edits=True)},
+            entry,
+            workflow_id,
+        )
+        for entry in entries
+        if can_see(entry) or entry["id"] in granted
     ]
 
 
@@ -665,13 +686,20 @@ def _guard_sandbox(request: Request, steps: object) -> None:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
-async def _guard_combined(container: ApplicationContainer, steps: object) -> None:
+async def _guard_combined(
+    container: ApplicationContainer, steps: object, workflow_id: str | None = None,
+) -> None:
     """Reject a combined_datasource step whose parts would only fail at run time."""
+    from app.application.visibility import sources_for_workflow
     from app.infrastructure.orchestration.combined_datasource import combined_step_errors
 
     errors = await combined_step_errors(
         steps if isinstance(steps, list) else [],
-        data_source_backend=getattr(container, "data_source_backend", None),
+        # Sources granted to this workflow count, though the caller cannot
+        # see them anywhere else.
+        data_source_backend=sources_for_workflow(
+            getattr(container, "data_source_backend", None), workflow_id
+        ),
         script_backend=getattr(container, "script_backend", None),
     )
     if errors:
@@ -698,7 +726,7 @@ async def create_workflow(
     assert container.workflow_backend is not None
     _guard_sandbox(request, body.steps)
     _guard_dynamic(body.steps)
-    await _guard_combined(container, body.steps)
+    await _guard_combined(container, body.steps, body.id)
 
     existing = await container.workflow_backend.get(body.id)
     if existing is not None:
@@ -719,7 +747,7 @@ async def create_workflow(
     )
     saved = await container.workflow_backend.create(defn)
     await container.refresh_runner(body.id)
-    return saved.model_dump(mode="json")
+    return present_sharing(saved.model_dump(mode="json"), saved)
 
 
 # ─── Run endpoints ────────────────────────────────────────────────────────────
@@ -1052,7 +1080,7 @@ async def get_workflow(
     defn = await container.workflow_backend.get(workflow_id)
     if defn is None:
         raise HTTPException(status_code=404, detail=f"Workflow '{workflow_id}' not found")
-    return defn.model_dump(mode="json")
+    return present_sharing(defn.model_dump(mode="json"), defn)
 
 
 @router.get("/{workflow_id}/graph")
@@ -1113,7 +1141,7 @@ async def update_workflow(
     if body.steps is not None:
         _guard_sandbox(request, body.steps)
         _guard_dynamic(body.steps)
-        await _guard_combined(container, body.steps)
+        await _guard_combined(container, body.steps, workflow_id)
 
     existing = await container.workflow_backend.get(workflow_id)
     if existing is None:
@@ -1141,7 +1169,7 @@ async def update_workflow(
     )
     saved = await container.workflow_backend.update(workflow_id, defn)
     await container.refresh_runner(workflow_id)
-    return saved.model_dump(mode="json")
+    return present_sharing(saved.model_dump(mode="json"), saved)
 
 
 @router.delete("/{workflow_id}", status_code=204)
@@ -1161,3 +1189,8 @@ async def delete_workflow(
 
     await container.workflow_backend.delete(workflow_id)
     await container.refresh_runner(workflow_id)
+
+
+# ─── Grants (after the item routes) ───────────────────────────────────────────
+
+add_grant_routes(router, "workflow")

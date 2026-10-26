@@ -43,6 +43,7 @@ _EXPECTED_TOOLS = {
     "delete_message",
     "who_am_i", "list_teams", "list_users", "create_team", "rename_team",
     "delete_team", "set_team_member", "remove_team_member", "set_resource_visibility",
+    "list_resource_grants", "grant_resource_access", "revoke_resource_access",
 }
 
 
@@ -110,7 +111,7 @@ async def test_registers_the_full_tool_set(mcp):
     _register(mcp, _Container())
     tools = await mcp.list_tools()
     assert {t.name for t in tools} == _EXPECTED_TOOLS
-    assert len(tools) == 71
+    assert len(tools) == 74
 
 
 async def test_ask_user_is_not_exposed_over_mcp(mcp):

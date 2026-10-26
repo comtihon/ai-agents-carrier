@@ -188,6 +188,10 @@ EXPECTED_TOOL_PERMISSIONS: dict[str, Permission] = {
     "set_team_member": Permission.WRITE,
     "remove_team_member": Permission.DELETE,
     "set_resource_visibility": Permission.WRITE,
+    # grants -- GET / POST / DELETE /{kind}/{id}/grants
+    "list_resource_grants": Permission.READ,
+    "grant_resource_access": Permission.WRITE,
+    "revoke_resource_access": Permission.DELETE,
 }
 
 _RUN_CONTROL_TOOLS = {

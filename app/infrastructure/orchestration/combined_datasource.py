@@ -393,10 +393,18 @@ class CombinedExecutor:
         runner = self.runner
         if runner._data_source_backend is None or runner._data_source_executor is None:
             raise CombinedPartError(path, "data source backend/executor not configured")
-        source = await runner._data_source_backend.get(part.get("source", ""))
+        from app.application.visibility import (
+            operation_denied, sources_for_workflow, workflow_grant_access,
+        )
+        source = await sources_for_workflow(
+            runner._data_source_backend, getattr(runner, "id", None)
+        ).get(part.get("source", ""))
         if source is None:
             raise CombinedPartError(path, f"data source '{part.get('source')}' not found")
         operation = part.get("operation", "")
+        denied = operation_denied(source, operation, workflow_grant_access(source, runner))
+        if denied:
+            raise CombinedPartError(path, denied)
         op = source.get_operation(operation)
         if op is not None:
             from app.infrastructure.datasources.destructive import is_destructive

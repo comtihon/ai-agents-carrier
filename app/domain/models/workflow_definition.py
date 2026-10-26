@@ -5,10 +5,10 @@ from typing import Any, ClassVar
 
 from pydantic import Field
 
-from app.domain.models.ownership import OwnedResource
+from app.domain.models.ownership import GrantableResource
 
 
-class WorkflowDefinition(OwnedResource):
+class WorkflowDefinition(GrantableResource):
     # Members of a team workflow's team may edit and run it, not only see it.
     team_editable: ClassVar[bool] = True
 
