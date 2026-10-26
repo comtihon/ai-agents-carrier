@@ -1146,6 +1146,9 @@ class YamlGraphRunner:
         self.owner_id: str | None = definition.get("owner_id")
         self.owner_name: str | None = definition.get("owner_name")
         self.team_id: str | None = definition.get("team_id")
+        # Grants on this workflow (see app.application.visibility); set from
+        # the stored definition by the loader.
+        self.grants: list[Any] = list(definition.get("grants") or [])
         # Resolve implicit fall-through into an explicit `next`/`targets` up
         # front, so array position stops being load-bearing below this line.
         # Every construction path — stored definition, on-disk YAML, a raw dict
@@ -1829,8 +1832,11 @@ class YamlGraphRunner:
             run_id: str = self._current_run.id if self._current_run else "unknown"
             callback_base_url: str = self._callback_base_url or ""
 
+            from app.application.visibility import granted_for_workflow
             from app.core.config import get_settings
             from app.steps.agent_executor import execute_agent_step
+            # Agents granted to this workflow resolve here, and only here.
+            agent_backend = granted_for_workflow(agent_backend, graph_id)
             logger.info("[%s] step '%s' running (%s)", graph_id, step_id, step["type"])
             try:
                 return await execute_agent_step(

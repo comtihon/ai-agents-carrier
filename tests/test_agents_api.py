@@ -127,6 +127,9 @@ async def test_summary_view_omits_agent_input_and_addons(client):
         "team_id": None,
         "team_name": None,
         "can_edit": True,
+        # Agents can be granted beyond their visibility.
+        "granted_access": None,
+        "can_share": True,
     }]
     # Default view is unchanged.
     full = (await c.get("/api/v1/agents")).json()[0]

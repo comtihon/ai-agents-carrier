@@ -287,15 +287,25 @@ def can_manage(resource: Any) -> bool:
     return subject.id is not None and owner == subject.id
 
 
-def can_edit(resource: Any, team_editable: bool | None = None) -> bool:
+def can_edit(
+    resource: Any, team_editable: bool | None = None, grant_edits: bool | None = None,
+) -> bool:
     """Change its content: whoever may manage it, plus — for a kind whose team
-    members may edit (workflows) — the members of its team."""
+    members may edit (workflows) — the members of its team, plus — for a kind
+    a grant can open to editing (agents, workflows) — a user holding a
+    ``read_write`` grant."""
     if can_manage(resource):
         return True
     if team_editable is None:
         team_editable = bool(getattr(resource, "team_editable", False))
+    if grant_edits is None:
+        grant_edits = bool(getattr(resource, "grant_edits", False))
     subject = get_current_subject()
-    return team_editable and subject is not None and _in_team(subject, resource)
+    if subject is None:
+        return False
+    if team_editable and _in_team(subject, resource):
+        return True
+    return grant_edits and user_grant(resource, subject.id) == "read_write"
 
 
 def can_change_visibility(resource: Any) -> bool:
@@ -425,9 +435,11 @@ class ReferenceGuard:
             return None
         return problem
 
-    async def access_through_grant(self, user: Any, user_kind: str, used: Any) -> str | None:
+    async def access_through_grant(
+        self, user: Any, user_kind: str, used: Any, used_kind: str = "datasource",
+    ) -> str | None:
         """The grant *user* needs to use *used*: None when its scope suffices."""
-        if await self._scope_violation(user, user_kind, used, "datasource") is None:
+        if await self._scope_violation(user, user_kind, used, used_kind) is None:
             return None
         return grant_access(user, user_kind, used)
 
@@ -456,7 +468,11 @@ class ReferenceGuard:
                 return f"This {own} cannot use {label} '{uid}': it is private to another user."
         return None
 
-    async def check_references(self, kind: str, resource: Any) -> None:
+    async def check_references(self, kind: str, resource: Any, existing: Any = None) -> None:
+        # What the stored version already used stays usable by whoever may
+        # edit it — a team member, or a read_write grantee who cannot see
+        # everything its owner can.
+        kept = set(references(kind, existing)) if existing is not None else set()
         for ref_kind, ref_id in dict.fromkeys(references(kind, resource)):
             if ref_kind == kind and ref_id == getattr(resource, "id", None):
                 continue
@@ -468,7 +484,11 @@ class ReferenceGuard:
                 # Dangling references are not this module's concern: they fail
                 # at run time exactly as they did before.
                 continue
-            if not can_see(target) and not grant_access(resource, kind, target):
+            if (
+                not can_see(target)
+                and not grant_access(resource, kind, target)
+                and (ref_kind, ref_id) not in kept
+            ):
                 raise InvalidReference(f"{_LABEL[ref_kind].capitalize()} '{ref_id}' not found")
             problem = await self._violation(resource, kind, target, ref_kind)
             if problem:
@@ -483,7 +503,11 @@ class ReferenceGuard:
     async def drop_workflow_grants(self, workflow_id: str) -> None:
         """Forget grants to a deleted workflow, so a new one reusing its id
         does not inherit them."""
-        backend = self._resolve("datasource")
+        for kind in ("datasource", "agent", "workflow"):
+            await self._drop_workflow_grants(kind, workflow_id)
+
+    async def _drop_workflow_grants(self, kind: str, workflow_id: str) -> None:
+        backend = self._resolve(kind)
         if backend is None:
             return
         for source in await backend.list():
@@ -654,7 +678,7 @@ class VisibilityScopedBackend:
                 )
         if subject is None:
             return
-        await self._guard.check_references(self.kind, resource)
+        await self._guard.check_references(self.kind, resource, existing)
         narrowed = existing is None and resource.visibility != "public" or (
             existing is not None
             and (
@@ -716,9 +740,10 @@ class VisibilityScopedBackend:
 
 
 class WorkflowSources:
-    """A data source backend as one workflow sees it: what the caller can see,
-    plus the sources granted to that workflow (which the caller may not see
-    anywhere else). Anything but ``get`` goes to the wrapped backend."""
+    """A definition backend (data sources, agents, workflows) as one workflow
+    sees it: what the caller can see, plus what is granted to that workflow
+    (which the caller may not see anywhere else). Anything but ``get`` and
+    ``granted`` goes to the wrapped backend."""
 
     def __init__(self, backend: Any, workflow_id: str | None) -> None:
         self._backend = backend
@@ -748,6 +773,10 @@ class WorkflowSources:
 
 def sources_for_workflow(backend: Any, workflow_id: str | None) -> Any:
     return None if backend is None else WorkflowSources(backend, workflow_id)
+
+
+# Same view, for agents and workflows.
+granted_for_workflow = sources_for_workflow
 
 
 def unwrap(backend: Any) -> Any:
@@ -814,7 +843,9 @@ async def ensure_run_visible(workflow_backend: Any, run: Any) -> None:
         raise ResourceNotFound("Run not found")
 
 
-def ownership_fields(resource: Any, team_editable: bool | None = None) -> dict[str, Any]:
+def ownership_fields(
+    resource: Any, team_editable: bool | None = None, grant_edits: bool | None = None,
+) -> dict[str, Any]:
     """The fields every list/summary entry carries."""
     from app.application.teams import team_name
     team_id = _team(resource)
@@ -824,7 +855,7 @@ def ownership_fields(resource: Any, team_editable: bool | None = None) -> dict[s
         "owner_name": _field(resource, "owner_name"),
         "team_id": team_id,
         "team_name": team_name(team_id),
-        "can_edit": can_edit(resource, team_editable),
+        "can_edit": can_edit(resource, team_editable, grant_edits),
     }
     if _field(resource, "grants") is not None:
         fields["granted_access"] = caller_grant(resource)

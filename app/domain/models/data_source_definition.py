@@ -18,9 +18,11 @@ import re
 from datetime import datetime
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, Field, computed_field
+from typing import ClassVar
 
-from app.domain.models.ownership import GrantAccess, OwnedResource, ResourceGrant
+from pydantic import BaseModel, Field
+
+from app.domain.models.ownership import GrantableResource
 from app.domain.models.sheet_binding import SheetBinding
 
 
@@ -320,8 +322,12 @@ class BigQuerySpec(BaseModel):
     max_rows: int = 0
 
 
-class DataSourceDefinition(OwnedResource):
+class DataSourceDefinition(GrantableResource):
     """Persistent definition of one remote API exposed as named operations."""
+
+    # A read_write grant widens the operations a grantee may call; it never
+    # lets them change the definition (or its credentials).
+    grant_edits: ClassVar[bool] = False
 
     id: str
     name: str = ""
@@ -365,22 +371,9 @@ class DataSourceDefinition(OwnedResource):
     # of the 40 GB node disk even with several runs streaming at once.
     max_result_bytes: int = 512 * 1024 * 1024
 
-    # Users and workflows outside the source's visibility that may use it
-    # anyway. Only the grant routes change these: every save through the
-    # scoped backend restamps them from the stored document, so a PUT can
-    # neither add nor drop one.
-    grants: list[ResourceGrant] = Field(default_factory=list)
-
     # Timestamps
     created_at: datetime | None = None
     updated_at: datetime | None = None
-
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def granted_access(self) -> GrantAccess | None:
-        """The *current caller's* own user grant on this source, if any. Never stored."""
-        from app.application.visibility import caller_grant
-        return caller_grant(self)
 
     def get_binding(self, name: str) -> SheetBinding | None:
         for binding in self.bindings:

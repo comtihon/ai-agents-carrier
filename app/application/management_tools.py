@@ -3482,3 +3482,158 @@ async def set_resource_visibility(
         f"{label} '{saved.id}' is now {now} (was: {describe(before_vis, before_team)}). "
         f"Owner: {owner}."
     )
+
+
+# ─── Grants (data sources, agents, workflows) ────────────────────────────────
+
+_GRANT_KIND_ALIASES = {
+    "datasource": "datasource", "datasources": "datasource", "data source": "datasource",
+    "data_source": "datasource", "agent": "agent", "agents": "agent",
+    "workflow": "workflow", "workflows": "workflow",
+}
+_GRANT_ACCESS_LABEL = {"read": "read", "read_write": "read & write"}
+
+
+def _grant_kind(kind: str) -> str | None:
+    return _GRANT_KIND_ALIASES.get((kind or "").strip().lower())
+
+
+def _grant_line(grant: dict[str, Any]) -> str:
+    who = grant.get("grantee_name") or grant["grantee_id"]
+    if grant.get("grantee_name") and grant["grantee_name"] != grant["grantee_id"]:
+        who += f" (id: {grant['grantee_id']})"
+    by = f", granted by {grant['granted_by_name']}" if grant.get("granted_by_name") else ""
+    return (
+        f"- {grant['grantee_type']} {who}: {_GRANT_ACCESS_LABEL.get(grant['access'], grant['access'])}"
+        f"{by} [grant id: {grant['id']}]"
+    )
+
+
+async def _grant_target(deps: ManagementDeps, kind: str, resource: str):
+    """(kind, resource_id, None) or (None, None, error)."""
+    normalized = _grant_kind(kind)
+    if normalized is None:
+        return None, None, (
+            f"Unknown kind '{kind}'; grants exist for datasource, agent and workflow."
+        )
+    _backend, found, err = await _owned_resource(deps, normalized, resource)
+    if err:
+        return None, None, err
+    return normalized, found.id, None
+
+
+async def _resolve_grantee(deps: ManagementDeps, grantee_type: str, query: str):
+    """(grantee_id, None) or (None, error).
+
+    A user by id, email or name among everyone the directory knows — the
+    people a resource can be shared with are not limited to one's team. A
+    workflow by id or name among those the caller can see, or by exact id
+    for one they cannot (someone's private workflow they were told the id of).
+    """
+    query = (query or "").strip()
+    if not query:
+        return None, f"Say which {grantee_type} to grant access to."
+    if grantee_type == "workflow":
+        resolved, err = await _resolve_workflow_id(deps, query)
+        return (resolved, None) if not err else (query, None)
+    if deps.team_directory is None:
+        return query, None
+    user = await deps.team_directory.get_user(query)
+    if user is not None:
+        return user.sub, None
+    users = await deps.team_directory.list_users()
+    matches = _best_matches(users, query, ("email", "name", "sub"))
+    if len(matches) == 1:
+        return matches[0].sub, None
+    if matches:
+        return None, (
+            f"Ambiguous user '{query}' — matches: {_candidates(matches, _user_label)}. "
+            "Use the email or id."
+        )
+    return None, (
+        f"User '{query}' not found. A user is known to carrier only after their "
+        "first sign-in."
+    )
+
+
+def _grantee_type(grantee_type: str) -> str | None:
+    value = (grantee_type or "user").strip().lower()
+    return value if value in ("user", "workflow") else None
+
+
+@requires(Permission.READ)
+async def list_resource_grants(deps: ManagementDeps, kind: str, resource: str) -> str:
+    from app.application import grants
+    normalized, resource_id, err = await _grant_target(deps, kind, resource)
+    if err:
+        return err
+    listed = await grants.list_grants(deps, normalized, resource_id)
+    if not listed:
+        return f"{normalized.capitalize()} '{resource_id}' is not shared beyond its visibility."
+    return f"Grants on {normalized} '{resource_id}':\n" + "\n".join(_grant_line(g) for g in listed)
+
+
+@requires(Permission.WRITE)
+async def grant_resource_access(
+    deps: ManagementDeps, kind: str, resource: str, grantee: str,
+    grantee_type: str = "user", access: str = "read",
+) -> str:
+    from app.application import grants
+    gtype = _grantee_type(grantee_type)
+    if gtype is None:
+        return f"Unknown grantee_type '{grantee_type}'; expected user or workflow."
+    access = (access or "read").strip().lower().replace("-", "_").replace(" ", "_")
+    access = {"rw": "read_write", "write": "read_write", "readwrite": "read_write",
+              "read_only": "read", "readonly": "read"}.get(access, access)
+    normalized, resource_id, err = await _grant_target(deps, kind, resource)
+    if err:
+        return err
+    grantee_id, err = await _resolve_grantee(deps, gtype, grantee)
+    if err:
+        return err
+    before = await grants.find_grant(deps, normalized, resource_id, gtype, grantee_id)
+    saved = await grants.grant(
+        deps, normalized, resource_id, grantee_type=gtype, grantee_id=grantee_id, access=access,
+    )
+    level = _GRANT_ACCESS_LABEL[saved["access"]]
+    who = f"{gtype} {saved.get('grantee_name') or grantee_id}"
+    if before is None:
+        return f"Granted {who} {level} access to {normalized} '{resource_id}' [grant id: {saved['id']}]."
+    if before["access"] == saved["access"]:
+        return f"{who.capitalize()} already had {level} access to {normalized} '{resource_id}'; nothing changed."
+    return (
+        f"Changed {who}'s access to {normalized} '{resource_id}' from "
+        f"{_GRANT_ACCESS_LABEL[before['access']]} to {level}."
+    )
+
+
+@requires(Permission.DELETE)
+async def revoke_resource_access(
+    deps: ManagementDeps, kind: str, resource: str, grantee: str, grantee_type: str = "user",
+) -> str:
+    from app.application import grants
+    gtype = _grantee_type(grantee_type)
+    if gtype is None:
+        return f"Unknown grantee_type '{grantee_type}'; expected user or workflow."
+    normalized, resource_id, err = await _grant_target(deps, kind, resource)
+    if err:
+        return err
+    listed = await grants.list_grants(deps, normalized, resource_id)
+    query = (grantee or "").strip()
+    found = next((g for g in listed if g["id"] == query), None)
+    if found is None:
+        grantee_id, err = await _resolve_grantee(deps, gtype, query)
+        if err:
+            return err
+        found = next(
+            (g for g in listed if g["grantee_type"] == gtype and g["grantee_id"] == grantee_id),
+            None,
+        )
+    if found is None:
+        return (
+            f"{gtype.capitalize()} '{query}' holds no grant on {normalized} '{resource_id}'; "
+            "nothing changed."
+        )
+    await grants.revoke(deps, normalized, resource_id, found["id"])
+    who = found.get("grantee_name") or found["grantee_id"]
+    return f"Revoked {found['grantee_type']} {who}'s access to {normalized} '{resource_id}'."

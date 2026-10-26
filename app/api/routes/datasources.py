@@ -38,9 +38,8 @@ from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from app.api.dependencies import get_container
 from app.domain.models.ownership import Visibility
-from app.application import grants as grant_service
+from app.api.routes.grants import add_grant_routes, present_sharing
 from app.application.visibility import (
-    can_change_visibility,
     caller_grant,
     ownership_fields,
     sources_for_workflow,
@@ -336,13 +335,7 @@ def _present(defn: DataSourceDefinition, workflow_id: str | None = None) -> dict
     """A definition as the caller may read it: secrets redacted, and the grant
     list only for someone who may manage it (a grantee learns their own access
     from ``granted_access``, not who else holds one)."""
-    payload = _redact_secrets(defn.model_dump(mode="json"))
-    payload["can_share"] = can_change_visibility(defn)
-    if not payload["can_share"]:
-        payload.pop("grants", None)
-    if workflow_id and workflow_grant(defn, workflow_id):
-        payload["granted_to_workflow"] = workflow_grant(defn, workflow_id)
-    return payload
+    return present_sharing(_redact_secrets(defn.model_dump(mode="json")), defn, workflow_id)
 
 
 async def _workflow_sources(
@@ -885,54 +878,7 @@ async def delete_datasource(
 
 # ─── Grants (nested under a source — after the item routes) ───────────────────
 
-class GrantRequest(BaseModel):
-    grantee_type: Literal["user", "workflow"]
-    grantee_id: str
-    access: Literal["read", "read_write"] = "read"
-
-
-@router.get("/{source_id}/grants")
-async def list_datasource_grants(
-    source_id: str, container: ApplicationContainer = Depends(get_container)
-) -> list[dict[str, Any]]:
-    """Who this source has been opened to beyond its visibility."""
-    _require_backend(container)
-    return await grant_service.list_grants(container, source_id)
-
-
-@router.get("/{source_id}/grants/candidates")
-async def list_datasource_grant_candidates(
-    source_id: str, container: ApplicationContainer = Depends(get_container)
-) -> dict[str, list[dict[str, Any]]]:
-    """Users and workflows the caller could grant this source to."""
-    _require_backend(container)
-    return await grant_service.candidates(container, source_id)
-
-
-@router.post("/{source_id}/grants", status_code=201)
-async def create_datasource_grant(
-    source_id: str,
-    body: GrantRequest,
-    container: ApplicationContainer = Depends(get_container),
-) -> dict[str, Any]:
-    """Grant a user or a workflow read or read-write use of this source.
-
-    Granting to one that already holds a grant changes its access.
-    """
-    _require_backend(container)
-    return await grant_service.grant(
-        container, source_id,
-        grantee_type=body.grantee_type, grantee_id=body.grantee_id, access=body.access,
-    )
-
-
-@router.delete("/{source_id}/grants/{grant_id}", status_code=204)
-async def revoke_datasource_grant(
-    source_id: str, grant_id: str, container: ApplicationContainer = Depends(get_container)
-):
-    """Revoke a grant. Whatever relied on it fails on its next save or run."""
-    _require_backend(container)
-    await grant_service.revoke(container, source_id, grant_id)
+add_grant_routes(router, "datasource")
 
 
 # ─── Sheet bindings (nested under a source — after the item routes) ───────────

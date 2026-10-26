@@ -12,10 +12,10 @@ from app.domain.models.agent_addon import (
     S3Addon,
     ToolsAddon,
 )
-from app.domain.models.ownership import OwnedResource
+from app.domain.models.ownership import GrantableResource
 
 
-class AgentDefinition(OwnedResource):
+class AgentDefinition(GrantableResource):
     """Persistent definition of a registered agent.
 
     Agents are invoked by ``langgraph-agent`` and ``claude-agent`` workflow

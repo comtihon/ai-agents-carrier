@@ -1421,6 +1421,75 @@ def build_default_workflow(
         """
         return await core.set_resource_visibility(deps, kind, resource, visibility, team)
 
+    @tool
+    async def list_resource_grants(kind: str, resource: str) -> str:
+        """List who a data source, agent or workflow has been shared with beyond
+        its visibility: users and workflows, with their access and grant id.
+
+        Who may: the resource's owner, an admin of the team it is shared with,
+        or a super admin.
+
+        Args:
+            kind: "datasource", "agent" or "workflow".
+            resource: The resource's id or name.
+        """
+        return await core.list_resource_grants(deps, kind, resource)
+
+    @tool
+    async def grant_resource_access(
+        kind: str, resource: str, grantee: str, grantee_type: str = "user", access: str = "read",
+    ) -> str:
+        """Share a data source, agent or workflow with a user outside its team,
+        or with one specific workflow. Granting again changes the access level.
+
+        A user grant lets that user see it and use it in their own private
+        workflows (and agents). A workflow grant lets that one workflow use it
+        — e.g. team A's workflow calling team B's workflow or agent — while
+        its editors still cannot pick it anywhere else.
+
+        access: "read" or "read_write". On a data source, "read" allows only
+        operations that do not write and "read_write" all of them. On an agent
+        or a workflow, "read" is see/run/use and "read_write" also lets the
+        user edit it; a workflow grantee always gets "read".
+
+        Examples: "share data source CRM read-only with carol@example.com" ->
+        grant_resource_access(kind="datasource", resource="CRM",
+        grantee="carol@example.com"); "let workflow team-a-report call
+        workflow enrich" -> grant_resource_access(kind="workflow",
+        resource="enrich", grantee="team-a-report", grantee_type="workflow").
+
+        Who may: the resource's owner, an admin of the team it is shared with,
+        or a super admin. Public resources, the owner, members of its team and
+        workflows that can already use it need no grant.
+
+        Args:
+            kind: "datasource", "agent" or "workflow".
+            resource: The resource's id or name.
+            grantee: The user's email, name or id, or the workflow's id or name.
+            grantee_type: "user" (default) or "workflow".
+            access: "read" (default) or "read_write".
+        """
+        return await core.grant_resource_access(deps, kind, resource, grantee, grantee_type, access)
+
+    @tool
+    async def revoke_resource_access(
+        kind: str, resource: str, grantee: str, grantee_type: str = "user",
+    ) -> str:
+        """Revoke a user's or a workflow's grant on a data source, agent or
+        workflow. Whatever relied on it fails on its next save or run.
+
+        Who may: the resource's owner, an admin of the team it is shared with,
+        or a super admin.
+
+        Args:
+            kind: "datasource", "agent" or "workflow".
+            resource: The resource's id or name.
+            grantee: The user's email, name or id, the workflow's id or name,
+                or the grant id from list_resource_grants.
+            grantee_type: "user" (default) or "workflow".
+        """
+        return await core.revoke_resource_access(deps, kind, resource, grantee, grantee_type)
+
     platform_tools = [list_workflows, get_workflow, run_workflow, list_runs, get_run, ask_user,
                       list_run_data, get_run_data_artifact,
                       read_run_data_artifact,
@@ -1445,7 +1514,8 @@ def build_default_workflow(
                       send_direct_message, delete_message,
                       who_am_i, list_teams, list_users, create_team, rename_team,
                       delete_team, set_team_member, remove_team_member,
-                      set_resource_visibility]
+                      set_resource_visibility,
+                      list_resource_grants, grant_resource_access, revoke_resource_access]
 
     # --- Run control tools ---
     #
