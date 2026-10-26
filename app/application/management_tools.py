@@ -944,13 +944,16 @@ def _clip(text: str) -> str:
     return f"{text[:_APPROVAL_VALUE_CHARS]}… [{len(text)} chars total]"
 
 
-async def _combined_errors(deps: "ManagementDeps", steps: Any) -> list[str]:
+async def _combined_errors(
+    deps: "ManagementDeps", steps: Any, workflow_id: str | None = None,
+) -> list[str]:
     """Save-time problems of combined_datasource steps (parts, refs, sources, scripts)."""
+    from app.application.visibility import sources_for_workflow
     from app.infrastructure.orchestration.combined_datasource import combined_step_errors
 
     return await combined_step_errors(
         steps,
-        data_source_backend=deps.data_source_backend,
+        data_source_backend=sources_for_workflow(deps.data_source_backend, workflow_id),
         script_backend=deps.script_backend,
     )
 
@@ -1085,7 +1088,7 @@ async def create_workflow(
     dynamic_errors = validate_dynamic_steps(steps)
     if dynamic_errors:
         return "Invalid dynamic step: " + "; ".join(dynamic_errors)
-    combined_errors = await _combined_errors(deps, steps)
+    combined_errors = await _combined_errors(deps, steps, workflow_id)
     if combined_errors:
         return "Invalid combined_datasource step: " + "; ".join(combined_errors)
 
@@ -1173,7 +1176,7 @@ async def update_workflow(
         dynamic_errors = validate_dynamic_steps(steps)
         if dynamic_errors:
             return "Invalid dynamic step: " + "; ".join(dynamic_errors)
-        combined_errors = await _combined_errors(deps, steps)
+        combined_errors = await _combined_errors(deps, steps, workflow_id)
         if combined_errors:
             return "Invalid combined_datasource step: " + "; ".join(combined_errors)
         from app.application.graph_layout import apply_layout

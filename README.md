@@ -1027,6 +1027,12 @@ DELETE /api/v1/teams/{id}                     409 while resources are shared wit
 PUT    /api/v1/teams/{id}/members/{sub}       optional {role: member|admin}
 DELETE /api/v1/teams/{id}/members/{sub}
 GET    /api/v1/users                          super admin: all; team admin: own team + users in no team
+
+# Data source grants (owner, team admin of its team, or super admin)
+GET    /api/v1/datasources/{id}/grants
+GET    /api/v1/datasources/{id}/grants/candidates   {users: [...], workflows: [...]}
+POST   /api/v1/datasources/{id}/grants        {grantee_type: user|workflow, grantee_id, access: read|read_write}
+DELETE /api/v1/datasources/{id}/grants/{grant_id}
 ```
 
 ### Ownership and visibility
@@ -1066,6 +1072,25 @@ kept.
   follow the same rules. Narrowing a resource (public → team → private, or to
   another team) is refused (`409`) while something it would break still uses
   it; a referrer the caller cannot see is not named.
+- **Data source grants** open a team or private data source to someone its
+  visibility leaves out, stored on the source (`grants`) so they can be listed
+  and revoked there. A grant goes to a **user** — who then sees the source and
+  may use it in resources *private to them* (not team or public ones) — or to
+  one **workflow**, which may use it whatever its scope while whoever edits it
+  still cannot pick the source anywhere else. Access is `read` (only
+  operations that do not write: GET/HEAD/OPTIONS, GraphQL queries, BigQuery,
+  or an operation marked `destructive: false`) or `read_write` (all of them),
+  enforced on save (`422`, workflow steps and agent add-ons alike) and when a
+  workflow step runs, triggered runs included. A grant
+  never lets the grantee edit, delete or re-share the source. The owner, an
+  admin of the source's team, or a super admin grants and revokes; granting to
+  someone who already holds a grant changes its level; a public source, its
+  owner, its team's members and a workflow already in scope need none (`409`).
+  Revoking takes effect on the next save or run; deleting a workflow drops
+  its grants. Non-sharers never see the grant list — a user grantee sees
+  `granted_access` on the source. Pass `workflow_id` to `GET /datasources` (or
+  `/datasources/{id}`) to also get the sources granted to that workflow, each
+  marked `granted_to_workflow`, when the caller can see the workflow.
 - **Super admins** are callers holding a role in `AUTH_SUPER_ADMIN_ROLES`
   (or, when that is empty, `AUTH_ADMIN_ROLES`), evaluated even when
   `AUTH_ENFORCE_PERMISSIONS` is off (in shadow mode every caller is *granted*

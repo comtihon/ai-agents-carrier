@@ -2380,9 +2380,19 @@ class YamlGraphRunner:
                 if self._data_source_backend is None or self._data_source_executor is None:
                     raise ValueError("data source backend/executor not configured")
                 params = self._render_deep(step.get("params") or {}, state)
-                source = await self._data_source_backend.get(source_id)
+                from app.application.visibility import (
+                    operation_denied, sources_for_workflow, workflow_grant_access,
+                )
+                source = await sources_for_workflow(
+                    self._data_source_backend, self.id
+                ).get(source_id)
                 if source is None:
                     raise ValueError(f"Data source '{source_id}' not found")
+                denied = operation_denied(
+                    source, operation, workflow_grant_access(source, self)
+                )
+                if denied:
+                    raise PermissionError(denied)
 
                 gate = await self._gate_destructive(step, source, operation, params)
                 if gate is not None and not gate["approved"]:

@@ -82,3 +82,32 @@ def is_destructive(operation: Any, source: Any = None) -> bool:
         return graphql_writes(getattr(operation, "query", None))
     method = (getattr(operation, "method", "") or "GET").upper()
     return method in DESTRUCTIVE_METHODS
+
+
+# Verbs that only read. Anything else -- including a verb nobody recognises --
+# counts as a write in :func:`operation_writes`.
+READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def operation_writes(operation: Any, source: Any = None) -> bool:
+    """Whether *operation* can change anything at all -- the line a read-only
+    grant draws (see app.application.visibility).
+
+    Broader than :func:`is_destructive`: a POST that creates is not
+    destructive, but it is a write. Mirrors ``operationLevel`` in the UI's
+    ``datasourceRisk.ts`` -- anything it does not paint ``read`` is a write --
+    except that an unknown verb counts as a write here: a read-only grant
+    fails closed.
+    """
+    explicit = getattr(operation, "destructive", None)
+    if explicit is not None:
+        # ``destructive: false`` is how an operation says "this POST only
+        # reads" (a search endpoint); the UI paints it read for the same reason.
+        return bool(explicit)
+    kind = getattr(source, "kind", "http") if source is not None else "http"
+    if kind == "bigquery":
+        return False
+    if kind == "graphql":
+        return graphql_writes(getattr(operation, "query", None))
+    method = (getattr(operation, "method", "") or "GET").upper()
+    return method not in READ_METHODS

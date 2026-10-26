@@ -1,13 +1,38 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import ClassVar, Literal
 
 from pydantic import BaseModel, computed_field
 
 Visibility = Literal["public", "team", "private"]
+GrantAccess = Literal["read", "read_write"]
+GranteeType = Literal["user", "workflow"]
 
 # Computed per caller (or per lookup) on every read; never written to a store.
-COMPUTED_FIELDS: frozenset[str] = frozenset({"can_edit", "team_name"})
+COMPUTED_FIELDS: frozenset[str] = frozenset({"can_edit", "team_name", "granted_access"})
+
+
+class ResourceGrant(BaseModel):
+    """Access to a resource for someone its visibility leaves out.
+
+    Granted to a ``user`` — who may then see it and use it in their own private
+    workflows and agents — or to one ``workflow``, which may then use it while
+    whoever edits that workflow still cannot pick it anywhere else. ``access``
+    says which operations: ``read`` ones only, or all of them (``read_write``).
+    Neither lets the grantee change the resource itself. What a grant permits
+    is app.application.visibility; who may grant is app.application.grants.
+    """
+
+    id: str
+    grantee_type: GranteeType
+    grantee_id: str
+    # Display name at grant time (a user's name, a workflow's name).
+    grantee_name: str | None = None
+    access: GrantAccess = "read"
+    granted_by: str | None = None
+    granted_by_name: str | None = None
+    granted_at: datetime | None = None
 
 
 class OwnedResource(BaseModel):

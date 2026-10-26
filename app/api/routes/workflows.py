@@ -665,13 +665,20 @@ def _guard_sandbox(request: Request, steps: object) -> None:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
-async def _guard_combined(container: ApplicationContainer, steps: object) -> None:
+async def _guard_combined(
+    container: ApplicationContainer, steps: object, workflow_id: str | None = None,
+) -> None:
     """Reject a combined_datasource step whose parts would only fail at run time."""
+    from app.application.visibility import sources_for_workflow
     from app.infrastructure.orchestration.combined_datasource import combined_step_errors
 
     errors = await combined_step_errors(
         steps if isinstance(steps, list) else [],
-        data_source_backend=getattr(container, "data_source_backend", None),
+        # Sources granted to this workflow count, though the caller cannot
+        # see them anywhere else.
+        data_source_backend=sources_for_workflow(
+            getattr(container, "data_source_backend", None), workflow_id
+        ),
         script_backend=getattr(container, "script_backend", None),
     )
     if errors:
@@ -698,7 +705,7 @@ async def create_workflow(
     assert container.workflow_backend is not None
     _guard_sandbox(request, body.steps)
     _guard_dynamic(body.steps)
-    await _guard_combined(container, body.steps)
+    await _guard_combined(container, body.steps, body.id)
 
     existing = await container.workflow_backend.get(body.id)
     if existing is not None:
@@ -1113,7 +1120,7 @@ async def update_workflow(
     if body.steps is not None:
         _guard_sandbox(request, body.steps)
         _guard_dynamic(body.steps)
-        await _guard_combined(container, body.steps)
+        await _guard_combined(container, body.steps, workflow_id)
 
     existing = await container.workflow_backend.get(workflow_id)
     if existing is None:
