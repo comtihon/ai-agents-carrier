@@ -7,12 +7,16 @@ frame it sends, so the client counts what it received and reconnects with
 ``Acp-Connection-Id`` + ``Acp-Last-Seq``; the proxy replays the rest. Requests
 in flight stay pending across a reconnect — their responses arrive with the
 replay.
+
+A runner (acp-web-proxy in dial mode, see app.application.runners) is not
+dialled: carrier asks it over its control socket to dial a data socket back.
+For that the connection takes an ``opener`` instead of a URL; everything above
+the socket — counting, resume, correlation — is the same.
 """
 
 from __future__ import annotations
 
 import asyncio
-import itertools
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -25,6 +29,10 @@ logger = logging.getLogger(__name__)
 
 NotificationHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
 RequestHandler = Callable[[str, dict[str, Any]], Awaitable[Any]]
+# (connection_id or None for a new one, frames received so far) → a socket
+# with ``connection_id``, async iteration over text frames, ``send``, ``close``
+# and ``close_code``.
+SocketOpener = Callable[[str | None, int], Awaitable[Any]]
 
 CLOSE_REPLAY_GAP = 4409
 CLOSE_CONNECTION_ENDED = 4001
@@ -57,8 +65,8 @@ def to_ws_url(agent_url: str, path: str = "/acp") -> str:
 class AcpConnection:
     def __init__(
         self,
-        url: str,
-        token: str,
+        url: str | None,
+        token: str | None,
         *,
         on_notification: NotificationHandler | None = None,
         on_request: RequestHandler | None = None,
@@ -66,6 +74,9 @@ class AcpConnection:
         max_reconnects: int = 20,
         reconnect_delay: float = 1.0,
         max_message_bytes: int = 32 * 1024 * 1024,
+        opener: SocketOpener | None = None,
+        first_id: int = 1,
+        send_timeout: float = 120,
     ) -> None:
         self.url = url
         self.token = token
@@ -73,7 +84,11 @@ class AcpConnection:
         self.received = 0
         self._on_notification = on_notification
         self._on_request = on_request
-        self._ids = itertools.count(1)
+        self._opener = opener
+        self._send_timeout = send_timeout
+        # Ids continue across a re-attach, so a new request never reuses the id
+        # of one the proxy still remembers on this connection.
+        self._next_id = first_id
         self._pending: dict[Any, asyncio.Future] = {}
         self._ws: Any = None
         self._reader: asyncio.Task | None = None
@@ -93,7 +108,23 @@ class AcpConnection:
         await self._open()
         self._reader = asyncio.create_task(self._read_loop(), name=f"acp-reader-{self.connection_id}")
 
+    @property
+    def lost(self) -> bool:
+        return self._lost is not None
+
+    @property
+    def started(self) -> bool:
+        """Whether ``connect`` has succeeded on this object."""
+        return self._reader is not None
+
     async def _open(self) -> None:
+        if self._opener is not None:
+            ws = await self._opener(self.connection_id, self.received)
+            self._ws = ws
+            self.connection_id = ws.connection_id
+            self._connected.set()
+            return
+        assert self.url is not None
         headers = {"Authorization": f"Bearer {self.token}"}
         if self.connection_id:
             headers["Acp-Connection-Id"] = self.connection_id
@@ -222,7 +253,7 @@ class AcpConnection:
         for _ in range(self._max_reconnects + 1):
             if self._lost is not None:
                 raise self._lost
-            await asyncio.wait_for(self._connected.wait(), timeout=120)
+            await asyncio.wait_for(self._connected.wait(), timeout=self._send_timeout)
             ws = self._ws
             try:
                 await ws.send(data)
@@ -236,7 +267,7 @@ class AcpConnection:
     async def request(self, method: str, params: dict[str, Any] | None = None, *, timeout: float | None = None, req_id: Any = None) -> Any:
         if self._lost is not None:
             raise self._lost
-        rid = req_id if req_id is not None else next(self._ids)
+        rid = req_id if req_id is not None else self.next_id()
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[rid] = fut
         try:
@@ -252,7 +283,13 @@ class AcpConnection:
         return fut
 
     def next_id(self) -> int:
-        return next(self._ids)
+        rid = self._next_id
+        self._next_id += 1
+        return rid
+
+    def peek_next_id(self) -> int:
+        """The id the next request will get (persisted for a re-attach)."""
+        return self._next_id
 
     async def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
         await self._send({"jsonrpc": "2.0", "method": method, "params": params or {}})

@@ -452,6 +452,27 @@ class Settings(BaseSettings):
     # Command that starts the agent's HTTP server, run with LOCAL_AGENT_DIR as cwd.
     local_agent_command: str = Field(default="node src/server.js", alias="LOCAL_AGENT_COMMAND")
 
+    # --- Runners (acp-web-proxy dialling in from users' machines) ---
+    # Enrollment endpoints are public (a machine has no credential yet); a
+    # signed-in user approves each machine by typing the number it shows.
+    acp_runners_enabled: bool = Field(default=True, alias="ACP_RUNNERS_ENABLED")
+    acp_runner_enrollment_ttl_s: int = Field(default=600, alias="ACP_RUNNER_ENROLLMENT_TTL_S")
+    # Roles allowed to approve machines, on top of WRITE. Empty: anyone with
+    # WRITE. Super admins always may.
+    acp_runner_enroll_roles: list[str] = Field(default_factory=list, alias="ACP_RUNNER_ENROLL_ROLES")
+    # How long a step waits for an offline runner before failing (an agent may
+    # override it with agent_input.runner_wait_s).
+    acp_runner_wait_s: int = Field(default=600, alias="ACP_RUNNER_WAIT_S")
+    # carrier-bridge URL, for the approval link a runner prints.
+    ui_base_url: str | None = Field(default=None, alias="UI_BASE_URL")
+
+    # --- Usage limits of subscription agents (ACP) ---
+    # Longest a step stays parked waiting for an agent's quota to reset
+    # (agent_input.quota_max_wait_s overrides it per agent).
+    acp_quota_max_wait_s: int = Field(default=86400, alias="ACP_QUOTA_MAX_WAIT_S")
+    # Retry interval when the agent did not say when its limit resets.
+    acp_quota_retry_s: int = Field(default=1800, alias="ACP_QUOTA_RETRY_S")
+
     # --- Python script sandbox (workflow `python` steps with sandbox: true) ---
     # Image used by the docker / k8s sandbox runtimes.  Must contain a Python
     # interpreter on PATH; no backend dependencies are needed inside it.

@@ -52,6 +52,8 @@ class AgentDefinitionRequest(BaseModel):
     addons: list[dict] = Field(default_factory=list)
     protocol: Literal["http-poll", "acp"] = "http-poll"
     acp_agent: str | None = None
+    # default_runtime "runner": the machine (app.application.runners) it runs on.
+    runner_id: str | None = None
     # None = the default: private when a user creates it, public without auth.
     visibility: Visibility | None = None
     # With visibility "team": which team. Omitted = the caller's own (a
@@ -74,6 +76,7 @@ class AgentDefinitionUpdateRequest(BaseModel):
     # not silently switch an ACP agent back to the poll protocol).
     protocol: Literal["http-poll", "acp"] | None = None
     acp_agent: str | None = None
+    runner_id: str | None = None
     # None = keep the stored visibility.
     visibility: Visibility | None = None
     # With visibility "team": which team. Omitted = the caller's own (a
@@ -88,13 +91,39 @@ def _require_backend(container: ApplicationContainer) -> None:
         raise HTTPException(status_code=501, detail="Agent backend not configured")
 
 
+_RUNTIMES = ("local", "docker", "k8s", "runner")
+
+
+async def _runner_fields(
+    container: ApplicationContainer, runtime: str, runner_id: str | None, protocol: str, acp_agent: str | None
+) -> dict[str, Any]:
+    """protocol/acp_agent/runner_id for *runtime*, checking the caller may use the runner.
+
+    A runner executes on someone's machine, so only someone who can see the
+    runner (its owner, its team when shared with one, a super admin) may point
+    an agent at it. Runner agents always speak ACP.
+    """
+    if runtime not in _RUNTIMES:
+        raise HTTPException(status_code=400, detail=f"Unknown runtime '{runtime}' (one of {', '.join(_RUNTIMES)})")
+    if runtime != "runner":
+        return {"protocol": protocol, "acp_agent": acp_agent, "runner_id": None}
+    from app.application.visibility import can_see
+    backend = getattr(container, "runner_backend", None)
+    runner = await backend.get_runner(runner_id) if backend is not None and runner_id else None
+    if runner is None or not can_see(runner):
+        raise HTTPException(status_code=400, detail=f"Runner '{runner_id}' not found" if runner_id else "runtime 'runner' needs runner_id")
+    if acp_agent and acp_agent not in runner.agents:
+        raise HTTPException(status_code=400, detail=f"Runner '{runner.name}' does not offer agent '{acp_agent}'")
+    return {"protocol": "acp", "acp_agent": acp_agent or None, "runner_id": runner.id}
+
+
 # ─── Literal-segment routes (must come before /{agent_id}) ───────────────────
 
 @router.get("/types")
 async def list_agent_types():
     """Return the supported runtimes."""
     return {
-        "runtimes": ["local", "docker", "k8s"],
+        "runtimes": list(_RUNTIMES),
     }
 
 
@@ -204,6 +233,9 @@ async def create_agent(
 
     from pydantic import TypeAdapter
     _addon_adapter: TypeAdapter[list[AnyAgentAddon]] = TypeAdapter(list[AnyAgentAddon])
+    runner_fields = await _runner_fields(
+        container, body.default_runtime, body.runner_id, body.protocol, body.acp_agent or None
+    )
     defn = AgentDefinition(
         id=body.id,
         name=body.name,
@@ -214,8 +246,7 @@ async def create_agent(
         helm_chart=body.helm_chart,
         helm_values=body.helm_values,
         addons=_addon_adapter.validate_python(body.addons),
-        protocol=body.protocol,
-        acp_agent=body.acp_agent or None,
+        **runner_fields,
         **visibility_kwargs(body.visibility, body.team_id),
     )
     saved = await container.agent_backend.create(defn)
@@ -274,6 +305,16 @@ async def update_agent(
         if body.addons is None
         else _addon_adapter.validate_python(body.addons)
     )
+    protocol = existing.protocol if body.protocol is None else body.protocol
+    acp_agent = existing.acp_agent if body.protocol is None else (body.acp_agent or None)
+    runner_id = body.runner_id
+    if body.default_runtime == "runner" and runner_id is None:
+        runner_id = existing.runner_id
+    if body.default_runtime == "runner" and runner_id == existing.runner_id and body.protocol is None:
+        # Unchanged runner: an older client round-trip keeps it as is.
+        runner_fields = {"protocol": "acp", "acp_agent": acp_agent, "runner_id": runner_id}
+    else:
+        runner_fields = await _runner_fields(container, body.default_runtime, runner_id, protocol, acp_agent)
     defn = AgentDefinition(
         id=agent_id,
         name=body.name,
@@ -285,8 +326,7 @@ async def update_agent(
         helm_values=body.helm_values,
         created_at=existing.created_at,
         addons=addons,
-        protocol=existing.protocol if body.protocol is None else body.protocol,
-        acp_agent=(existing.acp_agent if body.protocol is None else (body.acp_agent or None)),
+        **runner_fields,
         **visibility_kwargs(body.visibility, body.team_id),
     )
     saved = await container.agent_backend.update(agent_id, defn)

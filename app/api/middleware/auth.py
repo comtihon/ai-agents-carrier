@@ -80,9 +80,25 @@ _AGENT_CALLBACK_PATH = re.compile(
 )
 
 
+# Runner enrollment and self-service (app.api.routes.runners): a machine that
+# has no credential yet asks for an enrollment and polls it with its own poll
+# token; an enrolled runner revokes itself with its runner token. Approving
+# (lookup/approve/deny) and managing runners stays user-authenticated. The
+# runner sockets are WebSockets, which this HTTP middleware never sees; they
+# check the runner token themselves.
+_RUNNER_PUBLIC = (
+    ("GET", re.compile(r"^/api/v1/acp/runners/(?:info|install\.md)$")),
+    ("POST", re.compile(r"^/api/v1/acp/runners/enrollments$")),
+    ("GET", re.compile(r"^/api/v1/acp/runners/enrollments/[^/]+/poll$")),
+    ("DELETE", re.compile(r"^/api/v1/acp/runners/self$")),
+)
+
+
 def _is_unprotected(method: str, path: str) -> bool:
     """Whether `method path` may bypass user authentication."""
     if path in _UNPROTECTED_PATHS or path.startswith(_UNPROTECTED_PREFIXES):
+        return True
+    if any(method == m and rx.match(path) for m, rx in _RUNNER_PUBLIC):
         return True
     for exempt_method, prefix in _UNPROTECTED_METHOD_PREFIXES:
         if method == exempt_method and path.startswith(prefix):

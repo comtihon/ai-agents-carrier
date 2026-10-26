@@ -69,6 +69,13 @@ API at `http://localhost:8000`. Health check: `GET /health`.
 | `LOCAL_AGENT_COMMAND` | `node src/server.js` | Command that starts the local agent's HTTP server, run with `LOCAL_AGENT_DIR` as cwd |
 | `META_LLM_PROVIDER` | — | LLM provider for post-agent analysis (`anthropic` or `openai`; defaults to `LLM_PROVIDER`) |
 | `META_LLM_MODEL` | `claude-haiku-4-5-20251001` | Model for post-agent meta-analysis (haiku recommended for cost/speed) |
+| `ACP_RUNNERS_ENABLED` | `true` | Accept [runners](#runners-agents-on-users-machines): machines connected with acp-web-proxy |
+| `ACP_RUNNER_ENROLLMENT_TTL_S` | `600` | How long a machine's approval number stays valid |
+| `ACP_RUNNER_ENROLL_ROLES` | `[]` | Roles allowed to approve machines (on top of WRITE); empty = anyone with WRITE. Super admins always may |
+| `ACP_RUNNER_WAIT_S` | `600` | How long a step waits for an offline runner (`agent_input.runner_wait_s` per agent) |
+| `UI_BASE_URL` | — | carrier-bridge URL; runners print `<UI_BASE_URL>/#approve-runner` as the approval link |
+| `ACP_QUOTA_MAX_WAIT_S` | `86400` | Longest a step stays parked on an agent's usage limit (`agent_input.quota_max_wait_s` per agent) |
+| `ACP_QUOTA_RETRY_S` | `1800` | Retry interval when an agent's limit gives no reset time |
 
 ### Role-based permissions
 
@@ -748,6 +755,48 @@ Agents are registered persistent definitions that `langgraph-agent` / `claude-ag
 | `k8s`    | Helm release in `AGENT_NAMESPACE` | `helm_chart` / `helm_values`, `AGENT_SERVICE_ACCOUNT` |
 
 `local` needs `LOCAL_AGENT_DIR` set — there is no in-process agent to fall back on, and a step whose runtime resolves to `local` without it fails with a configuration error rather than running something different from production. Definitions written before this — `default_runtime: local` was the old inline LangGraph agent — need switching to `k8s`.
+
+### Runners: agents on users' machines
+
+A **runner** is [acp-web-proxy](https://github.com/comtihon/acp-web-proxy) on a
+machine carrier cannot reach (a laptop, a VM behind NAT), offering the coding
+agents installed there (Claude Code, Codex, Gemini CLI) to carrier. Ask Claude
+Code *"install acp-web-proxy and connect it to https://carrier.example.com"*, or
+run:
+
+```bash
+npx -y github:comtihon/acp-web-proxy install https://carrier.example.com
+```
+
+The machine shows an **approval number**; a signed-in user with WRITE (and one
+of `ACP_RUNNER_ENROLL_ROLES`, when set) enters it in carrier-bridge (Runners →
+Approve device), sees the machine's details and approves. The approver owns the
+runner (private by default) and the agent definitions created for it
+(`default_runtime: "runner"`, `runner_id`, `protocol: "acp"`, `acp_agent`). Only
+someone who can see a runner can point an agent at it. Deleting the runner
+revokes its credential at once.
+
+The runner dials carrier (`/api/v1/acp/runners/connect`) and reconnects with
+backoff; a step waits up to `ACP_RUNNER_WAIT_S` for it to come online, and a
+step running on it survives socket drops (replay) and carrier restarts
+(re-attach). Each step runs in `<runner workspace>/<run_id>` unless the agent
+sets `agent_input.acp_cwd`. Live runner sockets are held in memory: serve
+runners from a single replica. Protocol and enrollment details:
+[acp-web-proxy docs/runners.md](https://github.com/comtihon/acp-web-proxy/blob/main/docs/runners.md).
+
+### Usage limits (ACP agents)
+
+When a subscription agent runs out of quota mid-step, carrier parks the step
+instead of failing it: the run state carries `_quota_wait_<step>` (`resume_at`,
+`kind`, `message`), and at the reset time carrier continues the same session
+with a "continue where you stopped" prompt — over the same connection, or with
+`session/load` on a new one when the old one is gone (also after a carrier
+restart). Reset times come from Claude's `_claude/rateLimit` updates or its
+"resets 3pm (Europe/Berlin)" message, and from Codex's "Try again at 3:42 PM"
+(in the runner's time zone). No reset time: retry every `ACP_QUOTA_RETRY_S`.
+Out of credits / spend cap: the step fails. A runner remembers an agent's limit,
+so later steps wait before launching it. Nothing waits longer than
+`ACP_QUOTA_MAX_WAIT_S`.
 
 ### Two images: `slim` and `full`
 
