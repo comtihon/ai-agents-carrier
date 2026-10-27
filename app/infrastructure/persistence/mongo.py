@@ -25,6 +25,20 @@ _LIST_PROJECTION = {
 }
 
 
+INCOMPLETE_STATUSES = ("running", "waiting_approval", "waiting_agent")
+
+
+@dataclass(frozen=True)
+class RecoveryCandidate:
+    """The few fields of an incomplete run startup recovery decides on."""
+
+    id: str
+    graph_id: str
+    status: str
+    kind: str = "workflow"
+    recovery_attempts: int = 0
+
+
 class MongoGraphRunRepository:
     def __init__(self, collection: AsyncIOMotorCollection) -> None:
         self._collection = collection
@@ -79,9 +93,71 @@ class MongoGraphRunRepository:
         return self._from_doc(doc) if doc else None
 
     async def list_incomplete(self) -> list[GraphRun]:
-        cursor = self._collection.find({"status": {"$in": ["running", "waiting_approval", "waiting_agent"]}})
+        cursor = self._collection.find({"status": {"$in": list(INCOMPLETE_STATUSES)}})
         docs = await cursor.to_list(length=None)
         return [self._from_doc(doc) for doc in docs]
+
+    async def list_recovery_candidates(self) -> list[RecoveryCandidate]:
+        """Incomplete runs, projected down to what startup recovery decides on.
+
+        Startup used to load every incomplete run in full at once; one of them
+        can be close to Mongo's 16 MB limit. Recovery now reads this light
+        list, decides per run, and loads a single full document at a time.
+        """
+        cursor = self._collection.find(
+            {"status": {"$in": list(INCOMPLETE_STATUSES)}},
+            {"_id": 1, "graph_id": 1, "status": 1, "kind": 1, "recovery_attempts": 1},
+        ).sort("created_at", 1)
+        docs = await cursor.to_list(length=None)
+        return [
+            RecoveryCandidate(
+                id=d["_id"],
+                graph_id=d.get("graph_id", ""),
+                status=d.get("status", ""),
+                kind=d.get("kind", "workflow"),
+                recovery_attempts=int(d.get("recovery_attempts") or 0),
+            )
+            for d in docs
+        ]
+
+    async def begin_recovery(self, run_id: str) -> GraphRun | None:
+        """Record a startup recovery attempt, then return the run in full.
+
+        The ``$inc`` is committed before the caller resumes anything, so the
+        count survives the process being killed mid-resume (OOMKill,
+        DocumentTooLarge crash loop). Atomic, and does not rewrite the
+        (possibly huge) document. Returns None when the run is no longer
+        incomplete.
+        """
+        doc = await self._collection.find_one_and_update(
+            {"_id": run_id, "status": {"$in": list(INCOMPLETE_STATUSES)}},
+            {
+                "$inc": {"recovery_attempts": 1},
+                "$set": {"last_recovery_at": datetime.now(timezone.utc)},
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        return self._from_doc(doc) if doc else None
+
+    async def reset_recovery_attempts(self, run_id: str) -> None:
+        await self._collection.update_one({"_id": run_id}, {"$set": {"recovery_attempts": 0}})
+
+    async def fail_incomplete(self, run_id: str, error: str) -> bool:
+        """Mark an incomplete run failed without loading or rewriting it.
+
+        Used for runs too dangerous to load and resume. Returns True when the
+        run was still incomplete and is now failed.
+        """
+        result = await self._collection.update_one(
+            {"_id": run_id, "status": {"$in": list(INCOMPLETE_STATUSES)}},
+            {"$set": {
+                "status": "failed",
+                "state.error": error,
+                "agent_url": None,
+                "updated_at": datetime.now(timezone.utc),
+            }},
+        )
+        return result.modified_count == 1
 
     def _build_run_query(
         self,

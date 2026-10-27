@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, ClassVar
 
-from pydantic import BaseModel, Field
+from pydantic import Field
+
+from app.domain.models.ownership import GrantableResource
 
 
-class WorkflowDefinition(BaseModel):
+class WorkflowDefinition(GrantableResource):
+    # Members of a team workflow's team may edit and run it, not only see it.
+    team_editable: ClassVar[bool] = True
+
     id: str
     name: str = ""
     description: str = ""

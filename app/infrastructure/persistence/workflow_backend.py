@@ -8,6 +8,7 @@ from typing import Any
 
 import yaml
 
+from app.domain.models.ownership import COMPUTED_FIELDS
 from app.domain.models.workflow_definition import WorkflowDefinition
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,11 @@ class LocalFilesWorkflowBackend(WorkflowDefinitionBackend):
                 readonly=raw.get("readonly", self._readonly),
                 enabled=raw.get("enabled", True),
                 use_meta_llm=raw.get("use_meta_llm", True),
+                visibility=raw.get("visibility", "public"),
+                owner_id=raw.get("owner_id"),
+                owner_name=raw.get("owner_name"),
+                team_id=raw.get("team_id"),
+                grants=raw.get("grants") or [],
                 created_at=datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc),
                 updated_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
             )
@@ -122,6 +128,13 @@ class LocalFilesWorkflowBackend(WorkflowDefinitionBackend):
             data["ui"] = definition.ui
         data["use_meta_llm"] = definition.use_meta_llm
         data["enabled"] = definition.enabled
+        if definition.visibility != "public" or definition.owner_id:
+            data["visibility"] = definition.visibility
+            data["owner_id"] = definition.owner_id
+            data["owner_name"] = definition.owner_name
+            data["team_id"] = definition.team_id
+        if definition.grants:
+            data["grants"] = [g.model_dump(mode="json") for g in definition.grants]
         self._file_path(definition.id).write_text(
             yaml.dump(data, default_flow_style=False, allow_unicode=True, sort_keys=False)
         )
@@ -176,7 +189,7 @@ class MongoWorkflowBackend(WorkflowDefinitionBackend):
 
     @staticmethod
     def _to_doc(defn: WorkflowDefinition) -> dict[str, Any]:
-        data = defn.model_dump(mode="python")
+        data = defn.model_dump(mode="python", exclude=set(COMPUTED_FIELDS))
         data["_id"] = data.pop("id")
         return data
 

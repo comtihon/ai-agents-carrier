@@ -245,6 +245,12 @@ class Settings(BaseSettings):
     # --- Public base URL (used to build callback URLs in approval notifications) ---
     base_url: str = Field(default="http://localhost:8000", alias="BASE_URL")
 
+    # --- Startup run recovery crash-loop guard ---
+    # A run resumed on startup this many times in a row without completing a
+    # single step (i.e. the server died each time) is not resumed again: it is
+    # marked failed and its workflow disabled. 0 turns the guard off.
+    run_recovery_max_attempts: int = Field(default=3, alias="RUN_RECOVERY_MAX_ATTEMPTS")
+
     # --- Webhook / HTTP trigger ---
     webhook_secret: str | None = Field(default=None, alias="WEBHOOK_SECRET")
 
@@ -297,6 +303,22 @@ class Settings(BaseSettings):
     auth_write_roles: list[str] = Field(default_factory=list, alias="AUTH_WRITE_ROLES")
     auth_delete_roles: list[str] = Field(default_factory=list, alias="AUTH_DELETE_ROLES")
     auth_admin_roles: list[str] = Field(default_factory=list, alias="AUTH_ADMIN_ROLES")
+    # System-wide visibility and team management (see app.application.teams).
+    # Empty falls back to AUTH_ADMIN_ROLES, so a single admin role is enough
+    # for a small deployment; set it where ADMIN is a broad operations role.
+    auth_super_admin_roles: list[str] = Field(
+        default_factory=list, alias="AUTH_SUPER_ADMIN_ROLES"
+    )
+    # Login script (see app.infrastructure.auth.login_script): JavaScript run
+    # once per new token to derive the caller's roles, profile and team. Give
+    # the source inline or as a file path, not both (startup fails if both are
+    # set). Unset: roles come from the token as they always have.
+    auth_login_script: str | None = Field(default=None, alias="AUTH_LOGIN_SCRIPT")
+    auth_login_script_path: str | None = Field(default=None, alias="AUTH_LOGIN_SCRIPT_PATH")
+    # Wall-clock budget for one run of the script, in milliseconds.
+    auth_login_script_timeout_ms: int = Field(
+        default=1000, ge=1, le=60_000, alias="AUTH_LOGIN_SCRIPT_TIMEOUT_MS"
+    )
 
     # --- Outbound service identity (OAuth2 JWT bearer grant, RFC 7523) ---
     # When enabled, the backend mints its own access tokens from an OAuth2
@@ -430,6 +452,27 @@ class Settings(BaseSettings):
     # Command that starts the agent's HTTP server, run with LOCAL_AGENT_DIR as cwd.
     local_agent_command: str = Field(default="node src/server.js", alias="LOCAL_AGENT_COMMAND")
 
+    # --- Runners (acp-web-proxy dialling in from users' machines) ---
+    # Enrollment endpoints are public (a machine has no credential yet); a
+    # signed-in user approves each machine by typing the number it shows.
+    acp_runners_enabled: bool = Field(default=True, alias="ACP_RUNNERS_ENABLED")
+    acp_runner_enrollment_ttl_s: int = Field(default=600, alias="ACP_RUNNER_ENROLLMENT_TTL_S")
+    # Roles allowed to approve machines, on top of WRITE. Empty: anyone with
+    # WRITE. Super admins always may.
+    acp_runner_enroll_roles: list[str] = Field(default_factory=list, alias="ACP_RUNNER_ENROLL_ROLES")
+    # How long a step waits for an offline runner before failing (an agent may
+    # override it with agent_input.runner_wait_s).
+    acp_runner_wait_s: int = Field(default=600, alias="ACP_RUNNER_WAIT_S")
+    # carrier-bridge URL, for the approval link a runner prints.
+    ui_base_url: str | None = Field(default=None, alias="UI_BASE_URL")
+
+    # --- Usage limits of subscription agents (ACP) ---
+    # Longest a step stays parked waiting for an agent's quota to reset
+    # (agent_input.quota_max_wait_s overrides it per agent).
+    acp_quota_max_wait_s: int = Field(default=86400, alias="ACP_QUOTA_MAX_WAIT_S")
+    # Retry interval when the agent did not say when its limit resets.
+    acp_quota_retry_s: int = Field(default=1800, alias="ACP_QUOTA_RETRY_S")
+
     # --- Python script sandbox (workflow `python` steps with sandbox: true) ---
     # Image used by the docker / k8s sandbox runtimes.  Must contain a Python
     # interpreter on PATH; no backend dependencies are needed inside it.
@@ -500,6 +543,27 @@ class Settings(BaseSettings):
     # Hard stop on how many chunks one map_reduce step will run: past some
     # number that is a runaway LLM bill, not a workflow.
     stream_max_chunks: int = Field(default=200, alias="STREAM_MAX_CHUNKS")
+
+    # --- Step outputs in object storage (orchestration/step_outputs.py) ---
+    # Every step's output is written to the stream store as
+    # runs/<run_id>/<step_id>[-<n>].md and workflow state / the run document /
+    # the checkpoint keep a small reference instead of the value. Off = the
+    # pre-offload behaviour (values inline in state).
+    step_output_offload: bool = Field(default=True, alias="STEP_OUTPUT_OFFLOAD")
+    # Values whose JSON encoding is at most this many bytes also stay inline
+    # (they are no bigger than their reference); everything larger is a ref.
+    step_output_inline_max_bytes: int = Field(
+        default=256, alias="STEP_OUTPUT_INLINE_MAX_BYTES"
+    )
+    # Ceiling on what one step may have resolved into memory before it runs.
+    step_input_hydrate_max_bytes: int = Field(
+        default=32 * 1024 * 1024, alias="STEP_INPUT_HYDRATE_MAX_BYTES"
+    )
+    # Bytes of stored outputs a run API response resolves inline for display;
+    # the rest stay references carrying a download_url.
+    step_output_display_max_bytes: int = Field(
+        default=2 * 1024 * 1024, alias="STEP_OUTPUT_DISPLAY_MAX_BYTES"
+    )
 
     # --- Run-state divergence probe (see stream_graph_to_pause) ---
     # Diagnostic for the dual-state cleanup: after every streamed chunk,

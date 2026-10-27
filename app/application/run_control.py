@@ -187,6 +187,7 @@ async def terminate_run(
     run = await container.run_repository.get(run_id)
     if run is None:
         raise RunControlError(404, "Run not found")
+    await _require_run_visible(container, run)
     if run.status not in ("running", "waiting_agent"):
         raise RunControlError(409, f"Run is not active (status: {run.status})")
     from app.services.agent_cleanup import cleanup_run_agents
@@ -239,9 +240,21 @@ async def terminate_run(
 # approve / reject
 # ---------------------------------------------------------------------------
 
+async def _require_run_visible(container: "ApplicationContainer", run: "GraphRun") -> None:
+    """404 for a run of a workflow the caller cannot see (see app.application.visibility)."""
+    from app.application.visibility import workflow_visible
+    if not await workflow_visible(getattr(container, "workflow_backend", None), run.graph_id):
+        raise RunControlError(404, "Run not found")
+
+
 async def _claim_for_resume(
     container: "ApplicationContainer", run_id: str
 ) -> "GraphRun":
+    # A private workflow's run is its owner's: checked before the claim, so a
+    # caller who cannot see the run cannot change its state either.
+    visible = await container.run_repository.get(run_id)
+    if visible is not None:
+        await _require_run_visible(container, visible)
     # Atomic claim. Two concurrent /approve requests must not both schedule
     # a resume task on the same runner — see claim_for_resume's docstring
     # for the failure mode that motivated this.
@@ -368,6 +381,7 @@ async def retry_run(
     run = await container.run_repository.get(run_id)
     if run is None:
         raise RunControlError(404, "Run not found")
+    await _require_run_visible(container, run)
     if run.status != "failed":
         raise RunControlError(409, f"Run is not in failed state (status={run.status})")
     # Retrying re-executes graph steps, so it is a start like any other and the
@@ -440,6 +454,7 @@ async def restart_from_step(
     run = await container.run_repository.get(run_id)
     if run is None:
         raise RunControlError(404, "Run not found")
+    await _require_run_visible(container, run)
     if run.status in ("cancelled", "rejected"):
         raise RunControlError(409, f"Cannot restart a {run.status} run")
     if run.status == "running":

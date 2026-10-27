@@ -4,6 +4,11 @@ Scripts are reusable Python bodies that ``python`` workflow steps reference by
 ``script_id``.  Saving from a workflow node is a save-by-name: when the name is
 already taken the API answers 409 so the UI can ask the user to confirm an
 overwrite, and the retry carries ``overwrite: true``.
+
+Names are unique within what the caller can see: another user's private script
+neither blocks a name nor is revealed by it. Ids stay globally unique, so a
+name whose slug is the id of a script the caller cannot see answers 409 "id
+already taken" without saying whose (see app.application.visibility).
 """
 from __future__ import annotations
 
@@ -17,6 +22,8 @@ from app.api.dependencies import get_container
 # Shared with the workflow-save capture path so a name-derived id is the same
 # whichever route created it.
 from app.application.script_capture import slugify
+from app.domain.models.ownership import Visibility
+from app.application.visibility import ownership_fields, visibility_kwargs
 from app.core.container import ApplicationContainer
 from app.domain.models.script_definition import ScriptDefinition
 
@@ -36,12 +43,23 @@ class ScriptRequest(BaseModel):
     code: str = ""
     # Set by the client after the user confirmed the overwrite warning.
     overwrite: bool = False
+    # None = the default (private when a user creates it); on an overwrite,
+    # None keeps the stored visibility.
+    visibility: Visibility | None = None
+    # With visibility "team": which team. Omitted = the caller's own (a
+    # super admin may name any team; anyone else only their own).
+    team_id: str | None = None
 
 
 class ScriptUpdateRequest(BaseModel):
     name: str
     description: str | None = None
     code: str = ""
+    # None = keep the stored visibility.
+    visibility: Visibility | None = None
+    # With visibility "team": which team. Omitted = the caller's own (a
+    # super admin may name any team; anyone else only their own).
+    team_id: str | None = None
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -72,7 +90,7 @@ async def list_scripts(
     scripts.sort(key=lambda s: (s.name or s.id).lower())
     if view == "summary":
         return [
-            {"id": s.id, "name": s.name, "description": s.description}
+            {"id": s.id, "name": s.name, "description": s.description, **ownership_fields(s)}
             for s in scripts
         ]
     return [s.model_dump(mode="json") for s in scripts]
@@ -111,6 +129,7 @@ async def create_script(
         description=body.description,
         code=body.code,
         created_at=existing.created_at if existing else None,
+        **visibility_kwargs(body.visibility, body.team_id),
     )
     saved = await container.script_backend.create(defn)
     return saved.model_dump(mode="json")
@@ -157,6 +176,10 @@ async def update_script(
     existing.name = body.name
     existing.description = body.description
     existing.code = body.code
+    if body.visibility is not None:
+        existing.visibility = body.visibility
+    if body.team_id is not None:
+        existing.team_id = body.team_id
     saved = await container.script_backend.update(script_id, existing)
     return saved.model_dump(mode="json")
 

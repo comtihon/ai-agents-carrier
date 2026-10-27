@@ -2,18 +2,30 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import replace
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.infrastructure.auth.auth_service import AuthError, AuthService
+from app.application.login import (
+    LoginService,
+    effective_roles,
+    login_decision,
+    login_script_store_of,
+    with_profile,
+)
+from app.application.teams import directory_of, resolve_subject
 from app.infrastructure.auth.authorization import (
     AuthorizationPolicy,
     Permission,
     permission_for_method,
     reset_current_permissions,
+    reset_current_subject,
     set_current_permissions,
+    set_current_subject,
+    subject_from_claims,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,9 +80,25 @@ _AGENT_CALLBACK_PATH = re.compile(
 )
 
 
+# Runner enrollment and self-service (app.api.routes.runners): a machine that
+# has no credential yet asks for an enrollment and polls it with its own poll
+# token; an enrolled runner revokes itself with its runner token. Approving
+# (lookup/approve/deny) and managing runners stays user-authenticated. The
+# runner sockets are WebSockets, which this HTTP middleware never sees; they
+# check the runner token themselves.
+_RUNNER_PUBLIC = (
+    ("GET", re.compile(r"^/api/v1/acp/runners/(?:info|install\.md)$")),
+    ("POST", re.compile(r"^/api/v1/acp/runners/enrollments$")),
+    ("GET", re.compile(r"^/api/v1/acp/runners/enrollments/[^/]+/poll$")),
+    ("DELETE", re.compile(r"^/api/v1/acp/runners/self$")),
+)
+
+
 def _is_unprotected(method: str, path: str) -> bool:
     """Whether `method path` may bypass user authentication."""
     if path in _UNPROTECTED_PATHS or path.startswith(_UNPROTECTED_PREFIXES):
+        return True
+    if any(method == m and rx.match(path) for m, rx in _RUNNER_PUBLIC):
         return True
     for exempt_method, prefix in _UNPROTECTED_METHOD_PREFIXES:
         if method == exempt_method and path.startswith(prefix):
@@ -84,12 +112,15 @@ class OAuthMiddleware(BaseHTTPMiddleware):
         app,
         auth_service: AuthService,
         policy: AuthorizationPolicy | None = None,
+        login_service: LoginService | None = None,
     ) -> None:
         super().__init__(app)
         self.auth_service = auth_service
         # No policy configured behaves as authentication-only, which is what every
         # deployment did before permissions existed.
         self.policy = policy or AuthorizationPolicy()
+        # The login script, if one is configured (app.application.login).
+        self.login_service = login_service
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
@@ -115,8 +146,23 @@ class OAuthMiddleware(BaseHTTPMiddleware):
 
         request.state.jwt_claims = claims
 
-        permissions = self.policy.permissions_for_claims(claims)
+        container = getattr(request.app.state, "container", None)
+        directory = directory_of(container)
+        decision = await login_decision(
+            self.login_service, token, claims, directory, login_script_store_of(container)
+        )
+        roles = effective_roles(self.policy, claims, decision)
+        permissions = self.policy.permissions_for_roles(roles)
         request.state.permissions = permissions
+        # Strict evaluation: in shadow mode `permissions` holds everything for
+        # everyone, which must not make every private resource visible.
+        would_grant = self.policy.permissions_for_roles_strict(roles)
+        subject = replace(
+            with_profile(
+                subject_from_claims(claims, Permission.SUPER_ADMIN in would_grant), decision
+            ),
+            roles=frozenset(roles),
+        )
 
         # Shadow mode. With enforcement off the policy grants everything, so the
         # checks below never fire — but the mapping can still be evaluated and
@@ -125,22 +171,20 @@ class OAuthMiddleware(BaseHTTPMiddleware):
         # (most likely one holding an opaque token whose userinfo response carries
         # no project roles) shows up in logs first, while still being served.
         if not self.policy.enforce:
-            would_grant = self.policy.evaluate_shadow(claims)
             required_if_enforced = permission_for_method(request.method)
             if Permission.ACCESS not in would_grant:
                 logger.warning(
                     "RBAC shadow: subject %s would be DENIED access (no matching role); "
                     "roles=%s path=%s %s",
-                    claims.get("sub"), sorted(self.policy.roles_of(claims)),
-                    request.method, path,
+                    claims.get("sub"), sorted(roles), request.method, path,
                 )
             elif required_if_enforced not in would_grant:
                 logger.warning(
                     "RBAC shadow: subject %s would be DENIED %s; roles=%s path=%s %s",
                     claims.get("sub"), required_if_enforced.value,
-                    sorted(self.policy.roles_of(claims)), request.method, path,
+                    sorted(roles), request.method, path,
                 )
-            return await self._call_with_principal(permissions, request, call_next)
+            return await self._call_with_principal(permissions, subject, directory, call_next, request)
 
         # ACCESS is the tenancy gate: an identity the provider issued a valid token
         # for, but which is not entitled to this API at all (a customer, on an
@@ -166,9 +210,9 @@ class OAuthMiddleware(BaseHTTPMiddleware):
                 content={"detail": f"Missing '{required.value}' permission"},
             )
 
-        return await self._call_with_principal(permissions, request, call_next)
+        return await self._call_with_principal(permissions, subject, directory, call_next, request)
 
-    async def _call_with_principal(self, permissions, request: Request, call_next):
+    async def _call_with_principal(self, permissions, subject, directory, call_next, request: Request):
         """Serve the request with *permissions* bound as the ambient principal.
 
         The HTTP method is not the whole story. A single authenticated request can
@@ -185,7 +229,12 @@ class OAuthMiddleware(BaseHTTPMiddleware):
         returned and reset its own copy.
         """
         token = set_current_permissions(permissions)
+        # The caller's team comes from carrier's own directory, read per
+        # request so a membership change applies at once on every replica.
+        subject = await resolve_subject(directory, subject)
+        subject_token = set_current_subject(subject)
         try:
             return await call_next(request)
         finally:
+            reset_current_subject(subject_token)
             reset_current_permissions(token)

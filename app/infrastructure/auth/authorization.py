@@ -11,16 +11,22 @@ role names appear in this repository:
     WRITE   — create, edit and run workflows; control runs
     DELETE  — delete workflows, runs, agents, data sources
     ADMIN   — privileged operations that can compromise the backend itself
+    SUPER_ADMIN — system-wide visibility and team management: sees and manages
+              every agent, data source, script, workflow, run and team
 
 ADMIN is not "WRITE plus a bit". It gates operations whose blast radius is the
 backend process rather than the data — today that means unsandboxed `python`
 steps, which execute inside this process alongside every credential it holds.
+It confers no visibility: an ADMIN sees other users' private resources only if
+they are also SUPER_ADMIN. SUPER_ADMIN has its own roles
+(``AUTH_SUPER_ADMIN_ROLES``), falling back to the ADMIN roles when none are
+configured, so a small deployment with one admin role needs no extra setting.
 
 Two principal kinds reach the API, and they are not equivalent. A user
 authenticates with an OAuth token and is granted permissions by role. The
 management MCP static API key is a single long-lived shared secret that cannot be
 attributed to a person or revoked per user, so it is capped: it never receives
-ADMIN, no matter how it is configured.
+ADMIN or SUPER_ADMIN, no matter how it is configured.
 """
 from __future__ import annotations
 
@@ -39,13 +45,14 @@ class Permission(str, Enum):
     WRITE = "write"
     DELETE = "delete"
     ADMIN = "admin"
+    SUPER_ADMIN = "super_admin"
 
 
 # Permissions the management MCP API key may never hold, regardless of config.
 # A shared static secret has no user identity behind it, so an action that can
 # execute code in this process must not be reachable with it — there would be no
 # way to say who did it.
-_KEY_FORBIDDEN_PERMISSIONS = frozenset({Permission.ADMIN})
+_KEY_FORBIDDEN_PERMISSIONS = frozenset({Permission.ADMIN, Permission.SUPER_ADMIN})
 
 # Standard Zitadel claim carrying the roles granted on one project. Machine users
 # do not run the custom-claims action, so their tokens carry this instead of the
@@ -116,6 +123,12 @@ class AuthorizationPolicy:
     write_roles: frozenset[str] = field(default_factory=frozenset)
     delete_roles: frozenset[str] = field(default_factory=frozenset)
     admin_roles: frozenset[str] = field(default_factory=frozenset)
+    # Empty means "the admin roles" (see effective_super_admin_roles).
+    super_admin_roles: frozenset[str] = field(default_factory=frozenset)
+
+    @property
+    def effective_super_admin_roles(self) -> frozenset[str]:
+        return self.super_admin_roles or self.admin_roles
 
     @staticmethod
     def _norm(roles: Iterable[str] | None) -> frozenset[str]:
@@ -131,6 +144,7 @@ class AuthorizationPolicy:
             write_roles=cls._norm(getattr(settings, "auth_write_roles", None)),
             delete_roles=cls._norm(getattr(settings, "auth_delete_roles", None)),
             admin_roles=cls._norm(getattr(settings, "auth_admin_roles", None)),
+            super_admin_roles=cls._norm(getattr(settings, "auth_super_admin_roles", None)),
         )
         policy.warn_if_misconfigured()
         return policy
@@ -190,6 +204,7 @@ class AuthorizationPolicy:
             (Permission.WRITE, self.write_roles),
             (Permission.DELETE, self.delete_roles),
             (Permission.ADMIN, self.admin_roles),
+            (Permission.SUPER_ADMIN, self.effective_super_admin_roles),
         ):
             if roles & allowed:
                 granted.add(permission)
@@ -198,7 +213,7 @@ class AuthorizationPolicy:
     def permissions_for_api_key(self) -> frozenset[Permission]:
         """Permissions for the management MCP static key.
 
-        Full data access, never ADMIN — see the module docstring.
+        Full data access, never ADMIN or SUPER_ADMIN — see the module docstring.
         """
         if not self.enforce:
             return frozenset(Permission) - _KEY_FORBIDDEN_PERMISSIONS
@@ -297,3 +312,73 @@ def missing_permission(required: Permission) -> Permission | None:
     if permissions is None:
         return None
     return None if required in permissions else required
+
+
+# ── Ambient subject ──────────────────────────────────────────────────────────
+# Permissions say what a caller may do in general; resource visibility needs to
+# know *who* it is, because a private agent, data source, script or workflow is
+# visible to its owner and to admins only. Bound in the same two places as the
+# permissions above (OAuthMiddleware and the management MCP wrapper), for the
+# same reason: the chat agent and the management tools get no request object.
+#
+# Three states, deliberately distinct:
+#   unbound (None)      — no authentication ran: OAuth disabled, a test, or the
+#                         platform itself (cron, Pub/Sub, webhook, agent
+#                         callbacks). Sees and may edit everything, exactly as
+#                         before visibility existed.
+#   Subject(id=None)    — authenticated but unattributable: the management MCP
+#                         static API key. Sees public resources only.
+#   Subject(id="<sub>") — a user. Sees public resources, their own, and their
+#                         team's (team_id is filled in from carrier's own user
+#                         directory on every request, so a membership change
+#                         takes effect on the caller's next request).
+
+
+@dataclass(frozen=True)
+class Subject:
+    """The identity behind a request, for ownership and visibility."""
+
+    id: str | None = None
+    name: str | None = None
+    email: str | None = None
+    # Super admin: holds a role mapped to SUPER_ADMIN, evaluated strictly —
+    # with enforcement off every caller is *granted* every permission, and that
+    # must not make every private resource visible to everyone. System-wide: a
+    # super admin's own team membership (if any) never narrows what they see or
+    # manage. Not the ADMIN permission, which only gates unsandboxed steps.
+    is_super_admin: bool = False
+    # The caller's team and role in it ("member" | "admin"), or None.
+    team_id: str | None = None
+    team_role: str | None = None
+    # The effective roles this request was authorized with (after the login
+    # script), recorded on the user directory for display. None: not a user.
+    roles: frozenset[str] | None = None
+
+
+_current_subject: "ContextVar[Subject | None]" = ContextVar("current_subject", default=None)
+
+
+def subject_from_claims(claims: dict[str, Any], is_super_admin: bool = False) -> Subject:
+    """The subject a validated token describes. ``sub`` is the owner id."""
+    sub = claims.get("sub")
+    name = claims.get("name") or claims.get("preferred_username") or claims.get("email")
+    email = claims.get("email")
+    return Subject(
+        id=str(sub) if sub else None,
+        name=str(name) if name else None,
+        email=str(email) if email else None,
+        is_super_admin=is_super_admin,
+    )
+
+
+def set_current_subject(subject: Subject | None) -> "Token":
+    return _current_subject.set(subject)
+
+
+def reset_current_subject(token: "Token") -> None:
+    _current_subject.reset(token)
+
+
+def get_current_subject() -> Subject | None:
+    """The bound subject, or ``None`` when nothing authenticated this task."""
+    return _current_subject.get()

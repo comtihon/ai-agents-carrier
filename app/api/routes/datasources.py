@@ -37,6 +37,15 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from app.api.dependencies import get_container
+from app.domain.models.ownership import Visibility
+from app.api.routes.grants import add_grant_routes, present_sharing
+from app.application.visibility import (
+    caller_grant,
+    ownership_fields,
+    sources_for_workflow,
+    unwrap,
+    workflow_grant,
+)
 from app.core.config import Settings, get_settings
 from app.core.container import ApplicationContainer
 from app.domain.models.data_source_definition import (
@@ -109,6 +118,11 @@ class CreateDataSourceRequest(BaseModel):
     cache: dict | None = None
     timeout_seconds: float = 30
     retries: dict | None = None
+    # None = the default: private when a user creates it, public without auth.
+    visibility: Visibility | None = None
+    # With visibility "team": which team. Omitted = the caller's own (a
+    # super admin may name any team; anyone else only their own).
+    team_id: str | None = None
 
 
 class UpdateDataSourceRequest(BaseModel):
@@ -127,6 +141,11 @@ class UpdateDataSourceRequest(BaseModel):
     cache: dict | None = None
     timeout_seconds: float | None = None
     retries: dict | None = None
+    # None = keep the stored visibility.
+    visibility: Visibility | None = None
+    # With visibility "team": which team. Omitted = the caller's own (a
+    # super admin may name any team; anyone else only their own).
+    team_id: str | None = None
 
 
 class ProbeDataSourceRequest(BaseModel):
@@ -312,6 +331,25 @@ def _reject_placeholder_secrets(auth: Any) -> None:
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
+def _present(defn: DataSourceDefinition, workflow_id: str | None = None) -> dict[str, Any]:
+    """A definition as the caller may read it: secrets redacted, and the grant
+    list only for someone who may manage it (a grantee learns their own access
+    from ``granted_access``, not who else holds one)."""
+    return present_sharing(_redact_secrets(defn.model_dump(mode="json")), defn, workflow_id)
+
+
+async def _workflow_sources(
+    container: ApplicationContainer, workflow_id: str | None
+) -> list[DataSourceDefinition]:
+    """Sources granted to *workflow_id* the caller cannot otherwise see —
+    offered only to someone who can see that workflow."""
+    if not workflow_id or container.workflow_backend is None:
+        return []
+    if await container.workflow_backend.get(workflow_id) is None:
+        return []
+    return await sources_for_workflow(container.data_source_backend, workflow_id).granted()
+
+
 def _require_backend(container: ApplicationContainer) -> None:
     if container.data_source_backend is None:
         raise HTTPException(status_code=501, detail="Data source backend not configured")
@@ -345,8 +383,10 @@ async def _refresh_datasource_tools(container: ApplicationContainer) -> None:
             get_datasources_mcp,
             rebuild_datasource_tools,
         )
+        # The tool list is global — every agent container reads it — so it is
+        # built from every source, not from what the saving user can see.
         await rebuild_datasource_tools(
-            get_datasources_mcp(), container.data_source_backend, lambda: container
+            get_datasources_mcp(), unwrap(container.data_source_backend), lambda: container
         )
     except Exception:
         logger.exception("failed to rebuild datasources MCP tools")
@@ -362,6 +402,7 @@ async def _refresh_datasource_tools(container: ApplicationContainer) -> None:
 @router.get("")
 async def list_datasources(
     view: Literal["full", "summary"] = "full",
+    workflow_id: str | None = None,
     container: ApplicationContainer = Depends(get_container),
 ):
     """List all registered data source definitions (auth secrets redacted).
@@ -373,10 +414,15 @@ async def list_datasources(
     operations), and none of them is read until a source is opened.  ``auth`` is
     dropped too rather than redacted, so a summary carries no secret shape at
     all.  Default stays ``full``.
+
+    ``workflow_id`` (the workflow being edited) adds the sources granted to
+    that workflow, which the caller sees nowhere else; each carries
+    ``granted_to_workflow``.
     """
     _require_backend(container)
     assert container.data_source_backend is not None
     sources = await container.data_source_backend.list()
+    sources += await _workflow_sources(container, workflow_id)
     if view == "summary":
         return [
             {
@@ -388,10 +434,15 @@ async def list_datasources(
                 "operations": [
                     {"name": op.name, "method": op.method} for op in s.operations
                 ],
+                **ownership_fields(s),
+                **(
+                    {"granted_to_workflow": workflow_grant(s, workflow_id)}
+                    if workflow_id and workflow_grant(s, workflow_id) else {}
+                ),
             }
             for s in sources
         ]
-    return [_redact_secrets(s.model_dump(mode="json")) for s in sources]
+    return [_present(s, workflow_id) for s in sources]
 
 
 @router.post("", status_code=201)
@@ -419,7 +470,7 @@ async def create_datasource(
     defn = _build_definition(payload)
     saved = await container.data_source_backend.create(defn)
     await _refresh_datasource_tools(container)
-    return _redact_secrets(saved.model_dump(mode="json"))
+    return _present(saved)
 
 
 @router.post("/probe")
@@ -636,6 +687,17 @@ async def try_datasource_operation(
     if defn.get_operation(body.operation) is None:
         raise HTTPException(status_code=422, detail=f"Unknown operation '{body.operation}'")
 
+    if body.source_id and container.data_source_backend is not None:
+        stored = await container.data_source_backend.get(body.source_id)
+        if stored is not None and not stored.can_edit:
+            # A grantee tries the stored source with its stored credentials:
+            # a read grant covers read operations only.
+            from app.application.visibility import can_see_natively, operation_denied
+            if not can_see_natively(stored):
+                denied = operation_denied(defn, body.operation, caller_grant(stored))
+                if denied:
+                    raise HTTPException(status_code=403, detail=denied)
+
     gate = await _gate_try_run(request, body, defn, container)
     if gate is not None:
         return gate
@@ -731,16 +793,26 @@ async def _gate_try_run(
 @router.get("/{source_id}")
 async def get_datasource(
     source_id: str,
+    workflow_id: str | None = None,
     container: ApplicationContainer = Depends(get_container),
 ):
-    """Get a specific data source definition by ID."""
+    """Get a specific data source definition by ID.
+
+    ``workflow_id``: also find a source granted to that workflow (if the
+    caller can see the workflow).
+    """
     _require_backend(container)
     assert container.data_source_backend is not None
 
     defn = await container.data_source_backend.get(source_id)
     if defn is None:
+        defn = next(
+            (s for s in await _workflow_sources(container, workflow_id) if s.id == source_id),
+            None,
+        )
+    if defn is None:
         raise HTTPException(status_code=404, detail=f"Data source '{source_id}' not found")
-    return _redact_secrets(defn.model_dump(mode="json"))
+    return _present(defn, workflow_id)
 
 
 @router.put("/{source_id}")
@@ -784,7 +856,7 @@ async def update_datasource(
         })
     saved = await container.data_source_backend.update(source_id, defn)
     await _refresh_datasource_tools(container)
-    return _redact_secrets(saved.model_dump(mode="json"))
+    return _present(saved)
 
 
 @router.delete("/{source_id}", status_code=204)
@@ -802,6 +874,11 @@ async def delete_datasource(
 
     await container.data_source_backend.delete(source_id)
     await _refresh_datasource_tools(container)
+
+
+# ─── Grants (nested under a source — after the item routes) ───────────────────
+
+add_grant_routes(router, "datasource")
 
 
 # ─── Sheet bindings (nested under a source — after the item routes) ───────────

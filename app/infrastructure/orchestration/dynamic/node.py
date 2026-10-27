@@ -194,7 +194,7 @@ def make_job_runner(runner: "YamlGraphRunner", step: dict[str, Any], config: Dyn
             result = await execute_agent_step(
                 agent_step,
                 job_state,
-                runner._agent_backend,
+                _agents_for(runner),
                 child_id,
                 runner._callback_base_url or "",
                 settings=settings,
@@ -269,7 +269,7 @@ def make_dynamic_node(runner: "YamlGraphRunner", step: dict[str, Any]):
             return {"__failed_step__": step_id, "error": "agent backend not configured"}
         agents: dict[str, Any] = {}
         for entry in config.agent_pool:
-            agent_def = await runner._agent_backend.get(entry.agent_id)
+            agent_def = await _agents_for(runner).get(entry.agent_id)
             if agent_def is None:
                 return {"__failed_step__": step_id, "error": f"dynamic step '{step_id}': agent '{entry.agent_id}' in the pool does not exist"}
             agents[entry.agent_id] = agent_def
@@ -389,3 +389,9 @@ async def child_summaries(run_repository: Any, run_id: str) -> dict[str, Any]:
             "updated_at": child.updated_at.isoformat() if child.updated_at else None,
         }
     return out
+
+
+def _agents_for(runner: Any) -> Any:
+    """The agent backend as this workflow sees it: agents granted to it count."""
+    from app.application.visibility import granted_for_workflow
+    return granted_for_workflow(runner._agent_backend, getattr(runner, "id", None))

@@ -50,10 +50,18 @@ API at `http://localhost:8000`. Health check: `GET /health`.
 | `AUTH_WRITE_ROLES` | `[]` | Roles granted WRITE (`POST`/`PUT`/`PATCH`, creates, updates, run control) |
 | `AUTH_DELETE_ROLES` | `[]` | Roles granted DELETE (`DELETE`, and the `delete_*` tools) |
 | `AUTH_ADMIN_ROLES` | `[]` | Roles granted ADMIN — `python` steps with `sandbox: false`, which run inside the backend process. Keep this narrowest |
+| `AUTH_SUPER_ADMIN_ROLES` | `[]` → `AUTH_ADMIN_ROLES` | Roles granted SUPER_ADMIN — system-wide visibility (every private and team resource, every run) and team management. Empty falls back to `AUTH_ADMIN_ROLES`; set it when ADMIN is a broad operations role |
+| `AUTH_LOGIN_SCRIPT` | — | JavaScript run when a user logs in, to derive their roles, profile and team from the token (see [Login script](#login-script)) |
+| `AUTH_LOGIN_SCRIPT_PATH` | — | Path to a file holding the login script, e.g. a mounted ConfigMap. Set this or `AUTH_LOGIN_SCRIPT`, not both: startup fails if both are set |
+| `AUTH_LOGIN_SCRIPT_TIMEOUT_MS` | `1000` | Wall-clock budget for one run of the login script |
 | `MANAGEMENT_MCP_API_KEY` | — | Static key for `/mcp/management`. Capped below ADMIN: a shared secret cannot be attributed to a person |
 | `OPENHANDS_BASE_URL` | `http://openhands:3000` | OpenHands service URL |
 | `OPENHANDS_API_KEY` | — | OpenHands auth token |
 | `OPENHANDS_MOCK_MODE` | `true` | Return stub results instead of calling OpenHands |
+| `STEP_OUTPUT_OFFLOAD` | `true` | Write every step output to the stream store as `runs/<run_id>/<step_id>[-<n>].md` and keep only references in state, the checkpoint and the run document (see [Step outputs](#step-outputs-in-object-storage)) |
+| `STEP_OUTPUT_INLINE_MAX_BYTES` | `256` | Outputs whose JSON is at most this size also stay inline (they are no bigger than their reference) |
+| `STEP_INPUT_HYDRATE_MAX_BYTES` | `33554432` | Cap on stored outputs resolved into memory for one step before it runs |
+| `STEP_OUTPUT_DISPLAY_MAX_BYTES` | `2097152` | Stored outputs a run API response resolves inline for display; the rest stay references with a `download_url` |
 | `STATE_DIVERGENCE_PROBE` | `false` | Log every key where the runner's hand-merged run state disagrees with the LangGraph checkpoint. Diagnostic only — never writes — and costs one extra checkpoint read per node |
 | `DOCKER_REGISTRY_USERNAME` | — | Registry username for pulling private images (DockerRuntime) |
 | `DOCKER_REGISTRY_PASSWORD` | — | Registry password / token for pulling private images |
@@ -61,6 +69,13 @@ API at `http://localhost:8000`. Health check: `GET /health`.
 | `LOCAL_AGENT_COMMAND` | `node src/server.js` | Command that starts the local agent's HTTP server, run with `LOCAL_AGENT_DIR` as cwd |
 | `META_LLM_PROVIDER` | — | LLM provider for post-agent analysis (`anthropic` or `openai`; defaults to `LLM_PROVIDER`) |
 | `META_LLM_MODEL` | `claude-haiku-4-5-20251001` | Model for post-agent meta-analysis (haiku recommended for cost/speed) |
+| `ACP_RUNNERS_ENABLED` | `true` | Accept [runners](#runners-agents-on-users-machines): machines connected with acp-web-proxy |
+| `ACP_RUNNER_ENROLLMENT_TTL_S` | `600` | How long a machine's approval number stays valid |
+| `ACP_RUNNER_ENROLL_ROLES` | `[]` | Roles allowed to approve machines (on top of WRITE); empty = anyone with WRITE. Super admins always may |
+| `ACP_RUNNER_WAIT_S` | `600` | How long a step waits for an offline runner (`agent_input.runner_wait_s` per agent) |
+| `UI_BASE_URL` | — | carrier-bridge URL; runners print `<UI_BASE_URL>/#approve-runner` as the approval link |
+| `ACP_QUOTA_MAX_WAIT_S` | `86400` | Longest a step stays parked on an agent's usage limit (`agent_input.quota_max_wait_s` per agent) |
+| `ACP_QUOTA_RETRY_S` | `1800` | Retry interval when an agent's limit gives no reset time |
 
 ### Role-based permissions
 
@@ -609,6 +624,43 @@ ADMIN a formality that any WRITE holder walks around by leaving a field unset.
 Sandbox defaults come from `SCRIPT_SANDBOX_IMAGE`, `SCRIPT_SANDBOX_TIMEOUT` and
 `SCRIPT_SANDBOX_MEMORY_MB`; a step can override the first two.
 
+### `combined_datasource` — fetch and filter in one step
+
+Ordered `parts`, each a `data_source` part, a `python` part, or a nested
+`combined_datasource`. Parts run in the order listed; any mix is allowed.
+
+```yaml
+- id: invoice_candidates
+  type: combined_datasource
+  output_key: invoice_candidates
+  output: get_classification        # optional; default = last part
+  parts:
+    - {id: fetch_at, type: data_source, source: crm-projects,
+       operation: list_projects_operations, params: {status: [10], page_size: 50}}
+    - {id: sel_at, type: python, script_id: invoice-candidates-select, stream: fetch_at}
+    - {id: cand, type: python,
+       code: "output = {'project_ids': sorted(set(parts['sel_at']['ids']))}"}
+    - {id: get_classification, type: data_source, source: crm-order-details,
+       operation: get_order_details, params: {id: "{cand[project_ids]}"}}
+```
+
+- A part sees workflow state plus every earlier part's output by id:
+  `{cand[project_ids]}` in params, `parts["sel_at"]` in python (a data source
+  output named that way is loaded as a list; `stream: <part id>` gives
+  `records()` instead).
+- A data source param that resolves to a list (or a whole `{part}` naming a
+  list stream) where the operation does not declare that param `array` is a
+  loop: one call per element (`concurrency`, default the executor fan-out),
+  results collected into one stream of `{"<param>": element, "result": ...}`.
+  Per-element errors are collected in the trace; `fail_on_error: true` makes
+  them fatal, `include_errors: true` keeps `{param, error}` records.
+- Every part's output is written to `runs/<run_id>/<step>.<part>.md`; only the
+  chosen output becomes the step output. The run API's step entry carries
+  `parts` (status, `duration_ms`, `records`, `calls`, `error_count`, `errors`).
+- Validated on save (REST and management MCP): unknown / forward / self part
+  references, missing `source` / `operation` / script, unknown data sources,
+  operations or scripts, destructive operations (use a `data_source` step).
+
 ### Script library
 
 Reusable scripts live in MongoDB (`script_definitions`) and are referenced by
@@ -703,6 +755,48 @@ Agents are registered persistent definitions that `langgraph-agent` / `claude-ag
 | `k8s`    | Helm release in `AGENT_NAMESPACE` | `helm_chart` / `helm_values`, `AGENT_SERVICE_ACCOUNT` |
 
 `local` needs `LOCAL_AGENT_DIR` set — there is no in-process agent to fall back on, and a step whose runtime resolves to `local` without it fails with a configuration error rather than running something different from production. Definitions written before this — `default_runtime: local` was the old inline LangGraph agent — need switching to `k8s`.
+
+### Runners: agents on users' machines
+
+A **runner** is [acp-web-proxy](https://github.com/comtihon/acp-web-proxy) on a
+machine carrier cannot reach (a laptop, a VM behind NAT), offering the coding
+agents installed there (Claude Code, Codex, Gemini CLI) to carrier. Ask Claude
+Code *"install acp-web-proxy and connect it to https://carrier.example.com"*, or
+run:
+
+```bash
+npx -y github:comtihon/acp-web-proxy install https://carrier.example.com
+```
+
+The machine shows an **approval number**; a signed-in user with WRITE (and one
+of `ACP_RUNNER_ENROLL_ROLES`, when set) enters it in carrier-bridge (Runners →
+Approve device), sees the machine's details and approves. The approver owns the
+runner (private by default) and the agent definitions created for it
+(`default_runtime: "runner"`, `runner_id`, `protocol: "acp"`, `acp_agent`). Only
+someone who can see a runner can point an agent at it. Deleting the runner
+revokes its credential at once.
+
+The runner dials carrier (`/api/v1/acp/runners/connect`) and reconnects with
+backoff; a step waits up to `ACP_RUNNER_WAIT_S` for it to come online, and a
+step running on it survives socket drops (replay) and carrier restarts
+(re-attach). Each step runs in `<runner workspace>/<run_id>` unless the agent
+sets `agent_input.acp_cwd`. Live runner sockets are held in memory: serve
+runners from a single replica. Protocol and enrollment details:
+[acp-web-proxy docs/runners.md](https://github.com/comtihon/acp-web-proxy/blob/main/docs/runners.md).
+
+### Usage limits (ACP agents)
+
+When a subscription agent runs out of quota mid-step, carrier parks the step
+instead of failing it: the run state carries `_quota_wait_<step>` (`resume_at`,
+`kind`, `message`), and at the reset time carrier continues the same session
+with a "continue where you stopped" prompt — over the same connection, or with
+`session/load` on a new one when the old one is gone (also after a carrier
+restart). Reset times come from Claude's `_claude/rateLimit` updates or its
+"resets 3pm (Europe/Berlin)" message, and from Codex's "Try again at 3:42 PM"
+(in the runner's time zone). No reset time: retry every `ACP_QUOTA_RETRY_S`.
+Out of credits / spend cap: the step fails. A runner remembers an agent's limit,
+so later steps wait before launching it. Nothing waits longer than
+`ACP_QUOTA_MAX_WAIT_S`.
 
 ### Two images: `slim` and `full`
 
@@ -969,7 +1063,261 @@ POST   /api/v1/webhooks/{workflow-id}         HTTP webhook trigger
 # Approval callbacks (no auth)
 POST   /api/v1/callbacks/{run-id}/approve
 POST   /api/v1/callbacks/{run-id}/reject
+
+# Caller
+GET    /api/v1/me                             {sub, name, is_admin, is_super_admin, auth_enabled,
+                                               team: {id, name, role} | null}
+
+# Teams and users (see "Teams" below for who may call what)
+GET    /api/v1/teams                          super admin: all; others: own team or []
+POST   /api/v1/teams                          {name}                      super admin
+PUT    /api/v1/teams/{id}                     {name}                      super admin
+DELETE /api/v1/teams/{id}                     409 while resources are shared with it
+PUT    /api/v1/teams/{id}/members/{sub}       optional {role: member|admin}
+DELETE /api/v1/teams/{id}/members/{sub}
+GET    /api/v1/users                          super admin: all; team admin: own team + users in no team
+
+# Grants on datasources, agents, workflows (owner, team admin of its team, or super admin)
+GET    /api/v1/{datasources|agents|workflows}/{id}/grants
+GET    /api/v1/{datasources|agents|workflows}/{id}/grants/candidates   {users: [...], workflows: [...]}
+POST   /api/v1/{datasources|agents|workflows}/{id}/grants   {grantee_type: user|workflow, grantee_id, access: read|read_write}
+DELETE /api/v1/{datasources|agents|workflows}/{id}/grants/{grant_id}
 ```
+
+### Ownership and visibility
+
+Agents, data sources, library scripts and workflows are each `public`, `team`
+or `private`, and owned by the user who created them (the token's `sub`). Every
+response object — full and `view=summary` alike, and the workflow list —
+carries `visibility`, `owner_id`, `owner_name`, `team_id`, `team_name` and
+`can_edit` (computed for the caller). Create and update bodies accept an
+optional `visibility` and, with `"team"`, an optional `team_id`; omitted on
+create visibility defaults to `private` for a user, omitted on update it is
+kept.
+
+- **Private** resources are visible to their owner and to super admins only.
+  To anyone else they do not exist: not listed, `404` by id, not offered to the
+  chat agent or the management MCP tools, absent from the dynamic dispatcher's
+  roster. A workflow's runs, traces, run data and approval cases follow the
+  workflow's visibility — filtered in the Mongo query, so pages and totals count
+  visible runs only, and a visibility or membership change applies at once.
+- **Team** resources are visible to the members of one team (see below) as
+  well. Members may *use* team agents, data sources and scripts in their
+  workflows, and may *edit and run* team workflows. A team resource keeps its
+  team when its owner leaves it; the owner still sees it, other leavers do not.
+  `team_id` defaults to the caller's team (`422` without one); naming another
+  team is `403` — except for a super admin, who may name any existing team
+  (`422` if unknown, and `422` "team_id required" when they are in no team).
+- **Editing** content is for the owner, a super admin, or — for team
+  workflows — the team's members: `403` otherwise. **Deleting** and **changing
+  visibility or team** is for the owner or a super admin only. Documents stored
+  before ownership existed load as public and unowned, and stay editable by
+  anyone with `WRITE`; narrowing one makes the caller its owner.
+- **References** are checked on save (`422`). Scopes rank public > team >
+  private, and a resource may only use what the caller can see and what is at
+  least as widely visible as itself: a public resource uses public ones; a team
+  resource uses public ones and its own team's; a private one uses public ones,
+  its owner's team's, and its owner's private ones. Agent data source add-ons
+  follow the same rules. Narrowing a resource (public → team → private, or to
+  another team) is refused (`409`) while something it would break still uses
+  it; a referrer the caller cannot see is not named.
+- **Grants** open a team or private data source, agent or workflow to someone
+  its visibility leaves out. They are stored on the resource (`grants`), so they
+  can be listed and revoked there. A grant goes to a **user** — who then sees the
+  resource and may use it in resources *private to them* (not team or public
+  ones) — or to one **workflow**, which may use it whatever its scope while
+  whoever edits it still cannot pick it anywhere else (e.g. team A's workflow
+  calling team B's workflow or agent). What `access` means depends on the kind:
+  - *data source*: `read` permits only operations that do not write
+    (GET/HEAD/OPTIONS, GraphQL queries, BigQuery, or an operation marked
+    `destructive: false`), `read_write` all of them. Enforced on save (`422`,
+    workflow steps and agent add-ons alike) and when a workflow step runs,
+    triggered runs included. Never lets the grantee edit the source.
+  - *agent* / *workflow*: `read` is see, run and use; `read_write` also lets a
+    user grantee edit it (not delete it, change its visibility or re-share
+    it — it stays its owner's). A workflow grantee is use only (`read`; `422`
+    otherwise).
+
+  The owner, an admin of the resource's team, or a super admin grants and
+  revokes; granting to someone who already holds a grant changes its level; a
+  public resource, its owner, its team's members and a workflow already in
+  scope need none (`409`). Revoking takes effect on the next save or run;
+  deleting a workflow drops grants to it everywhere. Non-sharers never see the
+  grant list — a user grantee sees `granted_access` on the resource. Pass
+  `workflow_id` to `GET /datasources`, `/agents` or `/workflows` (and to
+  `/datasources/{id}`, `/agents/{id}`) to also get what is granted to that
+  workflow, each marked `granted_to_workflow`, when the caller can see it.
+- **Super admins** are callers holding a role in `AUTH_SUPER_ADMIN_ROLES`
+  (or, when that is empty, `AUTH_ADMIN_ROLES`), evaluated even when
+  `AUTH_ENFORCE_PERMISSIONS` is off (in shadow mode every caller is *granted*
+  every permission, which must not make every private resource visible). They
+  work system-wide: every resource, team and run, whatever team they are in.
+  ADMIN on its own (unsandboxed `python` steps) confers no visibility once
+  `AUTH_SUPER_ADMIN_ROLES` is set. `/me` reports both: `is_admin` (ADMIN) and
+  `is_super_admin`.
+- **The management MCP static key** is nobody in particular: it sees and
+  creates public resources only.
+- **Without authentication** (`OAUTH_ENABLED=false`) there is no owner and all
+  of this is a no-op. The platform itself — cron, Pub/Sub, webhooks, agent
+  callbacks, the data sources MCP — likewise sees everything, so a triggered run
+  of a private or team workflow resolves the resources it was saved with.
+- **Script names** are unique within what one caller can see; ids stay global,
+  so saving a name whose id belongs to a script you cannot see answers `409`
+  ("id already taken") without saying whose.
+
+### Teams
+
+Teams live in carrier's own MongoDB (`teams`; membership on `users`), so they
+work with any OIDC provider. Every authenticated caller is recorded in `users`
+(name, email, last seen) — that is the list membership is managed from. A user
+is in at most one team, or none, as a `member` or an `admin`; their team is
+read on every request, so a change applies on their next one.
+
+- **Super admin**: creates, renames and deletes teams (a team with resources
+  shared with it cannot be deleted: `409`), and adds, moves (between teams),
+  promotes and removes anyone.
+- **Team admin** (`role: admin` in a team — a status only a super admin
+  assigns, directly or through the login script): adds users who are in *no*
+  team to their team as members (`409` for a user in another team — moving users
+  between teams is a super admin's) and removes its members. Making, demoting or
+  removing a team admin — themselves included — is a super admin's (`403`). Over
+  the team's resources one extra right: changing the visibility of a resource
+  shared with their team (not editing or deleting it).
+- Everyone else: no user or team management; `GET /teams` shows their own team
+  and its members.
+
+The same operations are management MCP tools (and chat agent tools), with the
+same rules: `who_am_i`, `list_teams`, `list_users`, `create_team`,
+`rename_team`, `delete_team`, `set_team_member` (add a user to a team, or set
+their role), `remove_team_member` and `set_resource_visibility` (public / team /
+private, and which team, for a workflow, agent, data source or script). Grants
+have three more: `list_resource_grants`, `grant_resource_access` (to a user or,
+with `grantee_type="workflow"`, a workflow; `access` `read` or `read_write`;
+granting again changes the level) and `revoke_resource_access` (by grantee or
+grant id) — READ, WRITE and DELETE respectively, like their REST routes. Users
+are named by email, name or id, teams by name or id; an ambiguous name is
+answered with the candidates.
+
+Membership can also be set automatically from the token by a
+[login script](#login-script).
+
+**User management** (for an admin screen):
+
+| endpoint | who | what |
+|---|---|---|
+| `GET /users` | super admin: everyone; team admin: their team plus users in no team | `[{sub, name, email, team: {id, name, role} \| null, is_super_admin, roles, last_seen}]` (also the flat `team_id`, `team_name`, `team_role`) |
+| `PUT /users/{sub}/team` | super admin | body `{team_id: string \| null, role: "member" \| "admin"}`: put the user in that team, or (`team_id: null`) in none. `404` for an unknown user or team. Not bound by the team-admin rules |
+| `DELETE /users/{sub}` | super admin | `204`: forget the stored user and their membership. Their resources keep their owner id; if they call again they are recorded again, in no team |
+
+`roles` and `is_super_admin` are what the user's most recent request was
+authorized with — the effective roles, after any login script — recorded with
+`last_seen` (at most once a minute per replica, at once when they change).
+They are for display: every request is authorized from its own token.
+
+### Login script
+
+A deployment can supply a JavaScript function that the backend runs when a user
+logs in, to turn whatever its identity provider puts in a token — groups,
+custom claims, an email domain — into carrier's roles, profile and team. No
+code change, and nothing provider-specific in this repository.
+
+```js
+// Example: groups claim -> roles, department claim -> team.
+function onLogin(ctx) {
+  const groups = ctx.claims.groups || [];
+  const result = {
+    roles: groups.filter((g) => g.startsWith("carrier-")),
+  };
+  if (ctx.claims.department) {
+    result.team = {
+      name: ctx.claims.department,
+      role: groups.includes("carrier-team-leads") ? "admin" : "member",
+    };
+  }
+  return result;
+}
+```
+
+Configure it inline with `AUTH_LOGIN_SCRIPT`, or as a file with
+`AUTH_LOGIN_SCRIPT_PATH` (the Helm chart mounts `auth.loginScript` for you, see
+[Deployment](#login-script-in-helm)). It only runs with `OAUTH_ENABLED=true`.
+With no script configured (and none [stored](#editing-the-login-script-at-runtime))
+nothing changes: roles come from the token.
+
+**Input.** `onLogin(ctx)` receives:
+
+| field | value |
+|---|---|
+| `ctx.claims` | the validated token's claims (or the userinfo response, for opaque tokens) |
+| `ctx.user` | the stored user — `{sub, name, email, team}` with `team` `{id, name, role}` or `null` — or `null` on a first login |
+| `ctx.teams` | every existing team, `[{id, name}]` |
+
+**Output.** An object; every field is optional. Returning nothing, `null` or
+`{}` changes nothing.
+
+| field | effect |
+|---|---|
+| `roles` | array of strings. *Replaces* the roles read from the token for the role mapping, so `AUTH_ACCESS_ROLES` … `AUTH_SUPER_ADMIN_ROLES` apply to these. `[]` means no roles; leave it out (or `null`) to keep the token's roles |
+| `name`, `email` | non-empty strings. Replace the stored profile and what `/me` reports |
+| `team` | `null`: in no team. `{name, role}` or `{id, role}`: in that team, `role` `"member"` (default) or `"admin"`. Leave it out to keep the stored membership, so teams can still be managed by hand |
+
+A team named by `name` (exact match) that does not exist yet is created: the
+script is configuration written by whoever deploys carrier, as trusted as the
+role settings themselves. A team named by an `id` that does not exist is
+logged and leaves the membership unchanged. A script that returns `team`
+*owns* membership: a manual change holds only until that user's next login.
+The team-admin rules of the API (a team keeps at least one admin) do not bind
+the script.
+
+**When it runs.** There is no login endpoint; a "login" is the first request
+with a token this replica has not seen. The script runs then, its profile and
+team changes are written, and its decision is cached (keyed by a hash of the
+token, bounded in size) until the token expires — or for five minutes for
+tokens with no `exp`. Every later request with that token reuses the cached
+roles; a new token (a refresh) is a new login. A caller whose resulting roles
+grant no access is refused and nothing is written for them. The management MCP
+static API key never runs the script and keeps its fixed permissions (never
+ADMIN or SUPER_ADMIN).
+
+**Failure.** If the script throws, exceeds `AUTH_LOGIN_SCRIPT_TIMEOUT_MS` or a
+64 MiB heap, or returns anything outside the contract above (an unknown field
+included, so a typo cannot silently do nothing), the error is logged and that
+login proceeds exactly as with no script: the token's own roles, profile and
+membership untouched. Nothing is granted that the token itself would not grant,
+and nobody is locked out by a broken script — unless the token carries no
+usable roles, in which case they get none. A failure is retried after 30
+seconds rather than cached until the token expires. A script that cannot be
+loaded at all (unreadable file, syntax error, no `onLogin` function) fails
+startup.
+
+**Sandbox.** The script runs in an embedded V8 isolate (`mini-racer`): no
+network, filesystem, process or module access, a fresh isolate for every run so nothing carries over between logins, and
+`onLogin` must return synchronously (a promise is an error).
+
+#### Editing the login script at runtime
+
+Without `AUTH_LOGIN_SCRIPT` / `AUTH_LOGIN_SCRIPT_PATH`, a super admin can store
+the script in MongoDB (`auth_settings` collection) and change it without a
+redeploy. A configured script always wins and is read-only through the API.
+
+| endpoint | what |
+|---|---|
+| `GET /auth/login-script` | `{source: "config" \| "db" \| "none", editable, script, timeout_ms, updated_at, updated_by, active, version}`. `active` is whether scripts run at all (`OAUTH_ENABLED`) |
+| `PUT /auth/login-script` | body `{script: string \| null}`. The script must load and define `onLogin` (`400 {detail}` otherwise; at most 256 KiB). `null` or `""` disables it. `409` when `source` is `config`. Answers like `GET` |
+| `POST /auth/login-script/test` | body `{script?, claims, sub?}`. A dry run that writes nothing: runs `script` (default: the active one) with `ctx.claims = claims`, `ctx.user` = the stored user `sub` (or `null`), `ctx.teams` = the real teams. Answers `{ok, result, error, duration_ms}` |
+
+All three are for super admins only (`403`). The dry run's `result` is the
+validated output — `roles`, `name`, `email`, `team` (`{id, name, role}` or
+`null`) — plus `team_action` (`keep`, `clear`, `assign`, `create` for a team
+named but not existing yet, `unknown_team` for an id that does not exist), and
+what the caller would get: `effective_roles`, `permissions`, `is_super_admin`,
+`admitted`.
+
+Saving bumps a version on the stored document. The replica that saved drops
+its cached login decisions at once; every other replica reads that version at
+most every 3 seconds and recompiles only when it changed. Cached decisions are
+keyed by version, so after a change every token's next request runs the new
+script.
 
 ---
 
@@ -1026,3 +1374,49 @@ serviceAccount:
 ```
 
 Either way the chart's Role and RoleBinding keep their release-derived names, so the agent-manager permissions follow whichever account the pod actually uses.
+
+### Login script in Helm
+
+Set `auth.loginScript` to the script's source. The chart renders it into a
+ConfigMap, mounts it read-only at `/etc/carrier/auth/login.js`, points
+`AUTH_LOGIN_SCRIPT_PATH` at it, and rolls the pods when it changes (the script
+is loaded at startup). Empty (the default) renders nothing.
+
+```yaml
+auth:
+  loginScript: |
+    function onLogin(ctx) {
+      return { roles: ctx.claims.groups || [] };
+    }
+config:
+  AUTH_LOGIN_SCRIPT_TIMEOUT_MS: "500"   # optional
+```
+
+---
+
+## Step outputs in object storage
+
+Every step's output is written to the data stream store (GCS when
+`STREAM_BACKEND=gcs`) under the run's folder, `runs/<run_id>/<step_id>[-<n>].md`:
+a short markdown header (step, type, run, iteration, timestamp) followed by the
+values in one fenced ```` ```json ```` block that parses back exactly. Workflow
+state, the LangGraph checkpoint, `run.state` and `run.step_outputs` keep a
+reference instead of the value:
+
+```json
+{"__ref__": true, "uri": "gs://bucket/runs/r1/plan.md", "key": "runs/r1/plan.md",
+ "field": "plan", "bytes": 48213, "sha256": "…", "kind": "dict", "items": 12, "preview": "…"}
+```
+
+Steps never fetch anything themselves: before a node runs, the engine resolves
+the references the step needs (keys named in its templates, `when`, params,
+route conditions; python / agent steps get every reference, up to
+`STEP_INPUT_HYDRATE_MAX_BYTES`) and passes the hydrated state in. `run.step_inputs`
+records only the keys a step referenced, compacted — never a full state
+snapshot. Old runs with inline values load and resume unchanged.
+
+`GET /api/v1/workflows/runs/{id}` resolves small references inline for display;
+`GET /api/v1/runs/{id}/outputs` lists the files and
+`GET /api/v1/runs/{id}/outputs/{file}.md[?field=<key>]` downloads one. Deleting
+a run deletes its folder.
+

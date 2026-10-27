@@ -36,6 +36,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse, StreamingResponse
 
 from app.api.dependencies import get_container
+from app.application.visibility import ensure_run_visible, workflow_visible
 from app.application.data_artifacts import (
     DataArtifactError,
     find_run_artifact,
@@ -79,6 +80,7 @@ async def list_run_data(
     run = await container.run_repository.get(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
+    await ensure_run_visible(container.workflow_backend, run)
 
     artifacts = await list_run_artifacts(
         getattr(container, "data_artifact_backend", None),
@@ -157,6 +159,8 @@ async def download_run_data(
     # Resolved through the run, which is what makes a data source result
     # exactly as accessible as the run that produced it -- and no more.
     run = await container.run_repository.get(run_id)
+    if run is not None and not await workflow_visible(container.workflow_backend, run.graph_id):
+        run = None
     artifact = None if run is None else await find_run_artifact(
         getattr(container, "data_artifact_backend", None),
         run,
@@ -214,4 +218,97 @@ async def download_run_data(
         headers["Content-Length"] = str(download.content_length)
     return StreamingResponse(
         download.chunks, media_type=download.content_type, headers=headers
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stored step outputs (runs/<run_id>/<step>.md)
+# ---------------------------------------------------------------------------
+#
+# Same rule as a data source result: a file is found by looking for a
+# reference inside the run named in the path -- never by opening a key the
+# caller supplied -- so a stored output is exactly as readable as its run.
+
+def _output_refs_of(run) -> dict[str, dict]:
+    """Every stored-output reference the run carries, keyed by file name."""
+    from app.infrastructure.orchestration.step_outputs import (
+        find_output_refs,
+        run_prefix,
+    )
+
+    prefix = run_prefix(run.id)
+    found: dict[str, dict] = {}
+    sources = [run.state if isinstance(run.state, dict) else {}]
+    sources += [o for o in (run.step_outputs or {}).values() if isinstance(o, dict)]
+    for source in sources:
+        for ref in find_output_refs(source).values():
+            key = ref.get("key", "")
+            if key.startswith(prefix):
+                found.setdefault(key.rsplit("/", 1)[-1], ref)
+    return found
+
+
+@router.get("/{run_id}/outputs")
+async def list_run_outputs(
+    run_id: str,
+    container: ApplicationContainer = Depends(get_container),
+):
+    """The stored step-output files this run's state references."""
+    run = await container.run_repository.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    await ensure_run_visible(container.workflow_backend, run)
+    files: dict[str, dict] = {}
+    for name, ref in _output_refs_of(run).items():
+        entry = files.setdefault(name, {
+            "name": name,
+            "key": ref.get("key"),
+            "uri": ref.get("uri"),
+            "fields": [],
+            "download_url": f"/runs/{run_id}/outputs/{name}",
+        })
+        entry["fields"].append({"field": ref.get("field"), "bytes": ref.get("bytes"),
+                                "kind": ref.get("kind")})
+    return {"run_id": run_id, "outputs": list(files.values())}
+
+
+@router.get("/{run_id}/outputs/{name}")
+async def download_run_output(
+    run_id: str,
+    name: str,
+    field: str | None = Query(
+        None, description="Return only this value, as JSON, instead of the markdown file."
+    ),
+    container: ApplicationContainer = Depends(get_container),
+):
+    """One stored step-output file (markdown), or one value from it as JSON."""
+    from fastapi.responses import JSONResponse, Response
+
+    from app.infrastructure.orchestration.step_outputs import (
+        StepOutputUnavailable,
+        parse_markdown,
+    )
+
+    run = await container.run_repository.get(run_id)
+    if run is not None and not await workflow_visible(container.workflow_backend, run.graph_id):
+        run = None
+    ref = None if run is None else _output_refs_of(run).get(name)
+    if ref is None:
+        raise HTTPException(status_code=404, detail=f"No stored output '{name}' for run '{run_id}'")
+    store = getattr(container, "step_output_store", None)
+    if store is None:
+        raise HTTPException(status_code=503, detail="No step output store is configured on this backend")
+    try:
+        data = await store.read_file(ref["key"])
+    except StepOutputUnavailable as exc:
+        raise HTTPException(status_code=410, detail=str(exc)) from exc
+    if field is not None:
+        values = parse_markdown(data)
+        if field not in values:
+            raise HTTPException(status_code=404, detail=f"'{name}' has no value '{field}'")
+        return JSONResponse(values[field])
+    return Response(
+        content=data,
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{name}"'},
     )

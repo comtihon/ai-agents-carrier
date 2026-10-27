@@ -24,6 +24,7 @@ def _build_container() -> ApplicationContainer:
     mcp.stop = AsyncMock()
     run_repository = AsyncMock()
     run_repository.list_incomplete = AsyncMock(return_value=[])
+    run_repository.list_recovery_candidates = AsyncMock(return_value=[])
     mongo_provider = MagicMock()
     mongo_provider.close = AsyncMock()
     return ApplicationContainer(

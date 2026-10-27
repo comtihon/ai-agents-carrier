@@ -56,6 +56,11 @@ class YamlGraphRegistry:
                 "description": runner.description,
                 "readonly": runner.readonly,
                 "enabled": runner.enabled,
+                "visibility": getattr(runner, "visibility", "public"),
+                "owner_id": getattr(runner, "owner_id", None),
+                "owner_name": getattr(runner, "owner_name", None),
+                "team_id": getattr(runner, "team_id", None),
+                "grants": [g.model_dump(mode="json") for g in getattr(runner, "grants", None) or []],
                 "steps": [
                     {
                         "id": s["id"],
@@ -67,6 +72,14 @@ class YamlGraphRegistry:
                 ],
             })
         return result
+
+
+def _copy_ownership(runner: YamlGraphRunner, definition: WorkflowDefinition) -> None:
+    runner.visibility = definition.visibility
+    runner.owner_id = definition.owner_id
+    runner.owner_name = definition.owner_name
+    runner.team_id = definition.team_id
+    runner.grants = list(definition.grants)
 
 
 def build_registry_from_definitions(
@@ -96,6 +109,7 @@ def build_registry_from_definitions(
             )
             runner.readonly = defn.readonly
             runner.enabled = defn.enabled
+            _copy_ownership(runner, defn)
             runners[runner.id] = runner
             logger.info("Loaded workflow '%s' from backend", runner.id)
         except Exception:
@@ -129,6 +143,7 @@ def build_runner_from_definition(
     )
     runner.readonly = definition.readonly
     runner.enabled = definition.enabled
+    _copy_ownership(runner, definition)
     runner._registry = registry
     runner._run_repository = run_repository
     return runner

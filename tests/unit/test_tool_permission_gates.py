@@ -177,6 +177,21 @@ EXPECTED_TOOL_PERMISSIONS: dict[str, Permission] = {
     "read_thread": Permission.READ,
     "send_direct_message": Permission.WRITE,
     "delete_message": Permission.DELETE,
+    # teams / users / visibility -- the same tier the REST route's HTTP
+    # method demands (GET /teams, PUT /teams/{id}/members/{sub}, DELETE ...)
+    "who_am_i": Permission.READ,
+    "list_teams": Permission.READ,
+    "list_users": Permission.READ,
+    "create_team": Permission.WRITE,
+    "rename_team": Permission.WRITE,
+    "delete_team": Permission.DELETE,
+    "set_team_member": Permission.WRITE,
+    "remove_team_member": Permission.DELETE,
+    "set_resource_visibility": Permission.WRITE,
+    # grants -- GET / POST / DELETE /{kind}/{id}/grants
+    "list_resource_grants": Permission.READ,
+    "grant_resource_access": Permission.WRITE,
+    "revoke_resource_access": Permission.DELETE,
 }
 
 _RUN_CONTROL_TOOLS = {

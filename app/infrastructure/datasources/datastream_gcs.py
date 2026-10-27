@@ -47,6 +47,7 @@ from typing import Any, BinaryIO
 from app.domain.models.datastream import PREVIEW_ITEMS, DataRef, shrink_preview
 from app.infrastructure.datasources.datastream import (
     DataStreamStore,
+    validate_object_key,
     NotStreamable,
     StreamGone,
     StreamReadTooLarge,
@@ -519,6 +520,79 @@ class GcsStreamStore(DataStreamStore):
         if removed:
             logger.info("data stream store (gcs): purged %d expired stream(s)", removed)
         return removed
+
+    # -- named objects ---------------------------------------------------
+    def _object_name(self, key: str) -> str:
+        key = validate_object_key(key)
+        return f"{self._prefix}/{key}" if self._prefix else key
+
+    async def put_object(
+        self, key: str, data: bytes, *, content_type: str = "text/markdown"
+    ) -> str:
+        name = self._object_name(key)
+
+        def _put() -> None:
+            blob = self._bucket().blob(name)
+            blob.upload_from_string(data, content_type=content_type)
+
+        await asyncio.to_thread(_put)
+        return self.object_uri(key)
+
+    async def get_object(self, key: str) -> bytes:
+        name = self._object_name(key)
+
+        def _get() -> bytes | None:
+            blob = self._bucket().get_blob(name)
+            if blob is None:
+                return None
+            return blob.download_as_bytes()
+
+        data = await asyncio.to_thread(_get)
+        if data is None:
+            raise StreamGone(f"stored step output '{key}' is gone from gs://{self._bucket_name}/{name}")
+        return data
+
+    async def delete_objects(self, prefix: str) -> int:
+        name = self._object_name(prefix)
+
+        def _delete() -> int:
+            self._bucket()
+            removed = 0
+            for blob in self._client.list_blobs(self._bucket_name, prefix=name):  # type: ignore[union-attr]
+                try:
+                    blob.delete()
+                    removed += 1
+                except Exception:  # noqa: BLE001 — already gone is the goal state
+                    continue
+            return removed
+
+        return await asyncio.to_thread(_delete)
+
+    def object_uri(self, key: str) -> str:
+        return f"gs://{self._bucket_name}/{self._object_name(key)}"
+
+    async def object_signed_url(
+        self, key: str, *, filename: str = "", content_type: str = ""
+    ) -> str | None:
+        """A signed GET URL for a named object, or ``None`` when unsignable."""
+        name = self._object_name(key)
+        disposition = f'attachment; filename="{filename}"' if filename else None
+
+        def _sign() -> str | None:
+            blob = self._bucket().get_blob(name)
+            if blob is None:
+                return None
+            return blob.generate_signed_url(
+                version="v4", expiration=SIGNED_URL_TTL, method="GET",
+                response_disposition=disposition,
+                response_type=content_type or None,
+            )
+
+        try:
+            return await asyncio.to_thread(_sign)
+        except Exception as exc:  # noqa: BLE001 — every failure means "cannot sign"
+            logger.info("object '%s': cannot sign a URL (%s)", key, exc)
+            return None
 
     # -- signing --------------------------------------------------------
     async def signed_url(

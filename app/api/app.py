@@ -5,6 +5,7 @@ import app.compat  # noqa: F401 — must be first, patches langgraph.graph.graph
 import logging
 import secrets
 from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import replace
 from uuid import uuid4
 
 from copilotkit import Action, CopilotKitRemoteEndpoint, LangGraphAGUIAgent
@@ -12,6 +13,7 @@ from copilotkit.integrations.fastapi import add_fastapi_endpoint
 from copilotkit.integrations.fastapi import handler as _ck_handler
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from langgraph.types import Command
 from starlette.routing import get_route_path
 
@@ -26,9 +28,25 @@ from app.api.middleware.auth import OAuthMiddleware
 from app.infrastructure.auth.authorization import (
     AuthorizationPolicy,
     Permission,
+    Subject,
     reset_current_permissions,
+    reset_current_subject,
     set_current_permissions,
+    set_current_subject,
+    subject_from_claims,
 )
+from app.application.login import (
+    LoginService,
+    effective_roles,
+    login_decision,
+    login_script_store_of,
+    with_profile,
+)
+from app.application.teams import directory_of, resolve_subject
+from app.application.visibility import VisibilityError, can_see, unwrap, workflow_visible
+from app.api.routes.me import router as me_router
+from app.api.routes.teams import router as teams_router
+from app.api.routes.login_script import router as login_script_router
 from app.api.routes.agent_callbacks import router as agent_callbacks_router
 from app.api.routes.agents import router as agents_router
 from app.api.routes.approvals import router as approvals_router
@@ -40,12 +58,14 @@ from app.api.routes.scripts import router as scripts_router
 from app.api.routes.health import router as health_router
 from app.api.routes.llm import router as llm_router
 from app.api.routes.run_data import router as run_data_router
+from app.api.routes.runners import router as runners_router
 from app.api.routes.webhooks import router as webhooks_router
 from app.api.routes.workflows import router as workflows_router
 from app.core.config import get_settings
 from app.core.container import ApplicationContainer, build_container
 from app.domain.models.graph_run import GraphRun
 from app.infrastructure.auth.auth_service import AuthError, AuthService
+from app.infrastructure.auth.login_script import load_login_script
 from app.infrastructure.auth.datasource_grant import (
     DatasourceGrant,
     looks_like_grant,
@@ -197,9 +217,11 @@ class _ManagementAuthWrapper:
         oauth_enabled: bool,
         auth_service: AuthService | None = None,
         policy: AuthorizationPolicy | None = None,
+        login_service: LoginService | None = None,
     ) -> None:
         self._app = app
         self._policy = policy or AuthorizationPolicy()
+        self._login_service = login_service
         # Strip surrounding whitespace (a Secret Manager value often carries a
         # trailing newline, which no HTTP header value can hold, so an unstripped
         # key could never match); empty / whitespace-only counts as unset.
@@ -224,8 +246,9 @@ class _ManagementAuthWrapper:
         ):
             # The static key is capped below ADMIN, so tools guarded on ADMIN
             # (unsandboxed python steps) refuse it regardless of role config.
+            # A shared key is nobody in particular: it sees public resources only.
             await self._call_with_principal(
-                self._policy.permissions_for_api_key(), scope, receive, send
+                self._policy.permissions_for_api_key(), Subject(), scope, receive, send
             )
             return
 
@@ -239,7 +262,14 @@ class _ManagementAuthWrapper:
                 logger.warning("management MCP auth rejected: %s", exc.message)
                 await _send_401(send)
                 return
-            permissions = self._policy.permissions_for_claims(claims)
+            app = scope.get("app")
+            container = getattr(getattr(app, "state", None), "container", None)
+            directory = directory_of(container)
+            decision = await login_decision(
+                self._login_service, token, claims, directory, login_script_store_of(container)
+            )
+            roles = effective_roles(self._policy, claims, decision)
+            permissions = self._policy.permissions_for_roles(roles)
             if Permission.ACCESS not in permissions:
                 logger.warning(
                     "management MCP authorization rejected: subject %s holds no role "
@@ -248,13 +278,23 @@ class _ManagementAuthWrapper:
                 )
                 await _send_403(send)
                 return
-            await self._call_with_principal(permissions, scope, receive, send)
+            is_super_admin = (
+                Permission.SUPER_ADMIN in self._policy.permissions_for_roles_strict(roles)
+            )
+            subject = await resolve_subject(
+                directory,
+                replace(
+                    with_profile(subject_from_claims(claims, is_super_admin), decision),
+                    roles=frozenset(roles),
+                ),
+            )
+            await self._call_with_principal(permissions, subject, scope, receive, send)
             return
 
         await _send_401(send)
 
 
-    async def _call_with_principal(self, permissions, scope, receive, send) -> None:
+    async def _call_with_principal(self, permissions, subject, scope, receive, send) -> None:
         """Run the inner app with *permissions* bound for this request's task.
 
         FastMCP passes no request object to tool bodies, so a tool cannot ask who
@@ -262,9 +302,11 @@ class _ManagementAuthWrapper:
         the call so nothing leaks between requests.
         """
         token = set_current_permissions(permissions)
+        subject_token = set_current_subject(subject)
         try:
             await self._app(scope, receive, send)
         finally:
+            reset_current_subject(subject_token)
             reset_current_permissions(token)
 
 
@@ -342,8 +384,16 @@ def _config(thread_id: str) -> dict:
 def _build_actions(container: ApplicationContainer) -> list[Action]:
     """Create CopilotKit backend actions backed by the application container."""
 
+    def _visible_runner(graph_id: str):
+        # A private workflow does not exist for anyone but its owner and admins
+        # (app.application.visibility); runners carry the ownership fields.
+        runner = container.yaml_graph_registry.get(graph_id)
+        return runner if runner is not None and can_see(runner) else None
+
     async def list_graphs_handler() -> dict:
-        runners = container.yaml_graph_registry.list_ids()
+        runners = [
+            gid for gid in container.yaml_graph_registry.list_ids() if _visible_runner(gid)
+        ]
         return {
             "graphs": [
                 {
@@ -356,7 +406,7 @@ def _build_actions(container: ApplicationContainer) -> list[Action]:
         }
 
     async def start_graph_run_handler(graph_id: str, request: str) -> dict:
-        runner = container.yaml_graph_registry.get(graph_id)
+        runner = _visible_runner(graph_id)
         if runner is None:
             return {"error": f"Graph '{graph_id}' not found"}
         thread_id = str(uuid4())
@@ -376,16 +426,16 @@ def _build_actions(container: ApplicationContainer) -> list[Action]:
 
     async def get_graph_run_handler(graph_id: str, thread_id: str) -> dict:
         run = await container.run_repository.get(thread_id)
-        if run is None:
+        if run is None or not await workflow_visible(container.workflow_backend, run.graph_id):
             return {"error": "Run not found"}
         return {"graph_id": run.graph_id, "thread_id": run.id, "status": run.status}
 
     async def approve_graph_run_handler(graph_id: str, thread_id: str) -> dict:
-        runner = container.yaml_graph_registry.get(graph_id)
+        runner = _visible_runner(graph_id)
         if runner is None:
             return {"error": f"Graph '{graph_id}' not found"}
         run = await container.run_repository.get(thread_id)
-        if run is None:
+        if run is None or not await workflow_visible(container.workflow_backend, run.graph_id):
             return {"error": "Run not found"}
         await runner.graph.ainvoke(Command(resume={"approved": True}), _config(thread_id))
         snap = await runner.graph.aget_state(_config(thread_id))
@@ -397,11 +447,11 @@ def _build_actions(container: ApplicationContainer) -> list[Action]:
     async def reject_graph_run_handler(
         graph_id: str, thread_id: str, reason: str = ""
     ) -> dict:
-        runner = container.yaml_graph_registry.get(graph_id)
+        runner = _visible_runner(graph_id)
         if runner is None:
             return {"error": f"Graph '{graph_id}' not found"}
         run = await container.run_repository.get(thread_id)
-        if run is None:
+        if run is None or not await workflow_visible(container.workflow_backend, run.graph_id):
             return {"error": "Run not found"}
         await runner.graph.ainvoke(
             Command(resume={"approved": False, "reason": reason or None}),
@@ -482,7 +532,7 @@ async def lifespan(app: FastAPI):
     datasources_mcp = get_datasources_mcp()
     try:
         await rebuild_datasource_tools(
-            datasources_mcp, container.data_source_backend, lambda: app.state.container
+            datasources_mcp, unwrap(container.data_source_backend), lambda: app.state.container
         )
     except Exception:
         logger.exception("failed to build initial datasources MCP tools")
@@ -574,6 +624,10 @@ async def lifespan(app: FastAPI):
     await container.shutdown()
 
 
+async def _visibility_error_response(request: Request, exc: VisibilityError) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(title=settings.app_name, debug=settings.debug, lifespan=lifespan)
@@ -582,6 +636,7 @@ def create_app() -> FastAPI:
     authz_policy = AuthorizationPolicy.from_settings(settings)
     app.state.authz_policy = authz_policy
     auth_service: AuthService | None = None
+    login_service: LoginService | None = None
     if settings.oauth_enabled:
         auth_service = AuthService(
             jwks_url=settings.oauth_jwks_url,
@@ -589,7 +644,26 @@ def create_app() -> FastAPI:
             algorithms=settings.oauth_algorithms,
             audience=settings.oauth_audience,
         )
-        app.add_middleware(OAuthMiddleware, auth_service=auth_service, policy=authz_policy)
+        # Fails startup on a configured but unusable script. Without one, the
+        # service still runs whatever script a super admin stores at runtime
+        # (none until then: roles come from the token).
+        login_service = LoginService(
+            load_login_script(settings),
+            policy=authz_policy,
+            timeout_ms=settings.auth_login_script_timeout_ms,
+        )
+        app.add_middleware(
+            OAuthMiddleware,
+            auth_service=auth_service,
+            policy=authz_policy,
+            login_service=login_service,
+        )
+    elif settings.auth_login_script or settings.auth_login_script_path:
+        logger.warning("A login script is configured but OAUTH_ENABLED is false; it never runs")
+    app.state.login_service = login_service
+    # Ownership/visibility refusals are raised from the scoped backends, below
+    # every route; this turns them into the status each one names.
+    app.add_exception_handler(VisibilityError, _visibility_error_response)
     # CORSMiddleware must be outermost — added after OAuthMiddleware so it wraps it
     app.add_middleware(
         CORSMiddleware,
@@ -599,8 +673,12 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.include_router(health_router)
+    app.include_router(me_router, prefix=settings.api_prefix)
+    app.include_router(teams_router, prefix=settings.api_prefix)
+    app.include_router(login_script_router, prefix=settings.api_prefix)
     app.include_router(workflows_router, prefix=settings.api_prefix)
     app.include_router(agents_router, prefix=settings.api_prefix)
+    app.include_router(runners_router, prefix=settings.api_prefix)
     app.include_router(datasources_router, prefix=settings.api_prefix)
     app.include_router(approvals_router, prefix=settings.api_prefix)
     app.include_router(events_router, prefix=settings.api_prefix)
@@ -665,6 +743,7 @@ def create_app() -> FastAPI:
             oauth_enabled=settings.oauth_enabled,
             auth_service=auth_service,
             policy=authz_policy,
+            login_service=login_service,
         )
     app.mount("/mcp", _McpDispatcher(mcp_routes))
     return app

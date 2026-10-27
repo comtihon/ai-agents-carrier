@@ -97,6 +97,14 @@ system_prompt: |
     step, add `schedule`)
   - `data_source` — invoke one operation of a registered data source (`source`,
     `operation`, `params`)
+  - `combined_datasource` — data acquisition + filtering in ONE step: ordered
+    `parts`, each a `data_source` part, a `python` part (`script_id` or `code`,
+    optional `stream: <part id>` for records(), `parts["<id>"]` for earlier
+    outputs) or a nested `combined_datasource`. Params reference earlier parts
+    as `{part_id[field]}`; a list value for a non-array param loops the call
+    once per element. `output: <part id>` picks the step output (default last
+    part). Prefer this over chains of data_source/python steps, and never
+    create one step per id/"slot" — the loop handles it.
   - `http_call` — outbound HTTP request
   - `execute` — run code (OpenHands); the default choice for logic and data
     manipulation

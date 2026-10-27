@@ -18,8 +18,11 @@ import re
 from datetime import datetime
 from typing import Annotated, Any, Literal, Union
 
+from typing import ClassVar
+
 from pydantic import BaseModel, Field
 
+from app.domain.models.ownership import GrantableResource
 from app.domain.models.sheet_binding import SheetBinding
 
 
@@ -319,8 +322,12 @@ class BigQuerySpec(BaseModel):
     max_rows: int = 0
 
 
-class DataSourceDefinition(BaseModel):
+class DataSourceDefinition(GrantableResource):
     """Persistent definition of one remote API exposed as named operations."""
+
+    # A read_write grant widens the operations a grantee may call; it never
+    # lets them change the definition (or its credentials).
+    grant_edits: ClassVar[bool] = False
 
     id: str
     name: str = ""

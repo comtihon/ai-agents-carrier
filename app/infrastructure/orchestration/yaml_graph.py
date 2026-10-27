@@ -29,6 +29,7 @@ from langgraph.errors import GraphBubbleUp
 from langgraph.types import interrupt
 
 from app.application import data_artifacts
+from app.infrastructure.orchestration import step_outputs as _step_outputs
 from app.application.step_normalization import normalize_edges
 from app.domain.models.graph_run import GraphRun
 from app.infrastructure.tools.mcp_client import McpToolsProvider
@@ -139,6 +140,10 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
         # same superstep as another key cannot blank the counter.
         if step.get("type") == "proceed_or":
             fields[f"_proceed_or_{step['id']}"] = Annotated[Any, _merge_dicts]  # type: ignore[assignment]
+        # combined_datasource keeps its per-part trace (status, timing, counts)
+        # next to its output; declared or LangGraph drops it.
+        if step.get("type") == "combined_datasource":
+            fields[f"_combined_{step['id']}"] = Any  # type: ignore[assignment]
         # Regular output nodes store their result under output_key
         if "output_key" in step:
             fields[step["output_key"]] = Any  # type: ignore[assignment]
@@ -445,7 +450,10 @@ async def stream_graph_to_pause(
                 # step_statuses (it would show up as a phantom "done" step in the UI).
                 if node_name == "__interrupt__":
                     _stream_interrupt_output = output
-                    run.step_inputs[node_name] = dict(current_state)
+                    # No state snapshot: step_inputs used to hold a full copy of
+                    # state per entry, which is what grew the run document to
+                    # steps x state. The interrupt payload is in step_outputs.
+                    run.step_inputs[node_name] = {}
                     if output:
                         run.step_outputs[node_name] = output
                     run.touch()
@@ -462,15 +470,22 @@ async def stream_graph_to_pause(
                     # that the node body actually executed.
                     ran=run.step_statuses.get(node_name) == "running",
                 )
-                run.step_inputs[node_name] = dict(current_state)
+                run.step_inputs[node_name] = _step_outputs.step_input_snapshot(
+                    _node_def, current_state
+                )
                 run.step_statuses[node_name] = status
                 run.current_step = node_name
                 if output:
-                    run.step_outputs[node_name] = output
+                    run.step_outputs[node_name] = _step_outputs.step_output_record(output)
                     if isinstance(output, dict):
                         current_state.update(output)
                 logger.info("run %s: step '%s' → %s", run.id, node_name, status)
                 last_processed = node_name
+                # A step completed: the run is making progress, so it is not
+                # crash-looping the server. Persisted together with the step
+                # (if that write itself fails — e.g. DocumentTooLarge — the
+                # reset is lost too, which is exactly what we want).
+                run.recovery_attempts = 0
                 run.touch()
                 await run_repository.update(run)
                 if _probe_enabled:
@@ -492,13 +507,17 @@ async def stream_graph_to_pause(
             None,
         )
         if running_sid is not None:
-            run.step_inputs[running_sid] = dict(current_state)
+            run.step_inputs[running_sid] = _step_outputs.step_input_snapshot(
+                runner.step_by_id(running_sid), current_state
+            )
             run.step_statuses[running_sid] = "failed"
             run.step_outputs[running_sid] = {"error": error_msg}
         else:
             failed_sid = current_state.get("__failed_step__") if isinstance(current_state, dict) else None
             if isinstance(failed_sid, str) and failed_sid in run.step_statuses:
-                run.step_inputs[failed_sid] = dict(current_state)
+                run.step_inputs[failed_sid] = _step_outputs.step_input_snapshot(
+                    runner.step_by_id(failed_sid), current_state
+                )
                 run.step_statuses[failed_sid] = "failed"
                 if not run.step_outputs.get(failed_sid):
                     run.step_outputs[failed_sid] = {"error": error_msg}
@@ -660,6 +679,9 @@ async def stream_graph_to_pause(
 
     if run.status == "waiting_approval" and base_url and run.current_step:
         step = next((s for s in runner.steps if s["id"] == run.current_step), None)
+        # Notification templates render against state outside any node, so the
+        # stored outputs they name are resolved here, as the node wrapper would.
+        _notify_values = await runner.hydrate_for_step(step, dict(snap.values or {}))
         # Fire Slack notification for explicit ask_context steps AND for agent steps
         # that raised an ask_context interrupt internally via meta-LLM — but only
         # when a Slack addon (slack_notifications) is attached to the agent step.
@@ -701,7 +723,7 @@ async def stream_graph_to_pause(
                             bot_token=effective_token,
                             payload_template=step["slack_payload"],
                             run_id=run.id,
-                            state={**(snap.values or {}), **extra},
+                            state={**_notify_values, **extra},
                             questions=questions,
                         )
                     elif existing_ts and existing_channel:
@@ -713,7 +735,7 @@ async def stream_graph_to_pause(
                         # First interrupt: open a new root message
                         notif_resp = await post_slack_ask_context(
                             effective_token, effective_channel,
-                            questions, run.id, snap.values,
+                            questions, run.id, _notify_values,
                         )
                         if notif_resp and notif_resp.get("ok"):
                             ts = notif_resp.get("ts")
@@ -729,7 +751,7 @@ async def stream_graph_to_pause(
                                 await run_repository.update(run)
 
         elif step and step.get("notify"):
-            notif_resp = await send_approval_notification(step["notify"], run.id, snap.values, base_url)
+            notif_resp = await send_approval_notification(step["notify"], run.id, _notify_values, base_url)
             if notif_resp and notif_resp.get("ok"):
                 ts = notif_resp.get("ts")
                 channel = notif_resp.get("channel")
@@ -1117,6 +1139,16 @@ class YamlGraphRunner:
         # Read off the definition (not post-construction like readonly) so runners
         # built straight from a YAML dict carry the flag too. Absent means enabled.
         self.enabled: bool = bool(definition.get("enabled", True))
+        # Ownership, so registry listings can be filtered by visibility without
+        # a store round-trip (see app.application.visibility). Set from the
+        # stored definition by the loaders; absent means public, unowned.
+        self.visibility: str = definition.get("visibility", "public")
+        self.owner_id: str | None = definition.get("owner_id")
+        self.owner_name: str | None = definition.get("owner_name")
+        self.team_id: str | None = definition.get("team_id")
+        # Grants on this workflow (see app.application.visibility); set from
+        # the stored definition by the loader.
+        self.grants: list[Any] = list(definition.get("grants") or [])
         # Resolve implicit fall-through into an explicit `next`/`targets` up
         # front, so array position stops being load-bearing below this line.
         # Every construction path — stored definition, on-disk YAML, a raw dict
@@ -1158,6 +1190,11 @@ class YamlGraphRunner:
         # `data_source` step still runs, it just cannot spill, so an oversized
         # result fails the step instead.
         self._stream_store: Any = None
+        # Injected post-construction: writes every step's output to the stream
+        # store under the run's folder and leaves a reference in state (see
+        # app.infrastructure.orchestration.step_outputs). None = outputs stay
+        # inline, the pre-offload behaviour (and what bare test runners get).
+        self._step_output_store: Any = None
         # Injected post-construction for `data` steps: the run download
         # manifest.  Optional -- without it a `data` step still runs and still
         # returns state unchanged, it simply records nothing (and says so).
@@ -1184,6 +1221,97 @@ class YamlGraphRunner:
     @property
     def steps(self) -> list[dict[str, Any]]:
         return self._steps
+
+    def step_by_id(self, step_id: str | None) -> dict[str, Any] | None:
+        return next((s for s in self._steps if s.get("id") == step_id), None)
+
+    # ------------------------------------------------------------------
+    # Stored step outputs (references in state, values in the store)
+    # ------------------------------------------------------------------
+
+    async def hydrate_for_step(self, step: dict[str, Any] | None, state: Any) -> Any:
+        """*state* with the stored outputs *step* references resolved.
+
+        Best-effort for callers outside a node (notification templates): a
+        failure to read leaves the references in place rather than raising.
+        """
+        store = self._step_output_store
+        if store is None or not isinstance(state, dict) or step is None:
+            return state
+        try:
+            return await store.hydrate(
+                state, _step_outputs.referenced_keys(step), step_id=step.get("id", "")
+            )
+        except Exception:  # noqa: BLE001 — a notification must not fail the run
+            logger.warning("[%s] could not hydrate state for step '%s'", self.id,
+                           step.get("id"), exc_info=True)
+            return state
+
+    def _run_id_from(self, config: Any) -> str:
+        try:
+            thread_id = ((config or {}).get("configurable") or {}).get("thread_id")
+        except AttributeError:
+            thread_id = None
+        if thread_id:
+            return str(thread_id)
+        run = self._current_run
+        return str(getattr(run, "id", "") or "")
+
+    def _output_iteration(self, step_id: str, run_id: str, state: dict) -> int:
+        """How many times *step_id* has started in this run (>= 1).
+
+        Read off the routing journal when this runner is driving that run --
+        it records every node start, loop-guard-exempt types included -- and
+        off the loop guard's visit counter otherwise.
+        """
+        run = self._current_run
+        if run is not None and getattr(run, "id", None) == run_id:
+            starts = sum(
+                1 for e in (run.routing_log or [])
+                if getattr(e, "event", None) == "node_start" and getattr(e, "node", None) == step_id
+            )
+            if starts:
+                return starts
+        return int(((state or {}).get("_visit_counts") or {}).get(step_id, 0)) + 1
+
+    def _wrap_with_step_io(self, step: dict[str, Any], fn: Callable) -> Callable:
+        """Resolve the stored outputs a step reads; store the outputs it writes.
+
+        Outermost wrapper, so the ``when`` guard, every template, a switch's
+        conditions and a python step's ``state`` all see values, and so what
+        LangGraph checkpoints -- and the run document copies -- is references.
+        """
+        step_id = step["id"]
+        step_type = str(step.get("type") or "")
+        needed = _step_outputs.referenced_keys(step)
+        is_async = asyncio.iscoroutinefunction(fn)
+
+        async def _io(state: dict, config=None) -> dict:
+            store = self._step_output_store
+            if store is None:
+                return (await fn(state)) if is_async else fn(state)
+            run_id = self._run_id_from(config)
+            try:
+                hydrated = await store.hydrate(state, needed, step_id=step_id)
+            except Exception:
+                # Attribute the failure to this step: nothing inside has had
+                # the chance to mark it running.
+                run = self._current_run
+                if run is not None and getattr(run, "id", None) == run_id:
+                    run.step_statuses[step_id] = "running"
+                raise
+            result = (await fn(hydrated)) if is_async else fn(hydrated)
+            if not run_id or not isinstance(result, dict) or not result:
+                return result
+            return await store.offload(
+                run_id=run_id,
+                step_id=step_id,
+                step_type=step_type,
+                iteration=self._output_iteration(step_id, run_id, state),
+                update=result,
+            )
+
+        return _io
 
     # ------------------------------------------------------------------
     # Graph construction
@@ -1321,6 +1449,8 @@ class YamlGraphRunner:
             fn = self._http_call_node(step)
         elif t == "data_source":
             fn = self._data_source_node(step)
+        elif t == "combined_datasource":
+            fn = self._combined_datasource_node(step)
         elif t == "data":
             fn = self._data_node(step)
         elif t == "python":
@@ -1344,7 +1474,7 @@ class YamlGraphRunner:
             raise ValueError(f"Unknown step type '{t}' in graph '{self.id}'")
         wrapped = self._wrap_with_status_running(self._wrap_with_loop_guard(step, fn), step)
         wrapped = self._wrap_with_when(step, wrapped)
-        return self._wrap_with_fail_guard(step, wrapped)
+        return self._wrap_with_step_io(step, self._wrap_with_fail_guard(step, wrapped))
 
     _NO_LOOP_GUARD_TYPES: frozenset = frozenset({"ask_context", "human_approval", "cron", "http", "pubsub", "parallel", "join", "proceed_or", "switch", "langgraph-agent", "claude-agent", "dynamic"})
     # join handles __failed_step__ itself via failure_policy; all others must abort when
@@ -1590,8 +1720,14 @@ class YamlGraphRunner:
             )
 
         runner = self
+        cond_keys = _step_outputs.condition_keys(r.get("when") for r in routes)
 
         async def router(state: dict) -> str:
+            store = runner._step_output_store
+            if store is not None and cond_keys:
+                # Route conditions are evaluated outside the node, against the
+                # checkpointed state -- resolve the stored outputs they name.
+                state = await store.hydrate(state, cond_keys, step_id=source_id)
             chosen = _select(state)
             logger.info(
                 "[%s] router '%s' → '%s' (condition: %r)",
@@ -1682,8 +1818,11 @@ class YamlGraphRunner:
             run_id: str = self._current_run.id if self._current_run else "unknown"
             callback_base_url: str = self._callback_base_url or ""
 
+            from app.application.visibility import granted_for_workflow
             from app.core.config import get_settings
             from app.steps.agent_executor import execute_agent_step
+            # Agents granted to this workflow resolve here, and only here.
+            agent_backend = granted_for_workflow(agent_backend, graph_id)
             logger.info("[%s] step '%s' running (%s)", graph_id, step_id, step["type"])
             try:
                 return await execute_agent_step(
@@ -2233,9 +2372,19 @@ class YamlGraphRunner:
                 if self._data_source_backend is None or self._data_source_executor is None:
                     raise ValueError("data source backend/executor not configured")
                 params = self._render_deep(step.get("params") or {}, state)
-                source = await self._data_source_backend.get(source_id)
+                from app.application.visibility import (
+                    operation_denied, sources_for_workflow, workflow_grant_access,
+                )
+                source = await sources_for_workflow(
+                    self._data_source_backend, self.id
+                ).get(source_id)
                 if source is None:
                     raise ValueError(f"Data source '{source_id}' not found")
+                denied = operation_denied(
+                    source, operation, workflow_grant_access(source, self)
+                )
+                if denied:
+                    raise PermissionError(denied)
 
                 gate = await self._gate_destructive(step, source, operation, params)
                 if gate is not None and not gate["approved"]:
@@ -2307,6 +2456,48 @@ class YamlGraphRunner:
             except Exception as exc:
                 logger.exception("[%s] step '%s' data_source failed", graph_id, step_id)
                 return {output_key: {"error": str(exc)}}
+
+        return node
+
+    def _combined_datasource_node(self, step: dict[str, Any]):
+        """Run an ordered pipeline of data source / python / nested parts.
+
+        See ``app.infrastructure.orchestration.combined_datasource``. The chosen
+        part's output (``output``, default the last part) is stored under
+        ``output_key`` (default the step id); every part's output goes to the
+        run's folder in the store, and ``_combined_<step id>`` carries the
+        per-part trace. A failing part fails the step (``__failed_step__``),
+        with the trace up to the failure kept.
+        """
+        from app.infrastructure.orchestration.combined_datasource import (
+            CombinedExecutor,
+            CombinedPartError,
+        )
+
+        graph_id = self.id
+        step_id = step["id"]
+        output_key = step.get("output_key") or step_id
+        trace_key = f"_combined_{step_id}"
+
+        async def node(state: dict) -> dict:
+            run = self._current_run
+            run_id = str(getattr(run, "id", "") or "")
+            iteration = self._output_iteration(step_id, run_id, state) if run_id else 1
+            executor = CombinedExecutor(self, step, run_id=run_id, iteration=iteration)
+            logger.info("[%s] step '%s' running (combined_datasource, %d part(s))",
+                        graph_id, step_id, len(step.get("parts") or []))
+            try:
+                output, trace = await executor.run(state)
+            except CombinedPartError as exc:
+                logger.exception("[%s] step '%s' combined_datasource failed", graph_id, step_id)
+                return {
+                    output_key: {"error": str(exc), "part": exc.path},
+                    trace_key: getattr(exc, "trace", None),
+                    "__failed_step__": step_id,
+                    "error": f"[step '{step_id}'] {exc}",
+                }
+            logger.info("[%s] step '%s' finished", graph_id, step_id)
+            return {output_key: output, trace_key: trace}
 
         return node
 
@@ -2522,6 +2713,72 @@ class YamlGraphRunner:
             raise ValueError(f"Script '{script_id}' not found in the library")
         return script.code
 
+    async def _run_python(
+        self, step: dict[str, Any], code: str, script_state: dict[str, Any], ref: Any,
+    ) -> Any:
+        """Run *code* the way *step* asks (sandboxed or in-process); return ``output``.
+
+        Shared by the ``python`` step and the python parts of a
+        ``combined_datasource`` step. Raises on failure.
+        """
+        graph_id = self.id
+        step_id = step["id"]
+        sandbox = step.get("sandbox", True)
+        sandbox_runtime = step.get("sandbox_runtime") or "local"
+        if sandbox:
+            from app.core.config import get_settings
+            from app.infrastructure.orchestration.script_sandbox import run_script
+
+            settings = get_settings()
+            delivery = await self._stream_delivery(ref, sandbox_runtime, step_id)
+            # Popped rather than passed on: run_script knows nothing
+            # about it, and it must be removed whether the script
+            # succeeds or fails.
+            tmp_stream = delivery.pop("_tempfile", None)
+            try:
+                result = await run_script(
+                    code,
+                    script_state,
+                    runtime=sandbox_runtime,
+                    timeout=float(step.get("timeout_seconds") or settings.script_sandbox_timeout),
+                    image=step.get("sandbox_image") or settings.script_sandbox_image,
+                    memory_mb=settings.script_sandbox_memory_mb,
+                    namespace=settings.agent_namespace,
+                    **delivery,
+                )
+            finally:
+                # A failing script must not leave the materialised copy
+                # behind: these are whole data source results, and the
+                # pod has a 4Gi ephemeral-storage limit.
+                if tmp_stream:
+                    with contextlib.suppress(OSError):
+                        os.unlink(tmp_stream)
+        else:
+            # Single namespace for globals and locals -- see the same
+            # fix in script_sandbox's bootstrap. Two namespaces make a
+            # top-level `def` invisible to another function's body, so
+            # any script with helpers fails on NameError.
+            local_vars: dict[str, Any] = {
+                "__builtins__": __builtins__,
+                "state": script_state,
+                # Same contract as the sandbox: the data arrives as a
+                # generator over the stream, never as a value.
+                "records": self._records_callable(ref),
+                "stream_records": ref.items if ref is not None else 0,
+                "stream_truncated": bool(ref is not None and ref.truncated),
+                "output": None,
+            }
+            compiled = compile(code, f"<workflow:{graph_id}:{step_id}>", "exec")
+
+            def _run() -> None:
+                exec(compiled, local_vars, local_vars)  # noqa: S102
+
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, _run)
+            result = local_vars.get("output")
+
+        return result
+
     def _python_node(self, step: dict[str, Any]):
         """Execute a Python script, inline or from the script library.
 
@@ -2568,57 +2825,7 @@ class YamlGraphRunner:
                         f"result reference"
                     )
 
-                if sandbox:
-                    from app.core.config import get_settings
-                    from app.infrastructure.orchestration.script_sandbox import run_script
-
-                    settings = get_settings()
-                    delivery = await self._stream_delivery(ref, sandbox_runtime, step_id)
-                    # Popped rather than passed on: run_script knows nothing
-                    # about it, and it must be removed whether the script
-                    # succeeds or fails.
-                    tmp_stream = delivery.pop("_tempfile", None)
-                    try:
-                        result = await run_script(
-                            code,
-                            dict(state),
-                            runtime=sandbox_runtime,
-                            timeout=float(step.get("timeout_seconds") or settings.script_sandbox_timeout),
-                            image=step.get("sandbox_image") or settings.script_sandbox_image,
-                            memory_mb=settings.script_sandbox_memory_mb,
-                            namespace=settings.agent_namespace,
-                            **delivery,
-                        )
-                    finally:
-                        # A failing script must not leave the materialised copy
-                        # behind: these are whole data source results, and the
-                        # pod has a 4Gi ephemeral-storage limit.
-                        if tmp_stream:
-                            with contextlib.suppress(OSError):
-                                os.unlink(tmp_stream)
-                else:
-                    # Single namespace for globals and locals -- see the same
-                    # fix in script_sandbox's bootstrap. Two namespaces make a
-                    # top-level `def` invisible to another function's body, so
-                    # any script with helpers fails on NameError.
-                    local_vars: dict[str, Any] = {
-                        "__builtins__": __builtins__,
-                        "state": dict(state),
-                        # Same contract as the sandbox: the data arrives as a
-                        # generator over the stream, never as a value.
-                        "records": self._records_callable(ref),
-                        "stream_records": ref.items if ref is not None else 0,
-                        "stream_truncated": bool(ref is not None and ref.truncated),
-                        "output": None,
-                    }
-                    compiled = compile(code, f"<workflow:{graph_id}:{step_id}>", "exec")
-
-                    def _run() -> None:
-                        exec(compiled, local_vars, local_vars)  # noqa: S102
-
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(None, _run)
-                    result = local_vars.get("output")
+                result = await self._run_python(step, code, dict(state), ref)
 
                 logger.info("[%s] step '%s' finished", graph_id, step_id)
                 return {output_key: result}

@@ -17,6 +17,14 @@ from google.cloud import storage
 from pydantic import BaseModel, Field
 
 from app.api.dependencies import get_container
+from app.domain.models.ownership import Visibility
+from app.api.routes.grants import add_grant_routes, present_sharing
+from app.application.visibility import (
+    ensure_run_visible,
+    granted_for_workflow,
+    ownership_fields,
+    visibility_kwargs,
+)
 from app.core.config import get_settings
 from app.core.container import ApplicationContainer
 from app.domain.models.agent_addon import AnyAgentAddon
@@ -44,6 +52,13 @@ class AgentDefinitionRequest(BaseModel):
     addons: list[dict] = Field(default_factory=list)
     protocol: Literal["http-poll", "acp"] = "http-poll"
     acp_agent: str | None = None
+    # default_runtime "runner": the machine (app.application.runners) it runs on.
+    runner_id: str | None = None
+    # None = the default: private when a user creates it, public without auth.
+    visibility: Visibility | None = None
+    # With visibility "team": which team. Omitted = the caller's own (a
+    # super admin may name any team; anyone else only their own).
+    team_id: str | None = None
 
 
 class AgentDefinitionUpdateRequest(BaseModel):
@@ -61,6 +76,12 @@ class AgentDefinitionUpdateRequest(BaseModel):
     # not silently switch an ACP agent back to the poll protocol).
     protocol: Literal["http-poll", "acp"] | None = None
     acp_agent: str | None = None
+    runner_id: str | None = None
+    # None = keep the stored visibility.
+    visibility: Visibility | None = None
+    # With visibility "team": which team. Omitted = the caller's own (a
+    # super admin may name any team; anyone else only their own).
+    team_id: str | None = None
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -70,13 +91,39 @@ def _require_backend(container: ApplicationContainer) -> None:
         raise HTTPException(status_code=501, detail="Agent backend not configured")
 
 
+_RUNTIMES = ("local", "docker", "k8s", "runner")
+
+
+async def _runner_fields(
+    container: ApplicationContainer, runtime: str, runner_id: str | None, protocol: str, acp_agent: str | None
+) -> dict[str, Any]:
+    """protocol/acp_agent/runner_id for *runtime*, checking the caller may use the runner.
+
+    A runner executes on someone's machine, so only someone who can see the
+    runner (its owner, its team when shared with one, a super admin) may point
+    an agent at it. Runner agents always speak ACP.
+    """
+    if runtime not in _RUNTIMES:
+        raise HTTPException(status_code=400, detail=f"Unknown runtime '{runtime}' (one of {', '.join(_RUNTIMES)})")
+    if runtime != "runner":
+        return {"protocol": protocol, "acp_agent": acp_agent, "runner_id": None}
+    from app.application.visibility import can_see
+    backend = getattr(container, "runner_backend", None)
+    runner = await backend.get_runner(runner_id) if backend is not None and runner_id else None
+    if runner is None or not can_see(runner):
+        raise HTTPException(status_code=400, detail=f"Runner '{runner_id}' not found" if runner_id else "runtime 'runner' needs runner_id")
+    if acp_agent and acp_agent not in runner.agents:
+        raise HTTPException(status_code=400, detail=f"Runner '{runner.name}' does not offer agent '{acp_agent}'")
+    return {"protocol": "acp", "acp_agent": acp_agent or None, "runner_id": runner.id}
+
+
 # ─── Literal-segment routes (must come before /{agent_id}) ───────────────────
 
 @router.get("/types")
 async def list_agent_types():
     """Return the supported runtimes."""
     return {
-        "runtimes": ["local", "docker", "k8s"],
+        "runtimes": list(_RUNTIMES),
     }
 
 
@@ -116,9 +163,26 @@ async def list_mcp_integrations():
 
 # ─── Collection routes ────────────────────────────────────────────────────────
 
+def _present(defn: AgentDefinition, workflow_id: str | None = None) -> dict[str, Any]:
+    return present_sharing(defn.model_dump(mode="json"), defn, workflow_id)
+
+
+async def _workflow_agents(
+    container: ApplicationContainer, workflow_id: str | None
+) -> list[AgentDefinition]:
+    """Agents granted to *workflow_id* the caller cannot otherwise see —
+    offered only to someone who can see that workflow."""
+    if not workflow_id or container.workflow_backend is None:
+        return []
+    if await container.workflow_backend.get(workflow_id) is None:
+        return []
+    return await granted_for_workflow(container.agent_backend, workflow_id).granted()
+
+
 @router.get("")
 async def list_agents(
     view: Literal["full", "summary"] = "full",
+    workflow_id: str | None = None,
     container: ApplicationContainer = Depends(get_container),
 ):
     """List all registered agent definitions.
@@ -126,10 +190,16 @@ async def list_agents(
     ``view=summary`` leaves out ``agent_input`` (which carries the system
     prompt), ``helm_values`` and ``addons`` -- everything a list of agents does
     not draw.  Default stays ``full``.
+
+    ``workflow_id`` (the workflow being edited) adds the agents granted to
+    that workflow, each marked ``granted_to_workflow``.
     """
     _require_backend(container)
     assert container.agent_backend is not None
     agents = await container.agent_backend.list()
+    granted = await _workflow_agents(container, workflow_id)
+    granted_ids = {a.id for a in granted}
+    agents += granted
     if view == "summary":
         return [
             {
@@ -137,10 +207,15 @@ async def list_agents(
                 "name": a.name,
                 "description": a.description,
                 "default_runtime": a.default_runtime,
+                **ownership_fields(a),
+                **(
+                    {"granted_to_workflow": "read"}
+                    if a.id in granted_ids else {}
+                ),
             }
             for a in agents
         ]
-    return [a.model_dump(mode="json") for a in agents]
+    return [_present(a, workflow_id) for a in agents]
 
 
 @router.post("", status_code=201)
@@ -158,6 +233,9 @@ async def create_agent(
 
     from pydantic import TypeAdapter
     _addon_adapter: TypeAdapter[list[AnyAgentAddon]] = TypeAdapter(list[AnyAgentAddon])
+    runner_fields = await _runner_fields(
+        container, body.default_runtime, body.runner_id, body.protocol, body.acp_agent or None
+    )
     defn = AgentDefinition(
         id=body.id,
         name=body.name,
@@ -168,11 +246,11 @@ async def create_agent(
         helm_chart=body.helm_chart,
         helm_values=body.helm_values,
         addons=_addon_adapter.validate_python(body.addons),
-        protocol=body.protocol,
-        acp_agent=body.acp_agent or None,
+        **runner_fields,
+        **visibility_kwargs(body.visibility, body.team_id),
     )
     saved = await container.agent_backend.create(defn)
-    return saved.model_dump(mode="json")
+    return _present(saved)
 
 
 # ─── Item routes (parameterised — must come AFTER literal-segment routes) ─────
@@ -180,16 +258,26 @@ async def create_agent(
 @router.get("/{agent_id}")
 async def get_agent(
     agent_id: str,
+    workflow_id: str | None = None,
     container: ApplicationContainer = Depends(get_container),
 ):
-    """Get a specific agent definition by ID."""
+    """Get a specific agent definition by ID.
+
+    ``workflow_id``: also find an agent granted to that workflow (if the
+    caller can see the workflow).
+    """
     _require_backend(container)
     assert container.agent_backend is not None
 
     defn = await container.agent_backend.get(agent_id)
     if defn is None:
+        defn = next(
+            (a for a in await _workflow_agents(container, workflow_id) if a.id == agent_id),
+            None,
+        )
+    if defn is None:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
-    return defn.model_dump(mode="json")
+    return _present(defn, workflow_id)
 
 
 @router.put("/{agent_id}")
@@ -217,6 +305,16 @@ async def update_agent(
         if body.addons is None
         else _addon_adapter.validate_python(body.addons)
     )
+    protocol = existing.protocol if body.protocol is None else body.protocol
+    acp_agent = existing.acp_agent if body.protocol is None else (body.acp_agent or None)
+    runner_id = body.runner_id
+    if body.default_runtime == "runner" and runner_id is None:
+        runner_id = existing.runner_id
+    if body.default_runtime == "runner" and runner_id == existing.runner_id and body.protocol is None:
+        # Unchanged runner: an older client round-trip keeps it as is.
+        runner_fields = {"protocol": "acp", "acp_agent": acp_agent, "runner_id": runner_id}
+    else:
+        runner_fields = await _runner_fields(container, body.default_runtime, runner_id, protocol, acp_agent)
     defn = AgentDefinition(
         id=agent_id,
         name=body.name,
@@ -228,11 +326,11 @@ async def update_agent(
         helm_values=body.helm_values,
         created_at=existing.created_at,
         addons=addons,
-        protocol=existing.protocol if body.protocol is None else body.protocol,
-        acp_agent=(existing.acp_agent if body.protocol is None else (body.acp_agent or None)),
+        **runner_fields,
+        **visibility_kwargs(body.visibility, body.team_id),
     )
     saved = await container.agent_backend.update(agent_id, defn)
-    return saved.model_dump(mode="json")
+    return _present(saved)
 
 
 @router.delete("/{agent_id}", status_code=204)
@@ -288,7 +386,10 @@ async def update_agent_addons(
     _addon_adapter: TypeAdapter[list[AnyAgentAddon]] = TypeAdapter(list[AnyAgentAddon])
     existing.addons = _addon_adapter.validate_python(body.addons)
     saved = await container.agent_backend.update(agent_id, existing)
-    return saved.model_dump(mode="json")
+    return _present(saved)
+
+
+add_grant_routes(router, "agent")
 
 
 # ─── S3 addon file browser helpers ───────────────────────────────────────────
@@ -316,6 +417,7 @@ async def _resolve_s3_addon(
     run = await container.run_repository.get(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
+    await ensure_run_visible(container.workflow_backend, run)
 
     path = addon.path.replace("{workflow_id}", run.id or "")
     path = path.replace("{project_id}", (run.state or {}).get("project_id", ""))

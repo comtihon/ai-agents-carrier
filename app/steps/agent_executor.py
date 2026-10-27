@@ -757,7 +757,14 @@ async def execute_agent_step(
     # suspend on an interrupt until the agent calls back with its output.
     from app.runtime.factory import get_runtime
 
-    runtime: AgentRuntime = get_runtime(
+    # A runner agent runs on a machine that dialled carrier: nothing to spawn.
+    if agent_def.default_runtime == "runner":
+        if agent_def.protocol != "acp":
+            raise ValueError(f"[step '{step_id}'] agent '{agent_id}' runs on a runner and must use protocol 'acp'")
+        runtime_type = "runner"
+    elif runtime_type == "runner":
+        raise ValueError(f"[step '{step_id}'] agent '{agent_id}' is not a runner agent (set it up from a connected machine)")
+    runtime: AgentRuntime | None = None if runtime_type == "runner" else get_runtime(
         runtime_type,
         registry_username=settings.docker_registry_username,
         registry_password=settings.docker_registry_password,

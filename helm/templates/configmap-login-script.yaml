@@ -1,0 +1,9 @@
+{{- if (.Values.auth).loginScript }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ai-agents-carrier.fullname" . }}-login-script
+data:
+  login.js: |
+{{ .Values.auth.loginScript | indent 4 }}
+{{- end }}

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 from app.domain.models.agent_addon import (
     AnyAgentAddon,
@@ -12,9 +12,10 @@ from app.domain.models.agent_addon import (
     S3Addon,
     ToolsAddon,
 )
+from app.domain.models.ownership import GrantableResource
 
 
-class AgentDefinition(BaseModel):
+class AgentDefinition(GrantableResource):
     """Persistent definition of a registered agent.
 
     Agents are invoked by ``langgraph-agent`` and ``claude-agent`` workflow
@@ -45,7 +46,10 @@ class AgentDefinition(BaseModel):
     id: str
     name: str = ""
     description: str | None = None          # UI + dispatcher roster — NOT sent to agent
-    default_runtime: Literal["local", "docker", "k8s"] = "local"
+    # "runner": an ACP agent on a user's machine connected with acp-web-proxy
+    # (app.application.runners); needs ``runner_id`` and ``protocol: "acp"``.
+    default_runtime: Literal["local", "docker", "k8s", "runner"] = "local"
+    runner_id: str | None = None
 
     # Sent to the agent on every run:
     agent_input: dict = Field(default_factory=dict)

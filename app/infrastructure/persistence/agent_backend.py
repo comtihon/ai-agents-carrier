@@ -4,6 +4,7 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
+from app.domain.models.ownership import COMPUTED_FIELDS
 from app.domain.models.agent_definition import AgentDefinition
 
 logger = logging.getLogger(__name__)
@@ -82,7 +83,7 @@ class MongoAgentBackend(AgentDefinitionBackend):
 
     @staticmethod
     def _to_doc(defn: AgentDefinition) -> dict[str, Any]:
-        data = defn.model_dump(mode="python")
+        data = defn.model_dump(mode="python", exclude=set(COMPUTED_FIELDS))
         data["_id"] = data.pop("id")
         return data
 

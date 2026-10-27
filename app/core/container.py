@@ -27,6 +27,12 @@ from app.infrastructure.integrations.openhands import OpenHandsAdapter
 from app.infrastructure.orchestration.checkpointer import MongoDBCheckpointSaver
 from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner, stream_graph_to_pause
 from app.infrastructure.persistence.mongo import MongoClientProvider, MongoGraphRunRepository, MongoPvcLeaseRepository, MongoAgentTaskRepository, MongoWarmPodRepository
+from app.application.visibility import ReferenceGuard, VisibilityScopedBackend, unwrap
+from app.infrastructure.persistence.login_script_store import (
+    LoginScriptStore,
+    MongoLoginScriptStore,
+)
+from app.infrastructure.persistence.team_directory import MongoTeamDirectory, TeamDirectory
 from app.infrastructure.persistence.agent_backend import (
     AgentDefinitionBackend,
     MongoAgentBackend,
@@ -73,6 +79,15 @@ from app.infrastructure.triggers.pubsub_subscriber import (
 logger = logging.getLogger(__name__)
 
 
+# Container attribute -> visibility kind, for the backends that are scoped.
+_SCOPED_BACKENDS: dict[str, str] = {
+    "workflow_backend": "workflow",
+    "agent_backend": "agent",
+    "data_source_backend": "datasource",
+    "script_backend": "script",
+}
+
+
 @dataclass
 class ApplicationContainer:
     settings: Settings
@@ -97,6 +112,9 @@ class ApplicationContainer:
     # Reads back what the executor spilled; the `data_source`, `python` and
     # `llm` steps all go through it.
     stream_store: "DataStreamStore | None" = None
+    # Step outputs written to the stream store; state keeps references. Built
+    # lazily from stream_store + settings (see step_output_store property).
+    _step_output_store: Any = None
     # Run download manifests written by `data` steps and read by
     # GET /runs/{id}/data.  None in legacy test setups, which then run a `data`
     # step as a no-op that records nothing.
@@ -132,14 +150,49 @@ class ApplicationContainer:
     pubsub_subscriber: PubSubSubscriberManager | None = None
     pvc_lease_repository: MongoPvcLeaseRepository | None = None
     agent_task_repository: MongoAgentTaskRepository | None = None
+    # Machines connected with acp-web-proxy (app.application.runners). None in
+    # legacy test setups: the runner routes answer 404.
+    runner_backend: Any = None
     warm_pod_repository: MongoWarmPodRepository | None = None
+    # Carrier's users and teams (app.application.teams). None in legacy test
+    # setups: nobody is in a team, and team management answers 503.
+    team_directory: TeamDirectory | None = None
+    # The login script a super admin edits at runtime (app.application.login_admin).
+    # None: only a deployment-configured script can be used.
+    login_script_store: LoginScriptStore | None = None
     # References to background tasks created in startup() — held so they
     # can't be garbage-collected mid-flight, and cancelled on shutdown().
     _recover_task: asyncio.Task | None = field(default=None, init=False, repr=False, compare=False)
     _datasources_mcp_task: asyncio.Task | None = field(default=None, init=False, repr=False, compare=False)
     _stream_housekeeping_task: asyncio.Task | None = field(default=None, init=False, repr=False, compare=False)
 
+    # The four definition backends are always held behind a visibility scope
+    # (app.application.visibility): every reader — REST routes, management and
+    # chat tools, the dispatcher's roster, run-time lookups — goes through it,
+    # so no surface can show a private resource the others hide. Done on
+    # assignment rather than in __post_init__ so a backend swapped in later (as
+    # tests do) is wrapped too.
+    def __setattr__(self, name: str, value: Any) -> None:
+        kind = _SCOPED_BACKENDS.get(name)
+        if kind is not None and value is not None and not isinstance(value, VisibilityScopedBackend):
+            value = VisibilityScopedBackend(value, kind, self._visibility_guard())
+        object.__setattr__(self, name, value)
+
+    def _visibility_guard(self) -> ReferenceGuard:
+        guard = self.__dict__.get("_reference_guard")
+        if guard is None:
+            fields = {kind: name for name, kind in _SCOPED_BACKENDS.items()}
+            guard = ReferenceGuard(
+                lambda kind: unwrap(self.__dict__.get(fields[kind])),
+                lambda: self.__dict__.get("team_directory"),
+            )
+            object.__setattr__(self, "_reference_guard", guard)
+        return guard
+
     async def startup(self) -> None:
+        # Runner steps record usage limits through the hub.
+        from app.application.runners import get_runner_hub
+        get_runner_hub().backend = self.runner_backend
         # Fail fast on an enabled-but-incomplete outbound auth configuration.
         if self.service_token_provider is not None:
             self.service_token_provider.validate_configuration()
@@ -150,6 +203,11 @@ class ApplicationContainer:
             await self.run_repository.ensure_indexes()
         except Exception:
             logger.exception("failed to ensure graph_runs indexes; run list may be slow")
+        if self.team_directory is not None and hasattr(self.team_directory, "ensure_indexes"):
+            try:
+                await self.team_directory.ensure_indexes()
+            except Exception:
+                logger.exception("failed to ensure users/teams indexes")
         await self.mcp_tools_provider.start()
         self.cron_scheduler.start()
         if self.settings.pubsub_enabled and self.pubsub_subscriber is None:
@@ -216,6 +274,23 @@ class ApplicationContainer:
             replace_existing=True,
         )
 
+    @property
+    def step_output_store(self) -> Any:
+        """Step-output offload over the stream store, or None when disabled."""
+        if self._step_output_store is None and self.stream_store is not None:
+            settings = getattr(self, "settings", None)
+            if settings is None or getattr(settings, "step_output_offload", True):
+                from app.infrastructure.orchestration.step_outputs import StepOutputStore
+
+                self._step_output_store = StepOutputStore(
+                    self.stream_store,
+                    inline_max_bytes=getattr(settings, "step_output_inline_max_bytes", 256),
+                    hydrate_max_bytes=getattr(
+                        settings, "step_input_hydrate_max_bytes", 32 * 1024 * 1024
+                    ),
+                )
+        return self._step_output_store
+
     def _inject_runner_dependencies(self, runner: YamlGraphRunner) -> None:
         """Inject shared repositories onto a runner instance.
 
@@ -238,6 +313,8 @@ class ApplicationContainer:
             runner._data_source_executor = self.data_source_executor
         if self.stream_store is not None:
             runner._stream_store = self.stream_store
+            if self.step_output_store is not None:
+                runner._step_output_store = self.step_output_store
         if self.data_artifact_backend is not None:
             runner._data_artifact_backend = self.data_artifact_backend
         if self.approval_service is not None:
@@ -306,7 +383,7 @@ class ApplicationContainer:
             await asyncio.sleep(delay)
             try:
                 await rebuild_datasource_tools(
-                    get_datasources_mcp(), self.data_source_backend, lambda: self
+                    get_datasources_mcp(), unwrap(self.data_source_backend), lambda: self
                 )
                 await self.mcp_tools_provider.refresh_server("datasources")
                 logger.info("datasources MCP tools loaded")
@@ -323,7 +400,7 @@ class ApplicationContainer:
         """Populate yaml_graph_registry from the configured backend."""
         assert self.workflow_backend is not None
         try:
-            definitions = await self.workflow_backend.list()
+            definitions = await unwrap(self.workflow_backend).list()
         except Exception:
             logger.exception("Failed to load workflow definitions from backend — registry will be empty")
             return
@@ -688,7 +765,9 @@ class ApplicationContainer:
         # definition still wants. _register_pubsub_steps syncs instead, and the
         # deleted-workflow branch below unregisters explicitly.
         self.cron_scheduler.unregister_workflow(workflow_id)
-        defn = await self.workflow_backend.get(workflow_id)
+        # The registry is global: rebuilt from the stored definition whoever's
+        # request triggered the refresh, never from what that caller can see.
+        defn = await unwrap(self.workflow_backend).get(workflow_id)
         if defn is not None:
             runner = build_runner_from_definition(
                 defn,
@@ -713,20 +792,88 @@ class ApplicationContainer:
             logger.info("Registry runner removed for workflow '%s'", workflow_id)
 
     async def _recover_incomplete_runs(self) -> None:
-        """On startup, find runs still marked running/waiting_approval and restore them."""
+        """On startup, find runs still marked running/waiting_* and restore them.
+
+        Crash-loop guard: each resume is counted on the run document
+        (``recovery_attempts``, atomic ``$inc``) *before* it starts, so the
+        count survives the process being killed by the very run it resumed.
+        The counter is zeroed whenever the run completes a step (see
+        ``stream_graph_to_pause``) or is parked again in a waiting state, so
+        it only measures consecutive recoveries without progress. A run found
+        with ``recovery_attempts >= run_recovery_max_attempts`` crashed the
+        server that many times in a row: it is failed instead of resumed and
+        its workflow is disabled.
+
+        One run failing to recover never stops the others.
+        """
         try:
-            incomplete = await self.run_repository.list_incomplete()
+            candidates = await self.run_repository.list_recovery_candidates()
         except Exception:
             logger.exception("Failed to query incomplete runs for recovery")
             return
-        if not incomplete:
+        if not candidates:
             return
-        logger.info("Recovering %d incomplete run(s) after restart", len(incomplete))
-        for run in incomplete:
+        logger.info("Recovering %d incomplete run(s) after restart", len(candidates))
+        max_attempts = self.settings.run_recovery_max_attempts
+        for candidate in candidates:
             try:
+                if candidate.kind == "job":
+                    # Not executed on recovery (just closed), so never counted.
+                    run = await self.run_repository.get(candidate.id)
+                    if run is not None:
+                        await self._recover_run(run)
+                    continue
+                if max_attempts > 0 and candidate.recovery_attempts >= max_attempts:
+                    await self._quarantine_crash_looping_run(candidate.id, candidate.graph_id, candidate.recovery_attempts)
+                    continue
+                run = await self.run_repository.begin_recovery(candidate.id)
+                if run is None:
+                    continue  # finished or failed since the candidate list was read
                 await self._recover_run(run)
+                if run.status in ("waiting_approval", "waiting_agent"):
+                    # Re-parked without executing anything: the recovery itself
+                    # survived, so this is not a crash loop.
+                    run.recovery_attempts = 0
+                    await self.run_repository.reset_recovery_attempts(run.id)
             except Exception:
-                logger.exception("Failed to recover run %s", run.id)
+                logger.exception("Failed to recover run %s", candidate.id)
+
+    async def _quarantine_crash_looping_run(self, run_id: str, workflow_id: str, attempts: int) -> None:
+        """Fail a run that crashed the server on every recovery, and disable its workflow."""
+        error = (
+            f"auto-failed: crashed the server on {attempts} consecutive recoveries "
+            f"(workflow '{workflow_id}' disabled to prevent a restart loop)"
+        )
+        logger.error(
+            "run %s (workflow '%s'): resumed %d times on startup without progress and the server "
+            "went down each time — NOT resuming it; marking failed and disabling the workflow",
+            run_id, workflow_id, attempts,
+        )
+        await self.run_repository.fail_incomplete(run_id, error)
+        await self._disable_workflow(workflow_id, reason=f"run {run_id} crash-looped the server")
+
+    async def _disable_workflow(self, workflow_id: str, reason: str) -> None:
+        # The in-memory runner first, so nothing can trigger it on this process
+        # even when persisting the flag fails (e.g. a read-only ConfigMap).
+        runner = self.yaml_graph_registry.get(workflow_id)
+        if runner is not None:
+            runner.enabled = False
+        if self.workflow_backend is None:
+            logger.warning("workflow '%s' disabled in memory only (no workflow backend): %s", workflow_id, reason)
+            return
+        try:
+            backend = unwrap(self.workflow_backend)
+            defn = await backend.get(workflow_id)
+            if defn is None:
+                logger.warning("workflow '%s' not found; cannot persist disable (%s)", workflow_id, reason)
+                return
+            if defn.enabled:
+                defn.enabled = False
+                await backend.update(workflow_id, defn)
+            await self.refresh_runner(workflow_id)
+            logger.error("workflow '%s' disabled: %s", workflow_id, reason)
+        except Exception:
+            logger.exception("Failed to persist disable of workflow '%s' (%s)", workflow_id, reason)
 
     async def _recover_run(self, run: GraphRun) -> None:
         if run.kind == "job":
@@ -995,12 +1142,14 @@ class ApplicationContainer:
         await self.mongo_provider.close()
         if self.checkpointer is not None:
             self.checkpointer.close()
-        if isinstance(self.workflow_backend, MongoWorkflowBackend):
-            await self.workflow_backend.close()
-        if isinstance(self.agent_backend, MongoAgentBackend):
-            await self.agent_backend.close()
-        if isinstance(self.data_source_backend, MongoDataSourceBackend):
-            await self.data_source_backend.close()
+        if isinstance(unwrap(self.workflow_backend), MongoWorkflowBackend):
+            await unwrap(self.workflow_backend).close()
+        if isinstance(unwrap(self.agent_backend), MongoAgentBackend):
+            await unwrap(self.agent_backend).close()
+        if self.runner_backend is not None and hasattr(self.runner_backend, "close"):
+            await self.runner_backend.close()
+        if isinstance(unwrap(self.data_source_backend), MongoDataSourceBackend):
+            await unwrap(self.data_source_backend).close()
         if isinstance(self.approval_backend, MongoApprovalBackend):
             await self.approval_backend.close()
         if isinstance(self.event_backend, MongoEventBackend):
@@ -1189,6 +1338,9 @@ def build_container(settings: Settings) -> ApplicationContainer:
         MongoClient(settings.mongodb_uri),
         db_name=settings.mongodb_database,
     )
+    team_directory = MongoTeamDirectory(settings.mongodb_uri, settings.mongodb_database)
+    from app.infrastructure.persistence.runner_backend import MongoRunnerBackend
+    runner_backend = MongoRunnerBackend(settings.mongodb_uri, settings.mongodb_database)
     # Registry starts empty; populated asynchronously in startup().
     return ApplicationContainer(
         settings=settings,
@@ -1217,4 +1369,7 @@ def build_container(settings: Settings) -> ApplicationContainer:
         pvc_lease_repository=pvc_lease_repository,
         agent_task_repository=agent_task_repository,
         warm_pod_repository=warm_pod_repository,
+        runner_backend=runner_backend,
+        team_directory=team_directory,
+        login_script_store=MongoLoginScriptStore(team_directory.database),
     )
