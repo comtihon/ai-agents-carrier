@@ -1,16 +1,13 @@
-"""LangGraph wiring for ``type: dynamic`` steps.
+"""Workflow-graph wiring for ``type: dynamic`` steps.
 
-A dynamic step becomes two graph nodes:
-
-    <id>        runs the engine until it completes, fails, or needs a human
-    <id>__gate  interrupts for that human, then loops back to <id>
-
-Pausing through a separate gate node (rather than calling ``interrupt()``
-inside the long-running node) keeps LangGraph's resume semantics simple: the
-gate is re-executed on resume and returns the decision; the dynamic node then
-runs a fresh pass that reloads the persisted DAG and applies it. The gate is an
-ordinary step in the runner's step list, so the run status (waiting_approval),
-the approvals panel and approve/reject all work unchanged.
+A dynamic step is one node of the workflow graph that runs the job graph
+(``graph.py``) as a LangGraph subgraph, orchestrated by the meta-agent
+(``meta_agent.py``). The subgraph checkpoints under that node, and a gate's
+``interrupt()`` inside it pauses the whole workflow: the run shows
+``waiting_approval`` at the dynamic step, the approvals panel and
+approve/reject work unchanged, and ``Command(resume=...)`` on the workflow
+resumes the subgraph exactly where it stopped. Attempts running at the time
+keep running on the step's ``JobHub``; their results wait for the resume.
 
 Each job attempt runs as a child ``GraphRun`` (kind="job") through the same
 ``execute_agent_step`` every static agent step uses — runtimes, warm pods,
@@ -23,107 +20,39 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from app.domain.models.dynamic import DynamicConfig, DynamicRunState, Job, JobAttempt
-from app.infrastructure.orchestration.dynamic.dispatcher import Dispatcher, build_llm_call, build_roster
-from app.infrastructure.orchestration.dynamic.engine import OUTPUT_FIELDS, DynamicEngine, JobOutcome
+from app.infrastructure.orchestration.dynamic.dispatcher import build_llm_call, build_roster, validate_jobs
+from app.infrastructure.orchestration.dynamic.engine import OUTPUT_FIELDS, AttemptResult, JobOutcome, result_of
+from app.infrastructure.orchestration.dynamic.graph import build_job_graph, initial_input
+from app.infrastructure.orchestration.dynamic.hub import drop_hub, hub_for
+from app.infrastructure.orchestration.dynamic.meta_agent import LlmMetaAgent
 
 if TYPE_CHECKING:  # pragma: no cover
     from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner
 
 logger = logging.getLogger(__name__)
 
-GATE_SUFFIX = "__gate"
-
-
-def gate_key(step_id: str) -> str:
-    return f"_dynamic_gate_{step_id}"
-
-
-def resolution_key(step_id: str) -> str:
-    return f"_dynamic_resolution_{step_id}"
+# Supersteps one pass of the job graph may take (two per event). The DAG's own
+# budgets — jobs, retries, rearrangements, replans — are what bound the loops.
+RECURSION_LIMIT = 100_000
 
 
 def output_key(step: dict[str, Any]) -> str:
     return step.get("output_key") or step["id"]
 
 
-def expand_dynamic_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Insert each dynamic step's gate right after it (idempotent)."""
-    if not isinstance(steps, list):
-        return steps
-    ids = {s.get("id") for s in steps if isinstance(s, dict)}
-    out: list[dict[str, Any]] = []
-    for step in steps:
-        out.append(step)
-        if isinstance(step, dict) and step.get("type") == "dynamic":
-            gid = f"{step['id']}{GATE_SUFFIX}"
-            if gid not in ids:
-                out.append({"id": gid, "type": "dynamic_gate", "dynamic_step": step["id"], "next": step["id"]})
-    return out
-
-
 def state_fields(step: dict[str, Any]) -> dict[str, Any]:
     """State keys a dynamic step writes; LangGraph drops undeclared keys."""
     if step.get("type") != "dynamic":
         return {}
-    sid = step["id"]
-    return {gate_key(sid): Any, resolution_key(sid): Any, output_key(step): Any}
-
-
-def router(step: dict[str, Any]):
-    """After the dynamic node: to the gate when it paused, else onward."""
-    sid = step["id"]
-    gate = f"{sid}{GATE_SUFFIX}"
-    nxt = step.get("next") or "END"
-
-    def route(state: dict) -> str:
-        return gate if state.get(gate_key(sid)) else nxt
-
-    return route, gate, nxt
-
-
-def make_gate_node(runner: "YamlGraphRunner", step: dict[str, Any]):
-    dynamic_id = step["dynamic_step"]
-
-    def node(state: dict) -> dict:
-        from langgraph.types import interrupt
-
-        pending = state.get(gate_key(dynamic_id)) or {}
-        logger.info("[%s] dynamic step '%s' waiting for a decision", runner.id, dynamic_id)
-        decision = interrupt({"type": "dynamic_approval", "step_id": dynamic_id, **pending})
-        if not isinstance(decision, dict):
-            decision = {"approved": bool(decision)}
-        record = {
-            "step_id": step["id"],
-            "approved": decision.get("approved", False),
-            "reason": decision.get("reason"),
-            "corrections": decision.get("corrections") or None,
-            "approver_name": decision.get("approver_name"),
-            "approver_id": decision.get("approver_id"),
-            "approver_source": decision.get("approver_source"),
-            "decided_at": decision.get("decided_at"),
-        }
-        history = list(state.get("approval_history") or [])
-        history.append(record)
-        return {gate_key(dynamic_id): None, resolution_key(dynamic_id): decision, "approval_history": history}
-
-    return node
-
-
-def _gate_payload(state: DynamicRunState, config: DynamicConfig) -> dict[str, Any]:
-    decisions = state.open_decisions()
-    return {
-        "automation": config.automation,
-        "decisions": [d.model_dump(mode="json") for d in decisions],
-        # A one-line text for the generic approval panel and Slack.
-        "plan": "\n".join(f"[{d.kind}] {d.summary}" for d in decisions),
-    }
+    return {output_key(step): Any}
 
 
 class _RunStore:
-    """Persists the DAG onto the parent run without clobbering concurrent writes."""
+    """Mirrors the DAG onto the parent run without clobbering concurrent writes."""
 
     def __init__(self, run: Any, repo: Any, step_id: str) -> None:
         self.run = run
@@ -131,27 +60,68 @@ class _RunStore:
         self.step_id = step_id
         self._lock = asyncio.Lock()
 
+    def _raw(self) -> dict[str, Any] | None:
+        return (getattr(self.run, "dynamic", None) or {}).get(self.step_id) if self.run is not None else None
+
     def load(self) -> DynamicRunState:
-        raw = (getattr(self.run, "dynamic", None) or {}).get(self.step_id) if self.run is not None else None
+        raw = self._raw()
         return DynamicRunState.model_validate(raw) if raw else DynamicRunState(step_id=self.step_id)
 
     async def save(self, state: DynamicRunState) -> None:
-        if self.run is None or self.repo is None:
-            return
-        data = state.model_dump(mode="json")
         async with self._lock:
-            # The run object is shared with the stream loop: keep it current so
-            # its own full-document writes carry the DAG too.
-            self.run.dynamic = {**(self.run.dynamic or {}), self.step_id: data}
-            try:
-                set_dynamic = getattr(self.repo, "set_dynamic", None)
-                if set_dynamic is not None:
-                    await set_dynamic(self.run.id, self.step_id, data)
-                else:
-                    self.run.touch()
-                    await self.repo.update(self.run)
-            except Exception:
-                logger.exception("dynamic step '%s': failed to persist DAG", self.step_id)
+            await self._write(state.model_dump(mode="json"))
+
+    async def record_attempt(self, job_id: str, n: int, child_run_id: str | None, result: AttemptResult | None) -> None:
+        """Note an attempt's child run, then its result, on the mirrored DAG."""
+        async with self._lock:
+            raw = self._raw()
+            if not raw:
+                return
+            state = DynamicRunState.model_validate(raw)
+            job = state.job(job_id)
+            attempt = next((a for a in job.attempts if a.n == n), None) if job is not None else None
+            if attempt is None:
+                return
+            attempt.child_run_id = child_run_id or attempt.child_run_id
+            if result is not None:
+                attempt.status = result.status  # type: ignore[assignment]
+                attempt.output = result.output
+                attempt.error = result.error
+                attempt.questions = result.questions
+                attempt.finished_at = datetime.now(timezone.utc)
+            await self._write(state.model_dump(mode="json"))
+
+    def recorded(self, job_id: str, n: int) -> AttemptResult | None:
+        """The result an attempt already reported, if a replayed wave reaches it again."""
+        raw = self._raw()
+        if not raw:
+            return None
+        job = DynamicRunState.model_validate(raw).job(job_id)
+        attempt = next((a for a in job.attempts if a.n == n), None) if job is not None else None
+        if attempt is None or attempt.finished_at is None or attempt.status not in ("finished", "failed", "needs_input"):
+            return None
+        return AttemptResult(
+            status=attempt.status, output=attempt.output, error=attempt.error, questions=attempt.questions,
+            job_id=job_id, attempt=n, child_run_id=attempt.child_run_id,
+        )
+
+    async def _write(self, data: dict[str, Any]) -> None:
+        if self.run is None:
+            return
+        # The run object is shared with the stream loop: keep it current so
+        # its own full-document writes carry the DAG too.
+        self.run.dynamic = {**(self.run.dynamic or {}), self.step_id: data}
+        if self.repo is None:
+            return
+        try:
+            set_dynamic = getattr(self.repo, "set_dynamic", None)
+            if set_dynamic is not None:
+                await set_dynamic(self.run.id, self.step_id, data)
+            else:
+                self.run.touch()
+                await self.repo.update(self.run)
+        except Exception:
+            logger.exception("dynamic step '%s': failed to persist DAG", self.step_id)
 
 
 def _questions_from_interrupt(exc: BaseException) -> list[str]:
@@ -172,7 +142,7 @@ def make_job_runner(runner: "YamlGraphRunner", step: dict[str, Any], config: Dyn
         from app.core.config import get_settings
         from app.domain.models.graph_run import GraphRun
         from app.services.agent_cleanup import cleanup_run_agents
-        from app.steps.agent_executor import MetaLLMRejectionError, execute_agent_step
+        from app.steps.agent_executor import AgentNeedsInput, MetaLLMRejectionError, execute_agent_step
 
         settings = get_settings()
         repo = runner._current_run_repository
@@ -200,6 +170,14 @@ def make_job_runner(runner: "YamlGraphRunner", step: dict[str, Any], config: Dyn
             "agent_id": job.agent_id,
             "input_mapping": {k: k for k in payload if k != "clarification_context"},
             "output_mapping": {f: f for f in fields},
+            # Questions come back as the attempt's result: the meta-agent decides.
+            "questions_mode": "return",
+        }
+        # Only sources enabled for the step reach the grant, whatever the job lists.
+        grants = {
+            d.source_id: list(d.operations)
+            for sid in job.datasources
+            if (d := config.datasource(sid)) is not None and d.operations
         }
         if config.shared_volume is not None:
             # Every job of the run mounts the same claim.
@@ -225,11 +203,14 @@ def make_job_runner(runner: "YamlGraphRunner", step: dict[str, Any], config: Dyn
                 agent_task_repository=runner._agent_task_repository,
                 warm_pod_repository=runner._warm_pod_repository,
                 use_meta_llm=runner._use_meta_llm,
+                datasource_grants=grants or None,
             )
             output = {k: result[k] for k in fields if k in result}
             if "_meta_llm_result" in result:
                 output["_meta_llm_result"] = result["_meta_llm_result"]
             outcome = JobOutcome(status="finished", output=output)
+        except AgentNeedsInput as exc:
+            outcome = JobOutcome(status="needs_input", questions=exc.questions)
         except GraphInterrupt as exc:
             outcome = JobOutcome(status="needs_input", questions=_questions_from_interrupt(exc))
         except MetaLLMRejectionError as exc:
@@ -276,12 +257,13 @@ def make_dynamic_node(runner: "YamlGraphRunner", step: dict[str, Any]):
     out_key = output_key(step)
 
     async def node(state: dict) -> dict:
+        from langgraph.errors import GraphBubbleUp
+
         config = DynamicConfig.from_step(step)
         run = runner._current_run
         repo = runner._current_run_repository
         run_id = run.id if run is not None else "unknown"
         store = _RunStore(run, repo, step_id)
-        dstate = store.load()
 
         if runner._agent_backend is None:
             return {"__failed_step__": step_id, "error": "agent backend not configured"}
@@ -296,6 +278,7 @@ def make_dynamic_node(runner: "YamlGraphRunner", step: dict[str, Any]):
         request = runner._render(template, state) if template else str(state.get("request") or "")
 
         from app.core.config import get_settings
+        from app.services.agent_inbox import deliver_answer
 
         async def stopped() -> bool:
             if repo is None or run is None:
@@ -306,27 +289,47 @@ def make_dynamic_node(runner: "YamlGraphRunner", step: dict[str, Any]):
                 return False
             return fresh is not None and fresh.status in ("failed", "cancelled")
 
-        engine = DynamicEngine(
+        async def deliver(child_run_id: str, text: str) -> None:
+            await deliver_answer(repo, child_run_id, text)
+
+        # The hub outlives this node across a gate: attempts started before the
+        # pause keep running and are found again on resume.
+        hub = hub_for(run_id, step_id)
+        hub.configure(
+            job_runner=make_job_runner(runner, step, config, run_id),
+            on_attempt=store.record_attempt,
+            recorded=store.recorded,
+            deliver_answer=deliver,
+        )
+        graph = build_job_graph(
             config=config,
-            state=dstate,
-            dispatcher=Dispatcher(build_llm_call(config, get_settings())),
+            meta=LlmMetaAgent(build_llm_call(config, get_settings())),
             roster=build_roster(config, agents),
             request=request,
-            job_runner=make_job_runner(runner, step, config, run_id),
-            persist=store.save,
             run_id=run_id,
+            hub=hub,
+            persist=store.save,
             stop_check=stopped,
         )
-        outcome = await engine.advance(state.get(resolution_key(step_id)))
-        update: dict[str, Any] = {resolution_key(step_id): None}
-        if outcome == "gate":
-            update[gate_key(step_id)] = _gate_payload(engine.state, config)
-            return update
-        update[gate_key(step_id)] = None
-        update[out_key] = engine.result()
-        if outcome == "failed":
+        # A fresh pass starts from the mirrored DAG (empty, or kept by a manual
+        # retry); a resumed pass ignores the input and continues from the
+        # subgraph's own checkpoint.
+        try:
+            final = await graph.ainvoke(initial_input(store.load()), {"recursion_limit": RECURSION_LIMIT})
+        except GraphBubbleUp:
+            raise  # paused at a gate: the hub keeps the running attempts
+        except BaseException:
+            drop_hub(run_id, step_id)
+            raise
+        drop_hub(run_id, step_id)
+        dag = DynamicRunState.model_validate(final["dag"])
+        update: dict[str, Any] = {out_key: result_of(dag)}
+        approvals = final.get("approvals") or []
+        if approvals:
+            update["approval_history"] = [*(state.get("approval_history") or []), *approvals]
+        if dag.status == "failed":
             update["__failed_step__"] = step_id
-            update["error"] = engine.state.error
+            update["error"] = dag.error
         return update
 
     return node
@@ -343,8 +346,6 @@ def validate_dynamic_steps(steps: Any) -> list[str]:
         if not isinstance(step, dict) or step.get("type") != "dynamic":
             continue
         sid = step.get("id", "?")
-        if str(sid).endswith(GATE_SUFFIX):
-            errors.append(f"step '{sid}': a dynamic step id may not end with '{GATE_SUFFIX}'")
         try:
             config = DynamicConfig.from_step(step)
         except ValidationError as exc:
@@ -354,9 +355,13 @@ def validate_dynamic_steps(steps: Any) -> list[str]:
             continue
         if not config.agent_pool:
             errors.append(f"step '{sid}': agent_pool is empty — select the agents this workflow may use")
-        can_execute = any(not a.categories or "execution" in a.categories for a in config.agent_pool)
-        if config.agent_pool and not can_execute:
-            errors.append(f"step '{sid}': no agent in the pool may fill execution jobs")
+        for category, slot in config.jobs.items():
+            can_fill = any(not a.categories or category in a.categories for a in config.agent_pool)
+            if config.agent_pool and slot.min > 0 and not can_fill:
+                errors.append(f"step '{sid}': no agent in the pool may fill {category} jobs (jobs.{category}.min is {slot.min})")
+        if config.plan is not None and config.agent_pool:
+            for problem in validate_jobs(config.plan, config, []):
+                errors.append(f"step '{sid}': plan: {problem}")
     return errors
 
 
