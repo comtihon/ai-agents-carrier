@@ -149,7 +149,22 @@ async def test_post_message_sends_json_with_a_bearer_token(transport):
     request = t.requests[0]
     assert str(request.url) == "https://slack.com/api/chat.postMessage"
     assert request.headers["Authorization"] == f"Bearer {TOKEN}"
-    assert json.loads(request.content) == {"channel": "C1", "text": "hello"}
+    assert json.loads(request.content) == {
+        "channel": "C1", "text": "hello",
+        "unfurl_links": False, "unfurl_media": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_post_message_unfurls_only_when_extra_asks(transport):
+    t = transport({"chat.postMessage": {"ok": True, "ts": "1.1", "channel": "C1"}})
+    await SlackProvider(TOKEN).post_message(
+        "C1", "https://example.com",
+        extra={"unfurl_links": True, "unfurl_media": True},
+    )
+
+    body = json.loads(t.requests[0].content)
+    assert body["unfurl_links"] is True and body["unfurl_media"] is True
 
 
 @pytest.mark.asyncio

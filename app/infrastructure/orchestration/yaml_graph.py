@@ -3241,6 +3241,8 @@ class YamlGraphRunner:
                      the thread — the idempotency guard
         ``ignore_errors``  capture a provider error under ``output_key`` instead
                      of failing the run
+        ``unfurl``   show link/media previews for URLs in the text (post/reply/dm);
+                     off by default so a posted URL does not balloon the message
 
         Every string field is ``{state}``-templated like the other steps.  The
         credential is never part of this config: the provider reads
@@ -3267,6 +3269,7 @@ class YamlGraphRunner:
                 channel = self._render(str(step.get("channel") or ""), state).strip()
                 text = self._render(str(step.get("text") or ""), state)
                 thread_id = self._render(str(step.get("thread_id") or ""), state).strip()
+                extra = self._unfurl_extra(step)
 
                 logger.info(
                     "[%s] step '%s' running (%s %s channel=%s)",
@@ -3275,13 +3278,13 @@ class YamlGraphRunner:
 
                 if action == "post":
                     self._need(step_id, "channel", channel)
-                    posted = await provider.post_message(channel, text)
+                    posted = await provider.post_message(channel, text, extra=extra)
                     result: Any = posted.as_dict()
 
                 elif action == "reply":
                     self._need(step_id, "channel", channel)
                     result = await self._post_replies(step, state, provider, channel,
-                                                      thread_id, text)
+                                                      thread_id, text, extra)
 
                 elif action == "history":
                     self._need(step_id, "channel", channel)
@@ -3304,7 +3307,7 @@ class YamlGraphRunner:
                     user_id = self._render(str(step.get("user_id") or ""), state).strip()
                     self._need(step_id, "user_id", user_id)
                     dm_channel = await provider.open_dm(user_id)
-                    posted = await provider.post_message(dm_channel, text)
+                    posted = await provider.post_message(dm_channel, text, extra=extra)
                     result = {**posted.as_dict(), "user_id": user_id}
 
                 else:  # delete
@@ -3333,6 +3336,17 @@ class YamlGraphRunner:
         return node
 
     @staticmethod
+    def _unfurl_extra(step: dict[str, Any]) -> dict[str, Any] | None:
+        """Provider passthrough for ``unfurl: true``; ``None`` keeps previews off.
+
+        The Slack provider suppresses link/media previews unless told otherwise,
+        so the flag only has to be sent when a step opts in.
+        """
+        if not step.get("unfurl"):
+            return None
+        return {"unfurl_links": True, "unfurl_media": True}
+
+    @staticmethod
     def _need(step_id: str, field: str, value: str) -> None:
         if not value:
             raise ValueError(f"step '{step_id}' needs a non-empty '{field}'")
@@ -3346,6 +3360,7 @@ class YamlGraphRunner:
         channel: str,
         thread_id: str,
         text: str,
+        extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Post one thread reply, or a batch of them, skipping duplicates.
 
@@ -3395,7 +3410,12 @@ class YamlGraphRunner:
                 if any(m.text == entry_text and m.id != entry_thread for m in existing):
                     skipped.append({"thread_id": entry_thread, "reason": "already_replied"})
                     continue
-            sent = await provider.reply_in_thread(channel, entry_thread, entry_text)
+            if extra:
+                sent = await provider.post_message(
+                    channel, entry_text, thread_id=entry_thread, extra=extra
+                )
+            else:
+                sent = await provider.reply_in_thread(channel, entry_thread, entry_text)
             posted.append({**sent.as_dict(), "thread_id": entry_thread})
 
         if not batch:

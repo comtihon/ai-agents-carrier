@@ -30,6 +30,7 @@ class FakeProvider(MessagingProvider):
 
     def __init__(self) -> None:
         self.posted: list[dict] = []
+        self.extras: list[dict | None] = []
         self.opened: list[str] = []
         self.deleted: list[tuple[str, str]] = []
         self.history: list[Message] = []
@@ -47,6 +48,7 @@ class FakeProvider(MessagingProvider):
         if self.fail_with:
             raise self.fail_with
         self.posted.append({"channel": channel, "text": text, "thread_id": thread_id})
+        self.extras.append(extra)
         return PostedMessage(id=self._next_ts(), channel=channel)
 
     async def reply_in_thread(self, channel, thread_id, text):
@@ -113,6 +115,25 @@ async def test_post_templates_channel_and_text(provider):
         {"channel": "C0123456789", "text": "Board:\n3 alerts", "thread_id": None}
     ]
     assert out["digest"] == {"message_id": "99.1", "channel": "C0123456789"}
+
+
+@pytest.mark.asyncio
+async def test_link_previews_stay_off_unless_the_step_asks(provider):
+    await _node({"id": "s", "action": "post", "channel": "C1",
+                 "text": "https://example.com"})({})
+    assert provider.extras == [None]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("step", [
+    {"action": "post", "channel": "C1"},
+    {"action": "reply", "channel": "C1", "thread_id": "170.1"},
+    {"action": "dm", "user_id": "U1"},
+])
+async def test_unfurl_true_turns_link_previews_on(provider, step):
+    await _node({"id": "s", "text": "https://example.com", "unfurl": True, **step})({})
+    assert provider.extras == [{"unfurl_links": True, "unfurl_media": True}]
+    assert provider.posted[0]["thread_id"] == step.get("thread_id")
 
 
 @pytest.mark.asyncio

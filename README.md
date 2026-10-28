@@ -464,6 +464,8 @@ than a new step type.
   action: dm
   user_id: "{owner_slack_id}"      # the DM channel is opened for you
   text: "{board_warning}"
+  unfurl: false                    # post/reply/dm — link & media previews for
+                                   #   URLs in the text; off by default
   output_key: dm
 ```
 

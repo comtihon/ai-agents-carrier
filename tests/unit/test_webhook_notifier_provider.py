@@ -62,7 +62,8 @@ async def test_thread_reply_hits_chat_postmessage_with_the_thread_ts(slack):
     request = t.requests[0]
     assert str(request.url) == "https://slack.com/api/chat.postMessage"
     assert request.headers["Authorization"] == f"Bearer {TOKEN}"
-    assert _body(t) == {"channel": "C9", "text": "done", "thread_ts": "170.1"}
+    assert _body(t) == {"channel": "C9", "text": "done", "thread_ts": "170.1",
+                        "unfurl_links": False, "unfurl_media": False}
 
 
 @pytest.mark.asyncio

@@ -201,7 +201,15 @@ class SlackProvider(MessagingProvider):
         blocks: list[Any] | None = None,
         extra: dict[str, Any] | None = None,
     ) -> PostedMessage:
-        payload: dict[str, Any] = {**(extra or {}), "channel": channel}
+        # Link and media previews are off unless the caller asks for them via
+        # ``extra``: an unfurled URL turns a one-line notice into a card that
+        # buries the message it belongs to.
+        payload: dict[str, Any] = {
+            "unfurl_links": False,
+            "unfurl_media": False,
+            **(extra or {}),
+            "channel": channel,
+        }
         if text or "text" not in payload:
             payload["text"] = text
         if blocks is not None:
