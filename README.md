@@ -73,6 +73,7 @@ API at `http://localhost:8000`. Health check: `GET /health`.
 | `ACP_RUNNER_ENROLLMENT_TTL_S` | `600` | How long a machine's approval number stays valid |
 | `ACP_RUNNER_ENROLL_ROLES` | `[]` | Roles allowed to approve machines (on top of WRITE); empty = anyone with WRITE. Super admins always may |
 | `ACP_RUNNER_WAIT_S` | `600` | How long a step waits for an offline runner (`agent_input.runner_wait_s` per agent) |
+| `ACP_RUNNER_WORKSPACE_URL_TTL_S` | `86400` | Validity of the signed URLs a runner syncs an `s3`-addon workspace with (max 7 days; re-signed on every launch) |
 | `UI_BASE_URL` | — | carrier-bridge URL; runners print `<UI_BASE_URL>/#approve-runner` as the approval link |
 | `ACP_QUOTA_MAX_WAIT_S` | `86400` | Longest a step stays parked on an agent's usage limit (`agent_input.quota_max_wait_s` per agent) |
 | `ACP_QUOTA_RETRY_S` | `1800` | Retry interval when an agent's limit gives no reset time |
@@ -783,7 +784,41 @@ backoff; a step waits up to `ACP_RUNNER_WAIT_S` for it to come online, and a
 step running on it survives socket drops (replay) and carrier restarts
 (re-attach). Each step runs in `<runner workspace>/<run_id>` unless the agent
 sets `agent_input.acp_cwd`. Live runner sockets are held in memory: serve
-runners from a single replica. Protocol and enrollment details:
+runners from a single replica.
+
+Addons on a runner agent:
+
+- **s3** — the same workspace a pod agent gets
+  (`gs://<bucket>/<path>/workspace.tar.gz`): carrier signs a GET and a PUT URL
+  for it and passes them in `_proxy/launch` `config.workspace`; the proxy
+  restores the step directory before the agent starts and uploads it after
+  every turn (acp-web-proxy ≥ 0.3, *Workspace sync*). The machine needs no
+  bucket access. Signing needs a credential that can sign — under Workload
+  Identity, `roles/iam.serviceAccountTokenCreator` for the backend's service
+  account on itself; without it the step runs unsynced and says so in its
+  progress. `agent_input.workspace_exclude` (tar patterns) keeps files out of
+  the upload.
+- **datasource** — works; the machine is handed `BASE_URL/mcp/datasources`
+  (not the cluster-internal callback address) with the scoped grant.
+- **mcp** — HTTP/SSE servers work when their URL is reachable from the
+  machine. Stdio servers are dropped by the proxy's default runner policy
+  (`allow_stdio_mcp: false`).
+- **tools** — the grant reaches the agent in `_meta.carrier.tools`, which only
+  pi-carrier-agent reads; tool secrets are never sent to a machine, nor are
+  backend credentials or step `env_vars`.
+
+**Isolation.** Grants are scoped per agent definition inside carrier — a step
+gets only its own agent's MCP servers and data source operations — but every
+agent on one machine runs as the same OS user, with a shell and with that
+user's own local MCP configuration. Treat a machine as one trust domain: what
+is granted to one agent on it (data source grants, MCP bearer tokens) and what
+the user configured locally is reachable by every agent that runs there. Put
+agents that must not share access on different machines. Details:
+[acp-web-proxy docs/runners.md](https://github.com/comtihon/acp-web-proxy/blob/main/docs/runners.md#isolation-between-agents-on-one-machine).
+
+Runners need `/mcp/datasources` reachable at `BASE_URL`: its host is accepted
+alongside the callback address, so the static `MCP_DATASOURCES_API_KEY` (all
+sources) is usable wherever `BASE_URL` is — keep it secret accordingly. Protocol and enrollment details:
 [acp-web-proxy docs/runners.md](https://github.com/comtihon/acp-web-proxy/blob/main/docs/runners.md).
 
 ### Usage limits (ACP agents)

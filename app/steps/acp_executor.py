@@ -29,10 +29,12 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from app.application.runners import RunnerOffline
+from app.core.config import DATASOURCES_MCP_NAME
 from app.domain.models.runner import AgentLimit
 from app.infrastructure.acp.client import AcpConnection, AcpError, AcpMethodError, to_ws_url
 from app.services import agent_inbox
 from app.steps.acp_limits import LimitInfo, classify_limit
+from app.steps.acp_runner_workspace import WorkspaceUnavailable, runner_workspace
 
 if TYPE_CHECKING:  # pragma: no cover
     from app.core.config import Settings
@@ -258,8 +260,12 @@ async def run_acp_agent(
     blocked = list(agent_config.get("blocked_commands") or [])
     # While session/load replays the conversation, its updates are history.
     loading = False
+    # gs:// URI of a runner's workspace archive, once the proxy uploaded it.
+    workspace_uri: str | None = None
+    workspace_uploaded = False
 
     async def on_notification(method: str, params: dict[str, Any]) -> None:
+        nonlocal workspace_uploaded
         if method == "session/update":
             if loading:
                 return
@@ -267,6 +273,11 @@ async def run_acp_agent(
             await sink.maybe_flush()
         elif method == "_proxy/agent_exited":
             sink.add(f"agent exited (code {params.get('code')})")
+        elif method == "_proxy/workspace":
+            if params.get("event") == "uploaded":
+                workspace_uploaded = True
+            else:
+                sink.add(f"workspace upload failed: {params.get('error')}")
 
     async def on_request(method: str, params: dict[str, Any]) -> Any:
         if method == "session/request_permission":
@@ -347,8 +358,17 @@ async def run_acp_agent(
         launch_params: dict[str, Any] = {}
         if runner_agent:
             launch_params["agent"] = runner_agent
+        if runner is not None:
+            workspace = await launch_workspace()
+            if workspace is not None:
+                launch_params["config"] = {"workspace": workspace}
         launched = await c.request("_proxy/launch", launch_params, timeout=600)
         c.connection_id = c.connection_id or (launched or {}).get("connection_id")
+        restore = ((launched or {}).get("workspace") or {}).get("restore")
+        if restore:
+            sink.add({"restored": f"workspace restored from {workspace_uri}",
+                      "empty": "workspace starts empty (nothing uploaded yet)",
+                      "kept": "workspace kept from the previous launch"}.get(restore, f"workspace: {restore}"))
         init = await c.request("initialize", {
             "protocolVersion": PROTOCOL_VERSION,
             "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False}, "terminal": False},
@@ -369,8 +389,31 @@ async def run_acp_agent(
             cwd = _session_cwd(agent_def, runner, run_id)
         return cwd
 
+    async def launch_workspace() -> dict[str, Any] | None:
+        """Signed URLs the runner syncs the session directory with (``s3`` addon)."""
+        nonlocal workspace_uri
+        cwd = await session_cwd()
+        root = ((runner.labels or {}).get("workspace") or "").rstrip("/\\")
+        try:
+            found = await runner_workspace(agent_config, cwd, settings)
+        except WorkspaceUnavailable as exc:
+            sink.add(f"workspace not synced: {exc}")
+            return None
+        if found is None:
+            return None
+        if not root or not cwd.startswith(root + ("\\" if runner.os == "win32" else "/")):
+            sink.add(f"workspace not synced: {cwd} is outside the machine's workspace {root or '(none reported)'}")
+            return None
+        workspace, workspace_uri = found
+        return workspace
+
     def session_mcp_servers() -> list[dict[str, Any]]:
-        mcp_servers = to_acp_mcp_servers(agent_config.get("mcp_servers"))
+        servers = agent_config.get("mcp_servers") or []
+        if runner is not None and hasattr(settings, "resolved_runner_mcp_datasources_url"):
+            # The bridge's agent address is cluster-internal; a machine dials the public one.
+            runner_url = settings.resolved_runner_mcp_datasources_url()
+            servers = [{**s, "url": runner_url} if s.get("name") == DATASOURCES_MCP_NAME else s for s in servers]
+        mcp_servers = to_acp_mcp_servers(servers)
         mcp_caps = caps.get("mcpCapabilities") or {}
         dropped = [
             s["name"] for s in mcp_servers
@@ -496,8 +539,11 @@ async def run_acp_agent(
             conn = await open_connection()
             carrier_meta = {**agent_config, "run_id": run_id, "task_id": task_key}
             if runner is not None:
-                # A user's machine gets no carrier-side credentials (tool env).
+                # A user's machine gets no carrier-side credentials: no step env,
+                # no backend API keys, no tool secrets.
                 carrier_meta.pop("env_vars", None)
+                carrier_meta.pop("credentials", None)
+                carrier_meta["tools"] = [{**t, "env": {}} for t in carrier_meta.get("tools") or []]
             meta: dict[str, Any] = {"carrier": carrier_meta}
             if agent_config.get("system_prompt"):
                 # claude-agent-acp's slot for a system prompt; others ignore it.
@@ -596,6 +642,8 @@ async def run_acp_agent(
             raw["meta_token_usage"] = meta_out["meta_usage"]
         if meta_out.get("workspace_path"):
             raw["workspace_s3_path"] = meta_out["workspace_path"]
+        elif workspace_uploaded and workspace_uri:
+            raw["workspace_s3_path"] = workspace_uri
         if stop in ("max_tokens", "max_turn_requests", "refusal"):
             raw["stop_reason"] = stop
         return raw

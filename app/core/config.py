@@ -463,6 +463,9 @@ class Settings(BaseSettings):
     # How long a step waits for an offline runner before failing (an agent may
     # override it with agent_input.runner_wait_s).
     acp_runner_wait_s: int = Field(default=600, alias="ACP_RUNNER_WAIT_S")
+    # Validity of the signed URLs a runner syncs an s3-addon workspace with
+    # (capped at 7 days); they are signed afresh on every launch.
+    acp_runner_workspace_url_ttl_s: int = Field(default=86400, alias="ACP_RUNNER_WORKSPACE_URL_TTL_S")
     # carrier-bridge URL, for the approval link a runner prints.
     ui_base_url: str | None = Field(default=None, alias="UI_BASE_URL")
 
@@ -755,14 +758,18 @@ class Settings(BaseSettings):
             return [h for h in self.mcp_datasources_allowed_hosts if h]
         from urllib.parse import urlsplit
 
-        netloc = urlsplit(self.resolved_agent_mcp_datasources_url()).netloc
-        if not netloc:
-            return []
-        # Both forms: the declared address may or may not carry a port, and a
-        # client is free to include or omit the default one for the scheme.
-        host = netloc.split("@")[-1]
-        bare = host.rsplit(":", 1)[0] if ":" in host and not host.endswith("]") else host
-        return list(dict.fromkeys([host, bare, f"{bare}:*"]))
+        hosts: list[str] = []
+        # Pod agents dial the callback address, runners the public one.
+        for url in (self.resolved_agent_mcp_datasources_url(), self.resolved_runner_mcp_datasources_url()):
+            netloc = urlsplit(url).netloc
+            if not netloc:
+                continue
+            # Both forms: the declared address may or may not carry a port, and a
+            # client is free to include or omit the default one for the scheme.
+            host = netloc.split("@")[-1]
+            bare = host.rsplit(":", 1)[0] if ":" in host and not host.endswith("]") else host
+            hosts += [host, bare, f"{bare}:*"]
+        return list(dict.fromkeys(hosts))
 
     def resolved_datasource_grant_signing_key(self) -> str | None:
         """Key that signs and verifies ``/mcp/datasources`` capability grants.
@@ -788,6 +795,14 @@ class Settings(BaseSettings):
         """
         base = (self.agent_callback_url or self.base_url).rstrip("/")
         return f"{base}/mcp/datasources"
+
+    def resolved_runner_mcp_datasources_url(self) -> str:
+        """URL of the data sources MCP server as a *runner* agent must dial it.
+
+        A runner is a user's machine outside the cluster: the callback address
+        is usually cluster-internal, so it gets the public ``BASE_URL``.
+        """
+        return f"{self.base_url.rstrip('/')}/mcp/datasources"
 
     def resolved_service_auth_private_key(self) -> str | None:
         """Private key of the flat ``SERVICE_AUTH_*`` identity, newlines fixed."""

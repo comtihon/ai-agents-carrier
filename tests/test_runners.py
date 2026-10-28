@@ -18,6 +18,7 @@ from langchain_core.language_models.fake_chat_models import FakeMessagesListChat
 from langchain_core.messages import AIMessage
 
 import app.steps.acp_executor as acp_executor
+import app.steps.acp_runner_workspace as acp_runner_workspace
 from app.api.app import create_app
 from app.application.runners import get_runner_hub, sha256
 from app.core.config import Settings
@@ -256,6 +257,7 @@ class FakeRunner:
         self.control = None
         self.task: asyncio.Task | None = None
         self.forget_after_limit = False
+        self.upload_result: dict = {"event": "uploaded", "bytes": 10}
 
     async def start(self) -> None:
         self.control = await websockets.connect(self.s.ws, additional_headers={"Authorization": f"Bearer {self.token}"})
@@ -319,7 +321,10 @@ class FakeRunner:
         self.calls.append((m, p))
         reply = lambda result: self.emit(cid, {"jsonrpc": "2.0", "id": rid, "result": result})  # noqa: E731
         if m == "_proxy/launch":
-            await reply({"connection_id": cid, "agent": p.get("agent")})
+            ws = (p.get("config") or {}).get("workspace")
+            self.conns[cid]["workspace"] = ws
+            await reply({"connection_id": cid, "agent": p.get("agent"),
+                         **({"workspace": {"dir": ws["dir"], "restore": "restored"}} if ws else {})})
         elif m == "initialize":
             await reply({"protocolVersion": 1, "agentCapabilities": {"loadSession": True, "mcpCapabilities": {"http": True}}})
         elif m == "session/new":
@@ -339,6 +344,8 @@ class FakeRunner:
                     await conn["ws"].close()
                 return
             await self.emit(cid, _chunk('{"summary": "done"}'))
+            if self.conns[cid].get("workspace"):
+                await self.emit(cid, {"jsonrpc": "2.0", "method": "_proxy/workspace", "params": self.upload_result})
             await reply({"stopReason": "end_turn"})
         elif m == "_proxy/shutdown":
             await reply({})
@@ -373,17 +380,20 @@ class Tasks:
 SETTINGS = SimpleNamespace(acp_runner_wait_s=5, acp_quota_max_wait_s=86400, acp_quota_retry_s=60)
 
 
-async def _step(runs: Runs | None = None, tasks: Tasks | None = None, acp_agent: str | None = "codex") -> dict:
+async def _step(
+    runs: Runs | None = None, tasks: Tasks | None = None, acp_agent: str | None = "codex",
+    agent_config: dict | None = None, settings: Any = SETTINGS,
+) -> dict:
     return await run_acp_agent(
         step={"id": "code"},
         agent_def=AgentDefinition(id="laptop-codex", default_runtime="runner", runner_id="rnr-1", protocol="acp", acp_agent=acp_agent),
         input_data={"task": "fix it"},
-        agent_config={"env_vars": {"SECRET": "x"}, "system_prompt": "be good"},
+        agent_config=agent_config or {"env_vars": {"SECRET": "x"}, "system_prompt": "be good"},
         runtime=None,
         run_id="run-1",
         task_key="run-1_code_0",
         callback_base_url="http://carrier",
-        settings=SETTINGS,  # type: ignore[arg-type]
+        settings=settings,  # type: ignore[arg-type]
         run_repository=runs or Runs(),
         agent_task_repository=tasks or Tasks(),
     )
@@ -406,6 +416,86 @@ async def test_runner_step_runs_on_the_machine(server):
         new = dict(fake.calls)["session/new"]
         assert new["cwd"] == "/home/val/carrier-workspaces/run-1"
         assert "env_vars" not in new["_meta"]["carrier"]
+    finally:
+        await fake.stop()
+
+
+S3_CONFIG = {"system_prompt": "be good", "extra": {"s3_bucket": "ws-bucket", "s3_path": "runs/run-1/", "workspace_exclude": ["*.jpg"]}}
+
+
+async def test_runner_syncs_the_s3_workspace_through_signed_urls(server, monkeypatch):
+    signed: list[tuple] = []
+
+    def fake_sign(bucket, obj, ttl):
+        signed.append((bucket, obj, ttl))
+        return "https://gcs/get?sig", "https://gcs/put?sig"
+
+    monkeypatch.setattr(acp_runner_workspace, "_sign_urls", fake_sign)
+    _, token = await _runner(server)
+    fake = FakeRunner(server, token, ["ok"])
+    await fake.start()
+    try:
+        runs = Runs()
+        out = await _step(runs, agent_config=S3_CONFIG)
+        launch = dict(fake.calls)["_proxy/launch"]
+        assert launch["config"]["workspace"] == {
+            "dir": "/home/val/carrier-workspaces/run-1",
+            "download_url": "https://gcs/get?sig",
+            "upload_url": "https://gcs/put?sig",
+            "upload_headers": {"content-type": "application/gzip"},
+            "exclude": ["*.jpg"],
+        }
+        assert signed == [("ws-bucket", "runs/run-1/workspace.tar.gz", 86400)]
+        assert out["workspace_s3_path"] == "gs://ws-bucket/runs/run-1/workspace.tar.gz"
+        progress = runs.run.state["_agent_progress_code"]
+        assert "workspace restored from gs://ws-bucket/runs/run-1/workspace.tar.gz" in progress
+    finally:
+        await fake.stop()
+
+
+async def test_runner_step_runs_without_sync_when_carrier_cannot_sign(server, monkeypatch):
+    def no_key(bucket, obj, ttl):
+        raise RuntimeError("no signer")
+
+    monkeypatch.setattr(acp_runner_workspace, "_sign_urls", no_key)
+    _, token = await _runner(server)
+    fake = FakeRunner(server, token, ["ok"])
+    await fake.start()
+    try:
+        runs = Runs()
+        out = await _step(runs, agent_config=S3_CONFIG)
+        assert "config" not in dict(fake.calls)["_proxy/launch"]
+        assert "workspace_s3_path" not in out
+        assert any(line.startswith("workspace not synced: carrier cannot sign") for line in runs.run.state["_agent_progress_code"])
+    finally:
+        await fake.stop()
+
+
+async def test_runner_gets_no_backend_secrets_and_the_public_datasources_url(server):
+    _, token = await _runner(server)
+    fake = FakeRunner(server, token, ["ok"])
+    await fake.start()
+    settings = SimpleNamespace(
+        **vars(SETTINGS),
+        resolved_runner_mcp_datasources_url=lambda: "https://carrier.example.com/mcp/datasources",
+    )
+    try:
+        await _step(settings=settings, agent_config={
+            "env_vars": {"SECRET": "x"},
+            "credentials": {"ANTHROPIC_API_KEY": "sk-backend"},
+            "tools": [{"name": "github", "command": "gh", "env": {"GH_TOKEN": "ghp_backend"}}],
+            "mcp_servers": [
+                {"name": "datasources", "transport": "streamable_http", "url": "http://carrier.svc.cluster.local:8000/mcp/datasources", "api_key": "grant"},
+                {"name": "github", "transport": "streamable_http", "url": "https://api.githubcopilot.com/mcp/"},
+            ],
+        })
+        new = dict(fake.calls)["session/new"]
+        meta = new["_meta"]["carrier"]
+        assert "env_vars" not in meta and "credentials" not in meta
+        assert meta["tools"] == [{"name": "github", "command": "gh", "env": {}}]
+        urls = {s["name"]: s["url"] for s in new["mcpServers"]}
+        assert urls == {"datasources": "https://carrier.example.com/mcp/datasources", "github": "https://api.githubcopilot.com/mcp/"}
+        assert new["mcpServers"][0]["headers"] == [{"name": "Authorization", "value": "Bearer grant"}]
     finally:
         await fake.stop()
 
