@@ -51,6 +51,7 @@ API at `http://localhost:8000`. Health check: `GET /health`.
 | `AUTH_DELETE_ROLES` | `[]` | Roles granted DELETE (`DELETE`, and the `delete_*` tools) |
 | `AUTH_ADMIN_ROLES` | `[]` | Roles granted ADMIN — `python` steps with `sandbox: false`, which run inside the backend process. Keep this narrowest |
 | `AUTH_SUPER_ADMIN_ROLES` | `[]` → `AUTH_ADMIN_ROLES` | Roles granted SUPER_ADMIN — system-wide visibility (every private and team resource, every run) and team management. Empty falls back to `AUTH_ADMIN_ROLES`; set it when ADMIN is a broad operations role |
+| `AUTH_DENY_ROLES` | `["CLIENT_ADMIN", "CLIENT_PROJECT_MANAGER", "CLIENT_VIEWER", "ORG_USER_MANAGER"]` | Roles that deny everything, even alongside an allowed role — the customer roles of an identity provider shared with staff. Checked before the lists above, and against the token's roles even when a login script replaces them. `[]` disables it |
 | `AUTH_LOGIN_SCRIPT` | — | JavaScript run when a user logs in, to derive their roles, profile and team from the token (see [Login script](#login-script)) |
 | `AUTH_LOGIN_SCRIPT_PATH` | — | Path to a file holding the login script, e.g. a mounted ConfigMap. Set this or `AUTH_LOGIN_SCRIPT`, not both: startup fails if both are set |
 | `AUTH_LOGIN_SCRIPT_TIMEOUT_MS` | `1000` | Wall-clock budget for one run of the login script |
@@ -1294,7 +1295,7 @@ nothing changes: roles come from the token.
 
 | field | effect |
 |---|---|
-| `roles` | array of strings. *Replaces* the roles read from the token for the role mapping, so `AUTH_ACCESS_ROLES` … `AUTH_SUPER_ADMIN_ROLES` apply to these. `[]` means no roles; leave it out (or `null`) to keep the token's roles |
+| `roles` | array of strings. *Replaces* the roles read from the token for the role mapping, so `AUTH_ACCESS_ROLES` … `AUTH_SUPER_ADMIN_ROLES` apply to these. `[]` means no roles; leave it out (or `null`) to keep the token's roles. Roles the token carries that are in `AUTH_DENY_ROLES` are kept regardless, so a script cannot map a customer onto staff roles |
 | `name`, `email` | non-empty strings. Replace the stored profile and what `/me` reports |
 | `team` | `null`: in no team. `{name, role}` or `{id, role}`: in that team, `role` `"member"` (default) or `"admin"`. Leave it out to keep the stored membership, so teams can still be managed by hand |
 

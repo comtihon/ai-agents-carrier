@@ -277,8 +277,8 @@ class _ManagementAuthWrapper:
             if Permission.ACCESS not in permissions:
                 logger.warning(
                     "management MCP authorization rejected: subject %s holds no role "
-                    "granting access",
-                    claims.get("sub"),
+                    "granting access (denied roles: %s)",
+                    claims.get("sub"), sorted(self._policy.denied_roles(roles)),
                 )
                 await _send_403(send)
                 return

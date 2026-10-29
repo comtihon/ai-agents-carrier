@@ -172,7 +172,14 @@ class OAuthMiddleware(BaseHTTPMiddleware):
         # no project roles) shows up in logs first, while still being served.
         if not self.policy.enforce:
             required_if_enforced = permission_for_method(request.method)
-            if Permission.ACCESS not in would_grant:
+            denied = self.policy.denied_roles(roles)
+            if denied:
+                logger.warning(
+                    "RBAC shadow: subject %s would be DENIED access (holds denied "
+                    "role %s); roles=%s path=%s %s",
+                    claims.get("sub"), sorted(denied), sorted(roles), request.method, path,
+                )
+            elif Permission.ACCESS not in would_grant:
                 logger.warning(
                     "RBAC shadow: subject %s would be DENIED access (no matching role); "
                     "roles=%s path=%s %s",
@@ -191,8 +198,9 @@ class OAuthMiddleware(BaseHTTPMiddleware):
         # identity provider shared with staff).
         if Permission.ACCESS not in permissions:
             logger.warning(
-                "Authorization rejected: subject %s holds no role granting access",
-                claims.get("sub"),
+                "Authorization rejected: subject %s holds no role granting access "
+                "(denied roles: %s)",
+                claims.get("sub"), sorted(self.policy.denied_roles(roles)),
             )
             return JSONResponse(
                 status_code=403,

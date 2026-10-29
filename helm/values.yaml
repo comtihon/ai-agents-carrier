@@ -42,6 +42,9 @@ service:
 #   AUTH_ADMIN_ROLES: '["ops"]'            # unsandboxed python steps
 #   AUTH_SUPER_ADMIN_ROLES: '["platform"]' # see/manage everything + teams;
 #                                          # empty falls back to AUTH_ADMIN_ROLES
+#   AUTH_DENY_ROLES: '["customer"]'        # denies everything, even with an
+#                                          # allowed role; default: AFP's
+#                                          # customer roles, '[]' disables
 config: {}
 
 # Login script (README "Login script"): JavaScript defining onLogin(ctx), run

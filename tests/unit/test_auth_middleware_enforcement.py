@@ -43,6 +43,7 @@ POLICY_ROLES = dict(
     write_roles=frozenset({"staff"}),
     delete_roles=frozenset({"admin-role"}),
     admin_roles=frozenset({"admin-role"}),
+    deny_roles=frozenset({"CLIENT_ADMIN"}),
 )
 
 TOKENS = {
@@ -50,7 +51,8 @@ TOKENS = {
     "manager": ["manager"],          # read only
     "admin": ["staff", "admin-role"],
     "customer": ["client"],          # valid token, outside the access list
-    "roleless": [],                  # e.g. an opaque token whose userinfo has no roles
+    "roleless": [],
+    "staff-and-client": ["staff", "CLIENT_ADMIN"],  # an allowed role does not save it                  # e.g. an opaque token whose userinfo has no roles
 }
 
 
@@ -125,6 +127,22 @@ def test_role_outside_the_access_list_is_403(enforcing: TestClient) -> None:
     resp = enforcing.get("/api/v1/thing", headers=_auth("customer"))
     assert resp.status_code == 403
     assert resp.json()["detail"] == "Not authorized to access this service"
+
+
+def test_denied_role_is_403_even_with_an_allowed_role(enforcing: TestClient) -> None:
+    resp = enforcing.get("/api/v1/thing", headers=_auth("staff-and-client"))
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Not authorized to access this service"
+
+
+def test_shadow_reports_a_denied_role(
+    shadow: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="app.api.middleware.auth"):
+        resp = shadow.get("/api/v1/thing", headers=_auth("staff-and-client"))
+    assert resp.status_code == 200
+    line = "\n".join(r.getMessage() for r in caplog.records)
+    assert "would be DENIED access (holds denied role ['CLIENT_ADMIN'])" in line
 
 
 def test_token_without_roles_is_403(enforcing: TestClient) -> None:

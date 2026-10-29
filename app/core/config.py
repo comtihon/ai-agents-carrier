@@ -309,6 +309,15 @@ class Settings(BaseSettings):
     auth_super_admin_roles: list[str] = Field(
         default_factory=list, alias="AUTH_SUPER_ADMIN_ROLES"
     )
+    # Holding any of these denies everything, even alongside an allowed role.
+    # Defaults to AFP's customer roles (ORG_USER_MANAGER is what AFP gives a
+    # customer admin in their own org); staff never hold them. [] disables it.
+    auth_deny_roles: list[str] = Field(
+        default_factory=lambda: [
+            "CLIENT_ADMIN", "CLIENT_PROJECT_MANAGER", "CLIENT_VIEWER", "ORG_USER_MANAGER",
+        ],
+        alias="AUTH_DENY_ROLES",
+    )
     # Login script (see app.infrastructure.auth.login_script): JavaScript run
     # once per new token to derive the caller's roles, profile and team. Give
     # the source inline or as a file path, not both (startup fails if both are

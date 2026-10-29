@@ -248,3 +248,86 @@ def test_roles_of_reports_what_the_policy_reads() -> None:
 def test_roles_of_is_empty_for_a_token_carrying_no_roles() -> None:
     """The opaque-token case: userinfo may return a subject and nothing else."""
     assert _policy().roles_of({"sub": "user-1", "email": "a@b.c"}) == set()
+
+
+# ── the deny list ────────────────────────────────────────────────────────────
+# Customer roles on an identity provider shared with staff. A denied role must
+# win over every allow-list, so a customer role that also ends up allowed (by a
+# rename or a mis-click) still gets nothing.
+
+_CUSTOMER_ROLES = frozenset(
+    {"CLIENT_ADMIN", "CLIENT_PROJECT_MANAGER", "CLIENT_VIEWER", "ORG_USER_MANAGER"}
+)
+
+
+def _denying(**kw) -> AuthorizationPolicy:
+    return _policy(**{
+        "access_roles": frozenset({"EMPLOYEE", "AFP_ADMIN"}),
+        "read_roles": frozenset({"EMPLOYEE", "AFP_ADMIN"}),
+        "admin_roles": frozenset({"AFP_ADMIN"}),
+        "deny_roles": _CUSTOMER_ROLES,
+        **kw,
+    })
+
+
+@pytest.mark.parametrize("role", sorted(_CUSTOMER_ROLES))
+def test_a_denied_role_alone_gets_nothing(role: str) -> None:
+    assert _denying().permissions_for_roles({role}) == frozenset()
+
+
+@pytest.mark.parametrize("role", sorted(_CUSTOMER_ROLES))
+def test_a_denied_role_overrides_an_allowed_one(role: str) -> None:
+    """Even SUPER_ADMIN: the deny list is checked before every allow-list."""
+    policy = _denying()
+    assert policy.permissions_for_roles({role, "EMPLOYEE"}) == frozenset()
+    assert policy.permissions_for_roles_strict({role, "AFP_ADMIN"}) == frozenset()
+    assert policy.evaluate_shadow({"roles": [role, "AFP_ADMIN"]}) == frozenset()
+
+
+def test_a_denied_role_on_an_allow_list_still_denies() -> None:
+    policy = _denying(access_roles=frozenset({"EMPLOYEE", "ORG_USER_MANAGER"}))
+    assert policy.permissions_for_roles({"ORG_USER_MANAGER"}) == frozenset()
+
+
+def test_staff_roles_are_unaffected_by_the_deny_list() -> None:
+    policy = _denying()
+    assert policy.permissions_for_roles({"EMPLOYEE"}) == {Permission.ACCESS, Permission.READ}
+    assert Permission.SUPER_ADMIN in policy.permissions_for_roles({"AFP_ADMIN"})
+
+
+def test_shadow_mode_still_grants_but_reports_the_denied_role() -> None:
+    policy = _denying(enforce=False)
+    assert policy.permissions_for_roles({"CLIENT_ADMIN", "EMPLOYEE"}) == frozenset(Permission)
+    assert policy.denied_roles({"CLIENT_ADMIN", "EMPLOYEE"}) == {"CLIENT_ADMIN"}
+
+
+def test_an_empty_deny_list_denies_nothing() -> None:
+    policy = _denying(
+        deny_roles=frozenset(), access_roles=frozenset({"EMPLOYEE", "CLIENT_ADMIN"})
+    )
+    assert Permission.ACCESS in policy.permissions_for_roles({"CLIENT_ADMIN"})
+
+
+def test_deny_roles_come_from_settings_and_default_to_the_customer_roles() -> None:
+    from app.core.config import Settings
+
+    assert set(Settings.model_fields["auth_deny_roles"].default_factory()) == _CUSTOMER_ROLES
+    policy = AuthorizationPolicy.from_settings(
+        type("S", (), {"auth_enforce_permissions": True, "auth_deny_roles": [" X ", ""]})()
+    )
+    assert policy.deny_roles == frozenset({"X"})
+
+
+def test_a_login_script_cannot_launder_a_denied_token_role() -> None:
+    """Script roles replace the token's, but denied token roles are kept."""
+    from app.application.login import effective_roles
+    from app.infrastructure.auth.login_script import LoginDecision
+
+    policy = _denying()
+    claims = {"roles": ["CLIENT_VIEWER", "SOMETHING"]}
+    roles = effective_roles(policy, claims, LoginDecision(roles=frozenset({"EMPLOYEE"})))
+    assert roles == {"EMPLOYEE", "CLIENT_VIEWER"}
+    assert policy.permissions_for_roles(roles) == frozenset()
+    # A staff token is still mapped onto the script's roles alone.
+    staff = effective_roles(policy, {"roles": ["X"]}, LoginDecision(roles=frozenset({"EMPLOYEE"})))
+    assert staff == {"EMPLOYEE"}

@@ -22,6 +22,12 @@ they are also SUPER_ADMIN. SUPER_ADMIN has its own roles
 (``AUTH_SUPER_ADMIN_ROLES``), falling back to the ADMIN roles when none are
 configured, so a small deployment with one admin role needs no extra setting.
 
+On top of the allow-lists sits a deny list (``AUTH_DENY_ROLES``). A caller
+holding any denied role gets no permission at all, whatever else it holds. It is
+the backstop for an identity provider shared with customers: a customer role that
+also ends up on an allow-list (a role renamed, a grant mis-clicked) still locks
+the caller out rather than letting them in.
+
 Two principal kinds reach the API, and they are not equivalent. A user
 authenticates with an OAuth token and is granted permissions by role. The
 management MCP static API key is a single long-lived shared secret that cannot be
@@ -111,6 +117,11 @@ class AuthorizationPolicy:
     roles over time; with a deny-list every such addition would silently gain
     access, whereas an unlisted role here is denied by default.
 
+    ``deny_roles`` is checked before all of them and overrides them: a caller
+    holding any denied role gets nothing. It does not replace the allow-list —
+    an unlisted role is still denied — it only guarantees that the roles known to
+    belong to customers can never be granted anything, even by mistake.
+
     ``enforce`` off preserves pre-RBAC behaviour — any authenticated caller may do
     anything — because flipping to deny-by-default on upgrade would lock out every
     existing deployment. It logs a warning at startup so it cannot be forgotten.
@@ -125,6 +136,8 @@ class AuthorizationPolicy:
     admin_roles: frozenset[str] = field(default_factory=frozenset)
     # Empty means "the admin roles" (see effective_super_admin_roles).
     super_admin_roles: frozenset[str] = field(default_factory=frozenset)
+    # Any of these denies everything, whatever else the caller holds.
+    deny_roles: frozenset[str] = field(default_factory=frozenset)
 
     @property
     def effective_super_admin_roles(self) -> frozenset[str]:
@@ -145,6 +158,7 @@ class AuthorizationPolicy:
             delete_roles=cls._norm(getattr(settings, "auth_delete_roles", None)),
             admin_roles=cls._norm(getattr(settings, "auth_admin_roles", None)),
             super_admin_roles=cls._norm(getattr(settings, "auth_super_admin_roles", None)),
+            deny_roles=cls._norm(getattr(settings, "auth_deny_roles", None)),
         )
         policy.warn_if_misconfigured()
         return policy
@@ -178,6 +192,10 @@ class AuthorizationPolicy:
         # customer who happens to hold a role named in read_roles still gets nothing.
         return self.permissions_for_roles_strict(roles)
 
+    def denied_roles(self, roles: Iterable[str]) -> frozenset[str]:
+        """The roles in *roles* that are on the deny list. Exposed for diagnostics."""
+        return frozenset(roles) & self.deny_roles
+
     def permissions_for_claims(self, claims: dict[str, Any]) -> frozenset[Permission]:
         return self.permissions_for_roles(extract_roles(claims, self.project_id))
 
@@ -196,7 +214,8 @@ class AuthorizationPolicy:
 
     def permissions_for_roles_strict(self, roles: set[str]) -> frozenset[Permission]:
         """Role mapping with the ``enforce`` short-circuit removed."""
-        if not (roles & self.access_roles):
+        # The deny list wins over every allow-list, SUPER_ADMIN included.
+        if roles & self.deny_roles or not (roles & self.access_roles):
             return frozenset()
         granted = {Permission.ACCESS}
         for permission, allowed in (

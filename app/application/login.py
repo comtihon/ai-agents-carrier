@@ -357,9 +357,13 @@ def login_script_store_of(holder: Any) -> Any:
 def effective_roles(
     policy: AuthorizationPolicy, claims: dict[str, Any], decision: LoginDecision | None
 ) -> set[str]:
-    """The script's roles when it returned some, else the token's."""
+    """The script's roles when it returned some, else the token's.
+
+    Denied roles the token carries are kept even when the script replaces the
+    roles: a script must not be able to map a customer token onto staff roles.
+    """
     if decision is not None and decision.roles is not None:
-        return set(decision.roles)
+        return set(decision.roles) | policy.denied_roles(policy.roles_of(claims))
     return policy.roles_of(claims)
 
 
