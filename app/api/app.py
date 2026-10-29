@@ -256,6 +256,10 @@ class _ManagementAuthWrapper:
 
         if self._oauth_enabled and auth_header.startswith("Bearer "):
             token = auth_header.split(" ", 1)[1]
+            # Mirror OAuthMiddleware: "Bearer " with no token is a plain 401.
+            if not token.strip():
+                await _send_401(send)
+                return
             try:
                 claims = await self._auth_service.validate_token(token)
             except AuthError as exc:

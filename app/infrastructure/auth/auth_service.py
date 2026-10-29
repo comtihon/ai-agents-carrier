@@ -125,6 +125,11 @@ class AuthService:
         # caller of validate_token keeps turning it into a clean 401.
         if not token.isascii():
             raise AuthError("Invalid token: non-ASCII characters in bearer token")
+        # An empty / whitespace-only token (``Authorization: Bearer ``) is no
+        # credential either; sent on to userinfo it does not come back as a clean
+        # 401/403, so the caller used to answer 500.  Reject it up front too.
+        if not token.strip():
+            raise AuthError("Invalid token: empty bearer token")
 
         # Fast path: try standard JWT validation
         try:

@@ -256,6 +256,26 @@ async def test_non_ascii_token_raises_auth_error_on_jwks_path(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("token", ["", " ", "   "])
+async def test_empty_token_raises_auth_error_without_userinfo_call(monkeypatch, token):
+    """``Authorization: Bearer `` (empty token) must 401, not 500, on every caller."""
+    service = _make_service()
+    transport = _ExplodingTransport()
+    real_client = httpx.AsyncClient
+
+    def _client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client)
+
+    with pytest.raises(AuthError):
+        await service.validate_token(token)
+
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
 async def test_ascii_junk_token_still_reaches_userinfo():
     """Guard must not swallow ordinary ASCII junk tokens (still a 401 path)."""
     service = _make_service()

@@ -102,6 +102,23 @@ async def test_invalid_jwt_is_rejected():
     assert resp.status_code == 401
 
 
+@pytest.mark.parametrize("auth", [b"Bearer ", b"Bearer    "])
+async def test_empty_bearer_token_is_401_not_500(auth):
+    """Prod regression: ``Authorization: Bearer `` (empty token) answered 500.
+
+    Like OAuthMiddleware, the wrapper rejects it before validate_token is called.
+    """
+    service = _auth_service(valid=True)
+    wrapper = _ManagementAuthWrapper(
+        _inner_app(), api_key="secret", oauth_enabled=True, auth_service=service
+    )
+
+    status = await _raw_asgi_post(wrapper, "/management", auth=auth)
+
+    assert status == 401
+    service.validate_token.assert_not_awaited()
+
+
 async def test_fails_closed_without_api_key_and_without_oauth():
     wrapper = _ManagementAuthWrapper(_inner_app(), api_key=None, oauth_enabled=False)
     async with AsyncClient(transport=ASGITransport(app=wrapper), base_url="http://t") as c:
