@@ -314,7 +314,7 @@ class Settings(BaseSettings):
     # customer admin in their own org); staff never hold them. [] disables it.
     auth_deny_roles: list[str] = Field(
         default_factory=lambda: [
-            "CLIENT_ADMIN", "CLIENT_PROJECT_MANAGER", "CLIENT_VIEWER", "ORG_USER_MANAGER",
+            "CLIENT", "CLIENT_ADMIN", "CLIENT_PROJECT_MANAGER", "CLIENT_VIEWER", "ORG_USER_MANAGER",
         ],
         alias="AUTH_DENY_ROLES",
     )

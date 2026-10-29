@@ -256,7 +256,7 @@ def test_roles_of_is_empty_for_a_token_carrying_no_roles() -> None:
 # rename or a mis-click) still gets nothing.
 
 _CUSTOMER_ROLES = frozenset(
-    {"CLIENT_ADMIN", "CLIENT_PROJECT_MANAGER", "CLIENT_VIEWER", "ORG_USER_MANAGER"}
+    {"CLIENT", "CLIENT_ADMIN", "CLIENT_PROJECT_MANAGER", "CLIENT_VIEWER", "ORG_USER_MANAGER"}
 )
 
 
