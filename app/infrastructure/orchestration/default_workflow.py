@@ -486,14 +486,20 @@ def build_default_workflow(
         )
 
     @tool
-    async def update_agent(agent_id: str, name: str = None, description: str = None, default_runtime: str = None, agent_input_json: str = None, protocol: str = None, acp_agent: str = None) -> str:
+    async def update_agent(agent_id: str, name: str = None, description: str = None, default_runtime: str = None, agent_input_json: str = None, protocol: str = None, acp_agent: str = None, addons_json: str = None) -> str:
         """Update an existing agent definition. Only provided fields are changed; others preserved.
 
         protocol: "http-poll" or "acp". acp_agent: the proxy's agent name for
         ACP agents (pi, claude, codex); "" resets it to the proxy default.
+        addons_json: the agent's full addon list (replaces it; "[]" clears),
+        read the current one with get_agent first. Types: s3 {bucket, path --
+        "{workflow_id}" is the run id; the run's workspace archive lives at
+        <path>/workspace.tar.gz}, mcp {servers: {name: bool}}, tools {tools:
+        {name: bool}}, datasource {source_id, allowed_operations}.
         """
         return await core.update_agent(
-            deps, agent_id, name, description, default_runtime, agent_input_json, protocol, acp_agent
+            deps, agent_id, name, description, default_runtime, agent_input_json, protocol, acp_agent,
+            addons_json,
         )
 
     @tool

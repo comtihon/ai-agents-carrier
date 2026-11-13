@@ -1311,6 +1311,7 @@ async def update_agent(
     agent_input_json: str = None,
     protocol: str = None,
     acp_agent: str = None,
+    addons_json: str = None,
 ) -> str:
     if deps.agent_backend is None:
         return "Agent backend not configured."
@@ -1330,9 +1331,20 @@ async def update_agent(
     if description is not None:
         updated.description = description
     if default_runtime is not None:
-        if default_runtime not in ("local", "docker", "k8s"):
-            return f"Invalid default_runtime '{default_runtime}'. Must be one of: local, docker, k8s."
+        if default_runtime not in ("local", "docker", "k8s", "runner"):
+            return f"Invalid default_runtime '{default_runtime}'. Must be one of: local, docker, k8s, runner."
+        if default_runtime == "runner" and not updated.runner_id:
+            return "default_runtime 'runner' needs a connected machine: approve one in the Runners panel."
         updated.default_runtime = default_runtime
+    if addons_json is not None:
+        # The whole list, like the REST API's `addons`: [] clears them.
+        from pydantic import TypeAdapter, ValidationError
+
+        from app.domain.models.agent_addon import AnyAgentAddon
+        try:
+            updated.addons = TypeAdapter(list[AnyAgentAddon]).validate_json(addons_json)
+        except ValidationError as e:
+            return f"Invalid addons_json: {e}"
     if agent_input_json is not None:
         try:
             agent_input = _json.loads(agent_input_json)

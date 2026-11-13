@@ -53,3 +53,31 @@ async def test_rejects_unknown_protocol():
     deps.agent_backend.items["x"] = AgentDefinition(id="x")
     assert "Invalid protocol" in await core.update_agent(deps, "x", protocol="grpc")
     assert "Invalid protocol" in await core.create_agent(deps, "y", "Y", protocol="grpc")
+
+
+@pytest.mark.asyncio
+async def test_update_sets_and_clears_addons():
+    deps = _Deps()
+    deps.agent_backend.items["r"] = AgentDefinition(id="r", default_runtime="runner", runner_id="rnr-1", protocol="acp")
+    out = await core.update_agent(
+        deps, "r", addons_json='[{"type": "s3", "bucket": "b", "path": "workspaces/{workflow_id}"}]',
+    )
+    assert "updated" in out
+    a = deps.agent_backend.items["r"]
+    assert a.s3_addon is not None and (a.s3_addon.bucket, a.s3_addon.path) == ("b", "workspaces/{workflow_id}")
+    assert a.runner_id == "rnr-1" and a.default_runtime == "runner"
+
+    assert "Invalid addons_json" in await core.update_agent(deps, "r", addons_json='[{"type": "nope"}]')
+    assert deps.agent_backend.items["r"].s3_addon is not None
+
+    await core.update_agent(deps, "r", addons_json="[]")
+    assert deps.agent_backend.items["r"].addons == []
+
+
+@pytest.mark.asyncio
+async def test_runner_runtime_needs_a_machine():
+    deps = _Deps()
+    deps.agent_backend.items["x"] = AgentDefinition(id="x")
+    assert "needs a connected machine" in await core.update_agent(deps, "x", default_runtime="runner")
+    deps.agent_backend.items["x"].runner_id = "rnr-1"
+    assert "updated" in await core.update_agent(deps, "x", default_runtime="runner")
