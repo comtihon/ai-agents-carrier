@@ -155,13 +155,58 @@ _SECCOMP_ALLOWED_SYSCALLS = (
     334,  # rseq
 )
 
+# Added to the allow-list when the script runs in a workspace (docker/k8s with a
+# `workspace`): what CPython needs to open, list, write, rename and remove files.
+_WORKSPACE_SYSCALLS = (
+    2,    # open
+    4,    # stat
+    6,    # lstat
+    17,   # pread64
+    18,   # pwrite64
+    19,   # readv
+    20,   # writev
+    21,   # access
+    40,   # sendfile          (shutil.copyfile)
+    74,   # fsync
+    75,   # fdatasync
+    76,   # truncate
+    77,   # ftruncate
+    78,   # getdents
+    80,   # chdir
+    81,   # fchdir
+    82,   # rename
+    83,   # mkdir
+    84,   # rmdir
+    87,   # unlink
+    89,   # readlink
+    90,   # chmod
+    91,   # fchmod
+    217,  # getdents64        (os.scandir / os.walk)
+    221,  # fadvise64
+    257,  # openat
+    258,  # mkdirat
+    263,  # unlinkat
+    264,  # renameat
+    267,  # readlinkat
+    268,  # fchmodat
+    269,  # faccessat
+    280,  # utimensat
+    285,  # fallocate
+    316,  # renameat2
+    326,  # copy_file_range
+    332,  # statx
+    439,  # faccessat2
+)
+
 # Installed by the bootstrap once the interpreter is warm. Kept as source text
 # because the sandboxed interpreter runs with -S: it cannot import a helper from
 # site-packages, so the filter is built with ctypes from the stdlib instead of
 # libseccomp. ctypes itself is torn out of sys.modules immediately afterwards.
 _SECCOMP_INSTALL = f'''
-def _install_seccomp():
+def _install_seccomp(extra=()):
     """Return None on success, or a string explaining why it could not install.
+
+    *extra* widens the allow-list (the workspace's file syscalls).
 
     Imports nothing: it runs after the import machinery has been dismantled, so
     it uses the ctypes/struct bound at the top of this bootstrap. os.uname()
@@ -175,7 +220,7 @@ def _install_seccomp():
     RET_ALLOW, RET_ERRNO, RET_KILL = 0x7FFF0000, 0x00050000, 0x80000000
     EPERM = 1
 
-    allowed = {tuple(_SECCOMP_ALLOWED_SYSCALLS)!r}
+    allowed = tuple(sorted(set({tuple(_SECCOMP_ALLOWED_SYSCALLS)!r}) | set(extra)))
     n = len(allowed)
 
     # arch guard first: syscall numbers are meaningless without it, so a
@@ -323,7 +368,14 @@ def _records():
             yield json.loads(_line)
 
 
-_seccomp_error = _install_seccomp()
+# A workspace is a container's own volume (docker/k8s only, never `local`):
+# the script may open, list, write and remove files there. The container holds
+# no credential and the script still has no network or processes, so opening
+# files is what it gains -- and that is the point of a workspace.
+_workspace_dir = _payload.get("workspace_dir")
+_seccomp_error = _install_seccomp(
+    {tuple(_WORKSPACE_SYSCALLS)!r} if _workspace_dir else ()
+)
 if _seccomp_error is not None:
     sys.stderr.write("sandbox: refusing to run, seccomp unavailable: %s\\n" % _seccomp_error)
     raise SystemExit(3)
@@ -356,6 +408,7 @@ _scope = {{
     "stream": _data_fh,
     "stream_records": _payload.get("stream_records") or 0,
     "stream_truncated": bool(_payload.get("stream_truncated")),
+    "workspace": _workspace_dir,
     "output": None,
 }}
 
@@ -366,6 +419,148 @@ _result = json.dumps({{"output": _scope.get("output")}}, default=str)
 sys.stdout.write("\\n{RESULT_MARKER}" + _result + "\\n")
 sys.stdout.flush()
 '''
+
+
+WORKSPACE_MARKER = "__WORKSPACE_RESULT__"
+
+# Where the workspace and the wrapper's scratch space live inside a docker or
+# k8s sandbox. Both are volumes of the container's own (an emptyDir / an
+# anonymous docker volume): the data never passes through the backend.
+_WS_DIR = "/workspace"
+_WS_SCRATCH = "/scratch"
+_K8S_WORKSPACE_LIMIT_MB = int(os.environ.get("SANDBOX_WORKSPACE_LIMIT_MB", "10240"))
+
+# Executed by the container's main process when a step has a workspace. It is
+# the only part of the sandbox with network: it restores the workspace from a
+# pre-signed GET URL, runs the script in a child interpreter under the usual
+# bootstrap (seccomp: no network, no processes; file syscalls allowed), then
+# uploads the workspace to a pre-signed PUT URL -- only when a file changed.
+# The URLs name one object, the run's workspace archive, and carry no other
+# access. argv[1] is the payload file.
+_WORKSPACE_WRAPPER = f"""
+import fnmatch, json, os, shutil, subprocess, sys, tarfile, urllib.error, urllib.request
+
+_BOOTSTRAP = {_BOOTSTRAP!r}
+_payload_path = sys.argv[1]
+with open(_payload_path, "r", encoding="utf-8") as fh:
+    _ws = json.load(fh)["workspace"]
+_dir, _scratch = _ws["dir"], _ws["scratch"]
+_exclude = [e for e in (_ws.get("exclude") or []) if e]
+_TIMEOUT = 1800
+
+
+def _excluded(rel):
+    parts = rel.split("/")
+    return any(
+        fnmatch.fnmatch(rel, pat) or any(fnmatch.fnmatch(part, pat) for part in parts)
+        for pat in _exclude
+    )
+
+
+def _manifest():
+    out = {{}}
+    for root, dirs, files in os.walk(_dir):
+        for name in list(dirs):
+            path = os.path.join(root, name)
+            rel = os.path.relpath(path, _dir)
+            if _excluded(rel):
+                dirs.remove(name)
+            elif os.path.islink(path):
+                out[rel] = "link:" + os.readlink(path)
+        for name in files:
+            path = os.path.join(root, name)
+            rel = os.path.relpath(path, _dir)
+            if _excluded(rel):
+                continue
+            if os.path.islink(path):
+                out[rel] = "link:" + os.readlink(path)
+            else:
+                st = os.stat(path)
+                out[rel] = "%d:%d" % (st.st_size, st.st_mtime_ns)
+    return out
+
+
+def _finish(report, code=0):
+    sys.stdout.flush()
+    sys.stdout.write("\\n{WORKSPACE_MARKER}" + json.dumps(report) + "\\n")
+    sys.stdout.flush()
+    sys.exit(code)
+
+
+os.makedirs(_dir, exist_ok=True)
+os.makedirs(_scratch, exist_ok=True)
+report = {{"restore": "empty", "uploaded": False}}
+
+if _ws.get("download_url"):
+    archive = os.path.join(_scratch, "restore.tar.gz")
+    try:
+        with urllib.request.urlopen(_ws["download_url"], timeout=_TIMEOUT) as res, open(archive, "wb") as out:
+            shutil.copyfileobj(res, out, 1 << 20)
+            report["version"] = res.headers.get("x-goog-generation") or res.headers.get("etag")
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            report["error"] = "GET workspace archive: HTTP %d" % exc.code
+            _finish(report, 4)
+    else:
+        with tarfile.open(archive, "r:gz") as tar:
+            if hasattr(tarfile, "data_filter"):
+                tar.extractall(_dir, filter="data")
+            else:  # pragma: no cover -- interpreters without PEP 706
+                tar.extractall(_dir)
+        os.unlink(archive)
+        report["restore"] = "restored"
+
+before = _manifest()
+report["files"] = len(before)
+
+child = subprocess.run(
+    [sys.executable, "-I", "-S", "-B", "-c", _BOOTSTRAP, _payload_path],
+    cwd=_dir, env={{}},
+)
+if child.returncode != 0:
+    # A failed script's half-written files are not uploaded: the archive stays
+    # the last good state of the run.
+    report["script_exit"] = child.returncode
+    _finish(report, child.returncode)
+
+after = _manifest()
+added = sorted(set(after) - set(before))
+deleted = sorted(set(before) - set(after))
+modified = sorted(k for k in set(before) & set(after) if before[k] != after[k])
+report["changes"] = {{
+    "added": added[:500], "modified": modified[:500], "deleted": deleted[:500],
+    "added_count": len(added), "modified_count": len(modified), "deleted_count": len(deleted),
+}}
+if max(len(added), len(modified), len(deleted)) > 500:
+    report["changes"]["truncated"] = True
+
+if (added or modified or deleted) and _ws.get("upload_url"):
+    archive = os.path.join(_scratch, "upload.tar.gz")
+
+    def _keep(info):
+        rel = info.name[2:] if info.name.startswith("./") else info.name
+        return None if rel not in (".", "") and _excluded(rel) else info
+
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(_dir, arcname=".", filter=_keep)
+    size = os.path.getsize(archive)
+    headers = dict(_ws.get("upload_headers") or {{}})
+    headers.setdefault("content-type", "application/gzip")
+    headers["content-length"] = str(size)
+    with open(archive, "rb") as body:
+        req = urllib.request.Request(_ws["upload_url"], data=body, method="PUT", headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=_TIMEOUT) as res:
+                report["version"] = res.headers.get("x-goog-generation") or res.headers.get("etag")
+        except urllib.error.HTTPError as exc:
+            report["error"] = "PUT workspace archive: HTTP %d" % exc.code
+            _finish(report, 5)
+    os.unlink(archive)
+    report["uploaded"] = True
+    report["bytes"] = size
+
+_finish(report)
+"""
 
 
 class ScriptSandboxError(RuntimeError):
@@ -419,6 +614,33 @@ def _parse_result(stdout: Any) -> Any:
     )
 
 
+def _parse_workspace(stdout: Any) -> dict[str, Any] | None:
+    """The workspace wrapper's report (its marker line), or None without one."""
+    stdout = _as_text(stdout)
+    for candidate in (stdout, _unwrap_bytes_repr(stdout)):
+        for line in reversed(candidate.splitlines()):
+            if line.startswith(WORKSPACE_MARKER):
+                return json.loads(line[len(WORKSPACE_MARKER):])
+    return None
+
+
+def _workspace_error(stdout: Any) -> str | None:
+    """The wrapper's own failure (restore/upload), if it reported one."""
+    try:
+        report = _parse_workspace(stdout)
+    except ValueError:
+        return None
+    return (report or {}).get("error")
+
+
+def _collect(stdout: Any, workspace: bool, workspace_report: dict[str, Any] | None) -> Any:
+    """The script's ``output``; the workspace report goes into *workspace_report*."""
+    result = _parse_result(stdout)
+    if workspace and workspace_report is not None:
+        workspace_report.update(_parse_workspace(stdout) or {})
+    return result
+
+
 def _payload_json(
     code: str,
     state: dict[str, Any],
@@ -428,6 +650,7 @@ def _payload_json(
     data_from_stdin: bool = False,
     stream_records: int = 0,
     stream_truncated: bool = False,
+    workspace: dict[str, Any] | None = None,
 ) -> str:
     # ``default=str`` keeps non-JSON state values (datetimes, ObjectIds, …)
     # transportable instead of failing the whole step.
@@ -440,6 +663,9 @@ def _payload_json(
             stream_records=stream_records,
             stream_truncated=stream_truncated,
         )
+    if workspace is not None:
+        body["workspace_dir"] = _WS_DIR
+        body["workspace"] = {**workspace, "dir": _WS_DIR, "scratch": _WS_SCRATCH}
     return json.dumps(body, default=str)
 
 
@@ -464,8 +690,18 @@ async def run_script(
     stream_copy: Any = None,
     stream_records: int = 0,
     stream_truncated: bool = False,
+    workspace: dict[str, Any] | None = None,
+    workspace_report: dict[str, Any] | None = None,
 ) -> Any:
     """Run *code* in a sandbox and return the value it assigned to ``output``.
+
+    ``workspace`` -- ``{download_url, upload_url, upload_headers?, exclude?}``,
+    pre-signed URLs of the run's workspace archive (``docker`` and ``k8s``
+    only). The container restores it into its own volume, the script runs with
+    that directory as its cwd (and as ``workspace``), and the container uploads
+    it again when a file changed. The data moves between the container and
+    object storage; it never passes through the backend. What happened is
+    written into ``workspace_report`` (restore, changes, uploaded, bytes).
 
     A data source result is handed over as a file, never as a value.  How it
     gets there depends on where the sandbox runs:
@@ -484,6 +720,12 @@ async def run_script(
     ``stream_records`` and ``stream_truncated`` are handed to the script so it
     knows how many records to expect and whether the read was cut short.
     """
+    if workspace is not None and runtime not in ("docker", "k8s"):
+        # A `local` sandbox would hold the whole workspace on the backend's own
+        # disk -- exactly what a workspace in its own container avoids.
+        raise ValueError(
+            f"a workspace needs sandbox_runtime 'docker' or 'k8s', not '{runtime}'"
+        )
     if runtime == "k8s":
         payload = _payload_json(
             code, state,
@@ -491,6 +733,7 @@ async def run_script(
             data_from_stdin=stream_copy is not None,
             stream_records=stream_records,
             stream_truncated=stream_truncated,
+            workspace=workspace,
         )
     elif runtime == "docker":
         payload = _payload_json(
@@ -498,6 +741,7 @@ async def run_script(
             data_path=_DOCKER_DATA_MOUNT if stream_path else None,
             stream_records=stream_records,
             stream_truncated=stream_truncated,
+            workspace=workspace,
         )
     else:
         payload = _payload_json(
@@ -511,12 +755,14 @@ async def run_script(
     if runtime == "docker":
         return await _run_docker(
             payload, timeout=timeout, image=image, memory_mb=memory_mb,
-            stream_path=stream_path,
+            stream_path=stream_path, workspace=workspace is not None,
+            workspace_report=workspace_report,
         )
     if runtime == "k8s":
         return await _run_k8s(
             payload, timeout=timeout, image=image, memory_mb=memory_mb,
             namespace=namespace, stream_copy=stream_copy,
+            workspace=workspace is not None, workspace_report=workspace_report,
         )
     raise ValueError(
         f"Unknown sandbox runtime '{runtime}'. Valid values are: 'local', 'docker', 'k8s'."
@@ -594,6 +840,8 @@ async def _run_docker(
     image: str,
     memory_mb: int,
     stream_path: str | None = None,
+    workspace: bool = False,
+    workspace_report: dict[str, Any] | None = None,
 ) -> Any:
     import aiodocker
 
@@ -607,11 +855,15 @@ async def _run_docker(
     docker = aiodocker.Docker()
     container = None
     try:
+        entry = _WORKSPACE_WRAPPER if workspace else _BOOTSTRAP
+        flags = ["-I"] if workspace else ["-I", "-S", "-B"]
         config = {
             "Image": image,
-            "Cmd": ["python", "-I", "-S", "-B", "-c", _BOOTSTRAP, "/sandbox/payload.json"],
+            "Cmd": ["python", *flags, "-c", entry, "/sandbox/payload.json"],
             "Env": [],
-            "NetworkDisabled": True,
+            # With a workspace the wrapper fetches and stores the archive
+            # itself; the script it runs is still denied `socket` by seccomp.
+            "NetworkDisabled": not workspace,
             "AttachStdout": True,
             "AttachStderr": True,
             "WorkingDir": "/tmp",
@@ -627,7 +879,16 @@ async def _run_docker(
                 "ReadonlyRootfs": True,
                 "Tmpfs": {"/tmp": "rw,size=64m"},
                 "Memory": memory_mb * 1024 * 1024,
-                "NetworkMode": "none",
+                "NetworkMode": "bridge" if workspace else "none",
+                # The workspace and scratch space are anonymous volumes of
+                # the container's own, removed with it.
+                **(
+                    {"Mounts": [
+                        {"Type": "volume", "Target": _WS_DIR},
+                        {"Type": "volume", "Target": _WS_SCRATCH},
+                    ]}
+                    if workspace else {}
+                ),
                 "AutoRemove": False,
                 "CapDrop": ["ALL"],
                 "SecurityOpt": ["no-new-privileges"],
@@ -648,13 +909,14 @@ async def _run_docker(
         exit_code = info.get("State", {}).get("ExitCode", 0)
         if exit_code != 0:
             raise ScriptSandboxError(
-                f"sandboxed script exited with code {exit_code}: {stdout.strip()[-2000:]}"
+                f"sandboxed script exited with code {exit_code}: "
+                f"{_workspace_error(stdout) or stdout.strip()[-2000:]}"
             )
-        return _parse_result(stdout)
+        return _collect(stdout, workspace, workspace_report)
     finally:
         if container is not None:
             try:
-                await container.delete(force=True)
+                await container.delete(force=True, v=True)
             except Exception:  # noqa: BLE001 — best-effort cleanup
                 logger.debug("docker sandbox: container cleanup failed", exc_info=True)
         await docker.close()
@@ -770,6 +1032,8 @@ async def _run_k8s(
     memory_mb: int,
     namespace: str,
     stream_copy: Any = None,
+    workspace: bool = False,
+    workspace_report: dict[str, Any] | None = None,
 ) -> Any:
     """Run a script in a one-shot pod, streaming its data stream in on stdin.
 
@@ -793,6 +1057,23 @@ async def _run_k8s(
 
     core = k8s_client.CoreV1Api()
     name = f"script-sandbox-{uuid.uuid4().hex[:10]}"
+
+    # A workspace gets disk-backed emptyDirs of its own: the files, and room
+    # for one archive of them (restore, then upload). The pod keeps its
+    # network for the wrapper's GET/PUT; the script itself is denied sockets.
+    ws_volumes: list[Any] = []
+    ws_mounts: list[Any] = []
+    ws_storage_mb = 0
+    if workspace:
+        ws_storage_mb = 2 * _K8S_WORKSPACE_LIMIT_MB
+        for vol, path in (("workspace", _WS_DIR), ("scratch", _WS_SCRATCH)):
+            ws_volumes.append(k8s_client.V1Volume(
+                name=vol,
+                empty_dir=k8s_client.V1EmptyDirVolumeSource(
+                    size_limit=f"{_K8S_WORKSPACE_LIMIT_MB}Mi"
+                ),
+            ))
+            ws_mounts.append(k8s_client.V1VolumeMount(name=vol, mount_path=path))
     loop = asyncio.get_event_loop()
 
     cm_body = k8s_client.V1ConfigMap(
@@ -824,18 +1105,24 @@ async def _run_k8s(
                         size_limit=f"{_K8S_DATA_LIMIT_MB}Mi"
                     ),
                 ),
+                *ws_volumes,
             ],
             containers=[
                 k8s_client.V1Container(
                     name="script",
                     image=image,
-                    command=["python", "-I", "-S", "-B", "-c", _BOOTSTRAP, "/sandbox/payload.json"],
+                    command=(
+                        ["python", "-I", "-c", _WORKSPACE_WRAPPER, "/sandbox/payload.json"]
+                        if workspace else
+                        ["python", "-I", "-S", "-B", "-c", _BOOTSTRAP, "/sandbox/payload.json"]
+                    ),
                     env=[],
                     working_dir="/tmp",
                     volume_mounts=[
                         k8s_client.V1VolumeMount(name="payload", mount_path="/sandbox", read_only=True),
                         k8s_client.V1VolumeMount(name="tmp", mount_path="/tmp"),
                         k8s_client.V1VolumeMount(name="data", mount_path="/data"),
+                        *ws_mounts,
                     ],
                     # stdin stays open until the backend has finished writing
                     # the stream; stdin_once closes it after that single
@@ -846,7 +1133,7 @@ async def _run_k8s(
                         limits={
                             "memory": f"{memory_mb}Mi",
                             "cpu": "1",
-                            "ephemeral-storage": f"{_K8S_DATA_LIMIT_MB + 64}Mi",
+                            "ephemeral-storage": f"{_K8S_DATA_LIMIT_MB + ws_storage_mb + 64}Mi",
                         },
                         requests={
                             "memory": f"{min(memory_mb, 128)}Mi",
@@ -960,7 +1247,9 @@ async def _run_k8s(
             await asyncio.sleep(0.5)
 
         if phase == "Failed":
-            raise ScriptSandboxError(f"sandboxed script failed: {stdout.strip()[-2000:]}")
+            raise ScriptSandboxError(
+                f"sandboxed script failed: {_workspace_error(stdout) or stdout.strip()[-2000:]}"
+            )
         if not stdout.strip():
             # Say what the container actually did. Without this the error names
             # only the symptom, and the cause (OOMKilled, an image that never
@@ -979,6 +1268,6 @@ async def _run_k8s(
             raise ScriptSandboxError(
                 f"sandboxed script produced no output (phase={phase}{state})"
             )
-        return _parse_result(stdout)
+        return _collect(stdout, workspace, workspace_report)
     finally:
         await _cleanup()

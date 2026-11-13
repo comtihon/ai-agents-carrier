@@ -68,7 +68,7 @@ ALL_STATE_TYPES = frozenset({
 # the step id, so `next: fetch` would otherwise hydrate `fetch` for nothing).
 _STRUCTURAL_FIELDS = frozenset({
     "id", "type", "name", "description", "next", "targets", "output_key",
-    "position", "ui", "layout", "sandbox", "sandbox_runtime", "sandbox_image",
+    "position", "ui", "layout", "sandbox", "sandbox_runtime", "sandbox_image", "workspace",
     "timeout_seconds", "max_loops", "result_mode", "limit",
 })
 

@@ -40,7 +40,27 @@ async def runner_workspace(agent_config: dict[str, Any], cwd: str, settings: Any
     path = str(extra.get("s3_path") or "").strip("/")
     if not bucket or not path:
         return None
-    obj = f"{path}/{ARCHIVE_NAME}"
+    exclude = extra.get("workspace_exclude")
+    urls, uri = await signed_workspace(bucket, path, settings, exclude=exclude)
+    return {"dir": cwd, **urls}, uri
+
+
+def workspace_path(template: str, run_id: str, state: dict[str, Any] | None) -> str:
+    """An ``s3`` path template with ``{workflow_id}`` (the run) and ``{project_id}`` filled in."""
+    path = template.replace("{workflow_id}", run_id or "")
+    return path.replace("{project_id}", str((state or {}).get("project_id", "") or ""))
+
+
+async def signed_workspace(
+    bucket: str, path: str, settings: Any, *, exclude: Any = None,
+) -> tuple[dict[str, Any], str]:
+    """Signed GET/PUT URLs of ``gs://<bucket>/<path>/workspace.tar.gz`` and that URI.
+
+    The same object an ``s3``-addon agent of the run restores and uploads, so
+    a runner agent, a pod agent and a sandboxed python step share one
+    workspace. Raises WorkspaceUnavailable when carrier cannot sign.
+    """
+    obj = f"{path.strip('/')}/{ARCHIVE_NAME}"
     ttl = min(int(getattr(settings, "acp_runner_workspace_url_ttl_s", 86400)), MAX_URL_TTL_S)
     try:
         download_url, upload_url = await asyncio.to_thread(_sign_urls, bucket, obj, ttl)
@@ -51,12 +71,10 @@ async def runner_workspace(agent_config: dict[str, Any], cwd: str, settings: Any
             "service account needs roles/iam.serviceAccountTokenCreator on itself"
         ) from exc
     spec: dict[str, Any] = {
-        "dir": cwd,
         "download_url": download_url,
         "upload_url": upload_url,
         "upload_headers": {"content-type": ARCHIVE_TYPE},
     }
-    exclude = extra.get("workspace_exclude")
     if isinstance(exclude, list) and exclude:
         spec["exclude"] = [str(e) for e in exclude if e]
     return spec, f"gs://{bucket}/{obj}"

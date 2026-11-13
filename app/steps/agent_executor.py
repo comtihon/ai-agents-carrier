@@ -246,9 +246,10 @@ def _build_agent_config(
 
     # Inject S3 workspace config when the agent has an s3 addon attached.
     if agent_def.s3_addon is not None:
+        from app.steps.acp_runner_workspace import workspace_path
+
         s3_addon = agent_def.s3_addon
-        s3_path = s3_addon.path.replace("{workflow_id}", run_id or "")
-        s3_path = s3_path.replace("{project_id}", (state or {}).get("project_id", ""))
+        s3_path = workspace_path(s3_addon.path, run_id or "", state)
         extra["s3_bucket"] = s3_addon.bucket
         extra["s3_path"] = s3_path
 
@@ -1501,6 +1502,10 @@ async def _finalize_agent_output(
     else:
         # No mapping configured — merge all agent output keys directly into state.
         result = raw_output
+
+    # Where the step's workspace archive is and which files it changed there.
+    if isinstance(raw_output, dict) and isinstance(raw_output.get("workspace"), dict):
+        result[f"_workspace_{step_id}"] = raw_output["workspace"]
 
     # Always surface the meta-LLM verdict so the UI shows full transparency on
     # every step — not just failed ones. The agent's full raw output (including

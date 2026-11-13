@@ -159,6 +159,12 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
         # human_approval with a custom output_key writes the bool result there
         if step.get("type") == "human_approval" and "output_key" in step:
             fields[step["output_key"]] = Any  # type: ignore[assignment]
+        # a python step with a workspace, and every agent step, reports what
+        # happened to the run's workspace archive (path, changed files)
+        if (step.get("type") == "python" and step.get("workspace")) or step.get("type") in (
+            "langgraph-agent", "claude-agent",
+        ):
+            fields[f"_workspace_{step['id']}"] = Any  # type: ignore[assignment]
         # mcp steps always store their tool output text for display in the UI
         if step.get("type") == "mcp":
             fields[f"_mcp_output_{step['id']}"] = Any  # type: ignore[assignment]
@@ -945,6 +951,12 @@ class YamlGraphRunner:
             sandbox_runtime: local     # python only — local | docker | k8s
             sandbox_image: python:3.12-slim  # python only — docker/k8s image override
             timeout_seconds: 60        # python only — sandbox wall-clock limit
+            workspace:                 # python only (docker | k8s) — the run's workspace
+              bucket: my-bucket        #   archive, gs://<bucket>/<path>/workspace.tar.gz,
+              path: "runs/{workflow_id}"  # shared with s3-addon agents ({workflow_id} =
+              exclude: ["*.tmp"]       #   the run). Restored into the sandbox's cwd; the
+                                       #   sandbox uploads it again when a file changed.
+                                       #   Report in state `_workspace_<step id>`.
             action: get                # storage only -- get | set | delete | keys
             key: "alert-state"         # storage only -- entry name; {state} templated
             value: {}                  # storage only (set) -- any JSON; {state} templated
@@ -2713,13 +2725,48 @@ class YamlGraphRunner:
             raise ValueError(f"Script '{script_id}' not found in the library")
         return script.code
 
+    async def _python_workspace(
+        self, step: dict[str, Any], runtime: str, state: dict[str, Any],
+    ) -> tuple[dict[str, Any], str] | None:
+        """Signed URLs of the step's ``workspace`` archive and its gs:// URI.
+
+        ``workspace: {bucket, path, exclude?}`` names the same object an agent's
+        ``s3`` addon does (``<path>/workspace.tar.gz``, ``{workflow_id}`` = the
+        run, ``{project_id}`` from state), so the script reads what an earlier
+        agent step left there and the next agent step gets what it wrote.
+        """
+        ws = step.get("workspace")
+        if not ws:
+            return None
+        if not isinstance(ws, dict) or not ws.get("bucket") or not ws.get("path"):
+            raise ValueError("`workspace` needs `bucket` and `path`")
+        if not step.get("sandbox", True) or runtime not in ("docker", "k8s"):
+            # Not `local`, and not in-process: the workspace is restored into
+            # the sandbox container's own volume so that a large one never
+            # lands on the backend's disk.
+            raise ValueError(
+                "`workspace` needs a sandboxed step with sandbox_runtime 'docker' or 'k8s'"
+            )
+        from app.core.config import get_settings
+        from app.steps.acp_runner_workspace import signed_workspace, workspace_path
+
+        run_id = str(getattr(self._current_run, "id", "") or "")
+        path = workspace_path(str(ws["path"]), run_id, state).strip("/")
+        if not path:
+            raise ValueError("`workspace.path` is empty once filled in")
+        return await signed_workspace(
+            str(ws["bucket"]), path, get_settings(), exclude=ws.get("exclude"),
+        )
+
     async def _run_python(
         self, step: dict[str, Any], code: str, script_state: dict[str, Any], ref: Any,
+        workspace_report: dict[str, Any] | None = None,
     ) -> Any:
         """Run *code* the way *step* asks (sandboxed or in-process); return ``output``.
 
         Shared by the ``python`` step and the python parts of a
-        ``combined_datasource`` step. Raises on failure.
+        ``combined_datasource`` step. Raises on failure. With a ``workspace``
+        on the step, what happened to it is written into *workspace_report*.
         """
         graph_id = self.id
         step_id = step["id"]
@@ -2730,6 +2777,10 @@ class YamlGraphRunner:
             from app.infrastructure.orchestration.script_sandbox import run_script
 
             settings = get_settings()
+            found = await self._python_workspace(step, sandbox_runtime, script_state)
+            workspace, workspace_uri = found if found else (None, None)
+            if workspace_report is not None and workspace_uri:
+                workspace_report["path"] = workspace_uri
             delivery = await self._stream_delivery(ref, sandbox_runtime, step_id)
             # Popped rather than passed on: run_script knows nothing
             # about it, and it must be removed whether the script
@@ -2744,6 +2795,8 @@ class YamlGraphRunner:
                     image=step.get("sandbox_image") or settings.script_sandbox_image,
                     memory_mb=settings.script_sandbox_memory_mb,
                     namespace=settings.agent_namespace,
+                    workspace=workspace,
+                    workspace_report=workspace_report if workspace else None,
                     **delivery,
                 )
             finally:
@@ -2754,6 +2807,10 @@ class YamlGraphRunner:
                     with contextlib.suppress(OSError):
                         os.unlink(tmp_stream)
         else:
+            if step.get("workspace"):
+                raise ValueError(
+                    "`workspace` needs a sandboxed step with sandbox_runtime 'docker' or 'k8s'"
+                )
             # Single namespace for globals and locals -- see the same
             # fix in script_sandbox's bootstrap. Two namespaces make a
             # top-level `def` invisible to another function's body, so
@@ -2825,9 +2882,14 @@ class YamlGraphRunner:
                         f"result reference"
                     )
 
-                result = await self._run_python(step, code, dict(state), ref)
+                ws_report: dict[str, Any] = {}
+                result = await self._run_python(
+                    step, code, dict(state), ref, workspace_report=ws_report,
+                )
 
                 logger.info("[%s] step '%s' finished", graph_id, step_id)
+                if step.get("workspace"):
+                    return {output_key: result, f"_workspace_{step_id}": ws_report}
                 return {output_key: result}
             except Exception as exc:
                 logger.exception("[%s] step '%s' python failed", graph_id, step_id)
