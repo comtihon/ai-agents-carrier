@@ -453,6 +453,50 @@ async def test_runner_syncs_the_s3_workspace_through_signed_urls(server, monkeyp
         await fake.stop()
 
 
+async def test_runner_reports_the_files_the_agent_changed(server, monkeypatch):
+    monkeypatch.setattr(acp_runner_workspace, "_sign_urls", lambda b, o, t: ("https://gcs/get", "https://gcs/put"))
+    _, token = await _runner(server)
+    fake = FakeRunner(server, token, ["ok", "ok"])
+    fake.upload_result = {"event": "uploaded", "bytes": 10, "changes": {
+        "added": ["summary.md"], "modified": ["a.txt"], "deleted": [],
+        "added_count": 1, "modified_count": 1, "deleted_count": 0}}
+    await fake.start()
+    try:
+        out = await _step(Runs(), agent_config=S3_CONFIG)
+        assert out["workspace"] == {
+            "path": "gs://ws-bucket/runs/run-1/workspace.tar.gz",
+            "uploaded": True,
+            "restore": "restored",
+            "changes": {"added": ["summary.md"], "modified": ["a.txt"], "deleted": []},
+        }
+    finally:
+        await fake.stop()
+
+
+async def test_runner_reports_no_upload_when_nothing_changed(server, monkeypatch):
+    monkeypatch.setattr(acp_runner_workspace, "_sign_urls", lambda b, o, t: ("https://gcs/get", "https://gcs/put"))
+    _, token = await _runner(server)
+    fake = FakeRunner(server, token, ["ok"])
+    fake.upload_result = {"event": "unchanged"}
+    await fake.start()
+    try:
+        out = await _step(Runs(), agent_config=S3_CONFIG)
+        assert "workspace_s3_path" not in out
+        assert out["workspace"]["uploaded"] is False
+        assert out["workspace"]["changes"] == {"added": [], "modified": [], "deleted": []}
+    finally:
+        await fake.stop()
+
+
+def test_workspace_changes_add_up_to_the_net_effect():
+    from app.steps.acp_executor import _merge_workspace_changes
+
+    acc = {"added": set(), "modified": set(), "deleted": set()}
+    _merge_workspace_changes(acc, {"added": ["new", "tmp"], "modified": ["a"], "deleted": ["b"]})
+    _merge_workspace_changes(acc, {"modified": ["new"], "deleted": ["tmp", "a"], "added": ["b"]})
+    assert acc == {"added": {"new"}, "modified": {"b"}, "deleted": {"a"}}
+
+
 async def test_runner_step_runs_without_sync_when_carrier_cannot_sign(server, monkeypatch):
     def no_key(bucket, obj, ttl):
         raise RuntimeError("no signer")

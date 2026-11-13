@@ -263,9 +263,13 @@ async def run_acp_agent(
     # gs:// URI of a runner's workspace archive, once the proxy uploaded it.
     workspace_uri: str | None = None
     workspace_uploaded = False
+    # Files the agent changed in the workspace, summed over its turns.
+    workspace_changes: dict[str, set[str]] = {"added": set(), "modified": set(), "deleted": set()}
+    workspace_truncated = False
+    workspace_restore: str | None = None
 
     async def on_notification(method: str, params: dict[str, Any]) -> None:
-        nonlocal workspace_uploaded
+        nonlocal workspace_uploaded, workspace_truncated
         if method == "session/update":
             if loading:
                 return
@@ -274,8 +278,14 @@ async def run_acp_agent(
         elif method == "_proxy/agent_exited":
             sink.add(f"agent exited (code {params.get('code')})")
         elif method == "_proxy/workspace":
-            if params.get("event") == "uploaded":
+            event = params.get("event")
+            if event == "uploaded":
                 workspace_uploaded = True
+                changes = params.get("changes") or {}
+                workspace_truncated = workspace_truncated or bool(changes.get("truncated"))
+                _merge_workspace_changes(workspace_changes, changes)
+            elif event == "unchanged":
+                pass
             else:
                 sink.add(f"workspace upload failed: {params.get('error')}")
 
@@ -339,7 +349,7 @@ async def run_acp_agent(
 
     async def open_connection() -> AcpConnection:
         """A new proxy connection with the agent launched and initialized."""
-        nonlocal caps
+        nonlocal caps, workspace_restore
         wait_key = f"_runner_wait_{step_id}"
         waiting = runner is not None and not hub.is_online(runner.id)
         if waiting:
@@ -366,9 +376,12 @@ async def run_acp_agent(
         c.connection_id = c.connection_id or (launched or {}).get("connection_id")
         restore = ((launched or {}).get("workspace") or {}).get("restore")
         if restore:
+            workspace_restore = restore
             sink.add({"restored": f"workspace restored from {workspace_uri}",
                       "empty": "workspace starts empty (nothing uploaded yet)",
-                      "kept": "workspace kept from the previous launch"}.get(restore, f"workspace: {restore}"))
+                      "kept": "workspace kept from the previous launch",
+                      "replaced": f"workspace replaced by a newer archive from {workspace_uri}",
+                      }.get(restore, f"workspace: {restore}"))
         init = await c.request("initialize", {
             "protocolVersion": PROTOCOL_VERSION,
             "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False}, "terminal": False},
@@ -644,6 +657,19 @@ async def run_acp_agent(
             raw["workspace_s3_path"] = meta_out["workspace_path"]
         elif workspace_uploaded and workspace_uri:
             raw["workspace_s3_path"] = workspace_uri
+        if workspace_uri:
+            # What carrier keeps of the agent's files: where the archive is
+            # and which files this step changed in it.
+            report: dict[str, Any] = {
+                "path": workspace_uri,
+                "uploaded": workspace_uploaded,
+                "changes": {k: sorted(v) for k, v in workspace_changes.items()},
+            }
+            if workspace_restore:
+                report["restore"] = workspace_restore
+            if workspace_truncated:
+                report["changes"]["truncated"] = True
+            raw["workspace"] = report
         if stop in ("max_tokens", "max_turn_requests", "refusal"):
             raw["stop_reason"] = stop
         return raw
@@ -672,6 +698,30 @@ async def run_acp_agent(
             await conn.close()
         if agent_url is not None and runner is None:
             await _terminate(runtime, agent_def, run_id, agent_url)
+
+
+def _merge_workspace_changes(acc: dict[str, set[str]], changes: dict[str, Any]) -> None:
+    """Fold one turn's ``{added, modified, deleted}`` into the step's total.
+
+    Net effect against the workspace the step started with: a file added and
+    then edited is "added"; added and then deleted was never there; deleted
+    and then written again is "modified".
+    """
+    for path in changes.get("added") or []:
+        if path in acc["deleted"]:
+            acc["deleted"].discard(path)
+            acc["modified"].add(path)
+        else:
+            acc["added"].add(path)
+    for path in changes.get("modified") or []:
+        if path not in acc["added"]:
+            acc["modified"].add(path)
+    for path in changes.get("deleted") or []:
+        if path in acc["added"]:
+            acc["added"].discard(path)
+        else:
+            acc["modified"].discard(path)
+            acc["deleted"].add(path)
 
 
 def _session_cwd(agent_def: Any, runner: Any, run_id: str) -> str:
