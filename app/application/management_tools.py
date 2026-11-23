@@ -1104,6 +1104,10 @@ async def create_workflow(
     dynamic_errors = validate_dynamic_steps(steps)
     if dynamic_errors:
         return "Invalid dynamic step: " + "; ".join(dynamic_errors)
+    from app.infrastructure.orchestration.pubsub_publish import validate_pubsub_publish_steps
+    publish_errors = validate_pubsub_publish_steps(steps)
+    if publish_errors:
+        return "Invalid pubsub_publish step: " + "; ".join(publish_errors)
     combined_errors = await _combined_errors(deps, steps, workflow_id)
     if combined_errors:
         return "Invalid combined_datasource step: " + "; ".join(combined_errors)
@@ -1198,6 +1202,10 @@ async def update_workflow(
         dynamic_errors = validate_dynamic_steps(steps)
         if dynamic_errors:
             return "Invalid dynamic step: " + "; ".join(dynamic_errors)
+        from app.infrastructure.orchestration.pubsub_publish import validate_pubsub_publish_steps
+        publish_errors = validate_pubsub_publish_steps(steps)
+        if publish_errors:
+            return "Invalid pubsub_publish step: " + "; ".join(publish_errors)
         combined_errors = await _combined_errors(deps, steps, workflow_id)
         if combined_errors:
             return "Invalid combined_datasource step: " + "; ".join(combined_errors)

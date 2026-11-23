@@ -106,6 +106,10 @@ system_prompt: |
     part). Prefer this over chains of data_source/python steps, and never
     create one step per id/"slot" — the loop handles it.
   - `http_call` — outbound HTTP request
+  - `pubsub_publish` — publish one Pub/Sub message: `topic` (short name or
+    projects/<p>/topics/<t>, {state} templated), optional `project_id`, `data`
+    (dict -> JSON, or string), string `attributes`; `output_key` gets
+    {message_id, topic}. Only topics in PUBSUB_PUBLISH_ALLOWED_TOPICS work.
   - `execute` — run code (OpenHands); the default choice for logic and data
     manipulation
   - `human_approval` — pause for user approval

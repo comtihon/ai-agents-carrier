@@ -279,7 +279,11 @@ def register_management_tools(
                 llm (free-form LLM),
                 mcp (single MCP tool call), human_approval (pause for approval),
                 execute (OpenHands code execution), workflow (child workflow),
-                http_call (outbound HTTP), langgraph-agent, claude-agent,
+                http_call (outbound HTTP),
+                pubsub_publish (publish one message: topic, optional project_id,
+                data dict|string, attributes, output_key -> {message_id, topic};
+                topic must match PUBSUB_PUBLISH_ALLOWED_TOPICS),
+                langgraph-agent, claude-agent,
                 data_source (invoke a DataSourceDefinition operation),
                 combined_datasource (ONE step that acquires and filters data
                 through ordered `parts`: data_source | python | nested
