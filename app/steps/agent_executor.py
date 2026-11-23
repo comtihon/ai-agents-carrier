@@ -176,6 +176,8 @@ def _build_agent_config(
     run_id: str | None = None,
     state: dict[str, Any] | None = None,
     datasource_grants: dict[str, list[str]] | None = None,
+    workflow_id: str | None = None,
+    workflow_brain_access: str | None = None,
 ) -> dict[str, Any]:
     """Build the ``agent_config`` payload to forward in ``POST /start``.
 
@@ -209,6 +211,12 @@ def _build_agent_config(
       stays in this process and is resolved per request by the executor.  The
       grant is minted at spawn time, so editing the addon mid-run does not
       change what a running agent may do.
+    - ``brain`` entry (shared company memory, gbrain): present iff gbrain is
+      configured, a grant signing key resolves, and the effective access —
+      ``min(agent.brain_access, workflow_brain_access)``, with a missing
+      workflow level read as ``"none"`` — is ``read`` or ``write``.  Its
+      ``api_key`` is a signed brain grant; a short section explaining the tools
+      is appended to ``system_prompt``.
     - ``credentials``: API keys from every active LLM integration plus the
       generic credential sweep, minus every env var claimed by a tool in the
       ``AGENT_TOOLS`` registry.
@@ -226,7 +234,7 @@ def _build_agent_config(
     that path is an explicit operator override and deliberately bypasses the
     registry above.
     """
-    from app.core.config import DATASOURCES_MCP_NAME, McpIntegrationConfig
+    from app.core.config import BRAIN_MCP_NAME, DATASOURCES_MCP_NAME, McpIntegrationConfig
 
     agent_input: dict[str, Any] = agent_def.agent_input or {}
 
@@ -284,8 +292,9 @@ def _build_agent_config(
         enabled_mcp = agent_def.mcp_addon.enabled_servers()
     mcp_servers: list[dict[str, Any]] = []
     for intg in raw_integrations:
-        if intg.name == DATASOURCES_MCP_NAME:
-            # Granted only by datasource addons, below — never by a checkbox.
+        if intg.name in (DATASOURCES_MCP_NAME, BRAIN_MCP_NAME):
+            # Granted only by datasource addons / brain_access, below — never
+            # by a checkbox.
             continue
         if intg.name not in enabled_mcp:
             continue
@@ -394,6 +403,15 @@ def _build_agent_config(
                     len(granted_operations),
                 )
 
+    # --- Shared company memory (gbrain): one grant at the effective level ---
+    brain_entry, brain_prompt = _brain_mcp_entry(
+        agent_def, settings, run_id=run_id, workflow_id=workflow_id,
+        workflow_brain_access=workflow_brain_access,
+    )
+    if brain_entry is not None:
+        mcp_servers.append(brain_entry)
+        system_prompt = f"{system_prompt}\n\n{brain_prompt}" if system_prompt else brain_prompt
+
     # --- Credentials (resolved API-key values) ---
     credentials: dict[str, str] = {}
     for llm_intg in settings.get_llm_integrations():
@@ -492,6 +510,85 @@ def _build_agent_config(
         "env_vars": env_vars,
         "expected_output_fields": list(_protocol_keys),
     }
+
+
+def _brain_mcp_entry(
+    agent_def: "AgentDefinition",
+    settings: "Settings",
+    *,
+    run_id: str | None,
+    workflow_id: str | None,
+    workflow_brain_access: str | None,
+) -> tuple[dict[str, Any] | None, str]:
+    """The ``brain`` MCP entry and its prompt section, or ``(None, "")``.
+
+    Fails closed at every step: no effective access, gbrain unconfigured, or
+    no signing key each mean no entry (the first silently, the others with a
+    warning, since somebody asked for access and is not getting it).
+    """
+    from app.core.config import BRAIN_MCP_NAME
+    from app.domain.models.brain_access import effective_brain_access
+
+    access = effective_brain_access(
+        getattr(agent_def, "brain_access", "none"), workflow_brain_access
+    )
+    if access == "none":
+        return None, ""
+    if not settings.gbrain_configured():
+        logger.warning(
+            "agent '%s' (run '%s') has shared memory access '%s' but gbrain is "
+            "not configured (GBRAIN_URL) — no shared memory tools offered",
+            agent_def.id, run_id or "-", access,
+        )
+        return None, ""
+
+    from app.infrastructure.auth.brain_grant import BrainGrant, mint_brain_grant
+
+    token = mint_brain_grant(
+        BrainGrant(
+            run_id=run_id or "",
+            agent_id=agent_def.id,
+            workflow_id=workflow_id or "",
+            access=access,
+        ),
+        settings.resolved_brain_grant_signing_key(),
+        ttl_seconds=settings.brain_grant_ttl_seconds,
+    )
+    if not token:
+        return None, ""
+    logger.info(
+        "agent '%s' (run '%s', workflow '%s') granted shared memory access '%s'",
+        agent_def.id, run_id or "-", workflow_id or "-", access,
+    )
+    namespace = (settings.gbrain_write_namespace or "carrier").strip("/") or "carrier"
+    lines = [
+        "## Shared company memory",
+        "",
+        f"You have {access} access to the company's shared memory through the "
+        f"`{BRAIN_MCP_NAME}` MCP tools. Check it before asking for or "
+        "rediscovering context the company may already know:",
+        "- `brain_search` for names, identifiers and exact phrases;",
+        "- `brain_query` for concept or topic questions;",
+        "- `brain_get_page` to read a page, `brain_list_pages` to browse;",
+        "- `brain_recall` for short remembered facts about an entity.",
+    ]
+    if access == "write":
+        lines += [
+            "",
+            "You may also record durable knowledge with `brain_put_page` "
+            "(pass `expected_revision` from `brain_get_page` when updating an "
+            f"existing page) and `brain_remember`. Writes are stored under the "
+            f"`{namespace}/` namespace and attributed to this run. Write only "
+            "reusable, verified knowledge. Never write secrets, credentials, "
+            "tokens or customer personal data (PII).",
+        ]
+    return {
+        "name": BRAIN_MCP_NAME,
+        "transport": "streamable_http",
+        "env": {},
+        "url": settings.resolved_agent_mcp_brain_url(),
+        "api_key": token,
+    }, "\n".join(lines)
 
 
 def _apply_usage_keys(
@@ -666,6 +763,8 @@ async def execute_agent_step(
     warm_pod_repository: Any = None,
     use_meta_llm: bool = True,
     datasource_grants: dict[str, list[str]] | None = None,
+    workflow_id: str | None = None,
+    workflow_brain_access: str | None = None,
 ) -> dict[str, Any]:
     """Execute a ``langgraph-agent`` or ``claude-agent`` step.
 
@@ -701,6 +800,10 @@ async def execute_agent_step(
         ``datasource`` addons. Only the dynamic-workflow job runner passes it,
         after checking the sources against those enabled for its step; a
         workflow's YAML cannot set it.
+    workflow_id / workflow_brain_access:
+        The running workflow and its ``brain_access`` level. The agent's shared
+        memory access is the lower of this and the agent's own level; ``None``
+        counts as ``"none"`` (fail closed).
 
     Returns
     -------
@@ -777,6 +880,7 @@ async def execute_agent_step(
     )
     agent_config_payload = _build_agent_config(
         agent_def, settings, step=step, run_id=run_id, state=state, datasource_grants=datasource_grants,
+        workflow_id=workflow_id, workflow_brain_access=workflow_brain_access,
     )
     resolved_env_vars: dict[str, str] = agent_config_payload.get("env_vars") or {}
 

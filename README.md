@@ -1359,6 +1359,70 @@ script.
 
 ---
 
+## Shared memory (gbrain)
+
+Optional. Agents can read from, and when allowed write to, the company's shared
+memory — a gbrain MCP server. With `GBRAIN_URL` unset the
+feature is off: nothing is mounted, no agent is offered the tools, and nothing
+errors.
+
+**Access.** Every agent and every workflow has a `brain_access` field —
+`"none"` (default), `"read"` or `"write"` — on the REST payloads
+(`/api/v1/agents`, `/api/v1/workflows`), the management MCP and chat tools.
+An agent step gets the **lower** of the two (none < read < write). A PUT that
+omits `brain_access` keeps the stored value.
+
+**How agents reach it.** At spawn time an agent with effective access gets an
+MCP server entry named `brain` pointing at this backend's `/mcp/brain`
+(`AGENT_CALLBACK_URL`/`BASE_URL` for pod agents, `BASE_URL` for runners), with a
+signed, per-run grant (`brg1.…`) as its bearer, plus a short system-prompt
+section. `/mcp/brain` accepts nothing but a valid grant. It exposes seven
+curated tools, which call gbrain with the backend's own `GBRAIN_API_KEY`
+(never forwarded to agents):
+
+| Tool | gbrain tool | Access |
+|---|---|---|
+| `brain_search(query, limit)` | `search` | read |
+| `brain_query(query, limit)` | `query` | read |
+| `brain_get_page(slug)` | `get_page` | read |
+| `brain_recall(entity, query, question, limit)` | `recall` | read |
+| `brain_list_pages(slug_prefix, type, limit)` | `list_pages` | read |
+| `brain_put_page(slug, content, reason, expected_revision)` | `put_page` | write |
+| `brain_remember(fact, entity, kind)` | `remember` | write |
+
+Writes are forced under `GBRAIN_WRITE_NAMESPACE/` (`..`, absolute slugs and
+empty segments are rejected), marked `content_origin: inferred`, and carry
+provenance `carrier run=<run> workflow=<workflow> agent=<agent>`. Every write
+is logged.
+
+**Health.** `GET /health/brain` (unauthenticated, always 200) returns
+`{"status": "not_configured" | "unavailable" | "ok", "detail": string | null}`.
+It probes gbrain's `get_brain_health` (falling back to listing tools), cached
+for 30 s, and never reveals the URL or key. `/health` is unchanged.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GBRAIN_URL` | unset | gbrain MCP streamable-http endpoint; unset = feature off |
+| `GBRAIN_API_KEY` | unset | gbrain bearer (`gbrain auth create <name> --scopes read,write`); secret |
+| `GBRAIN_TOOL_PREFIX` | `""` | `gbrain_` only when `GBRAIN_URL` is the Airteam MCP gateway |
+| `GBRAIN_WRITE_NAMESPACE` | `carrier` | slug namespace for agent writes |
+| `GBRAIN_TIMEOUT_SECONDS` | `15` | per-call timeout |
+| `BRAIN_GRANT_SIGNING_KEY` | falls back to the datasource grant key | signs `/mcp/brain` grants; secret |
+| `BRAIN_GRANT_TTL_SECONDS` | `86400` | grant lifetime (= revocation window) |
+
+Example (in-cluster gbrain, called directly, so no prefix):
+
+```bash
+GBRAIN_URL=http://gbrain.gbrain.svc.cluster.local:3131/mcp
+GBRAIN_API_KEY=<gbrain bearer>
+```
+
+In Helm: `gbrain.url` / `gbrain.toolPrefix` / `gbrain.writeNamespace`, and
+`GBRAIN_API_KEY` / `BRAIN_GRANT_SIGNING_KEY` under `secrets` with
+`optional: true` (see `helm/values.yaml`).
+
+---
+
 ## Add-ons
 
 ### Slack approvals

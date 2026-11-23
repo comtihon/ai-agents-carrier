@@ -160,6 +160,9 @@ class ApplicationContainer:
     # The login script a super admin edits at runtime (app.application.login_admin).
     # None: only a deployment-configured script can be used.
     login_script_store: LoginScriptStore | None = None
+    # Shared company memory (gbrain) client. None when GBRAIN_URL is unset:
+    # the feature is off and /mcp/brain is not mounted.
+    brain_client: Any = None
     # References to background tasks created in startup() — held so they
     # can't be garbage-collected mid-flight, and cancelled on shutdown().
     _recover_task: asyncio.Task | None = field(default=None, init=False, repr=False, compare=False)
@@ -1299,6 +1302,8 @@ def _build_stream_store(settings: Settings) -> DataStreamStore:
 
 
 def build_container(settings: Settings) -> ApplicationContainer:
+    from app.infrastructure.brain.gbrain_client import GbrainClient
+
     llm = build_llm(settings)
     llm_factory = _make_llm_factory(settings)
     mcp_tools_provider = McpToolsProvider(settings)
@@ -1372,4 +1377,5 @@ def build_container(settings: Settings) -> ApplicationContainer:
         runner_backend=runner_backend,
         team_directory=team_directory,
         login_script_store=MongoLoginScriptStore(team_directory.database),
+        brain_client=GbrainClient.from_settings(settings),
     )

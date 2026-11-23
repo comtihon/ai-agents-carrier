@@ -1,4 +1,4 @@
-{{- if or .Values.config .Values.llmIntegrations .Values.mcpIntegrations }}
+{{- if or .Values.config .Values.llmIntegrations .Values.mcpIntegrations (.Values.gbrain).url }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -6,6 +6,16 @@ metadata:
 data:
 {{- range $key, $val := .Values.config }}
   {{ $key }}: {{ $val | quote }}
+{{- end }}
+{{- with .Values.gbrain }}
+{{- if .url }}
+  GBRAIN_URL: {{ .url | quote }}
+  GBRAIN_TOOL_PREFIX: {{ default "" .toolPrefix | quote }}
+  GBRAIN_WRITE_NAMESPACE: {{ default "carrier" .writeNamespace | quote }}
+{{- if .timeoutSeconds }}
+  GBRAIN_TIMEOUT_SECONDS: {{ .timeoutSeconds | quote }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- if .Values.llmIntegrations }}
   LLM_INTEGRATIONS: |

@@ -34,6 +34,7 @@ from app.application.run_control import (
 )
 from app.core.container import ApplicationContainer
 from app.domain.models.graph_run import GraphRun
+from app.domain.models.brain_access import BrainAccess
 from app.domain.models.workflow_definition import WorkflowDefinition
 from app.infrastructure.config.graph_loader import build_runner_from_definition
 from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner, merge_out_of_band_state
@@ -88,6 +89,8 @@ class WorkflowDefinitionRequest(BaseModel):
     ui: dict[str, Any] = Field(default_factory=dict)
     use_meta_llm: bool = True
     use_storage: bool = False
+    # Shared company memory ceiling for this workflow's agent steps.
+    brain_access: BrainAccess = "none"
     enabled: bool = True
     # None = the default: private when a user creates it, public without auth.
     visibility: Visibility | None = None
@@ -111,6 +114,7 @@ class WorkflowDefinitionUpdateRequest(BaseModel):
     # appeared not to stick.
     use_meta_llm: bool | None = None
     use_storage: bool | None = None
+    brain_access: BrainAccess | None = None
     enabled: bool | None = None
     visibility: Visibility | None = None
     # With visibility "team": which team. Omitted = the caller's own (a
@@ -742,6 +746,7 @@ async def create_workflow(
         ui=body.ui,
         use_meta_llm=body.use_meta_llm,
         use_storage=body.use_storage,
+        brain_access=body.brain_access,
         enabled=body.enabled,
         **visibility_kwargs(body.visibility, body.team_id),
     )
@@ -1162,6 +1167,9 @@ async def update_workflow(
         ),
         use_storage=(
             existing.use_storage if body.use_storage is None else body.use_storage
+        ),
+        brain_access=(
+            existing.brain_access if body.brain_access is None else body.brain_access
         ),
         enabled=existing.enabled if body.enabled is None else body.enabled,
         created_at=existing.created_at,

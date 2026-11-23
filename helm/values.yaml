@@ -68,11 +68,46 @@ auth:
 # Secrets injected as individual env vars.
 # Key becomes the env var name (uppercased if needed by convention).
 # Value must have 'name' (k8s Secret name) and 'key' (Secret data key).
+# Optional 'optional: true' renders `optional: true` on the secretKeyRef, so a
+# missing Secret key leaves the env var unset instead of failing the pod with
+# CreateContainerConfigError — use it for keys that only some environments
+# have (e.g. GBRAIN_API_KEY, absent where there is no gbrain).
 # Example:
 #   ANTHROPIC_API_KEY:
 #     name: langgraph-backend-secrets
 #     key: ANTHROPIC_API_KEY
+#   MCP_DATASOURCES_API_KEY:
+#     name: langgraph-backend-secrets
+#     key: MCP_DATASOURCES_API_KEY
+#   GBRAIN_API_KEY:                 # see `gbrain` below
+#     name: langgraph-backend-secrets
+#     key: GBRAIN_API_KEY
+#     optional: true
+#   BRAIN_GRANT_SIGNING_KEY:        # optional; falls back to the datasource grant key
+#     name: langgraph-backend-secrets
+#     key: BRAIN_GRANT_SIGNING_KEY
+#     optional: true
 secrets: {}
+
+# Shared company memory (gbrain, README "Shared memory (gbrain)"). An empty
+# `url` turns the feature off entirely: nothing is rendered, /mcp/brain is not
+# mounted, agents get no brain tools, /health/brain says "not_configured".
+# Rendered into the app ConfigMap as GBRAIN_URL / GBRAIN_TOOL_PREFIX /
+# GBRAIN_WRITE_NAMESPACE (/ GBRAIN_TIMEOUT_SECONDS). The credentials go in
+# `secrets` above: GBRAIN_API_KEY (a gbrain bearer, minted with
+# `gbrain auth create <name> --scopes read,write`) and optionally
+# BRAIN_GRANT_SIGNING_KEY (signs agents' per-run brain grants; falls back to
+# DATASOURCE_GRANT_SIGNING_KEY, then MCP_DATASOURCES_API_KEY).
+# Example (prod, gbrain called directly in-cluster, tools unprefixed):
+#   gbrain:
+#     url: http://gbrain.gbrain.svc.cluster.local:3131/mcp
+#     toolPrefix: ""          # "gbrain_" only when url is the Airteam MCP gateway
+#     writeNamespace: carrier
+gbrain:
+  url: ""
+  toolPrefix: ""
+  writeNamespace: carrier
+  timeoutSeconds: ""
 
 # LLM provider integrations. Free-form list — any entry that exposes an
 # OpenAI / LiteLLM-compatible HTTP endpoint can be added without code changes.

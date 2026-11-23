@@ -28,6 +28,7 @@ from app.application.visibility import (
 from app.core.config import get_settings
 from app.core.container import ApplicationContainer
 from app.domain.models.agent_addon import AnyAgentAddon
+from app.domain.models.brain_access import BrainAccess
 from app.domain.models.agent_definition import AgentDefinition
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,8 @@ class AgentDefinitionRequest(BaseModel):
     acp_agent: str | None = None
     # default_runtime "runner": the machine (app.application.runners) it runs on.
     runner_id: str | None = None
+    # Shared company memory (gbrain) clearance: "none" | "read" | "write".
+    brain_access: BrainAccess = "none"
     # None = the default: private when a user creates it, public without auth.
     visibility: Visibility | None = None
     # With visibility "team": which team. Omitted = the caller's own (a
@@ -77,6 +80,8 @@ class AgentDefinitionUpdateRequest(BaseModel):
     protocol: Literal["http-poll", "acp"] | None = None
     acp_agent: str | None = None
     runner_id: str | None = None
+    # None = omitted -> keep the stored value.
+    brain_access: BrainAccess | None = None
     # None = keep the stored visibility.
     visibility: Visibility | None = None
     # With visibility "team": which team. Omitted = the caller's own (a
@@ -246,6 +251,7 @@ async def create_agent(
         helm_chart=body.helm_chart,
         helm_values=body.helm_values,
         addons=_addon_adapter.validate_python(body.addons),
+        brain_access=body.brain_access,
         **runner_fields,
         **visibility_kwargs(body.visibility, body.team_id),
     )
@@ -326,6 +332,7 @@ async def update_agent(
         helm_values=body.helm_values,
         created_at=existing.created_at,
         addons=addons,
+        brain_access=existing.brain_access if body.brain_access is None else body.brain_access,
         **runner_fields,
         **visibility_kwargs(body.visibility, body.team_id),
     )

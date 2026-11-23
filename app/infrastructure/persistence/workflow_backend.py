@@ -9,6 +9,7 @@ from typing import Any
 import yaml
 
 from app.domain.models.ownership import COMPUTED_FIELDS
+from app.domain.models.brain_access import normalize_brain_access
 from app.domain.models.workflow_definition import WorkflowDefinition
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,7 @@ class LocalFilesWorkflowBackend(WorkflowDefinitionBackend):
                 readonly=raw.get("readonly", self._readonly),
                 enabled=raw.get("enabled", True),
                 use_meta_llm=raw.get("use_meta_llm", True),
+                brain_access=normalize_brain_access(raw.get("brain_access")),
                 visibility=raw.get("visibility", "public"),
                 owner_id=raw.get("owner_id"),
                 owner_name=raw.get("owner_name"),
@@ -127,6 +129,8 @@ class LocalFilesWorkflowBackend(WorkflowDefinitionBackend):
         if definition.ui:
             data["ui"] = definition.ui
         data["use_meta_llm"] = definition.use_meta_llm
+        if definition.brain_access != "none":
+            data["brain_access"] = definition.brain_access
         data["enabled"] = definition.enabled
         if definition.visibility != "public" or definition.owner_id:
             data["visibility"] = definition.visibility

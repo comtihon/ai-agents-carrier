@@ -5,6 +5,7 @@ from typing import Any, ClassVar
 
 from pydantic import Field
 
+from app.domain.models.brain_access import BrainAccess
 from app.domain.models.ownership import GrantableResource
 
 
@@ -28,6 +29,9 @@ class WorkflowDefinition(GrantableResource):
     # workflow that never asked for state should not silently accumulate any,
     # and `storage` steps fail loudly rather than no-op when it is off.
     use_storage: bool = False
+    # Ceiling on the shared company memory (gbrain) access of this workflow's
+    # agent steps; each step gets min(this, the agent's brain_access).
+    brain_access: BrainAccess = "none"
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -46,5 +50,6 @@ class WorkflowDefinition(GrantableResource):
             d["ui"] = self.ui
         d["use_meta_llm"] = self.use_meta_llm
         d["use_storage"] = self.use_storage
+        d["brain_access"] = self.brain_access
         d["enabled"] = self.enabled
         return d

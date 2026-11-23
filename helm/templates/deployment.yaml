@@ -28,7 +28,7 @@ spec:
           ports:
             - containerPort: 8000
               name: http
-{{- if or .Values.config .Values.llmIntegrations .Values.mcpIntegrations }}
+{{- if or .Values.config .Values.llmIntegrations .Values.mcpIntegrations (.Values.gbrain).url }}
           envFrom:
             - configMapRef:
                 name: {{ include "ai-agents-carrier.fullname" . }}-config
@@ -45,6 +45,9 @@ spec:
                 secretKeyRef:
                   name: {{ $secret.name }}
                   key: {{ $secret.key }}
+{{- if $secret.optional }}
+                  optional: true
+{{- end }}
 {{- end }}
 {{- range $cfg := .Values.llmIntegrations }}
 {{- if $cfg.apiKeySecret }}
