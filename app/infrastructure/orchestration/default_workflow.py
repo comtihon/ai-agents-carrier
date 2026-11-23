@@ -487,7 +487,7 @@ def build_default_workflow(
         return await core.get_agent(deps, agent_id)
 
     @tool
-    async def create_agent(agent_id: str, name: str, description: str = "", default_runtime: str = "local", agent_input_json: str = "{}", protocol: str = "http-poll", acp_agent: str = None, brain_access: str = "none", max_concurrency: int = None) -> str:
+    async def create_agent(agent_id: str, name: str, description: str = "", default_runtime: str = "local", agent_input_json: str = "{}", protocol: str = "http-poll", acp_agent: str = None, brain_access: str = "none", max_concurrency: int = None, runner_id: str = None) -> str:
         """Create a new agent definition. agent_input_json is a JSON object of default input overrides.
 
         protocol: "http-poll" (pi-cloud-agent /start + /poll, the default) or
@@ -498,14 +498,17 @@ def build_default_workflow(
         workflow's brain_access.
         max_concurrency: most runs of this agent's runtime executing at once,
         across all workflows and users (more runs queue); omit or 0 = no limit.
+        runner_id: with default_runtime "runner", the connected machine
+        (Runners panel, e.g. "rnr-..."); protocol becomes "acp" and acp_agent
+        must be one the runner offers.
         """
         return await core.create_agent(
             deps, agent_id, name, description, default_runtime, agent_input_json, protocol, acp_agent,
-            brain_access, max_concurrency,
+            brain_access, max_concurrency, runner_id,
         )
 
     @tool
-    async def update_agent(agent_id: str, name: str = None, description: str = None, default_runtime: str = None, agent_input_json: str = None, protocol: str = None, acp_agent: str = None, addons_json: str = None, brain_access: str = None, max_concurrency: int = None) -> str:
+    async def update_agent(agent_id: str, name: str = None, description: str = None, default_runtime: str = None, agent_input_json: str = None, protocol: str = None, acp_agent: str = None, addons_json: str = None, brain_access: str = None, max_concurrency: int = None, runner_id: str = None) -> str:
         """Update an existing agent definition. Only provided fields are changed; others preserved.
 
         protocol: "http-poll" or "acp". acp_agent: the proxy's agent name for
@@ -520,10 +523,12 @@ def build_default_workflow(
         max_concurrency: most runs of this agent's runtime executing at once,
         across all workflows and users (more runs queue); 0 = no limit, omit
         to keep current.
+        runner_id: the connected machine for default_runtime "runner"
+        ("" clears it); omit to keep current.
         """
         return await core.update_agent(
             deps, agent_id, name, description, default_runtime, agent_input_json, protocol, acp_agent,
-            addons_json, brain_access, max_concurrency,
+            addons_json, brain_access, max_concurrency, runner_id,
         )
 
     @tool

@@ -442,6 +442,7 @@ def register_management_tools(
         acp_agent: str = None,
         brain_access: str = "none",
         max_concurrency: int = None,
+        runner_id: str = None,
     ) -> str:
         """Create a new agent definition. agent_input_json is a JSON object of default input overrides.
 
@@ -453,10 +454,13 @@ def register_management_tools(
         workflow's brain_access.
         max_concurrency: most runs of this agent's runtime executing at once,
         across all workflows and users (more runs queue); omit or 0 = no limit.
+        runner_id: with default_runtime "runner", the connected machine
+        (Runners panel, e.g. "rnr-..."); protocol becomes "acp" and acp_agent
+        must be one the runner offers.
         """
         return await core.create_agent(
             deps(), agent_id, name, description, default_runtime, agent_input_json, protocol, acp_agent,
-            brain_access, max_concurrency,
+            brain_access, max_concurrency, runner_id,
         )
 
     async def update_agent(
@@ -470,6 +474,7 @@ def register_management_tools(
         addons_json: str = None,
         brain_access: str = None,
         max_concurrency: int = None,
+        runner_id: str = None,
     ) -> str:
         """Update an existing agent definition. Only provided fields are changed; others preserved.
 
@@ -485,10 +490,12 @@ def register_management_tools(
         max_concurrency: most runs of this agent's runtime executing at once,
         across all workflows and users (more runs queue); 0 = no limit, omit
         to keep current.
+        runner_id: the connected machine for default_runtime "runner"
+        ("" clears it); omit to keep current.
         """
         return await core.update_agent(
             deps(), agent_id, name, description, default_runtime, agent_input_json, protocol, acp_agent,
-            addons_json, brain_access, max_concurrency,
+            addons_json, brain_access, max_concurrency, runner_id,
         )
 
     async def list_agent_concurrency(key: str = None) -> str:
