@@ -39,6 +39,7 @@ API at `http://localhost:8000`. Health check: `GET /health`.
 | `PUBSUB_MAX_MESSAGES` | `10` | Messages pulled concurrently per subscription |
 | `PUBSUB_DROP_INVALID_MESSAGES` | `true` | Ack (drop) events failing schema validation instead of nacking them |
 | `PUBSUB_DELETE_ORPHANED_SUBSCRIPTIONS` | `true` | Delete a backend-created subscription once its last trigger step is gone |
+| `PUBSUB_PUBLISH_ALLOWED_TOPICS` | — | Comma-separated `fnmatch` globs of topics `pubsub_publish` steps may publish to, matched against the full path and the short name. Empty disables publishing |
 | `OAUTH_ENABLED` | `false` | Enable JWT Bearer auth on all endpoints |
 | `OAUTH_JWKS_URL` | — | JWKS endpoint for token validation |
 | `OAUTH_ISSUER` | — | Expected token issuer; also where the userinfo endpoint is derived from |
@@ -433,6 +434,30 @@ POST /api/v1/callbacks/{run_id}/reject   body: {"reason": "..."}
     title: "{request}"
   output_key: ticket
 ```
+
+### `pubsub_publish` — publish a Pub/Sub message
+
+```yaml
+- id: notify
+  type: pubsub_publish
+  topic: "service.modelapi.prediction"   # short name -> projects/<PUBSUB_PROJECT_ID>/topics/<name>;
+                                         #   a full projects/<p>/topics/<t> path works too
+  project_id: engineering-368717         # optional — overrides PUBSUB_PROJECT_ID for short names
+  data:                                  # dict/list (JSON-encoded) or string; {state} templated
+    projectId: "{event.projectId}"
+    artifactUrl: "{result.artifact_url}"
+  attributes:                            # optional string attributes; {state} templated
+    source: agent
+    agentStatus: "{result.status}"
+  timeout_seconds: 30                    # optional, default 30
+  output_key: published                  # -> {message_id, topic}
+```
+
+Publishing is **closed by default**: the resolved topic must match a glob in
+`PUBSUB_PUBLISH_ALLOWED_TOPICS` (checked against both the full path and the short
+name), and an empty setting fails every `pubsub_publish` step. The service
+account needs `roles/pubsub.publisher` on the topic. Errors fail the step; set
+`ignore_errors: true` to capture them under `output_key` instead.
 
 ### `slack` — post to / read from a chat provider
 

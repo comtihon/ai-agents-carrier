@@ -288,6 +288,11 @@ class Settings(BaseSettings):
         default=True, alias="PUBSUB_DELETE_ORPHANED_SUBSCRIPTIONS",
     )
 
+    # Topics a `pubsub_publish` step may publish to: comma-separated fnmatch
+    # globs, matched against the full projects/<p>/topics/<t> path and the
+    # short topic name. Empty (default) disables publishing altogether.
+    pubsub_publish_allowed_topics: str = Field(default="", alias="PUBSUB_PUBLISH_ALLOWED_TOPICS")
+
     # --- OAuth ---
     oauth_enabled: bool = Field(default=False, alias="OAUTH_ENABLED")
     oauth_jwks_url: str | None = Field(default=None, alias="OAUTH_JWKS_URL")

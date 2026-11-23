@@ -714,7 +714,9 @@ def _guard_dynamic(steps: object) -> None:
     """Reject a dynamic step whose config would only fail at run time."""
     from app.infrastructure.orchestration.dynamic.node import validate_dynamic_steps
 
-    errors = validate_dynamic_steps(steps)
+    from app.infrastructure.orchestration.pubsub_publish import validate_pubsub_publish_steps
+
+    errors = validate_dynamic_steps(steps) + validate_pubsub_publish_steps(steps)
     if errors:
         raise HTTPException(status_code=422, detail="; ".join(errors))
 

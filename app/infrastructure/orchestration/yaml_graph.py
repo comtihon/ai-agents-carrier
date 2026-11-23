@@ -9,6 +9,7 @@ import os
 import tempfile
 import re
 import string
+from _string import formatter_field_name_split as _formatter_field_name_split
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Annotated, Any, TypedDict
@@ -907,7 +908,7 @@ class YamlGraphRunner:
         description: "..."
         steps:
           - id: <node-id>
-            type: llm | mcp | human_approval | execute | workflow | cron | http | http_call | python | data_source | parallel | join | proceed_or | switch | storage | slack
+            type: llm | mcp | human_approval | execute | workflow | cron | http | http_call | pubsub_publish | python | data_source | parallel | join | proceed_or | switch | storage | slack
             when: <state-key>          # skip node if state[key] is falsy
             system_prompt: "..."       # llm
             user_template: "..."       # {key} placeholders resolved from state
@@ -941,6 +942,15 @@ class YamlGraphRunner:
                                        #   identity to use; omit for the default
             body:                      # http_call only — JSON body; values support {key}
               issue_key: "{ticket_id}"
+            topic: "svc.events"        # pubsub_publish only — short name (resolved
+                                       #   against PUBSUB_PROJECT_ID) or full
+                                       #   projects/<p>/topics/<t>; {state} templated.
+                                       #   Must match PUBSUB_PUBLISH_ALLOWED_TOPICS
+            project_id: my-project     # pubsub_publish only — short-name project override
+            data: {id: "{event.id}"}   # pubsub_publish only — dict (JSON-encoded) or
+                                       #   string; values {state} templated
+            attributes: {source: agent}  # pubsub_publish only — string attributes;
+                                       #   output_key gets {message_id, topic}
             code: |                    # python only — executed with ``state`` dict in scope;
               output = state["x"] + 1  #   set ``output`` variable to store the result
             script_id: my-script       # python only — run a library script instead
@@ -1462,6 +1472,8 @@ class YamlGraphRunner:
             fn = self._pubsub_trigger_node(step)
         elif t == "http_call":
             fn = self._http_call_node(step)
+        elif t == "pubsub_publish":
+            fn = self._pubsub_publish_node(step)
         elif t == "data_source":
             fn = self._data_source_node(step)
         elif t == "combined_datasource":
@@ -2353,6 +2365,54 @@ class YamlGraphRunner:
             except Exception as exc:
                 logger.exception("[%s] step '%s' http_call failed", graph_id, step_id)
                 return {output_key: {"error": str(exc)}}
+
+        return node
+
+    def _pubsub_publish_node(self, step: dict[str, Any]):
+        """Publish one message to a Google Cloud Pub/Sub topic.
+
+        ``topic`` (short name or full path), ``project_id``, ``data`` and
+        ``attributes`` are all ``{state}``-templated.  A dict/list ``data`` is
+        JSON-encoded, a string is sent as UTF-8.  The topic must match
+        ``PUBSUB_PUBLISH_ALLOWED_TOPICS``; an empty setting disables publishing.
+        ``{message_id, topic}`` lands under ``output_key`` (default: step id).
+        Any error fails the step, unless ``ignore_errors`` captures it under
+        ``output_key`` instead.
+        """
+        from app.infrastructure.orchestration import pubsub_publish as pp
+
+        graph_id = self.id
+
+        async def node(state: dict) -> dict:
+            step_id = step["id"]
+            output_key = step.get("output_key") or step_id
+            try:
+                from app.core.config import get_settings
+
+                settings = get_settings()
+                project_id = (
+                    self._render(str(step.get("project_id") or ""), state).strip()
+                    or settings.pubsub_project_id
+                )
+                topic = pp.resolve_topic(self._render(str(step.get("topic") or ""), state), project_id)
+                pp.check_allowed(topic, pp.parse_allowlist(settings.pubsub_publish_allowed_topics))
+                raw_data = step.get("data")
+                data = self._render(raw_data, state) if isinstance(raw_data, str) else self._render_deep(raw_data, state)
+                attributes = {
+                    str(k): self._render(str(v), state)
+                    for k, v in (step.get("attributes") or {}).items()
+                    if v is not None
+                }
+                timeout = float(step.get("timeout_seconds") or pp.DEFAULT_TIMEOUT_SECONDS)
+                logger.info("[%s] step '%s' running (pubsub_publish %s)", graph_id, step_id, topic)
+                message_id = await pp.publish(topic, pp.encode_data(data), attributes, timeout)
+                logger.info("[%s] step '%s' published message %s", graph_id, step_id, message_id)
+                return {output_key: {"message_id": message_id, "topic": topic}}
+            except Exception as exc:
+                logger.exception("[%s] step '%s' pubsub_publish failed", graph_id, step_id)
+                if step.get("ignore_errors"):
+                    return {output_key: {"error": str(exc)}}
+                return {output_key: {"error": str(exc)}, "__failed_step__": step_id}
 
         return node
 
@@ -3665,10 +3725,22 @@ class YamlGraphRunner:
             def __missing__(self, key: str) -> "_Safe":
                 return _Safe()
 
+        class _Formatter(string.Formatter):
+            """``{event.field}`` reads a dict key, as the trigger docs promise."""
+            def get_field(self, field_name, args, kwargs):  # type: ignore[override]
+                first, rest = _formatter_field_name_split(field_name)
+                obj = self.get_value(first, args, kwargs)
+                for is_attr, key in rest:
+                    if is_attr and isinstance(obj, dict):
+                        obj = obj[key] if key in obj else _Safe()
+                    else:
+                        obj = getattr(obj, key) if is_attr else obj[key]
+                return obj, first
+
         d = _DefaultDict(_stream_safe_state(state))
         d["env"] = _EnvAccessor()
         try:
-            return string.Formatter().vformat(template, [], d)  # type: ignore[arg-type]
+            return _Formatter().vformat(template, [], d)  # type: ignore[arg-type]
         except ValueError:
             return template
 
