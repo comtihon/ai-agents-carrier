@@ -536,7 +536,19 @@ Spawns a registered agent, sends the task, suspends until the agent calls back w
       value: custom-value        # literal value
   output_mapping:                # map individual agent output keys → state keys (optional)
     result: agent_result
+  ignore_errors: true            # optional — on failure store {error, ok: false} under
+                                 #   output_key (default: the step id) and continue
 ```
+
+**Failures.** By default a failed agent step fails the run: every later step is
+skipped. With `ignore_errors: true` the failure — the agent could not be spawned,
+the runner stayed offline, the ACP turn errored or ran out of quota, the
+concurrency queue could not be joined, the output missed `output_mapping`, the
+meta-LLM rejected it — lands as `{"error": "...", "ok": false}` under
+`output_key` (the step id when unset) and the next step runs, so a later step can
+route on it or report it. Cancelling or terminating the run still stops it.
+There is no per-step wall-clock limit for agent steps; bound long work inside
+the agent's own task.
 
 **After the agent completes**, a meta-LLM call analyzes the output and decides:
 - **PROCEED** — result is good, workflow continues

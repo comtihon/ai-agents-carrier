@@ -195,6 +195,10 @@ def _build_state_schema(steps: list[dict[str, Any]]) -> type:
                     "agent output will not reach workflow state",
                     step.get("id"), step.get("type"),
                 )
+            if step.get("ignore_errors") and "output_key" not in step:
+                # ignore_errors stores {error, ok: false} under the step id
+                # when there is no output_key; undeclared, LangGraph drops it.
+                fields[step["id"]] = Any  # type: ignore[assignment]
             if step.get("slack_input_key"):
                 fields[step["slack_input_key"]] = Any  # type: ignore[assignment]
             # Agent-LLM and post-compact meta-LLM token usage are tracked as two
@@ -983,8 +987,11 @@ class YamlGraphRunner:
                                        #   list of {thread_id, text} to post in one go
             skip_if_replied: true      # slack only (reply) -- do not post a reply whose
                                        #   text is already in the thread (idempotency)
-            ignore_errors: true        # slack only -- capture provider errors under
-                                       #   output_key instead of failing the run
+            ignore_errors: true        # slack | langgraph-agent | claude-agent --
+                                       #   capture the error under
+                                       #   output_key (agents: {error, ok: false}, key
+                                       #   defaults to the step id) instead of failing
+                                       #   the run, so the next step still runs
             source: github             # data_source only — DataSourceDefinition id
             operation: list_repos      # data_source only — operation to invoke
             limit: 500                 # data_source only — cap on records
@@ -1866,6 +1873,26 @@ class YamlGraphRunner:
                 )
             except Exception as _step_exc:
                 from app.steps.agent_executor import MetaLLMRejectionError
+                if step.get("ignore_errors"):
+                    # Same contract as slack / pubsub_publish: the failure is
+                    # data for the next step, not the end of the run. Covers
+                    # every way the agent step can fail -- spawn, runner wait,
+                    # concurrency queue, the ACP turn, output validation and a
+                    # meta-LLM rejection.
+                    _err_key = step.get("output_key") or step_id
+                    _err: dict[str, Any] = {"error": str(_step_exc) or type(_step_exc).__name__, "ok": False}
+                    if isinstance(_step_exc, MetaLLMRejectionError):
+                        _err["meta_llm_rejection"] = _step_exc.reason
+                    logger.warning(
+                        "[%s] step '%s' failed, continuing (ignore_errors): %s",
+                        graph_id, step_id, _step_exc,
+                    )
+                    _update: dict[str, Any] = {_err_key: _err}
+                    if isinstance(_step_exc, MetaLLMRejectionError):
+                        # What the agent did produce stays visible, as without
+                        # ignore_errors -- minus the failure sentinel.
+                        _update = {**_step_exc.mapped_result, **_update}
+                    return _update
                 if isinstance(_step_exc, MetaLLMRejectionError):
                     # Include the agent's actual extracted output alongside the
                     # rejection so the UI can show what the agent produced and
