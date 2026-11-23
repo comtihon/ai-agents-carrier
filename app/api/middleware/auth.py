@@ -33,7 +33,10 @@ logger = logging.getLogger(__name__)
 # Exact paths that bypass authentication (health/readiness probes)
 # /mcp/management is the bare form of the "/mcp/management/" prefix below; it is
 # guarded by _ManagementAuthWrapper instead (see app.api.app).
-_UNPROTECTED_PATHS = {"/health", "/ready", "/mcp/management"}
+# /health/brain reports only "not_configured" | "unavailable" | "ok" (never a
+# URL or key), so probes and the UI can read it without a token. /mcp/brain is
+# the bare form of the "/mcp/brain/" prefix below.
+_UNPROTECTED_PATHS = {"/health", "/ready", "/health/brain", "/mcp/management", "/mcp/brain"}
 
 # Prefixes exempt for every method, because each already authenticates itself by
 # another mechanism. Nothing belongs here on the grounds that it is "internal":
@@ -57,6 +60,10 @@ _UNPROTECTED_PREFIXES = (
     # when no API key is configured. Listed "/"-terminated so it cannot also
     # exempt a sibling path like /mcp/managementfoo.
     "/mcp/management/",
+    # Shared memory MCP — spawned agents hold no user JWT, only a signed brain
+    # grant; app.api.app._BrainAuthWrapper verifies it and fails closed on
+    # anything else. "/"-terminated for the same reason as above.
+    "/mcp/brain/",
 )
 
 # (method, prefix) pairs exempt only for that HTTP method.

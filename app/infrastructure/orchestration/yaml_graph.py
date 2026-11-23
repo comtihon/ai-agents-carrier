@@ -1146,6 +1146,9 @@ class YamlGraphRunner:
         self.description: str = definition.get("description", "")
         self._max_iterations: int = definition.get("max_iterations", 10)
         self._use_meta_llm: bool = definition.get("use_meta_llm", True)
+        # Ceiling on agent steps' shared memory access; unknown/missing = none.
+        from app.domain.models.brain_access import normalize_brain_access
+        self._brain_access: str = normalize_brain_access(definition.get("brain_access"))
         self.readonly: bool = False  # Set post-construction by build_registry_from_definitions
         # A disabled workflow starts no runs; see app.application.run_control.
         # Read off the definition (not post-construction like readonly) so runners
@@ -1815,6 +1818,7 @@ class YamlGraphRunner:
         """
         graph_id = self.id
         use_meta_llm = self._use_meta_llm
+        brain_access = self._brain_access
 
         async def node(state: dict) -> dict:
             step_id = step["id"]
@@ -1845,6 +1849,8 @@ class YamlGraphRunner:
                     agent_task_repository=self._agent_task_repository,
                     warm_pod_repository=self._warm_pod_repository,
                     use_meta_llm=use_meta_llm,
+                    workflow_id=graph_id,
+                    workflow_brain_access=brain_access,
                 )
             except Exception as _step_exc:
                 from app.steps.agent_executor import MetaLLMRejectionError

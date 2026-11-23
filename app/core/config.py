@@ -216,6 +216,10 @@ _SYSTEM_ONLY_ALIASES = {
     "OPENHANDS_API_KEY",
     "DOCKER_REGISTRY_PASSWORD",
     "DOCKER_REGISTRY_USERNAME",
+    # The upstream shared-memory credential. Agents reach gbrain only through
+    # /mcp/brain with a scoped grant; forwarding this key would hand them
+    # unscoped read/write access to the whole company memory.
+    "GBRAIN_API_KEY",
 }
 
 # Suffixes that identify credential/secret fields worth forwarding to agents.
@@ -227,6 +231,11 @@ _CREDENTIAL_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_JSON", "_CREDENTIALS"
 # spawn path that reaches it only through a scoped grant
 # (app.steps.agent_executor).
 DATASOURCES_MCP_NAME = "datasources"
+
+# Name of the in-process shared memory (gbrain) bridge entry handed to agents.
+# Reserved the same way: it is granted only by ``brain_access``, never by an
+# ``mcp`` addon checkbox (app.steps.agent_executor).
+BRAIN_MCP_NAME = "brain"
 
 
 class Settings(BaseSettings):
@@ -625,6 +634,25 @@ class Settings(BaseSettings):
         default=None, alias="MCP_DATASOURCES_ALLOWED_HOSTS"
     )
 
+    # --- Shared company memory: gbrain (proxied in-process at /mcp/brain) ---
+    # gbrain's MCP streamable-http endpoint. Unset / blank turns the whole
+    # feature off: /mcp/brain is not mounted, no agent is offered the tools,
+    # and /health/brain answers "not_configured".
+    gbrain_url: str | None = Field(default=None, alias="GBRAIN_URL")
+    # Bearer for GBRAIN_URL. Never forwarded to agents (see _SYSTEM_ONLY_ALIASES).
+    gbrain_api_key: str | None = Field(default=None, alias="GBRAIN_API_KEY")
+    # Prepended to every upstream tool name. "" for gbrain itself; "gbrain_"
+    # when GBRAIN_URL points at the Airteam MCP gateway, which prefixes them.
+    gbrain_tool_prefix: str = Field(default="", alias="GBRAIN_TOOL_PREFIX")
+    # Slug namespace every agent write lands under (`<namespace>/...`).
+    gbrain_write_namespace: str = Field(default="carrier", alias="GBRAIN_WRITE_NAMESPACE")
+    gbrain_timeout_seconds: float = Field(default=15.0, alias="GBRAIN_TIMEOUT_SECONDS")
+    # Signs the per-run brain grants (app.infrastructure.auth.brain_grant).
+    # Falls back to the data source grant key, so a deployment that has one
+    # needs no new secret.
+    brain_grant_signing_key: str | None = Field(default=None, alias="BRAIN_GRANT_SIGNING_KEY")
+    brain_grant_ttl_seconds: int = Field(default=86400, alias="BRAIN_GRANT_TTL_SECONDS")
+
     # --- Management MCP (served in-process at /mcp/management) ---
     # Exposes the platform's own CRUD + run control tools to external MCP
     # clients. Token-gated and fail-closed (see app.api.app._ManagementAuthWrapper).
@@ -724,6 +752,8 @@ class Settings(BaseSettings):
         "mcp_datasources_api_key",
         "management_mcp_api_key",
         "datasource_grant_signing_key",
+        "gbrain_api_key",
+        "brain_grant_signing_key",
     )
     @classmethod
     def _strip_api_key(cls, value: str | None) -> str | None:
@@ -812,6 +842,40 @@ class Settings(BaseSettings):
         is usually cluster-internal, so it gets the public ``BASE_URL``.
         """
         return f"{self.base_url.rstrip('/')}/mcp/datasources"
+
+    # ── Shared memory (gbrain) ─────────────────────────────────────────────
+
+    def gbrain_configured(self) -> bool:
+        """Whether the shared memory feature is on (``GBRAIN_URL`` is set)."""
+        return bool((self.gbrain_url or "").strip())
+
+    def resolved_brain_grant_signing_key(self) -> str | None:
+        """Key that signs and verifies ``/mcp/brain`` grants, or ``None``."""
+        stripped = (self.brain_grant_signing_key or "").strip()
+        return stripped or self.resolved_datasource_grant_signing_key()
+
+    def resolved_mcp_brain_url(self) -> str:
+        """Loopback URL of the mounted ``/mcp/brain`` endpoint."""
+        port = os.environ.get("PORT", "8000")
+        return f"http://127.0.0.1:{port}/mcp/brain"
+
+    def resolved_agent_mcp_brain_url(self) -> str:
+        """``/mcp/brain`` as a spawned (pod / docker / local) agent dials it."""
+        base = (self.agent_callback_url or self.base_url).rstrip("/")
+        return f"{base}/mcp/brain"
+
+    def resolved_runner_mcp_brain_url(self) -> str:
+        """``/mcp/brain`` as a runner (a user's machine) dials it: the public URL."""
+        return f"{self.base_url.rstrip('/')}/mcp/brain"
+
+    def brain_mcp_allowed_hosts(self) -> list[str]:
+        """Host header values the ``/mcp/brain`` mount accepts besides loopback.
+
+        Agents reach it at the same addresses as ``/mcp/datasources``, so the
+        same derivation (and the same ``MCP_DATASOURCES_ALLOWED_HOSTS``
+        override) applies.
+        """
+        return self.datasources_mcp_allowed_hosts()
 
     def resolved_service_auth_private_key(self) -> str | None:
         """Private key of the flat ``SERVICE_AUTH_*`` identity, newlines fixed."""

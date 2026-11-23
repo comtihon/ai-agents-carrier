@@ -318,6 +318,7 @@ def build_default_workflow(
     async def create_workflow(
         workflow_id: str, name: str, description: str, steps_json: str,
         use_storage: bool = False, enabled: bool = True, use_meta_llm: bool = True,
+        brain_access: str = "none",
     ) -> str:
         """Create a new workflow definition and register it immediately.
 
@@ -387,6 +388,10 @@ def build_default_workflow(
                 default. Turn it off for a workflow that must stay fully
                 deterministic -- a scheduled watchdog whose verdict is computed
                 in `python` steps has no use for it.
+            brain_access: Shared company memory (gbrain) ceiling for this
+                workflow's agent steps: "none" (default), "read" or "write".
+                Each agent step gets the lower of this and the agent's own
+                brain_access.
             enabled: Pass False to create the workflow already disabled. A
                 workflow carrying a `cron` or `pubsub` trigger is eligible to fire
                 as soon as it is registered, so one that is not ready yet must be
@@ -404,6 +409,7 @@ def build_default_workflow(
         return await core.create_workflow(
             deps, workflow_id, name, description, steps_json,
             use_storage=use_storage, enabled=enabled, use_meta_llm=use_meta_llm,
+            brain_access=brain_access,
         )
 
     @tool
@@ -416,6 +422,7 @@ def build_default_workflow(
         use_storage: bool | None = None,
         use_meta_llm: bool | None = None,
         relayout: bool = False,
+        brain_access: str | None = None,
     ) -> str:
         """Update an existing workflow definition (name, description, steps, enabled).
 
@@ -435,6 +442,8 @@ def build_default_workflow(
                 Omit to keep current. A `storage` step in a workflow that has it
                 off fails loudly rather than quietly not persisting.
             use_meta_llm: Turn the meta-LLM on or off. Omit to keep current.
+            brain_access: Shared company memory ceiling ("none" | "read" |
+                "write") for the agent steps. Omit to keep current.
             relayout: Recompute every canvas position from the graph. Off by
                 default, because a stored position may be where a person dragged
                 the node on the canvas and replacing their arrangement is not an
@@ -449,7 +458,7 @@ def build_default_workflow(
         # Empty string means "omitted".
         return await core.update_workflow(
             deps, workflow_id, name, description, steps_json or None, enabled,
-            use_storage, use_meta_llm, relayout=relayout,
+            use_storage, use_meta_llm, relayout=relayout, brain_access=brain_access,
         )
 
     @tool
@@ -474,19 +483,23 @@ def build_default_workflow(
         return await core.get_agent(deps, agent_id)
 
     @tool
-    async def create_agent(agent_id: str, name: str, description: str = "", default_runtime: str = "local", agent_input_json: str = "{}", protocol: str = "http-poll", acp_agent: str = None) -> str:
+    async def create_agent(agent_id: str, name: str, description: str = "", default_runtime: str = "local", agent_input_json: str = "{}", protocol: str = "http-poll", acp_agent: str = None, brain_access: str = "none") -> str:
         """Create a new agent definition. agent_input_json is a JSON object of default input overrides.
 
         protocol: "http-poll" (pi-cloud-agent /start + /poll, the default) or
         "acp" (ACP over WebSocket through acp-web-proxy). acp_agent names the
         agent in the proxy's config (e.g. pi, claude, codex); empty = proxy default.
+        brain_access: shared company memory (gbrain) clearance, "none" (default),
+        "read" or "write"; a workflow step gets the lower of this and the
+        workflow's brain_access.
         """
         return await core.create_agent(
-            deps, agent_id, name, description, default_runtime, agent_input_json, protocol, acp_agent
+            deps, agent_id, name, description, default_runtime, agent_input_json, protocol, acp_agent,
+            brain_access,
         )
 
     @tool
-    async def update_agent(agent_id: str, name: str = None, description: str = None, default_runtime: str = None, agent_input_json: str = None, protocol: str = None, acp_agent: str = None, addons_json: str = None) -> str:
+    async def update_agent(agent_id: str, name: str = None, description: str = None, default_runtime: str = None, agent_input_json: str = None, protocol: str = None, acp_agent: str = None, addons_json: str = None, brain_access: str = None) -> str:
         """Update an existing agent definition. Only provided fields are changed; others preserved.
 
         protocol: "http-poll" or "acp". acp_agent: the proxy's agent name for
@@ -496,10 +509,12 @@ def build_default_workflow(
         "{workflow_id}" is the run id; the run's workspace archive lives at
         <path>/workspace.tar.gz}, mcp {servers: {name: bool}}, tools {tools:
         {name: bool}}, datasource {source_id, allowed_operations}.
+        brain_access: shared company memory clearance ("none" | "read" |
+        "write"); omit to keep current.
         """
         return await core.update_agent(
             deps, agent_id, name, description, default_runtime, agent_input_json, protocol, acp_agent,
-            addons_json,
+            addons_json, brain_access,
         )
 
     @tool

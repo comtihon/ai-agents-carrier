@@ -23,6 +23,11 @@ from app.api.mcp.datasources_server import (
     reset_current_grant,
     set_current_grant,
 )
+from app.api.mcp.brain_server import (
+    build_brain_mcp,
+    reset_current_brain_grant,
+    set_current_brain_grant,
+)
 from app.api.mcp.management_server import get_management_mcp, register_management_tools
 from app.api.middleware.auth import OAuthMiddleware
 from app.infrastructure.auth.authorization import (
@@ -66,6 +71,11 @@ from app.core.container import ApplicationContainer, build_container
 from app.domain.models.graph_run import GraphRun
 from app.infrastructure.auth.auth_service import AuthError, AuthService
 from app.infrastructure.auth.login_script import load_login_script
+from app.infrastructure.auth.brain_grant import (
+    BrainGrant,
+    looks_like_brain_grant,
+    verify_brain_grant,
+)
 from app.infrastructure.auth.datasource_grant import (
     DatasourceGrant,
     looks_like_grant,
@@ -188,6 +198,46 @@ class _DatasourcesAuthWrapper:
             await self._app(scope, receive, send)
         finally:
             reset_current_grant(token)
+
+
+class _BrainAuthWrapper:
+    """Pure-ASGI gate for the mounted ``/mcp/brain`` app.
+
+    Accepts exactly one credential: a valid, unexpired brain grant
+    (``app.infrastructure.auth.brain_grant``) signed with *grant_signing_key*.
+    There is no static key and no OAuth path — nothing inside the backend calls
+    this endpoint, only spawned agents holding a grant — so it always fails
+    closed: no signing key, no header, a data source grant, a forged or expired
+    token all get 401. Non-http scopes are refused too.
+    """
+
+    def __init__(self, app, grant_signing_key: str | None) -> None:
+        self._app = app
+        self._grant_signing_key = (grant_signing_key or "").strip() or None
+
+    def _verify(self, raw_auth: bytes) -> BrainGrant | None:
+        if self._grant_signing_key is None or not raw_auth.startswith(b"Bearer "):
+            return None
+        token = raw_auth[len(b"Bearer "):].decode("latin-1").strip()
+        if not looks_like_brain_grant(token):
+            return None
+        return verify_brain_grant(token, self._grant_signing_key)
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.close", "code": 1008})
+            return
+        headers = dict(scope.get("headers") or ())
+        grant = self._verify(headers.get(b"authorization", b""))
+        if grant is None:
+            await _send_401(send)
+            return
+        token = set_current_brain_grant(grant)
+        try:
+            await self._app(scope, receive, send)
+        finally:
+            reset_current_brain_grant(token)
 
 
 class _ManagementAuthWrapper:
@@ -624,6 +674,11 @@ async def lifespan(app: FastAPI):
         await stack.enter_async_context(datasources_mcp.session_manager.run())
         if management_mcp is not None:
             await stack.enter_async_context(management_mcp.session_manager.run())
+        # Shared memory MCP: built and mounted by create_app only when gbrain
+        # is configured; absent otherwise.
+        brain_mcp = getattr(app.state, "brain_mcp", None)
+        if brain_mcp is not None:
+            await stack.enter_async_context(brain_mcp.session_manager.run())
         yield
     await container.shutdown()
 
@@ -748,6 +803,27 @@ def create_app() -> FastAPI:
             auth_service=auth_service,
             policy=authz_policy,
             login_service=login_service,
+        )
+    # Shared memory (gbrain) MCP — curated, grant-scoped proxy for agents.
+    # GBRAIN_URL unset means the feature is off: nothing mounted (404).
+    app.state.brain_mcp = None
+    if settings.gbrain_configured():
+        if not settings.resolved_brain_grant_signing_key():
+            logger.warning(
+                "GBRAIN_URL is set but no grant signing key resolves "
+                "(BRAIN_GRANT_SIGNING_KEY / DATASOURCE_GRANT_SIGNING_KEY / "
+                "MCP_DATASOURCES_API_KEY) — /mcp/brain will reject every request "
+                "and no agent gets shared memory access."
+            )
+        brain_mcp = build_brain_mcp(
+            lambda: getattr(app.state, "container", None),
+            write_namespace=settings.gbrain_write_namespace,
+            allowed_hosts=settings.brain_mcp_allowed_hosts(),
+        )
+        app.state.brain_mcp = brain_mcp
+        mcp_routes["/brain"] = _BrainAuthWrapper(
+            brain_mcp.streamable_http_app(),
+            grant_signing_key=settings.resolved_brain_grant_signing_key(),
         )
     app.mount("/mcp", _McpDispatcher(mcp_routes))
     return app

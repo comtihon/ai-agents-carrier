@@ -32,14 +32,17 @@ Three properties matter:
 """
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
-import json
 import logging
 import time
 
 from pydantic import BaseModel, Field
+
+# Token encoding and signing are shared with the brain grant.
+from app.infrastructure.auth._signed_token import (
+    looks_like,
+    sign_payload,
+    verify_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,34 +80,13 @@ class DatasourceGrant(BaseModel):
         return not any(self.grants.values())
 
 
-def _b64u_encode(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-
-
-def _b64u_decode(text: str) -> bytes:
-    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
-
-
-def _signature(body: str, signing_key: str) -> str:
-    """HMAC over the encoded body, not over re-serialized JSON.
-
-    Signing the exact bytes that travel means verification never has to
-    reproduce a canonical JSON form, so a difference in key order or separators
-    can never turn a valid token into an invalid one (or vice versa).
-    """
-    digest = hmac.new(
-        signing_key.encode("utf-8"), body.encode("ascii"), hashlib.sha256
-    ).digest()
-    return _b64u_encode(digest)
-
-
 def looks_like_grant(token: str) -> bool:
     """Whether *token* is shaped like a grant, without verifying it.
 
     Lets the auth gate decide which check to run without spending a signature
     computation on a token that is plainly the static API key instead.
     """
-    return token.startswith(f"{GRANT_PREFIX}.") and token.count(".") == 2
+    return looks_like(token, GRANT_PREFIX)
 
 
 def mint_grant(
@@ -137,12 +119,7 @@ def mint_grant(
         ttl = DEFAULT_TTL_SECONDS if ttl_seconds is None else max(1, int(ttl_seconds))
         payload.expires_at = int((now if now is not None else time.time()) + ttl)
 
-    body = _b64u_encode(
-        json.dumps(
-            payload.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-    )
-    return f"{GRANT_PREFIX}.{body}.{_signature(body, key)}"
+    return sign_payload(GRANT_PREFIX, payload.model_dump(mode="json"), key)
 
 
 def verify_grant(
@@ -158,30 +135,10 @@ def verify_grant(
     "tampered" from "expired" in the response would only help an attacker
     probe.  The reason is logged instead.
     """
-    key = (signing_key or "").strip()
-    if not key:
-        return None
-    if not looks_like_grant(token):
-        return None
-
-    _, body, signature = token.split(".", 2)
-    expected = _signature(body, key)
-    # Compare bytes: a token arrives from an HTTP header, which Starlette
-    # latin-1 decodes, so `signature` can hold characters that would make
-    # compare_digest on str raise TypeError (a 500) instead of failing.
-    if not hmac.compare_digest(
-        signature.encode("utf-8"), expected.encode("utf-8")
-    ):
-        logger.warning("data source grant rejected: bad signature")
-        return None
-
-    try:
-        data = json.loads(_b64u_decode(body))
-    except Exception:  # noqa: BLE001 — any malformed payload is simply invalid
-        logger.warning("data source grant rejected: payload is not valid JSON")
-        return None
-    if not isinstance(data, dict):
-        logger.warning("data source grant rejected: payload is not an object")
+    data = verify_payload(
+        GRANT_PREFIX, token, signing_key, label="data source grant"
+    )
+    if data is None:
         return None
 
     try:

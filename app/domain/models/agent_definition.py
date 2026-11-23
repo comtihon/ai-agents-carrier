@@ -12,6 +12,7 @@ from app.domain.models.agent_addon import (
     S3Addon,
     ToolsAddon,
 )
+from app.domain.models.brain_access import BrainAccess
 from app.domain.models.ownership import GrantableResource
 
 
@@ -72,6 +73,10 @@ class AgentDefinition(GrantableResource):
     # ACP only: which agent of the proxy's config to launch (e.g. "pi",
     # "claude", "codex"); None = the proxy's default agent.
     acp_agent: str | None = None
+
+    # Shared company memory (gbrain) clearance. What a step actually gets is
+    # min(this, the workflow's brain_access) — see app.domain.models.brain_access.
+    brain_access: BrainAccess = "none"
 
     # Timestamps
     created_at: datetime | None = None

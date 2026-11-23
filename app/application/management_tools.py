@@ -1053,6 +1053,7 @@ async def get_workflow(
         f"Enabled: {defn.enabled}",
         f"Use storage: {defn.use_storage}",
         f"Use meta LLM: {defn.use_meta_llm}",
+        f"Brain access: {defn.brain_access}",
         f"Read-only: {defn.readonly}",
         f"Steps: {len(steps)}"
         + (" — " + ", ".join(f"{st.get('id')}({st.get('type')})" for st in steps
@@ -1067,13 +1068,24 @@ async def get_workflow(
     return "\n".join(lines)
 
 
+# Shared company memory (gbrain) access levels, for agents and workflows.
+_BRAIN_ACCESS_LEVELS = ("none", "read", "write")
+
+
+def _invalid_brain_access(value: str) -> str:
+    return f"Invalid brain_access '{value}'. Must be one of: {', '.join(_BRAIN_ACCESS_LEVELS)}."
+
+
 @requires(Permission.WRITE)
 async def create_workflow(
     deps: ManagementDeps, workflow_id: str, name: str, description: str, steps_json: str,
     use_storage: bool = False, enabled: bool = True, use_meta_llm: bool = True,
+    brain_access: str = "none",
 ) -> str:
     if deps.workflow_backend is None:
         return "Workflow creation unavailable: no persistent backend configured."
+    if brain_access not in _BRAIN_ACCESS_LEVELS:
+        return _invalid_brain_access(brain_access)
     try:
         steps = json.loads(steps_json)
     except json.JSONDecodeError as exc:
@@ -1109,6 +1121,7 @@ async def create_workflow(
     defn = WorkflowDefinition(
         id=workflow_id, name=name, description=description, steps=steps,
         use_storage=use_storage, enabled=enabled, use_meta_llm=use_meta_llm,
+        brain_access=brain_access,
         ui=apply_layout(None, steps),
     )
     await deps.workflow_backend.create(defn)
@@ -1136,9 +1149,12 @@ async def update_workflow(
     use_storage: bool | None = None,
     use_meta_llm: bool | None = None,
     relayout: bool = False,
+    brain_access: str | None = None,
 ) -> str:
     if deps.workflow_backend is None:
         return "Workflow updates unavailable: no persistent backend configured."
+    if brain_access is not None and brain_access not in _BRAIN_ACCESS_LEVELS:
+        return _invalid_brain_access(brain_access)
 
     resolved, err = await _resolve_workflow_id(deps, workflow_id)
     if err:
@@ -1162,6 +1178,8 @@ async def update_workflow(
         defn.use_storage = use_storage
     if use_meta_llm is not None:
         defn.use_meta_llm = use_meta_llm
+    if brain_access is not None:
+        defn.brain_access = brain_access  # type: ignore[assignment]
     if steps_json is not None:
         try:
             steps = json.loads(steps_json)
@@ -1270,9 +1288,12 @@ async def create_agent(
     agent_input_json: str = "{}",
     protocol: str = "http-poll",
     acp_agent: str | None = None,
+    brain_access: str = "none",
 ) -> str:
     if deps.agent_backend is None:
         return "Agent backend not configured."
+    if brain_access not in _BRAIN_ACCESS_LEVELS:
+        return _invalid_brain_access(brain_access)
     if protocol not in _AGENT_PROTOCOLS:
         return f"Invalid protocol '{protocol}'. Must be one of: {', '.join(_AGENT_PROTOCOLS)}."
     import json as _json
@@ -1296,6 +1317,7 @@ async def create_agent(
         agent_input=agent_input,
         protocol=protocol,
         acp_agent=(acp_agent or None) if protocol == "acp" else None,
+        brain_access=brain_access,
     )
     await deps.agent_backend.create(new_agent)
     return f"Agent '{agent_id}' created."
@@ -1312,9 +1334,12 @@ async def update_agent(
     protocol: str = None,
     acp_agent: str = None,
     addons_json: str = None,
+    brain_access: str = None,
 ) -> str:
     if deps.agent_backend is None:
         return "Agent backend not configured."
+    if brain_access is not None and brain_access not in _BRAIN_ACCESS_LEVELS:
+        return _invalid_brain_access(brain_access)
     if protocol is not None and protocol not in _AGENT_PROTOCOLS:
         return f"Invalid protocol '{protocol}'. Must be one of: {', '.join(_AGENT_PROTOCOLS)}."
     resolved, err = await _resolve_agent_id(deps, agent_id)
@@ -1360,6 +1385,8 @@ async def update_agent(
     if acp_agent is not None:
         # "" clears it (the proxy's default agent).
         updated.acp_agent = acp_agent or None
+    if brain_access is not None:
+        updated.brain_access = brain_access  # type: ignore[assignment]
     await deps.agent_backend.update(resolved, updated)
     return f"Agent '{resolved}' updated."
 

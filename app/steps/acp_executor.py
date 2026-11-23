@@ -29,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from app.application.runners import RunnerOffline
-from app.core.config import DATASOURCES_MCP_NAME
+from app.core.config import BRAIN_MCP_NAME, DATASOURCES_MCP_NAME
 from app.domain.models.runner import AgentLimit
 from app.infrastructure.acp.client import AcpConnection, AcpError, AcpMethodError, to_ws_url
 from app.services import agent_inbox
@@ -426,6 +426,10 @@ async def run_acp_agent(
             # The bridge's agent address is cluster-internal; a machine dials the public one.
             runner_url = settings.resolved_runner_mcp_datasources_url()
             servers = [{**s, "url": runner_url} if s.get("name") == DATASOURCES_MCP_NAME else s for s in servers]
+        if runner is not None and hasattr(settings, "resolved_runner_mcp_brain_url"):
+            # Same for the shared memory bridge.
+            brain_url = settings.resolved_runner_mcp_brain_url()
+            servers = [{**s, "url": brain_url} if s.get("name") == BRAIN_MCP_NAME else s for s in servers]
         mcp_servers = to_acp_mcp_servers(servers)
         mcp_caps = caps.get("mcpCapabilities") or {}
         dropped = [
