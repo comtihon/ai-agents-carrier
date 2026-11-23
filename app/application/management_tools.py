@@ -1290,6 +1290,20 @@ async def get_agent(deps: ManagementDeps, agent_id: str) -> str:
 _AGENT_PROTOCOLS = ("http-poll", "acp")
 
 
+
+async def _resolve_runner(deps: ManagementDeps, runner_id: str, acp_agent: str | None):
+    """The runner an agent may point at, or an error string (same rules as the REST API)."""
+    from app.application.visibility import can_see
+    backend = getattr(deps, "runner_backend", None)
+    runner = await backend.get_runner(runner_id) if backend is not None and runner_id else None
+    if runner is None or not can_see(runner):
+        return None, (f"Runner '{runner_id}' not found." if runner_id
+                      else "default_runtime 'runner' needs runner_id (see the Runners panel).")
+    if acp_agent and acp_agent not in runner.agents:
+        return None, f"Runner '{runner.name}' does not offer agent '{acp_agent}'."
+    return runner, None
+
+
 @requires(Permission.WRITE)
 async def create_agent(
     deps: ManagementDeps,
@@ -1302,6 +1316,7 @@ async def create_agent(
     acp_agent: str | None = None,
     brain_access: str = "none",
     max_concurrency: int | None = None,
+    runner_id: str | None = None,
 ) -> str:
     if deps.agent_backend is None:
         return "Agent backend not configured."
@@ -1318,8 +1333,14 @@ async def create_agent(
             return "agent_input_json must be a JSON object."
     except Exception as e:
         return f"Invalid agent_input_json: {e}"
-    if default_runtime not in ("local", "docker", "k8s"):
-        return f"Invalid default_runtime '{default_runtime}'. Must be one of: local, docker, k8s."
+    if default_runtime not in ("local", "docker", "k8s", "runner"):
+        return f"Invalid default_runtime '{default_runtime}'. Must be one of: local, docker, k8s, runner."
+    runner = None
+    if default_runtime == "runner":
+        runner, err = await _resolve_runner(deps, runner_id or "", acp_agent or None)
+        if err:
+            return err
+        protocol = "acp"  # runner agents always speak ACP
     existing = await deps.agent_backend.get(agent_id)
     if existing is not None:
         return f"Agent '{agent_id}' already exists. Use update_agent to modify it."
@@ -1334,6 +1355,7 @@ async def create_agent(
         acp_agent=(acp_agent or None) if protocol == "acp" else None,
         brain_access=brain_access,
         max_concurrency=max_concurrency or None,
+        runner_id=runner.id if runner is not None else None,
     )
     await deps.agent_backend.create(new_agent)
     return f"Agent '{agent_id}' created."
@@ -1352,6 +1374,7 @@ async def update_agent(
     addons_json: str = None,
     brain_access: str = None,
     max_concurrency: int = None,
+    runner_id: str = None,
 ) -> str:
     if deps.agent_backend is None:
         return "Agent backend not configured."
@@ -1374,12 +1397,24 @@ async def update_agent(
         updated.name = name
     if description is not None:
         updated.description = description
+    if runner_id is not None and runner_id != (updated.runner_id or ""):
+        if runner_id == "":
+            updated.runner_id = None
+        else:
+            runner, err = await _resolve_runner(
+                deps, runner_id, acp_agent if acp_agent is not None else updated.acp_agent)
+            if err:
+                return err
+            updated.runner_id = runner.id
+            updated.protocol = "acp"  # type: ignore[assignment]
     if default_runtime is not None:
         if default_runtime not in ("local", "docker", "k8s", "runner"):
             return f"Invalid default_runtime '{default_runtime}'. Must be one of: local, docker, k8s, runner."
         if default_runtime == "runner" and not updated.runner_id:
             return "default_runtime 'runner' needs a connected machine: approve one in the Runners panel."
         updated.default_runtime = default_runtime
+    if updated.default_runtime == "runner" and not updated.runner_id:
+        return "An agent with default_runtime 'runner' needs runner_id."
     if addons_json is not None:
         # The whole list, like the REST API's `addons`: [] clears them.
         from pydantic import TypeAdapter, ValidationError
