@@ -78,6 +78,11 @@ class AgentDefinition(GrantableResource):
     # min(this, the workflow's brain_access) — see app.domain.models.brain_access.
     brain_access: BrainAccess = "none"
 
+    # Most runs of this agent's runtime executing at once, across every workflow
+    # and user (app.application.concurrency); more runs queue. None: no limit.
+    # Runner agents share the limit of their machine's agent ("runner:<id>:<agent>").
+    max_concurrency: int | None = Field(default=None, ge=1)
+
     # Timestamps
     created_at: datetime | None = None
     updated_at: datetime | None = None

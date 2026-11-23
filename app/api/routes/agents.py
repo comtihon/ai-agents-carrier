@@ -57,6 +57,9 @@ class AgentDefinitionRequest(BaseModel):
     runner_id: str | None = None
     # Shared company memory (gbrain) clearance: "none" | "read" | "write".
     brain_access: BrainAccess = "none"
+    # Most runs of this agent's runtime at once, across all workflows and
+    # users; more runs queue. None = no limit.
+    max_concurrency: int | None = Field(default=None, ge=1)
     # None = the default: private when a user creates it, public without auth.
     visibility: Visibility | None = None
     # With visibility "team": which team. Omitted = the caller's own (a
@@ -82,6 +85,8 @@ class AgentDefinitionUpdateRequest(BaseModel):
     runner_id: str | None = None
     # None = omitted -> keep the stored value.
     brain_access: BrainAccess | None = None
+    # Omitted -> keep the stored value; explicit null -> no limit.
+    max_concurrency: int | None = Field(default=None, ge=1)
     # None = keep the stored visibility.
     visibility: Visibility | None = None
     # With visibility "team": which team. Omitted = the caller's own (a
@@ -212,6 +217,9 @@ async def list_agents(
                 "name": a.name,
                 "description": a.description,
                 "default_runtime": a.default_runtime,
+                "runner_id": a.runner_id,
+                "acp_agent": a.acp_agent,
+                "max_concurrency": a.max_concurrency,
                 **ownership_fields(a),
                 **(
                     {"granted_to_workflow": "read"}
@@ -252,6 +260,7 @@ async def create_agent(
         helm_values=body.helm_values,
         addons=_addon_adapter.validate_python(body.addons),
         brain_access=body.brain_access,
+        max_concurrency=body.max_concurrency,
         **runner_fields,
         **visibility_kwargs(body.visibility, body.team_id),
     )
@@ -333,6 +342,9 @@ async def update_agent(
         created_at=existing.created_at,
         addons=addons,
         brain_access=existing.brain_access if body.brain_access is None else body.brain_access,
+        max_concurrency=(
+            body.max_concurrency if "max_concurrency" in body.model_fields_set else existing.max_concurrency
+        ),
         **runner_fields,
         **visibility_kwargs(body.visibility, body.team_id),
     )

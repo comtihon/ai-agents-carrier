@@ -175,6 +175,9 @@ class ManagementDeps:
     # for the team and user management tools. None: those tools say teams are
     # unavailable, exactly as the REST routes answer 503.
     team_directory: Any = None
+    # Connected machines (app.application.runners), for their per-agent
+    # concurrency limits. None: those tools say runners are unavailable.
+    runner_backend: Any = None
 
 
 def deps_from_container(
@@ -202,6 +205,7 @@ def deps_from_container(
         pubsub_subscriber=getattr(container, "pubsub_subscriber", None),
         stream_store=getattr(container, "stream_store", None),
         team_directory=getattr(container, "team_directory", None),
+        runner_backend=getattr(container, "runner_backend", None),
     )
 
 
@@ -1289,11 +1293,14 @@ async def create_agent(
     protocol: str = "http-poll",
     acp_agent: str | None = None,
     brain_access: str = "none",
+    max_concurrency: int | None = None,
 ) -> str:
     if deps.agent_backend is None:
         return "Agent backend not configured."
     if brain_access not in _BRAIN_ACCESS_LEVELS:
         return _invalid_brain_access(brain_access)
+    if max_concurrency is not None and (not isinstance(max_concurrency, int) or max_concurrency < 0):
+        return "max_concurrency must be a positive integer (0 or omitted = no limit)."
     if protocol not in _AGENT_PROTOCOLS:
         return f"Invalid protocol '{protocol}'. Must be one of: {', '.join(_AGENT_PROTOCOLS)}."
     import json as _json
@@ -1318,6 +1325,7 @@ async def create_agent(
         protocol=protocol,
         acp_agent=(acp_agent or None) if protocol == "acp" else None,
         brain_access=brain_access,
+        max_concurrency=max_concurrency or None,
     )
     await deps.agent_backend.create(new_agent)
     return f"Agent '{agent_id}' created."
@@ -1335,11 +1343,14 @@ async def update_agent(
     acp_agent: str = None,
     addons_json: str = None,
     brain_access: str = None,
+    max_concurrency: int = None,
 ) -> str:
     if deps.agent_backend is None:
         return "Agent backend not configured."
     if brain_access is not None and brain_access not in _BRAIN_ACCESS_LEVELS:
         return _invalid_brain_access(brain_access)
+    if max_concurrency is not None and (not isinstance(max_concurrency, int) or max_concurrency < 0):
+        return "max_concurrency must be a positive integer (0 = no limit)."
     if protocol is not None and protocol not in _AGENT_PROTOCOLS:
         return f"Invalid protocol '{protocol}'. Must be one of: {', '.join(_AGENT_PROTOCOLS)}."
     resolved, err = await _resolve_agent_id(deps, agent_id)
@@ -1387,8 +1398,54 @@ async def update_agent(
         updated.acp_agent = acp_agent or None
     if brain_access is not None:
         updated.brain_access = brain_access  # type: ignore[assignment]
+    if max_concurrency is not None:
+        updated.max_concurrency = max_concurrency or None
     await deps.agent_backend.update(resolved, updated)
     return f"Agent '{resolved}' updated."
+
+
+@requires(Permission.READ)
+async def list_agent_concurrency(deps: ManagementDeps, key: str | None = None) -> str:
+    """Holders and queue of every concurrency-limited agent runtime the caller can see."""
+    import json as _json
+
+    from app.application.concurrency import describe_for_caller
+    entries = await describe_for_caller(
+        agent_backend=deps.agent_backend, runner_backend=deps.runner_backend,
+        workflow_backend=deps.workflow_backend, key=key or None,
+    )
+    if not entries:
+        return "No agent runtime has a concurrency limit, holders or waiters."
+    return _json.dumps(entries, indent=2, default=str)
+
+
+@requires(Permission.WRITE)
+async def update_runner_concurrency(
+    deps: ManagementDeps, runner_id: str, agent: str, max_concurrency: int,
+) -> str:
+    """Cap how many runs of one agent of a runner execute at once (0 = no cap)."""
+    from app.application.concurrency import merge_agent_concurrency
+    from app.application.visibility import can_edit, can_see
+    if deps.runner_backend is None:
+        return "Runners are not available."
+    runner = await deps.runner_backend.get_runner(runner_id)
+    if runner is None or not can_see(runner):
+        return f"Runner '{runner_id}' not found."
+    if not isinstance(max_concurrency, int) or max_concurrency < 0:
+        return "max_concurrency must be a positive integer (0 = no cap)."
+    try:
+        merged = merge_agent_concurrency(runner.agent_concurrency, {agent: max_concurrency})
+    except ValueError as exc:
+        return str(exc)
+    name = runner.name or runner.id
+    if merged != runner.agent_concurrency:
+        if not can_edit(runner):
+            return f"You may not change the concurrency limits of runner '{name}'."
+        await deps.runner_backend.update_runner(runner.id, {"agent_concurrency": merged})
+    cap = merged.get(agent.strip())
+    if cap:
+        return f"Runner '{name}': agent '{agent.strip()}' runs at most {cap} at once."
+    return f"Runner '{name}': agent '{agent.strip()}' has no concurrency cap."
 
 
 @requires(Permission.DELETE)

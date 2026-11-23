@@ -900,200 +900,56 @@ async def execute_agent_step(
             settings=settings,
             run_repository=run_repository,
             agent_task_repository=agent_task_repository,
+            agent_backend=agent_backend,
+            workflow_id=workflow_id,
         )
         return await _finalize_agent_output(
             step, raw_output, input_data, settings,
             run_id=run_id, run_repository=run_repository, use_meta_llm=use_meta_llm,
         )
 
-    # --- Warm pod reuse: check if a warm pod is available for this agent ---
-    _is_warm_reuse = False
-    _warm_agent_url: str | None = None
-    if warm_pod_repository is not None and runtime_type == "k8s":
-        _warm_record = await warm_pod_repository.get(run_id, agent_id)
-        if _warm_record is not None:
-            try:
-                async with httpx.AsyncClient() as _hc:
-                    _hr = await _hc.get(f"{_warm_record.agent_url}/health", timeout=5.0)
-                    if _hr.status_code == 200:
-                        _is_warm_reuse = True
-                        _warm_agent_url = _warm_record.agent_url
-                    else:
-                        # Unhealthy pod — delete stale record, fall through to spawn
-                        try:
-                            await warm_pod_repository.delete(run_id, agent_id)
-                        except Exception:
-                            pass
-            except Exception:
-                # Pod gone — delete the stale record for this specific agent
+    # --- HTTP poll protocol: spawn, /start, poll until finished ---
+    async def _drive_http_poll() -> dict:
+        # --- Warm pod reuse: check if a warm pod is available for this agent ---
+        _is_warm_reuse = False
+        _warm_agent_url: str | None = None
+        if warm_pod_repository is not None and runtime_type == "k8s":
+            _warm_record = await warm_pod_repository.get(run_id, agent_id)
+            if _warm_record is not None:
                 try:
-                    await warm_pod_repository.delete(run_id, agent_id)
+                    async with httpx.AsyncClient() as _hc:
+                        _hr = await _hc.get(f"{_warm_record.agent_url}/health", timeout=5.0)
+                        if _hr.status_code == 200:
+                            _is_warm_reuse = True
+                            _warm_agent_url = _warm_record.agent_url
+                        else:
+                            # Unhealthy pod — delete stale record, fall through to spawn
+                            try:
+                                await warm_pod_repository.delete(run_id, agent_id)
+                            except Exception:
+                                pass
                 except Exception:
-                    pass
+                    # Pod gone — delete the stale record for this specific agent
+                    try:
+                        await warm_pod_repository.delete(run_id, agent_id)
+                    except Exception:
+                        pass
 
-    # LangGraph reruns the node from scratch on resume. Detect this by checking
-    # whether a container already exists for this run (spawned in the first execution).
-    # If so, skip spawn+start — interrupt() will return immediately with the stored output.
-    _is_resume = (
-        not _is_warm_reuse
-        and hasattr(runtime, "has_container_for_run")
-        and await runtime.has_container_for_run(agent_def, run_id)
-    )
-
-    container_callback_url = callback_base_url  # default; overridden below for docker/non-resume
-    if _is_warm_reuse:
-        # Warm pod still alive — reuse it: send a fresh /start and enter poll loop.
-        agent_url = _warm_agent_url  # type: ignore[assignment]
-        container_callback_url = runtime.rewrite_callback_url(callback_base_url)
-        logger.info("[step '%s'] reusing warm pod at %s for run '%s'", step_id, agent_url, run_id)
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    f"{agent_url}/start",
-                    json={
-                        "run_id": run_id,
-                        "task_id": task_key,
-                        "input": input_data,
-                        "callback_url": container_callback_url,
-                        "agent_config": agent_config_payload,
-                    },
-                    timeout=10.0,
-                )
-                resp.raise_for_status()
-        except Exception as exc:
-            raise RuntimeError(
-                f"[step '{step_id}'] Failed to start warm agent at {agent_url}: {exc}"
-            ) from exc
-        if agent_task_repository is not None:
-            from datetime import datetime, timezone
-            _task_doc = {
-                "_id": task_key,
-                "run_id": run_id,
-                "step_id": step_id,
-                "agent_id": agent_id,
-                "agent_url": agent_url,
-                "input": input_data,
-                "agent_config": agent_config_payload if isinstance(agent_config_payload, dict) else {},
-                "status": "pending",
-                "loop_count": 0,
-                "max_loops": get_settings().agent_max_loops,
-                "outputs": [],
-                "created_at": datetime.now(timezone.utc),
-                "updated_at": datetime.now(timezone.utc),
-            }
-            try:
-                await agent_task_repository.save_task(_task_doc)
-            except Exception as _e:
-                logger.warning("[step '%s'] failed to save agent task (warm reuse): %s", step_id, _e)
-    elif not _is_resume:
-        # --- 5a. Spawn the agent HTTP server ---
-        agent_url = await runtime.spawn(agent_def, step, run_id, callback_base_url, extra_env=resolved_env_vars)
-        logger.info("[step '%s'] agent server spawned at %s", step_id, agent_url)
-
-        # For Docker, the agent runs in a container where localhost = itself.
-        container_callback_url = runtime.rewrite_callback_url(callback_base_url)
-
-        # --- 5b. Send POST /start to the agent ---
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    f"{agent_url}/start",
-                    json={
-                        "run_id": run_id,
-                        "task_id": task_key,
-                        "input": input_data,
-                        "callback_url": container_callback_url,
-                        "agent_config": agent_config_payload,
-                    },
-                    timeout=10.0,
-                )
-                resp.raise_for_status()
-        except Exception as exc:
-            try:
-                await runtime.terminate(agent_url)
-            except Exception:
-                pass
-            raise RuntimeError(
-                f"[step '{step_id}'] Failed to start agent at {agent_url}: {exc}"
-            ) from exc
-
-        logger.info(
-            "[step '%s'] agent started — polling run '%s' until output arrives",
-            step_id, run_id,
+        # LangGraph reruns the node from scratch on resume. Detect this by checking
+        # whether a container already exists for this run (spawned in the first execution).
+        # If so, skip spawn+start — interrupt() will return immediately with the stored output.
+        _is_resume = (
+            not _is_warm_reuse
+            and hasattr(runtime, "has_container_for_run")
+            and await runtime.has_container_for_run(agent_def, run_id)
         )
 
-        # Write task entity to MongoDB for poll-based tracking
-        if agent_task_repository is not None:
-            from datetime import datetime, timezone
-            _task_doc = {
-                "_id": task_key,
-                "run_id": run_id,
-                "step_id": step_id,
-                "agent_id": agent_id,
-                "agent_url": agent_url,
-                "input": input_data,
-                "agent_config": agent_config_payload if isinstance(agent_config_payload, dict) else {},
-                "status": "pending",
-                "loop_count": 0,
-                "max_loops": get_settings().agent_max_loops,
-                "outputs": [],
-                "created_at": datetime.now(timezone.utc),
-                "updated_at": datetime.now(timezone.utc),
-            }
-            try:
-                await agent_task_repository.save_task(_task_doc)
-            except Exception as _e:
-                logger.warning("[step '%s'] failed to save agent task: %s", step_id, _e)
-
-        # Write PVC lease for TTL cleanup
-        pvc_mount_point = step.get("pvc_mount_point")
-        if pvc_mount_point and pvc_lease_repository is not None:
-            from datetime import datetime, timezone
-            from app.runtime.pvc_manager import parse_ttl
-            pvc_name = step.get("pvc_name") or f"pvc-{run_id[:12]}"
-            ttl = parse_ttl(step.get("pvc_ttl", "1h"))
-            expires_at = datetime.now(timezone.utc) + ttl
-            lease = {
-                "pvc_name": pvc_name,
-                "namespace": settings.agent_namespace if settings else "default",
-                "run_id": run_id,
-                "expires_at": expires_at,
-                "created_at": datetime.now(timezone.utc),
-            }
-            try:
-                await pvc_lease_repository.save(lease)
-            except Exception as _exc:
-                logger.warning("Failed to save PVC lease for %s: %s", pvc_name, _exc)
-
-    else:
-        # Retrieve real agent_url from task repository for resume path
-        _stored_task = None
-        if agent_task_repository is not None:
-            _stored_task = await agent_task_repository.get_task(task_key)
-        if _stored_task and _stored_task.get("agent_url"):
-            agent_url = _stored_task["agent_url"]
-        else:
-            # Fall back to runtime lookup (only if method is a coroutine function)
-            import inspect as _inspect
-            _get_url_fn = getattr(runtime, "get_agent_url_for_run", None)
-            agent_url = await _get_url_fn(agent_def, run_id) if _get_url_fn is not None and _inspect.iscoroutinefunction(_get_url_fn) else None
-        if not agent_url:
-            # Stale pod from a failed spawn (e.g. helm timeout before task was saved).
-            # Terminate it and fall through to a fresh spawn below.
-            logger.warning(
-                "[step '%s'] agent_url not found for run '%s' — stale pod detected, terminating and respawning",
-                step_id, run_id,
-            )
-            _terminate_fn = getattr(runtime, "terminate_by_run_id", None)
-            if _terminate_fn is not None:
-                try:
-                    await _terminate_fn(agent_def, run_id)
-                except Exception as _te:
-                    logger.warning("[step '%s'] terminate_by_run_id failed: %s", step_id, _te)
-            _is_resume = False
-            agent_url = await runtime.spawn(agent_def, step, run_id, callback_base_url, extra_env=resolved_env_vars)
-            logger.info("[step '%s'] agent server respawned at %s", step_id, agent_url)
+        container_callback_url = callback_base_url  # default; overridden below for docker/non-resume
+        if _is_warm_reuse:
+            # Warm pod still alive — reuse it: send a fresh /start and enter poll loop.
+            agent_url = _warm_agent_url  # type: ignore[assignment]
             container_callback_url = runtime.rewrite_callback_url(callback_base_url)
+            logger.info("[step '%s'] reusing warm pod at %s for run '%s'", step_id, agent_url, run_id)
             try:
                 async with httpx.AsyncClient() as client:
                     resp = await client.post(
@@ -1109,12 +965,8 @@ async def execute_agent_step(
                     )
                     resp.raise_for_status()
             except Exception as exc:
-                try:
-                    await runtime.terminate(agent_url)
-                except Exception:
-                    pass
                 raise RuntimeError(
-                    f"[step '{step_id}'] Failed to start respawned agent at {agent_url}: {exc}"
+                    f"[step '{step_id}'] Failed to start warm agent at {agent_url}: {exc}"
                 ) from exc
             if agent_task_repository is not None:
                 from datetime import datetime, timezone
@@ -1136,163 +988,324 @@ async def execute_agent_step(
                 try:
                     await agent_task_repository.save_task(_task_doc)
                 except Exception as _e:
-                    logger.warning("[step '%s'] failed to save agent task on respawn: %s", step_id, _e)
-        else:
-            logger.info("[step '%s'] resuming run '%s' (container already running)", step_id, run_id)
+                    logger.warning("[step '%s'] failed to save agent task (warm reuse): %s", step_id, _e)
+        elif not _is_resume:
+            # --- 5a. Spawn the agent HTTP server ---
+            agent_url = await runtime.spawn(agent_def, step, run_id, callback_base_url, extra_env=resolved_env_vars)
+            logger.info("[step '%s'] agent server spawned at %s", step_id, agent_url)
 
-    # --- 5c. Pull-based polling: poll agent every N seconds until finished/failed/idle ---
-    _poll_interval = get_settings().agent_poll_interval_seconds
-    _max_loops = get_settings().agent_max_loops
-    _loop_count = 0
-    raw_output: dict = {}
+            # For Docker, the agent runs in a container where localhost = itself.
+            container_callback_url = runtime.rewrite_callback_url(callback_base_url)
 
-    while True:
-        await asyncio.sleep(_poll_interval)
-        try:
-            async with httpx.AsyncClient() as _hc:
-                _poll_resp = await _hc.get(f"{agent_url}/poll", timeout=10.0)
-                _poll_resp.raise_for_status()
-                _poll_data = _poll_resp.json()
-        except Exception as _poll_exc:
-            logger.warning("[step '%s'] poll failed: %s", step_id, _poll_exc)
-            _loop_count += 1
-            if _loop_count >= _max_loops and agent_task_repository is not None:
-                await agent_task_repository.update_task(task_key, {"status": "failed"})
-            if _loop_count >= _max_loops:
-                raise RuntimeError(f"[step '{step_id}'] agent unreachable after {_max_loops} poll attempts") from _poll_exc
-            continue
-
-        _poll_status = _poll_data.get("status", "idle")
-        _poll_outputs = _poll_data.get("outputs", [])
-
-        if agent_task_repository is not None and _poll_outputs:
+            # --- 5b. Send POST /start to the agent ---
             try:
-                await agent_task_repository.append_outputs(task_key, _poll_outputs)
-            except Exception as _e:
-                logger.warning("[step '%s'] failed to append agent task outputs: %s", step_id, _e)
-
-        # Cache final output from every poll cycle — the "final" output may arrive
-        # while status is still "working" (task_store marks it sent before the
-        # in-memory state["status"] flips to "done"), so we must capture it here
-        # rather than waiting until the "finished" poll cycle (which may see outputs=[]).
-        if not raw_output:
-            for _out in _poll_outputs:
-                if _out.get("type") == "final":
-                    raw_output = _out.get("content", {})
-                    break
-
-        # Forward progress messages to run state so the UI can see them.
-        if run_repository is not None and _poll_outputs:
-            _progress_msgs = [
-                out["content"]["message"]
-                for out in _poll_outputs
-                if out.get("type") == "progress"
-                and isinstance(out.get("content"), dict)
-                and out["content"].get("message")
-                and not out["content"]["message"].startswith("__")
-            ]
-            if _progress_msgs:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.post(
+                        f"{agent_url}/start",
+                        json={
+                            "run_id": run_id,
+                            "task_id": task_key,
+                            "input": input_data,
+                            "callback_url": container_callback_url,
+                            "agent_config": agent_config_payload,
+                        },
+                        timeout=10.0,
+                    )
+                    resp.raise_for_status()
+            except Exception as exc:
                 try:
-                    _run = await run_repository.get(run_id)
-                    if _run is not None:
-                        _progress_key = f"_agent_progress_{step_id}"
-                        _progress_list = list((_run.state or {}).get(_progress_key, []))
-                        _progress_list.extend(_progress_msgs)
-                        _run.state = {**(_run.state or {}), _progress_key: _progress_list}
-                        _run.touch()
-                        await run_repository.update(_run)
+                    await runtime.terminate(agent_url)
                 except Exception:
-                    pass  # progress is best-effort
+                    pass
+                raise RuntimeError(
+                    f"[step '{step_id}'] Failed to start agent at {agent_url}: {exc}"
+                ) from exc
 
-        if _poll_status == "finished":
-            # raw_output may already be set from an earlier poll cycle (race condition
-            # where "final" output was consumed before status flipped to "finished").
-            # Fall back to scanning _poll_outputs only if not already captured.
+            logger.info(
+                "[step '%s'] agent started — polling run '%s' until output arrives",
+                step_id, run_id,
+            )
+
+            # Write task entity to MongoDB for poll-based tracking
+            if agent_task_repository is not None:
+                from datetime import datetime, timezone
+                _task_doc = {
+                    "_id": task_key,
+                    "run_id": run_id,
+                    "step_id": step_id,
+                    "agent_id": agent_id,
+                    "agent_url": agent_url,
+                    "input": input_data,
+                    "agent_config": agent_config_payload if isinstance(agent_config_payload, dict) else {},
+                    "status": "pending",
+                    "loop_count": 0,
+                    "max_loops": get_settings().agent_max_loops,
+                    "outputs": [],
+                    "created_at": datetime.now(timezone.utc),
+                    "updated_at": datetime.now(timezone.utc),
+                }
+                try:
+                    await agent_task_repository.save_task(_task_doc)
+                except Exception as _e:
+                    logger.warning("[step '%s'] failed to save agent task: %s", step_id, _e)
+
+            # Write PVC lease for TTL cleanup
+            pvc_mount_point = step.get("pvc_mount_point")
+            if pvc_mount_point and pvc_lease_repository is not None:
+                from datetime import datetime, timezone
+                from app.runtime.pvc_manager import parse_ttl
+                pvc_name = step.get("pvc_name") or f"pvc-{run_id[:12]}"
+                ttl = parse_ttl(step.get("pvc_ttl", "1h"))
+                expires_at = datetime.now(timezone.utc) + ttl
+                lease = {
+                    "pvc_name": pvc_name,
+                    "namespace": settings.agent_namespace if settings else "default",
+                    "run_id": run_id,
+                    "expires_at": expires_at,
+                    "created_at": datetime.now(timezone.utc),
+                }
+                try:
+                    await pvc_lease_repository.save(lease)
+                except Exception as _exc:
+                    logger.warning("Failed to save PVC lease for %s: %s", pvc_name, _exc)
+
+        else:
+            # Retrieve real agent_url from task repository for resume path
+            _stored_task = None
+            if agent_task_repository is not None:
+                _stored_task = await agent_task_repository.get_task(task_key)
+            if _stored_task and _stored_task.get("agent_url"):
+                agent_url = _stored_task["agent_url"]
+            else:
+                # Fall back to runtime lookup (only if method is a coroutine function)
+                import inspect as _inspect
+                _get_url_fn = getattr(runtime, "get_agent_url_for_run", None)
+                agent_url = await _get_url_fn(agent_def, run_id) if _get_url_fn is not None and _inspect.iscoroutinefunction(_get_url_fn) else None
+            if not agent_url:
+                # Stale pod from a failed spawn (e.g. helm timeout before task was saved).
+                # Terminate it and fall through to a fresh spawn below.
+                logger.warning(
+                    "[step '%s'] agent_url not found for run '%s' — stale pod detected, terminating and respawning",
+                    step_id, run_id,
+                )
+                _terminate_fn = getattr(runtime, "terminate_by_run_id", None)
+                if _terminate_fn is not None:
+                    try:
+                        await _terminate_fn(agent_def, run_id)
+                    except Exception as _te:
+                        logger.warning("[step '%s'] terminate_by_run_id failed: %s", step_id, _te)
+                _is_resume = False
+                agent_url = await runtime.spawn(agent_def, step, run_id, callback_base_url, extra_env=resolved_env_vars)
+                logger.info("[step '%s'] agent server respawned at %s", step_id, agent_url)
+                container_callback_url = runtime.rewrite_callback_url(callback_base_url)
+                try:
+                    async with httpx.AsyncClient() as client:
+                        resp = await client.post(
+                            f"{agent_url}/start",
+                            json={
+                                "run_id": run_id,
+                                "task_id": task_key,
+                                "input": input_data,
+                                "callback_url": container_callback_url,
+                                "agent_config": agent_config_payload,
+                            },
+                            timeout=10.0,
+                        )
+                        resp.raise_for_status()
+                except Exception as exc:
+                    try:
+                        await runtime.terminate(agent_url)
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"[step '{step_id}'] Failed to start respawned agent at {agent_url}: {exc}"
+                    ) from exc
+                if agent_task_repository is not None:
+                    from datetime import datetime, timezone
+                    _task_doc = {
+                        "_id": task_key,
+                        "run_id": run_id,
+                        "step_id": step_id,
+                        "agent_id": agent_id,
+                        "agent_url": agent_url,
+                        "input": input_data,
+                        "agent_config": agent_config_payload if isinstance(agent_config_payload, dict) else {},
+                        "status": "pending",
+                        "loop_count": 0,
+                        "max_loops": get_settings().agent_max_loops,
+                        "outputs": [],
+                        "created_at": datetime.now(timezone.utc),
+                        "updated_at": datetime.now(timezone.utc),
+                    }
+                    try:
+                        await agent_task_repository.save_task(_task_doc)
+                    except Exception as _e:
+                        logger.warning("[step '%s'] failed to save agent task on respawn: %s", step_id, _e)
+            else:
+                logger.info("[step '%s'] resuming run '%s' (container already running)", step_id, run_id)
+
+        # --- 5c. Pull-based polling: poll agent every N seconds until finished/failed/idle ---
+        _poll_interval = get_settings().agent_poll_interval_seconds
+        _max_loops = get_settings().agent_max_loops
+        _loop_count = 0
+        raw_output: dict = {}
+
+        while True:
+            await asyncio.sleep(_poll_interval)
+            try:
+                async with httpx.AsyncClient() as _hc:
+                    _poll_resp = await _hc.get(f"{agent_url}/poll", timeout=10.0)
+                    _poll_resp.raise_for_status()
+                    _poll_data = _poll_resp.json()
+            except Exception as _poll_exc:
+                logger.warning("[step '%s'] poll failed: %s", step_id, _poll_exc)
+                _loop_count += 1
+                if _loop_count >= _max_loops and agent_task_repository is not None:
+                    await agent_task_repository.update_task(task_key, {"status": "failed"})
+                if _loop_count >= _max_loops:
+                    raise RuntimeError(f"[step '{step_id}'] agent unreachable after {_max_loops} poll attempts") from _poll_exc
+                continue
+
+            _poll_status = _poll_data.get("status", "idle")
+            _poll_outputs = _poll_data.get("outputs", [])
+
+            if agent_task_repository is not None and _poll_outputs:
+                try:
+                    await agent_task_repository.append_outputs(task_key, _poll_outputs)
+                except Exception as _e:
+                    logger.warning("[step '%s'] failed to append agent task outputs: %s", step_id, _e)
+
+            # Cache final output from every poll cycle — the "final" output may arrive
+            # while status is still "working" (task_store marks it sent before the
+            # in-memory state["status"] flips to "done"), so we must capture it here
+            # rather than waiting until the "finished" poll cycle (which may see outputs=[]).
             if not raw_output:
-                for _out in reversed(_poll_outputs):
+                for _out in _poll_outputs:
                     if _out.get("type") == "final":
                         raw_output = _out.get("content", {})
                         break
-            if not raw_output:
-                # Final output may have been consumed by a previous poll cycle or
-                # missed due to a race — check the task repository as fallback.
-                if agent_task_repository is not None:
-                    _stored = await agent_task_repository.get_task(task_key)
-                    if _stored:
-                        for _out in reversed(_stored.get("outputs", [])):
-                            if isinstance(_out, dict) and _out.get("type") == "final":
-                                raw_output = _out.get("content", {})
-                                logger.info("[step '%s'] recovered final output from task repository", step_id)
-                                break
+
+            # Forward progress messages to run state so the UI can see them.
+            if run_repository is not None and _poll_outputs:
+                _progress_msgs = [
+                    out["content"]["message"]
+                    for out in _poll_outputs
+                    if out.get("type") == "progress"
+                    and isinstance(out.get("content"), dict)
+                    and out["content"].get("message")
+                    and not out["content"]["message"].startswith("__")
+                ]
+                if _progress_msgs:
+                    try:
+                        _run = await run_repository.get(run_id)
+                        if _run is not None:
+                            _progress_key = f"_agent_progress_{step_id}"
+                            _progress_list = list((_run.state or {}).get(_progress_key, []))
+                            _progress_list.extend(_progress_msgs)
+                            _run.state = {**(_run.state or {}), _progress_key: _progress_list}
+                            _run.touch()
+                            await run_repository.update(_run)
+                    except Exception:
+                        pass  # progress is best-effort
+
+            if _poll_status == "finished":
+                # raw_output may already be set from an earlier poll cycle (race condition
+                # where "final" output was consumed before status flipped to "finished").
+                # Fall back to scanning _poll_outputs only if not already captured.
                 if not raw_output:
-                    logger.warning("[step '%s'] finished status but no 'final' output found in poll outputs or task repository", step_id)
-            if agent_task_repository is not None:
-                await agent_task_repository.update_task(task_key, {"status": "finished"})
-            break
-
-        if _poll_status == "failed":
-            if agent_task_repository is not None:
-                await agent_task_repository.update_task(task_key, {"status": "failed"})
-            raise RuntimeError(f"[step '{step_id}'] agent reported failure")
-
-        if _poll_status == "idle":
-            # Agent lost the task — meta LLM recovery
-            if use_meta_llm:
-                from app.services.agent_poller import _meta_llm_recovery
-                _task_for_recovery = {"input": input_data, "outputs": _poll_outputs}
-                if agent_task_repository is not None:
-                    _stored_task = await agent_task_repository.get_task(task_key)
-                    if _stored_task:
-                        _task_for_recovery = _stored_task
-                _is_complete = await _meta_llm_recovery(_task_for_recovery, settings)
-                if _is_complete:
-                    for _out in reversed(_task_for_recovery.get("outputs", [])):
-                        if isinstance(_out, dict) and _out.get("type") == "final":
+                    for _out in reversed(_poll_outputs):
+                        if _out.get("type") == "final":
                             raw_output = _out.get("content", {})
                             break
+                if not raw_output:
+                    # Final output may have been consumed by a previous poll cycle or
+                    # missed due to a race — check the task repository as fallback.
                     if agent_task_repository is not None:
-                        await agent_task_repository.update_task(task_key, {"status": "finished"})
-                    break
-            _loop_count += 1
-            if _loop_count >= _max_loops:
+                        _stored = await agent_task_repository.get_task(task_key)
+                        if _stored:
+                            for _out in reversed(_stored.get("outputs", [])):
+                                if isinstance(_out, dict) and _out.get("type") == "final":
+                                    raw_output = _out.get("content", {})
+                                    logger.info("[step '%s'] recovered final output from task repository", step_id)
+                                    break
+                    if not raw_output:
+                        logger.warning("[step '%s'] finished status but no 'final' output found in poll outputs or task repository", step_id)
+                if agent_task_repository is not None:
+                    await agent_task_repository.update_task(task_key, {"status": "finished"})
+                break
+
+            if _poll_status == "failed":
                 if agent_task_repository is not None:
                     await agent_task_repository.update_task(task_key, {"status": "failed"})
-                raise RuntimeError(f"[step '{step_id}'] agent idle after {_max_loops} recovery attempts")
-            # Resend task
-            logger.info("[step '%s'] resending task to agent (loop %d/%d)", step_id, _loop_count, _max_loops)
-            if agent_task_repository is not None:
-                await agent_task_repository.update_task(task_key, {"loop_count": _loop_count})
-            try:
-                async with httpx.AsyncClient() as _hc2:
-                    _restart_resp = await _hc2.post(
-                        f"{agent_url}/start",
-                        json={"run_id": run_id, "task_id": task_key, "input": input_data, "callback_url": container_callback_url, "agent_config": agent_config_payload},
-                        timeout=10.0,
-                    )
-                    _restart_resp.raise_for_status()
-            except Exception as _restart_exc:
-                logger.warning("[step '%s'] resend failed: %s", step_id, _restart_exc)
-            continue
-        # status == "working" or unknown — keep polling
+                raise RuntimeError(f"[step '{step_id}'] agent reported failure")
 
-    # After poll loop: either park as warm pod or terminate.
-    if warm_pod_repository is not None and runtime_type == "k8s":
-        from datetime import datetime, timezone, timedelta
-        from app.infrastructure.persistence.mongo import WarmPodRecord
-        _now = datetime.now(timezone.utc)
-        _release_name = runtime._release_name(agent_def, run_id) if hasattr(runtime, "_release_name") else ""
-        try:
-            await warm_pod_repository.upsert(WarmPodRecord(
-                run_id=run_id,
-                agent_id=agent_id,
-                agent_url=agent_url,
-                release_name=_release_name,
-                created_at=_now,
-                expires_at=_now + timedelta(hours=24),
-            ))
-            logger.info("[step '%s'] parked warm pod at %s (release=%s)", step_id, agent_url, _release_name)
-        except Exception as _wp_exc:
-            logger.warning("[step '%s'] failed to upsert warm pod record: %s — terminating instead", step_id, _wp_exc)
+            if _poll_status == "idle":
+                # Agent lost the task — meta LLM recovery
+                if use_meta_llm:
+                    from app.services.agent_poller import _meta_llm_recovery
+                    _task_for_recovery = {"input": input_data, "outputs": _poll_outputs}
+                    if agent_task_repository is not None:
+                        _stored_task = await agent_task_repository.get_task(task_key)
+                        if _stored_task:
+                            _task_for_recovery = _stored_task
+                    _is_complete = await _meta_llm_recovery(_task_for_recovery, settings)
+                    if _is_complete:
+                        for _out in reversed(_task_for_recovery.get("outputs", [])):
+                            if isinstance(_out, dict) and _out.get("type") == "final":
+                                raw_output = _out.get("content", {})
+                                break
+                        if agent_task_repository is not None:
+                            await agent_task_repository.update_task(task_key, {"status": "finished"})
+                        break
+                _loop_count += 1
+                if _loop_count >= _max_loops:
+                    if agent_task_repository is not None:
+                        await agent_task_repository.update_task(task_key, {"status": "failed"})
+                    raise RuntimeError(f"[step '{step_id}'] agent idle after {_max_loops} recovery attempts")
+                # Resend task
+                logger.info("[step '%s'] resending task to agent (loop %d/%d)", step_id, _loop_count, _max_loops)
+                if agent_task_repository is not None:
+                    await agent_task_repository.update_task(task_key, {"loop_count": _loop_count})
+                try:
+                    async with httpx.AsyncClient() as _hc2:
+                        _restart_resp = await _hc2.post(
+                            f"{agent_url}/start",
+                            json={"run_id": run_id, "task_id": task_key, "input": input_data, "callback_url": container_callback_url, "agent_config": agent_config_payload},
+                            timeout=10.0,
+                        )
+                        _restart_resp.raise_for_status()
+                except Exception as _restart_exc:
+                    logger.warning("[step '%s'] resend failed: %s", step_id, _restart_exc)
+                continue
+            # status == "working" or unknown — keep polling
+
+        # After poll loop: either park as warm pod or terminate.
+        if warm_pod_repository is not None and runtime_type == "k8s":
+            from datetime import datetime, timezone, timedelta
+            from app.infrastructure.persistence.mongo import WarmPodRecord
+            _now = datetime.now(timezone.utc)
+            _release_name = runtime._release_name(agent_def, run_id) if hasattr(runtime, "_release_name") else ""
+            try:
+                await warm_pod_repository.upsert(WarmPodRecord(
+                    run_id=run_id,
+                    agent_id=agent_id,
+                    agent_url=agent_url,
+                    release_name=_release_name,
+                    created_at=_now,
+                    expires_at=_now + timedelta(hours=24),
+                ))
+                logger.info("[step '%s'] parked warm pod at %s (release=%s)", step_id, agent_url, _release_name)
+            except Exception as _wp_exc:
+                logger.warning("[step '%s'] failed to upsert warm pod record: %s — terminating instead", step_id, _wp_exc)
+                if hasattr(runtime, "terminate_by_run_id"):
+                    await runtime.terminate_by_run_id(agent_def, run_id)
+                else:
+                    try:
+                        await runtime.terminate(agent_url)
+                    except Exception as _exc:
+                        logger.warning("[step '%s'] failed to terminate agent: %s", step_id, _exc)
+        else:
+            # Terminate using run_id label — works whether _containers is populated or not.
             if hasattr(runtime, "terminate_by_run_id"):
                 await runtime.terminate_by_run_id(agent_def, run_id)
             else:
@@ -1300,20 +1313,34 @@ async def execute_agent_step(
                     await runtime.terminate(agent_url)
                 except Exception as _exc:
                     logger.warning("[step '%s'] failed to terminate agent: %s", step_id, _exc)
-    else:
-        # Terminate using run_id label — works whether _containers is populated or not.
-        if hasattr(runtime, "terminate_by_run_id"):
-            await runtime.terminate_by_run_id(agent_def, run_id)
-        else:
-            try:
-                await runtime.terminate(agent_url)
-            except Exception as _exc:
-                logger.warning("[step '%s'] failed to terminate agent: %s", step_id, _exc)
 
-    logger.info(
-        "[step '%s'] agent run '%s' resumed, output keys: %s",
-        step_id, run_id, list(raw_output),
+        logger.info(
+            "[step '%s'] agent run '%s' resumed, output keys: %s",
+            step_id, run_id, list(raw_output),
+        )
+        return raw_output
+
+    # A limited runtime (max_concurrency) runs this step only once it has a slot.
+    from app.application.concurrency import ConcurrencySlot, queue_reporter, runtime_for
+    from app.steps.acp_executor import _ProgressSink
+    _rt_key, _rt_limit = await runtime_for(agent_def, None, agent_backend)
+    _sink = _ProgressSink(run_repository, run_id, step_id)
+    _on_wait, _on_acquired = queue_reporter(_sink, step_id, _rt_key, _rt_limit, agent_id)
+    _slot = ConcurrencySlot(
+        _rt_key, _rt_limit,
+        {"id": task_key, "run_id": run_id, "step_id": step_id, "agent_id": agent_id, "workflow_id": workflow_id},
+        ttl_s=float(getattr(settings, "agent_concurrency_ttl_s", 120)),
+        poll_s=float(getattr(settings, "agent_concurrency_poll_s", 2.0)),
+        on_wait=_on_wait, on_acquired=_on_acquired,
     )
+    try:
+        await _slot.acquire()
+        raw_output = await _drive_http_poll()
+    finally:
+        if _slot.gated:
+            await _slot.release()
+            await _sink.flush()
+            await _sink.set_state(f"_queue_wait_{step_id}", None)
 
     return await _finalize_agent_output(
         step, raw_output, input_data, settings,

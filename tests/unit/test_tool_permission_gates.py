@@ -109,6 +109,8 @@ EXPECTED_TOOL_PERMISSIONS: dict[str, Permission] = {
     "create_agent": Permission.WRITE,
     "update_agent": Permission.WRITE,
     "delete_agent": Permission.DELETE,
+    "list_agent_concurrency": Permission.READ,
+    "update_runner_concurrency": Permission.WRITE,
     # data sources
     "list_datasources": Permission.READ,
     "get_datasource": Permission.READ,
