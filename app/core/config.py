@@ -494,6 +494,13 @@ class Settings(BaseSettings):
     # Retry interval when the agent did not say when its limit resets.
     acp_quota_retry_s: int = Field(default=1800, alias="ACP_QUOTA_RETRY_S")
 
+    # --- Agent runtime concurrency (AgentDefinition.max_concurrency, Runner.agent_concurrency) ---
+    # A slot (or queue place) not heartbeated for this long is freed: a crashed
+    # replica cannot hold a runtime forever.
+    agent_concurrency_ttl_s: int = Field(default=120, alias="AGENT_CONCURRENCY_TTL_S")
+    # How often a queued step checks whether it may start.
+    agent_concurrency_poll_s: float = Field(default=2.0, alias="AGENT_CONCURRENCY_POLL_S")
+
     # --- Python script sandbox (workflow `python` steps with sandbox: true) ---
     # Image used by the docker / k8s sandbox runtimes.  Must contain a Python
     # interpreter on PATH; no backend dependencies are needed inside it.

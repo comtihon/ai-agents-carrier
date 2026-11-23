@@ -596,6 +596,34 @@ async def test_usage_limit_parks_and_continues_in_the_same_session(server, monke
         await fake.stop()
 
 
+async def test_parked_step_gives_up_its_runtime_slot(server, monkeypatch):
+    from app.application.concurrency import set_concurrency_backend
+    from app.infrastructure.persistence.concurrency_backend import InMemoryConcurrencyBackend
+
+    _, token = await _runner(server)
+    await server.runners.update_runner("rnr-1", {"agent_concurrency": {"codex": 1}})
+    leases = InMemoryConcurrencyBackend()
+    set_concurrency_backend(leases)
+    holders_while_parked: list[int] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        rows = await leases.list_keys(datetime.now(timezone.utc))
+        holders_while_parked.append(sum(len(r["holders"]) for r in rows))
+
+    monkeypatch.setattr(acp_executor, "_sleep", fake_sleep)
+    fake = FakeRunner(server, token, ["limit", "ok"])
+    await fake.start()
+    try:
+        out = await _step()
+        assert out["result"] == '{"summary": "done"}'
+        # Parked: the slot of runner:rnr-1:codex was free for others.
+        assert holders_while_parked == [0]
+        assert leases.docs["runner:rnr-1:codex"]["holders"] == []
+    finally:
+        set_concurrency_backend(None)
+        await fake.stop()
+
+
 async def test_usage_limit_reloads_the_session_when_the_connection_is_gone(server, monkeypatch):
     _, token = await _runner(server)
 

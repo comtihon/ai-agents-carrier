@@ -16,7 +16,7 @@ Signed-in users:
     POST   /acp/runners/enrollments/{id}/approve  {code, name?, visibility?, team_id?, agents?}
     POST   /acp/runners/enrollments/{id}/deny     {code}
     GET    /acp/runners                           runners the caller can see
-    PATCH  /acp/runners/{id}                      {name?, visibility?, team_id?}
+    PATCH  /acp/runners/{id}                      {name?, visibility?, team_id?, agent_concurrency?}
     DELETE /acp/runners/{id}                      revoke
     POST   /acp/runners/{id}/agents               {acp_agent, id?, name?} → agent definition
 """
@@ -34,6 +34,7 @@ from pydantic import BaseModel
 from starlette.websockets import WebSocketDisconnect
 
 from app.api.dependencies import get_container
+from app.application.concurrency import merge_agent_concurrency
 from app.application.runners import (
     EnrollmentError,
     EnrollmentService,
@@ -361,6 +362,9 @@ class RunnerUpdate(BaseModel):
     name: str | None = None
     visibility: Literal["private", "team", "public"] | None = None
     team_id: str | None = None
+    # Per agent on the machine: most runs at once, across all workflows and
+    # users. Merged into the stored map; null (or 0) removes an agent's cap.
+    agent_concurrency: dict[str, int | None] | None = None
 
 
 @router.patch("/{runner_id}")
@@ -377,6 +381,15 @@ async def update_runner(runner_id: str, body: RunnerUpdate, container: Applicati
             raise HTTPException(status_code=403, detail="You may not change who can use this runner")
         fields["visibility"] = body.visibility
         fields["team_id"] = _check_scope(body.visibility, body.team_id)
+    if body.agent_concurrency is not None:
+        try:
+            merged = merge_agent_concurrency(runner.agent_concurrency, body.agent_concurrency)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if merged != runner.agent_concurrency:
+            if not can_edit(runner):
+                raise HTTPException(status_code=403, detail="You may not change this runner's concurrency limits")
+            fields["agent_concurrency"] = merged
     if fields:
         await backend.update_runner(runner_id, fields)
         runner = await backend.get_runner(runner_id)

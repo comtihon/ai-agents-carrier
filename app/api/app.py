@@ -54,6 +54,7 @@ from app.api.routes.teams import router as teams_router
 from app.api.routes.login_script import router as login_script_router
 from app.api.routes.agent_callbacks import router as agent_callbacks_router
 from app.api.routes.agents import router as agents_router
+from app.api.routes.agent_runtimes import router as agent_runtimes_router
 from app.api.routes.approvals import router as approvals_router
 from app.api.routes.callbacks import router as callbacks_router
 from app.api.routes.chat import router as chat_router
@@ -737,6 +738,7 @@ def create_app() -> FastAPI:
     app.include_router(login_script_router, prefix=settings.api_prefix)
     app.include_router(workflows_router, prefix=settings.api_prefix)
     app.include_router(agents_router, prefix=settings.api_prefix)
+    app.include_router(agent_runtimes_router, prefix=settings.api_prefix)
     app.include_router(runners_router, prefix=settings.api_prefix)
     app.include_router(datasources_router, prefix=settings.api_prefix)
     app.include_router(approvals_router, prefix=settings.api_prefix)

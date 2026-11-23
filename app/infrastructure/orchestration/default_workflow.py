@@ -483,7 +483,7 @@ def build_default_workflow(
         return await core.get_agent(deps, agent_id)
 
     @tool
-    async def create_agent(agent_id: str, name: str, description: str = "", default_runtime: str = "local", agent_input_json: str = "{}", protocol: str = "http-poll", acp_agent: str = None, brain_access: str = "none") -> str:
+    async def create_agent(agent_id: str, name: str, description: str = "", default_runtime: str = "local", agent_input_json: str = "{}", protocol: str = "http-poll", acp_agent: str = None, brain_access: str = "none", max_concurrency: int = None) -> str:
         """Create a new agent definition. agent_input_json is a JSON object of default input overrides.
 
         protocol: "http-poll" (pi-cloud-agent /start + /poll, the default) or
@@ -492,14 +492,16 @@ def build_default_workflow(
         brain_access: shared company memory (gbrain) clearance, "none" (default),
         "read" or "write"; a workflow step gets the lower of this and the
         workflow's brain_access.
+        max_concurrency: most runs of this agent's runtime executing at once,
+        across all workflows and users (more runs queue); omit or 0 = no limit.
         """
         return await core.create_agent(
             deps, agent_id, name, description, default_runtime, agent_input_json, protocol, acp_agent,
-            brain_access,
+            brain_access, max_concurrency,
         )
 
     @tool
-    async def update_agent(agent_id: str, name: str = None, description: str = None, default_runtime: str = None, agent_input_json: str = None, protocol: str = None, acp_agent: str = None, addons_json: str = None, brain_access: str = None) -> str:
+    async def update_agent(agent_id: str, name: str = None, description: str = None, default_runtime: str = None, agent_input_json: str = None, protocol: str = None, acp_agent: str = None, addons_json: str = None, brain_access: str = None, max_concurrency: int = None) -> str:
         """Update an existing agent definition. Only provided fields are changed; others preserved.
 
         protocol: "http-poll" or "acp". acp_agent: the proxy's agent name for
@@ -511,11 +513,35 @@ def build_default_workflow(
         {name: bool}}, datasource {source_id, allowed_operations}.
         brain_access: shared company memory clearance ("none" | "read" |
         "write"); omit to keep current.
+        max_concurrency: most runs of this agent's runtime executing at once,
+        across all workflows and users (more runs queue); 0 = no limit, omit
+        to keep current.
         """
         return await core.update_agent(
             deps, agent_id, name, description, default_runtime, agent_input_json, protocol, acp_agent,
-            addons_json, brain_access,
+            addons_json, brain_access, max_concurrency,
         )
+
+    @tool
+    async def list_agent_concurrency(key: str = None) -> str:
+        """Who runs and who queues on each concurrency-limited agent runtime.
+
+        A runtime key is "runner:<runner_id>:<acp_agent>" (an agent on a
+        connected machine) or "agent:<agent_id>". Returns JSON: per key its
+        limit, holders and FIFO queue (runs of workflows you cannot see are
+        counted but hidden). key: only that runtime.
+        """
+        return await core.list_agent_concurrency(deps, key)
+
+    @tool
+    async def update_runner_concurrency(runner_id: str, agent: str, max_concurrency: int) -> str:
+        """Cap how many runs of one agent on a connected machine (runner) execute at once.
+
+        Applies across all workflows and users; more runs queue. agent: the
+        agent's name on the machine (e.g. claude, codex). max_concurrency: 0
+        removes the cap.
+        """
+        return await core.update_runner_concurrency(deps, runner_id, agent, max_concurrency)
 
     @tool
     async def delete_agent(agent_id: str) -> str:
@@ -1526,6 +1552,7 @@ def build_default_workflow(
                       list_pending_approvals, get_approval,
                       create_workflow, update_workflow, delete_workflow,
                       list_agents, get_agent, create_agent, update_agent, delete_agent,
+                      list_agent_concurrency, update_runner_concurrency,
                       list_datasources, get_datasource, create_datasource, update_datasource,
                       list_scripts, get_script, create_script, update_script, delete_script,
                       get_event,

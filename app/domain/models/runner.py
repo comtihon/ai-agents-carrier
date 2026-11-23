@@ -45,6 +45,9 @@ class Runner(OwnedResource):
     connected_at: datetime | None = None
     # Agents (by name on the machine) that hit a usage limit.
     limits: dict[str, AgentLimit] = Field(default_factory=dict)
+    # Most runs of each agent (by name on the machine) at once, across every
+    # workflow and user; more runs queue (app.application.concurrency).
+    agent_concurrency: dict[str, int] = Field(default_factory=dict)
 
 
 EnrollmentStatus = Literal["pending", "approved", "denied", "consumed"]

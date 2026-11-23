@@ -836,6 +836,38 @@ Out of credits / spend cap: the step fails. A runner remembers an agent's limit,
 so later steps wait before launching it. Nothing waits longer than
 `ACP_QUOTA_MAX_WAIT_S`.
 
+### Concurrency limits (agent runtimes)
+
+An agent runtime can be limited to N runs at once **across every workflow of
+every user** (private ones included) and every carrier replica. Runs over the
+limit queue FIFO; they never fail because of it.
+
+- `AgentDefinition.max_concurrency` (int ≥ 1, `null` = unlimited) — REST
+  `POST/PUT /api/v1/agents` (PUT: omitted keeps the stored value, `null`
+  clears), MCP `create_agent` / `update_agent` (`0` clears).
+- `Runner.agent_concurrency` (`{"claude": 1}`) — per agent on a machine,
+  `PATCH /api/v1/acp/runners/{id} {"agent_concurrency": {"claude": 1, "codex": null}}`
+  (merged; `null`/`0` removes), MCP `update_runner_concurrency`.
+
+The runtime key is `runner:<runner_id>:<acp_agent>` for runner agents (the
+definition's `acp_agent`, else the runner's default agent) and
+`agent:<agent_id>` for everything else. The effective limit is the lowest
+configured value: for a runner key, the runner's cap and `max_concurrency` of
+every agent definition using that runner agent. Nothing configured: no gating.
+
+Slots are leases in MongoDB (`agent_runtime_leases`, one document per key,
+single-document atomic updates). A holder heartbeats every
+`AGENT_CONCURRENCY_TTL_S / 4`; a slot not refreshed for
+`AGENT_CONCURRENCY_TTL_S` (default 120) is freed, so a crashed replica releases
+its runs' slots. Waiters poll every `AGENT_CONCURRENCY_POLL_S` (default 2).
+While a step waits, the run state carries `_queue_wait_<step>`
+(`{key, limit, position, holders, since, agent_id}`, position 1-based). A step
+parked on a usage limit gives up its slot and queues again before resuming; a
+step re-attached after a restart takes its slot back even if that briefly
+exceeds the limit. `GET /api/v1/agent-runtimes/concurrency[?key=]` (MCP
+`list_agent_concurrency`) lists holders and queue per key; runs of workflows
+the caller cannot see are counted but shown as `hidden`.
+
 ### Two images: `slim` and `full`
 
 The backend ships as two images built from the same `Dockerfile`:
@@ -1053,6 +1085,7 @@ POST   /api/v1/agents                         register an agent
 GET    /api/v1/agents/{id}                    get agent definition
 PUT    /api/v1/agents/{id}                    update agent definition
 DELETE /api/v1/agents/{id}                    delete agent definition
+GET    /api/v1/agent-runtimes/concurrency     holders and queue of limited agent runtimes
 
 # Scripts (Python script library)
 GET    /api/v1/scripts                        list scripts

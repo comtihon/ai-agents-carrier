@@ -28,6 +28,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
+from app.application.concurrency import ConcurrencySlot, queue_reporter, runtime_for
 from app.application.runners import RunnerOffline
 from app.core.config import BRAIN_MCP_NAME, DATASOURCES_MCP_NAME
 from app.domain.models.runner import AgentLimit
@@ -244,6 +245,9 @@ async def run_acp_agent(
     run_repository: Any = None,
     agent_task_repository: Any = None,
     runner_hub: Any = None,
+    agent_backend: Any = None,
+    workflow_id: str | None = None,
+    concurrency_backend: Any = None,
 ) -> dict[str, Any]:
     """Run one agent step over ACP; returns the raw output for _finalize_agent_output.
 
@@ -252,6 +256,10 @@ async def run_acp_agent(
     (app.application.runners). When the agent runs out of quota the step is
     parked until the limit resets and then continues in the same session
     (``session/load`` on a new connection when the old one is gone).
+
+    With a concurrency limit on the agent's runtime (app.application.concurrency)
+    the step first waits for a slot, holds it while the agent works, and gives
+    it up while parked on a usage limit.
     """
     step_id = step["id"]
     sink = _ProgressSink(run_repository, run_id, step_id)
@@ -316,6 +324,18 @@ async def run_acp_agent(
     quota_retry_s = float(getattr(settings, "acp_quota_retry_s", 1800))
     cwd: str | None = None
     agent_tz = runner.tz if runner else None
+
+    # A slot of the agent's runtime, when its concurrency is limited.
+    rt_key, rt_limit = await runtime_for(agent_def, runner, agent_backend)
+    on_wait, on_acquired = queue_reporter(sink, step_id, rt_key, rt_limit, agent_def.id)
+    slot = ConcurrencySlot(
+        rt_key, rt_limit,
+        {"id": task_key, "run_id": run_id, "step_id": step_id, "agent_id": agent_def.id, "workflow_id": workflow_id},
+        backend=concurrency_backend,
+        ttl_s=float(getattr(settings, "agent_concurrency_ttl_s", 120)),
+        poll_s=float(getattr(settings, "agent_concurrency_poll_s", 2.0)),
+        on_wait=on_wait, on_acquired=on_acquired,
+    )
 
     # Re-attach to a turn still running (or parked) from before a restart.
     stored = await agent_task_repository.get_task(task_key) if agent_task_repository is not None else None
@@ -496,8 +516,11 @@ async def run_acp_agent(
         sink.add(f"⏸ {_limit_words(limit.kind)} — resuming at {resume_at:%Y-%m-%d %H:%M} UTC" + (f": {limit.message}" if limit.message else ""))
         await sink.flush()
         logger.info("[step '%s'] %s; parked until %s", step_id, limit.kind, _iso(resume_at))
+        # A parked step does not occupy its runtime: others may run meanwhile.
+        await slot.release()
         await _sleep(max(0.0, (resume_at - _utcnow()).total_seconds()))
         await sink.set_state(wait_key, None)
+        await slot.acquire()
         sink.add("▶ resuming")
 
     async def resume_session() -> None:
@@ -538,6 +561,8 @@ async def run_acp_agent(
                 logger.info("[step '%s'] still parked on a usage limit; resuming the wait", step_id)
             else:
                 logger.info("[step '%s'] re-attaching to ACP connection %s", step_id, acp_state["connection_id"])
+                # The turn is executing already: keep (or take back) its slot.
+                await slot.acquire(force=True)
                 # Replay from the start: the turn's text is rebuilt from its updates.
                 await conn.connect(last_seq=0)
                 prompt_future = conn.expect(prompt_id)
@@ -548,6 +573,7 @@ async def run_acp_agent(
                 if known is not None:
                     # Known to be out of quota: wait before taking the machine's time.
                     await park(LimitInfo(known.kind, known.until, known.message))
+            await slot.acquire()
             if runner is None:
                 token = secrets.token_urlsafe(32)
                 env = dict(agent_config.get("env_vars") or {})
@@ -692,16 +718,22 @@ async def run_acp_agent(
                 pass
         raise
     finally:
-        await sink.flush()
-        if conn is not None:
-            if conn.started:
-                try:
-                    await asyncio.wait_for(conn.request("_proxy/shutdown", {}), 15)
-                except Exception:
-                    pass
-            await conn.close()
-        if agent_url is not None and runner is None:
-            await _terminate(runtime, agent_def, run_id, agent_url)
+        try:
+            await sink.flush()
+            if conn is not None:
+                if conn.started:
+                    try:
+                        await asyncio.wait_for(conn.request("_proxy/shutdown", {}), 15)
+                    except Exception:
+                        pass
+                await conn.close()
+            if agent_url is not None and runner is None:
+                await _terminate(runtime, agent_def, run_id, agent_url)
+        finally:
+            # Only once the agent is gone does the next run get its runtime.
+            if slot.gated:
+                await slot.release()
+                await sink.set_state(f"_queue_wait_{step_id}", None)
 
 
 def _merge_workspace_changes(acc: dict[str, set[str]], changes: dict[str, Any]) -> None:
