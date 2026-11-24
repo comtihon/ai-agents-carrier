@@ -306,6 +306,11 @@ async def run_acp_agent(
         raise AcpError(f"carrier does not implement {method}")
 
     agent_input = agent_def.agent_input or {}
+    # Agent-specific options for the ACP adapter, passed through untouched as
+    # ``_meta.claudeCode.options`` (claude-agent-acp hands them to the Claude
+    # Agent SDK, e.g. ``disallowedTools``). Carrier does not interpret them.
+    cc_options = agent_input.get("claude_code_options")
+    cc_options = cc_options if isinstance(cc_options, dict) and cc_options else None
     on_runner = agent_def.default_runtime == "runner"
     hub = None
     runner = None
@@ -544,7 +549,11 @@ async def run_acp_agent(
             raise RuntimeError(f"[step '{step_id}'] the agent's connection was lost and it cannot reload its session (no loadSession)")
         loading = True
         try:
-            await conn.request("session/load", {"sessionId": session_id, "cwd": await session_cwd(), "mcpServers": session_mcp_servers()}, timeout=900)
+            load: dict[str, Any] = {"sessionId": session_id, "cwd": await session_cwd(), "mcpServers": session_mcp_servers()}
+            if cc_options:
+                # The adapter rebuilds a loaded session from this request's own _meta.
+                load["_meta"] = {"claudeCode": {"options": cc_options}}
+            await conn.request("session/load", load, timeout=900)
         finally:
             loading = False
 
@@ -591,6 +600,8 @@ async def run_acp_agent(
             if agent_config.get("system_prompt"):
                 # claude-agent-acp's slot for a system prompt; others ignore it.
                 meta["systemPrompt"] = {"type": "preset", "preset": "claude_code", "append": agent_config["system_prompt"]}
+            if cc_options:
+                meta["claudeCode"] = {"options": cc_options}
             new = await conn.request("session/new", {
                 "cwd": await session_cwd(),
                 "mcpServers": session_mcp_servers(),

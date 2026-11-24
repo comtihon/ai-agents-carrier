@@ -20,10 +20,10 @@ router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
 # http trigger auth (``auth_mode`` on the workflow's ``http`` step):
 #   "hmac"   — HMAC-SHA256 of the raw body with ``webhook_secret`` (else the
-#              global WEBHOOK_SECRET), in any of SIGNATURE_HEADERS, bare hex or
-#              "sha256=<hex>" (carrier, gbrain, Jira system webhooks, GitHub);
-#   "bearer" — ``Authorization: Bearer <bearer_token>`` (Jira Automation);
-#   "any"    — either of the two, for a workflow started by both kinds of sender.
+#              global WEBHOOK_SECRET) in the ``signature_header`` header
+#              (default X-Webhook-Signature), bare hex or "sha256=<hex>";
+#   "bearer" — ``Authorization: Bearer <bearer_token>``;
+#   "any"    — either of the two.
 _AUTH_MODES = ("hmac", "bearer", "any")
 
 
@@ -50,11 +50,11 @@ async def receive_webhook(
     """Receive an authenticated HTTP trigger and start a workflow run.
 
     How the caller authenticates is the ``http`` trigger step's ``auth_mode``
-    (see ``_AUTH_MODES``): an HMAC-SHA256 signature of the raw body
-    (``X-Webhook-Signature``, ``X-Gbrain-Signature``, ``X-Hub-Signature`` or
-    ``X-Hub-Signature-256``, bare hex or ``sha256=<hex>``; secret from the
-    step's ``webhook_secret``, else the global ``WEBHOOK_SECRET``), a bearer
-    token (``Authorization: Bearer <bearer_token>``), or either (``any``).
+    (see ``_AUTH_MODES``): an HMAC-SHA256 signature of the raw body in the
+    step's ``signature_header`` (default ``X-Webhook-Signature``; bare hex or
+    ``sha256=<hex>``; secret from the step's ``webhook_secret``, else the
+    global ``WEBHOOK_SECRET``), a bearer token (``Authorization: Bearer
+    <bearer_token>``), or either (``any``).
 
     A field named ``request`` in the JSON body is used as the workflow's initial
     request string; if absent, the entire body is JSON-serialised as the request.
@@ -102,7 +102,8 @@ async def receive_webhook(
     if auth_mode == "any" and not token and not secret:
         raise HTTPException(status_code=503, detail="Neither a bearer token nor a webhook secret is configured on the http trigger step")
     ok = (use_bearer and valid_bearer(request.headers, token)) or (
-        use_hmac and bool(secret) and valid_signature(body, request.headers, secret)
+        use_hmac and bool(secret)
+        and valid_signature(body, request.headers, secret, (http_step or {}).get("signature_header"))
     )
     if not ok:
         logger.warning("Webhook auth (%s) failed for workflow '%s'", auth_mode, workflow_id)

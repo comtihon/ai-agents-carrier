@@ -32,6 +32,9 @@ class AgentDefinition(GrantableResource):
     agent_input:
         All runtime configuration sent to the agent on every run.
         Typical keys: ``system_prompt``, ``model``, ``tools``, ``max_tokens``.
+        ACP agents: ``claude_code_options`` is passed through as the ACP
+        session's ``_meta.claudeCode.options`` (Claude Agent SDK options such
+        as ``disallowedTools``), on session/new and session/load.
         Populates ``AgentConfig`` fields and ``extra`` for every runtime.
     image:
         Docker image (docker runtime only — ``local`` runs the agent from

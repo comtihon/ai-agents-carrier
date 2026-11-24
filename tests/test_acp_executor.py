@@ -187,13 +187,13 @@ AGENT_CONFIG = {
 }
 
 
-async def _run(proxy: FakeProxy, step: dict | None = None, task_repo: TaskRepo | None = None):
+async def _run(proxy: FakeProxy, step: dict | None = None, task_repo: TaskRepo | None = None, agent: AgentDefinition | None = None):
     runtime = FakeRuntime(proxy)
     repo = Repo()
     repo.runs["run-1"] = SimpleNamespace(id="run-1", state={}, touch=lambda: None)
     out = await run_acp_agent(
         step=step or {"id": "code"},
-        agent_def=_agent(),
+        agent_def=agent or _agent(),
         input_data={"task": "list files", "context": {"repo": "x"}},
         agent_config=AGENT_CONFIG,
         runtime=runtime,
@@ -410,3 +410,28 @@ async def test_an_urgent_message_cancels_the_running_turn_and_takes_its_place():
     assert proxy.cancelled.is_set()
     assert proxy.prompts == 2 and "use the streaming API" in proxy.prompt_texts[1]
     assert out["result"] == '{"summary": "switched approach"}'
+
+
+@pytest.mark.asyncio
+async def test_claude_code_options_pass_through_untouched():
+    options = {"disallowedTools": ["Edit", "Bash(foo:*)"], "anything": {"nested": 1}}
+    agent = AgentDefinition(id="a", default_runtime="k8s", protocol="acp", acp_agent="claude",
+                            agent_input={"claude_code_options": options})
+    proxy = FakeProxy()
+    await proxy.start()
+    try:
+        await _run(proxy, agent=agent)
+    finally:
+        await proxy.stop()
+    assert proxy.session_new["_meta"]["claudeCode"] == {"options": options}
+
+
+@pytest.mark.asyncio
+async def test_no_claude_code_options_no_meta():
+    proxy = FakeProxy()
+    await proxy.start()
+    try:
+        await _run(proxy)
+    finally:
+        await proxy.stop()
+    assert "claudeCode" not in proxy.session_new["_meta"]
