@@ -834,7 +834,11 @@ async def execute_agent_step(
         )
 
     # --- 2. Determine effective runtime ---
-    runtime_type: str = step.get("runtime_override") or agent_def.default_runtime
+    # This use of the agent may run it elsewhere and with other addons
+    # (app.domain.models.agent_usage): ``runtime`` / ``addons`` on the step.
+    from app.domain.models.agent_usage import apply_usage
+    agent_def = apply_usage(agent_def, step.get("runtime"), step.get("addons"), step.get("runtime_override"))
+    runtime_type: str = agent_def.default_runtime
     logger.info(
         "[step '%s'] agent='%s' runtime='%s' run_id='%s'",
         step_id, agent_id, runtime_type, run_id,

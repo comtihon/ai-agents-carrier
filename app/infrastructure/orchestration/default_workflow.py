@@ -336,7 +336,10 @@ def build_default_workflow(
                 pubsub_publish (publish one message: topic, optional project_id,
                 data dict|string, attributes, output_key -> {message_id, topic};
                 topic must match PUBSUB_PUBLISH_ALLOWED_TOPICS),
-                langgraph-agent, claude-agent,
+                langgraph-agent, claude-agent (optional `runtime` = where this
+                use runs: {kind: default|local|docker|k8s|runner|pool,
+                runner_id, acp_agent, pool_id}; optional `addons` = addons for
+                this use, overriding the agent's own of the same type),
                 data_source (invoke a DataSourceDefinition operation),
                 combined_datasource (ONE step that acquires and filters data
                 through ordered `parts`: data_source | python | nested
@@ -371,7 +374,8 @@ def build_default_workflow(
                 needs, and on a validator's change request or an agent's
                 question answers, rewinds the DAG or rearranges it; every
                 category is optional; set `plan` to author the job DAG yourself;
-                fields: agent_pool [{agent_id, max_instances, categories}],
+                fields: agent_pool [{agent_id, max_instances, categories,
+                runtime, addons}],
                 jobs {category: {min, max}}, datasources [{source_id,
                 operations, description}], plan [{id, category, agent_id,
                 prompt, depends_on, owns, datasources}], automation

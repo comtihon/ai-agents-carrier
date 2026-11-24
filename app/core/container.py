@@ -27,7 +27,7 @@ from app.infrastructure.integrations.openhands import OpenHandsAdapter
 from app.infrastructure.orchestration.checkpointer import MongoDBCheckpointSaver
 from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner, stream_graph_to_pause
 from app.infrastructure.persistence.mongo import MongoClientProvider, MongoGraphRunRepository, MongoPvcLeaseRepository, MongoAgentTaskRepository, MongoWarmPodRepository
-from app.application.visibility import ReferenceGuard, VisibilityScopedBackend, unwrap
+from app.application.visibility import ReferenceGuard, RunnerLookup, VisibilityScopedBackend, unwrap
 from app.infrastructure.persistence.login_script_store import (
     LoginScriptStore,
     MongoLoginScriptStore,
@@ -193,7 +193,10 @@ class ApplicationContainer:
         if guard is None:
             fields = {kind: name for name, kind in _SCOPED_BACKENDS.items()}
             guard = ReferenceGuard(
-                lambda kind: unwrap(self.__dict__.get(fields[kind])),
+                lambda kind: (
+                    RunnerLookup(self.__dict__.get("runner_backend")) if kind == "runner"
+                    else unwrap(self.__dict__.get(fields[kind]))
+                ),
                 lambda: self.__dict__.get("team_directory"),
             )
             object.__setattr__(self, "_reference_guard", guard)

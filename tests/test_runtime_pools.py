@@ -676,3 +676,20 @@ async def test_pool_wait_limit_per_agent(world, monkeypatch):
     with pytest.raises(NoMemberAvailable):
         await run_pool_agent(agent_def=agent, run_id="run-1", task_key="t", step={"id": "code"},
                              settings=object(), runner_hub=world.hub, agent_backend=world.agents_raw)
+
+
+@pytest.mark.asyncio
+async def test_present_counts_platforms_and_agents(world):
+    a, b, c = await _pool_of(world, "ann", "bob", "cid")
+    for agent, os_name in ((a, "linux"), (b, "linux"), (c, "win32")):
+        r = await world.hub.backend.get_runner(agent.runner_id)
+        r.os = os_name
+        await world.hub.backend.save_runner(r)
+    world.agents_raw.docs[c.id].acp_agent = "codex"
+    world.offline(b.runner_id)
+    pool = await world.pools_raw.get("eng")
+    data = await present(pool, agent_backend=world.agents_raw, hub=world.hub, pool_backend=world.pools_raw)
+    assert data["platforms"] == {"linux": 2, "win32": 1}
+    assert data["agents"] == {"claude": 2, "codex": 1}
+    assert data["agents_online"] == {"claude": 1, "codex": 1}
+    assert {m["agent_id"]: m["platform"] for m in data["members"]}[c.id] == "win32"

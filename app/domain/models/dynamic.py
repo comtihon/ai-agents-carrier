@@ -59,6 +59,17 @@ class PoolAgent(BaseModel):
     max_instances: int = Field(default=1, ge=1, le=32)
     # Restricts the categories this agent may fill. Empty = any category.
     categories: list[JobCategory] = Field(default_factory=list)
+    # Where this agent's jobs run in this workflow, and the addons they carry
+    # here (app.domain.models.agent_usage): omitted = the agent's own.
+    runtime: dict[str, Any] | None = None
+    addons: list[dict[str, Any]] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _usage(self) -> "PoolAgent":
+        from app.domain.models.agent_usage import parse_addons, parse_runtime
+        parse_runtime(self.runtime)
+        parse_addons(self.addons)
+        return self
 
 
 class StepDatasource(BaseModel):

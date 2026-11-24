@@ -173,6 +173,13 @@ def make_job_runner(runner: "YamlGraphRunner", step: dict[str, Any], config: Dyn
             # Questions come back as the attempt's result: the meta-agent decides.
             "questions_mode": "return",
         }
+        entry = config.pool_entry(job.agent_id)
+        if entry is not None:
+            # This workflow's runtime and addons for the agent (agent_usage).
+            if entry.runtime:
+                agent_step["runtime"] = entry.runtime
+            if entry.addons:
+                agent_step["addons"] = entry.addons
         # Only sources enabled for the step reach the grant, whatever the job lists.
         grants = {
             d.source_id: list(d.operations)
@@ -271,11 +278,13 @@ def make_dynamic_node(runner: "YamlGraphRunner", step: dict[str, Any]):
         if runner._agent_backend is None:
             return {"__failed_step__": step_id, "error": "agent backend not configured"}
         agents: dict[str, Any] = {}
+        from app.domain.models.agent_usage import apply_usage
         for entry in config.agent_pool:
             agent_def = await _agents_for(runner).get(entry.agent_id)
             if agent_def is None:
                 return {"__failed_step__": step_id, "error": f"dynamic step '{step_id}': agent '{entry.agent_id}' in the pool does not exist"}
-            agents[entry.agent_id] = agent_def
+            # The roster shows the agent as this workflow uses it.
+            agents[entry.agent_id] = apply_usage(agent_def, entry.runtime, entry.addons)
 
         template = step.get("request_template")
         request = runner._render(template, state) if template else str(state.get("request") or "")

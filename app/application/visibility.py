@@ -67,7 +67,7 @@ from typing import Any, Callable, Iterable, Literal
 
 from app.infrastructure.auth.authorization import get_current_subject
 
-Kind = Literal["agent", "datasource", "script", "workflow", "pool"]
+Kind = Literal["agent", "datasource", "script", "workflow", "pool", "runner"]
 
 _LABEL: dict[str, str] = {
     "agent": "agent",
@@ -75,6 +75,7 @@ _LABEL: dict[str, str] = {
     "script": "script",
     "workflow": "workflow",
     "pool": "runtime pool",
+    "runner": "runner",
 }
 
 
@@ -356,6 +357,9 @@ def references(kind: str, resource: Any) -> list[tuple[str, str]]:
             t = step.get("type")
             if t in ("langgraph-agent", "claude-agent") and step.get("agent_id"):
                 refs.append(("agent", str(step["agent_id"])))
+                # Where this use runs, and the addons it carries here.
+                from app.domain.models.agent_usage import usage_references
+                refs.extend(usage_references(step.get("runtime"), step.get("addons")))
             elif t == "data_source" and step.get("source"):
                 refs.append(("datasource", str(step["source"])))
             elif t == "python" and step.get("script_id"):
@@ -370,9 +374,11 @@ def references(kind: str, resource: Any) -> list[tuple[str, str]]:
                     elif part.get("type") == "python" and part.get("script_id"):
                         refs.append(("script", str(part["script_id"])))
             elif t == "dynamic":
+                from app.domain.models.agent_usage import usage_references
                 for entry in step.get("agent_pool") or []:
                     if isinstance(entry, dict) and entry.get("agent_id"):
                         refs.append(("agent", str(entry["agent_id"])))
+                        refs.extend(usage_references(entry.get("runtime"), entry.get("addons")))
     elif kind == "agent":
         for addon in getattr(resource, "addons", None) or []:
             if getattr(addon, "type", None) == "datasource" and getattr(addon, "source_id", None):
@@ -404,12 +410,37 @@ def datasource_operations(kind: str, resource: Any) -> dict[str, set[str]]:
                 for _path, part in iter_parts(step.get("parts")):
                     if part.get("type") == "data_source":
                         add(part.get("source"), part.get("operation"))
+            # Data source addons a use of an agent carries (agent_usage).
+            from app.domain.models.agent_usage import usage_datasource_operations
+            uses = [step.get("addons")] if t in ("langgraph-agent", "claude-agent") else []
+            if t == "dynamic":
+                uses += [e.get("addons") for e in step.get("agent_pool") or [] if isinstance(e, dict)]
+            for addons in uses:
+                for source, names in usage_datasource_operations(addons).items():
+                    for name in names:
+                        add(source, name)
     elif kind == "agent":
         for addon in getattr(resource, "addons", None) or []:
             if getattr(addon, "type", None) == "datasource":
                 for operation in getattr(addon, "allowed_operations", None) or []:
                     add(getattr(addon, "source_id", None), operation)
     return ops
+
+
+class RunnerLookup:
+    """Runners seen as a reference target (``get``/``list``), so a workflow
+    that runs an agent on a connected machine is checked like any reference:
+    a team workflow cannot pick someone's private machine (a private machine
+    reaches a team only by its owner adding its agent to a runtime pool)."""
+
+    def __init__(self, backend: Any) -> None:
+        self._backend = backend
+
+    async def get(self, runner_id: str) -> Any:
+        return await self._backend.get_runner(runner_id) if self._backend is not None else None
+
+    async def list(self) -> list[Any]:
+        return await self._backend.list_runners() if self._backend is not None else []
 
 
 class ReferenceGuard:

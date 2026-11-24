@@ -233,6 +233,9 @@ async def list_agents(
                 "runner_id": a.runner_id,
                 "pool_id": a.pool_id,
                 "acp_agent": a.acp_agent,
+                # A role agent has its own prompt; one without it (a machine's
+                # agent added from the Runners panel) is a runtime, not a role.
+                "has_prompt": bool((a.agent_input or {}).get("system_prompt")),
                 "max_concurrency": a.max_concurrency,
                 **ownership_fields(a),
                 **(
