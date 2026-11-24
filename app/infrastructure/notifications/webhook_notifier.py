@@ -518,3 +518,101 @@ async def post_slack_approval_outcome(
     if not (channel and thread_ts):
         return
     await post_slack_thread_reply(bot_token, channel, thread_ts, text)
+
+
+# ── Dynamic steps: a decision waiting for a human ────────────────────────────
+
+def dynamic_decision_lines(payload: dict[str, Any]) -> list[str]:
+    """What a paused dynamic step asks a human, one entry per open decision.
+
+    *payload* is the gate's interrupt value (``type: dynamic_approval``): its
+    ``decisions`` carry the meta-agent's actions. New jobs are listed with
+    category, agent and title; other actions by kind and text.
+    """
+    lines: list[str] = []
+    for decision in payload.get("decisions") or []:
+        kind = decision.get("kind") or "decision"
+        lines.append(f"*[{kind}]* {decision.get('summary') or ''}".rstrip())
+        body = decision.get("payload") or {}
+        if body.get("question"):
+            lines.append(f"> {body['question']}")
+        for action in body.get("actions") or []:
+            akind = action.get("kind")
+            if akind == "add_jobs":
+                for job in action.get("jobs") or []:
+                    title = job.get("title") or (job.get("prompt") or "")[:120]
+                    deps = job.get("depends_on") or []
+                    after = f" (after {', '.join(deps)})" if deps else ""
+                    lines.append(
+                        f"• `{job.get('id')}` {job.get('category')} → *{job.get('agent_id')}*: {title}{after}"
+                    )
+            elif akind in ("rewind", "remove"):
+                ids = ", ".join(action.get("job_ids") or [])
+                lines.append(f"• {akind} {ids}: {action.get('text') or ''}".rstrip(": "))
+            elif akind == "update_job":
+                lines.append(f"• update `{action.get('job_id')}`: {', '.join(sorted(action.get('changes') or {}))}")
+            elif akind in ("ask_human", "finish", "fail"):
+                lines.append(f"• {akind}: {action.get('text') or ''}")
+    return lines
+
+
+def dynamic_decision_blocks(
+    payload: dict[str, Any], run_id: str, request: str, run_url: str | None,
+) -> list[dict[str, Any]]:
+    """Block Kit for a paused dynamic step, with Approve / Reject buttons.
+
+    The buttons use the generic ``approve`` / ``reject`` actions with the run
+    id as value: ``/callbacks/slack/interactive`` resumes the run the same way
+    the UI does, and the dynamic gate takes ``{"approved": ...}``.
+    """
+    step_id = payload.get("step_id") or "dynamic"
+    head = f"*Decision needed* — step `{step_id}` of run `{run_id}`"
+    if request:
+        head += f"\n_{_truncate(request, 300)}_"
+    body = "\n".join(dynamic_decision_lines(payload)) or str(payload.get("plan") or "")
+    blocks: list[dict[str, Any]] = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": _truncate(head)}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": _truncate(body or "(no details)")}},
+    ]
+    if run_url:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"<{run_url}|Open the run>"}]})
+    blocks.append({
+        "type": "actions",
+        "elements": [
+            {"type": "button", "action_id": "approve", "value": run_id, "style": "primary",
+             "text": {"type": "plain_text", "text": "Approve"}},
+            {"type": "button", "action_id": "reject", "value": run_id, "style": "danger",
+             "text": {"type": "plain_text", "text": "Reject"}},
+        ],
+    })
+    return blocks
+
+
+async def post_slack_dynamic_decision(
+    bot_token: str,
+    channel: str,
+    run_id: str,
+    payload: dict[str, Any],
+    request: str = "",
+    run_url: str | None = None,
+) -> dict[str, Any] | None:
+    """Post a paused dynamic step's open decisions with Approve / Reject buttons."""
+    text = f"Decision needed for run {run_id}: " + "; ".join(
+        str(d.get("summary") or d.get("kind")) for d in payload.get("decisions") or []
+    )
+    try:
+        posted = await _slack(bot_token).post_message(
+            channel, _truncate(text, 2900), blocks=dynamic_decision_blocks(payload, run_id, request, run_url),
+        )
+        return posted.raw
+    except MessagingError as exc:
+        logger.warning("Slack dynamic decision post failed: %s", exc)
+        return None
+    except Exception:
+        logger.exception("Failed to post a dynamic decision to Slack")
+        return None
+
+
+def run_link(ui_base_url: str | None, run_id: str) -> str | None:
+    """Deep link to a run in the UI (``<UI>/#run=<id>``), when the UI is configured."""
+    return f"{ui_base_url.rstrip('/')}/#run={run_id}" if ui_base_url else None
