@@ -445,3 +445,47 @@ async def test_pool_step_error_on_online_machine_is_not_a_failover(world, monkey
     with pytest.raises(ValueError):
         await run_pool_agent(agent_def=_pool_agent(), run_id="run-1", task_key="t", step={"id": "code"},
                              settings=object(), runner_hub=world.hub, agent_backend=world.agents_raw)
+
+
+class Runs:
+    def __init__(self, parents: dict[str, str | None]) -> None:
+        self.parents = parents
+
+    async def get(self, run_id):
+        from types import SimpleNamespace
+        if run_id not in self.parents:
+            return None
+        return SimpleNamespace(id=run_id, parent_run_id=self.parents[run_id])
+
+
+@pytest.mark.asyncio
+async def test_jobs_of_one_workflow_run_share_its_member(world, monkeypatch):
+    from app.steps import acp_executor
+    from app.steps.acp_pool_executor import root_run_id, run_pool_agent
+    a, b, c = await _pool_of(world, "ann", "bob", "cid")
+    runs = Runs({"wf-1": None, "job-1": "wf-1", "job-2": "wf-1", "sub-1": "wf-1", "job-3": "sub-1",
+                 "wf-2": None, "job-4": "wf-2"})
+    assert await root_run_id(runs, "job-3") == "wf-1"
+    assert await root_run_id(runs, "unknown") == "unknown"
+    seen: dict[str, str] = {}
+
+    async def fake_run(**kw):
+        seen[kw["run_id"]] = kw["agent_def"].runner_id
+        return {"result": "ok"}
+
+    monkeypatch.setattr(acp_executor, "run_acp_agent", fake_run)
+    for child in ("job-1", "job-2", "job-3", "job-4"):
+        await run_pool_agent(agent_def=_pool_agent(), run_id=child, task_key=child, step={"id": child},
+                             settings=object(), runner_hub=world.hub, agent_backend=world.agents_raw,
+                             run_repository=runs)
+    # The child run id still reaches the step (its own session and workspace).
+    assert set(seen) == {"job-1", "job-2", "job-3", "job-4"}
+    assert seen["job-1"] == seen["job-2"] == seen["job-3"] == a.runner_id
+    assert seen["job-4"] == b.runner_id
+    assert (await world.pools_raw.get_assignment("eng", "wf-1")).agent_id == a.id
+
+
+@pytest.mark.asyncio
+async def test_root_run_id_survives_a_parent_cycle():
+    from app.steps.acp_pool_executor import root_run_id
+    assert await root_run_id(Runs({"x": "y", "y": "x"}), "x") in ("x", "y")
