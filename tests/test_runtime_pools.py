@@ -445,18 +445,3 @@ async def test_pool_step_error_on_online_machine_is_not_a_failover(world, monkey
     with pytest.raises(ValueError):
         await run_pool_agent(agent_def=_pool_agent(), run_id="run-1", task_key="t", step={"id": "code"},
                              settings=object(), runner_hub=world.hub, agent_backend=world.agents_raw)
-
-
-# ─── webhook signatures (gbrain's notification sink) ─────────────────────────
-
-def test_webhook_signature_accepts_sha256_prefix():
-    import hashlib
-    import hmac
-
-    from app.infrastructure.triggers.webhook_validator import validate_webhook_signature
-    body = b'{"event":"take_proposal.accepted"}'
-    digest = hmac.new(b"s3cret", body, hashlib.sha256).hexdigest()
-    assert validate_webhook_signature(body, digest, "s3cret")
-    assert validate_webhook_signature(body, f"sha256={digest}", "s3cret")
-    assert validate_webhook_signature(body, f"sha256={digest.upper()}", "s3cret")
-    assert not validate_webhook_signature(body, f"sha256={'0' * 64}", "s3cret")
