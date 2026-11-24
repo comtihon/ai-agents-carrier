@@ -35,6 +35,13 @@ class AgentDefinition(GrantableResource):
         ACP agents: ``claude_code_options`` is passed through as the ACP
         session's ``_meta.claudeCode.options`` (Claude Agent SDK options such
         as ``disallowedTools``), on session/new and session/load.
+        Further ACP options, generic across adapters: ``acp_session_mode``
+        (set with ``session/set_mode`` on every new or loaded session; the
+        step fails if the adapter refuses it), ``system_prompt_in_prompt``
+        (also send the system prompt at the top of the first prompt, for
+        adapters without a system-prompt slot), ``reject_tool_kinds`` (ACP
+        tool kinds whose permission requests are rejected) and
+        ``blocked_commands`` (commands whose permission requests are rejected).
         Populates ``AgentConfig`` fields and ``extra`` for every runtime.
     image:
         Docker image (docker runtime only — ``local`` runs the agent from

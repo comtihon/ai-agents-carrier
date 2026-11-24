@@ -40,6 +40,11 @@ class FakeProxy:
         self.port = 0
         self.prompts = 0
         self.token = None
+        self.perm_command = "rm -rf /"
+        self.perm_kind: str | None = None
+        self.prompt_texts: list[str] = []
+        self.modes: list[dict] = []
+        self.fail_set_mode = False
 
     async def start(self) -> None:
         self.server = await websockets.serve(self._handler, "127.0.0.1", 0, process_request=self._process, process_response=self._respond)
@@ -105,7 +110,14 @@ class FakeProxy:
         elif m == "session/new":
             self.session_new = p
             await reply({"sessionId": "sess-1"})
+        elif m == "session/set_mode":
+            self.modes.append(p)
+            if self.fail_set_mode:
+                await self.emit({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "unknown mode"}})
+            else:
+                await reply({})
         elif m == "session/prompt":
+            self.prompt_texts.append("".join(b.get("text", "") for b in p.get("prompt") or []))
             self.prompts += 1
             if self.prompts > 1:  # the output-protocol nudge
                 await self.emit(_chunk('{"summary": "fixed"}'))
@@ -115,7 +127,7 @@ class FakeProxy:
             await self.emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "sess-1", "update": {
                 "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "bash ls", "kind": "execute", "status": "pending",
                 "rawInput": {"command": "ls"}}}})
-            perm = await self.ask_client(900, "session/request_permission", {"sessionId": "sess-1", "toolCall": {"toolCallId": "t1", "rawInput": {"command": "rm -rf /"}},
+            perm = await self.ask_client(900, "session/request_permission", {"sessionId": "sess-1", "toolCall": {"toolCallId": "t1", "rawInput": {"command": self.perm_command}, **({"kind": self.perm_kind} if self.perm_kind else {})},
                                                                                  "options": [{"optionId": "y", "kind": "allow_once"}, {"optionId": "n", "kind": "reject_once"}]})
             self.permission_answer = perm
             await self.emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "sess-1", "update": {
@@ -435,3 +447,99 @@ async def test_no_claude_code_options_no_meta():
     finally:
         await proxy.stop()
     assert "claudeCode" not in proxy.session_new["_meta"]
+
+
+# ─── per-agent ACP session options (agent_input) ─────────────────────────────
+
+
+def _opt_agent(**agent_input) -> AgentDefinition:
+    return AgentDefinition(id="pi", default_runtime="k8s", protocol="acp", acp_agent="pi", agent_input=agent_input)
+
+
+def test_permission_rejects_configured_tool_kinds():
+    opts = [{"optionId": "y", "kind": "allow_once"}, {"optionId": "n", "kind": "reject_once"}]
+    edit = {"options": opts, "toolCall": {"kind": "edit", "rawInput": {"path": "a.py"}}}
+    run = {"options": opts, "toolCall": {"kind": "execute", "rawInput": {"command": "pytest"}}}
+    assert pick_permission_option(edit, [], ["edit", "delete"])["outcome"]["optionId"] == "n"
+    assert pick_permission_option(edit, [])["outcome"]["optionId"] == "y"
+    assert pick_permission_option(run, [], ["edit"])["outcome"]["optionId"] == "y"
+
+
+@pytest.mark.asyncio
+async def test_session_mode_is_set_right_after_session_new():
+    proxy = FakeProxy()
+    await proxy.start()
+    try:
+        await _run(proxy, agent=_opt_agent(acp_session_mode="read-only"))
+    finally:
+        await proxy.stop()
+    assert proxy.modes == [{"sessionId": "sess-1", "modeId": "read-only"}]
+    methods = [m.get("method") for m in proxy.received if m.get("method")]
+    assert methods.index("session/set_mode") < methods.index("session/prompt")
+
+
+@pytest.mark.asyncio
+async def test_no_mode_configured_no_set_mode():
+    proxy = FakeProxy()
+    await proxy.start()
+    try:
+        await _run(proxy)
+    finally:
+        await proxy.stop()
+    assert proxy.modes == []
+
+
+@pytest.mark.asyncio
+async def test_unknown_session_mode_fails_the_step():
+    proxy = FakeProxy()
+    proxy.fail_set_mode = True
+    await proxy.start()
+    try:
+        with pytest.raises(RuntimeError, match="could not be put in mode 'nope'"):
+            await _run(proxy, agent=_opt_agent(acp_session_mode="nope"))
+    finally:
+        await proxy.stop()
+    assert proxy.prompts == 0
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_in_prompt_heads_the_first_prompt_only_when_asked():
+    proxy = FakeProxy()
+    await proxy.start()
+    try:
+        await _run(proxy, agent=_opt_agent(system_prompt_in_prompt=True))
+    finally:
+        await proxy.stop()
+    first = proxy.prompt_texts[0]
+    assert first.startswith("## Your instructions\nYou are a coder.")
+    assert "## Your task\nlist files" in first
+
+    proxy = FakeProxy()
+    await proxy.start()
+    try:
+        await _run(proxy)
+    finally:
+        await proxy.stop()
+    assert "Your instructions" not in proxy.prompt_texts[0]
+    assert proxy.prompt_texts[0].startswith("list files")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent_input,command,kind,answer", [
+    ({"reject_tool_kinds": ["edit"]}, "ls", "edit", "n"),
+    ({"reject_tool_kinds": ["edit"]}, "ls", "execute", "y"),
+    ({"blocked_commands": ["deploy-prod"]}, "./deploy-prod --now", "execute", "n"),
+    ({}, "./deploy-prod --now", "execute", "y"),
+])
+async def test_agent_configured_permission_rules(agent_input, command, kind, answer):
+    proxy = FakeProxy()
+    proxy.perm_command = command
+    proxy.perm_kind = kind
+    await proxy.start()
+    try:
+        _, _, repo = await _run(proxy, agent=_opt_agent(**agent_input))
+    finally:
+        await proxy.stop()
+    assert proxy.permission_answer == {"outcome": {"outcome": "selected", "optionId": answer}}
+    refused = any("permission refused" in p for p in repo.runs["run-1"].state["_agent_progress_code"])
+    assert refused is (answer == "n")

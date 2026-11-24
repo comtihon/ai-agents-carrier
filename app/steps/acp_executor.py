@@ -130,15 +130,22 @@ def _yaml_load(text: str) -> Any:
     return yaml.safe_load(text)
 
 
-def pick_permission_option(params: dict[str, Any], blocked_commands: list[str]) -> dict[str, Any]:
+def pick_permission_option(
+    params: dict[str, Any], blocked_commands: list[str], reject_kinds: list[str] | None = None,
+) -> dict[str, Any]:
     """Answer session/request_permission for a headless run.
 
-    Allow (once) unless the tool call runs a blocked command — then reject.
+    Allow (once) unless the tool call runs a blocked command, or its ACP tool
+    kind (``edit``, ``delete``, ``move``, ``execute``, ``fetch``, ...) is one
+    of *reject_kinds* — then reject.
     """
     options = params.get("options") or []
     tool_call = params.get("toolCall") or {}
     raw = json.dumps(tool_call.get("rawInput") or {}, default=str) + " " + str(tool_call.get("title") or "")
     blocked = any(re.search(rf"(^|[\s\"'/;&|]){re.escape(cmd)}($|[\s\"';&|])", raw) for cmd in blocked_commands if cmd)
+    kind = str(tool_call.get("kind") or "").lower()
+    if kind and kind in {str(k).lower() for k in reject_kinds or ()}:
+        blocked = True
 
     def first(kinds: tuple[str, ...]) -> dict[str, Any] | None:
         for kind in kinds:
@@ -266,6 +273,19 @@ async def run_acp_agent(
     chunks: list[str] = []
     turn_text: list[str] = []
     blocked = list(agent_config.get("blocked_commands") or [])
+    # Per-agent ACP session settings (agent_input), all optional and generic:
+    #   blocked_commands       — more commands whose permission requests are rejected;
+    #   reject_tool_kinds      — ACP tool kinds whose permission requests are rejected;
+    #   acp_session_mode       — mode set with session/set_mode on every new or
+    #                            loaded session (the adapter's own modes);
+    #   system_prompt_in_prompt — also send the system prompt at the top of the
+    #                            first prompt, for adapters without a system-prompt slot.
+    _agent_input = agent_def.agent_input or {}
+    blocked += [str(c) for c in _agent_input.get("blocked_commands") or [] if c]
+    reject_kinds = [str(k) for k in _agent_input.get("reject_tool_kinds") or [] if k]
+    session_mode = _agent_input.get("acp_session_mode")
+    session_mode = str(session_mode) if session_mode else None
+    prompt_carries_system = bool(_agent_input.get("system_prompt_in_prompt"))
     # While session/load replays the conversation, its updates are history.
     loading = False
     # gs:// URI of a runner's workspace archive, once the proxy uploaded it.
@@ -299,7 +319,14 @@ async def run_acp_agent(
 
     async def on_request(method: str, params: dict[str, Any]) -> Any:
         if method == "session/request_permission":
-            return pick_permission_option(params, blocked)
+            answer = pick_permission_option(params, blocked, reject_kinds)
+            if answer["outcome"].get("optionId") and any(
+                o.get("optionId") == answer["outcome"]["optionId"] and str(o.get("kind", "")).startswith("reject")
+                for o in params.get("options") or []
+            ):
+                title = str((params.get("toolCall") or {}).get("title") or "a tool call")
+                sink.add(f"permission refused: {title[:200]}")
+            return answer
         if method == "_carrier/ask":
             answer = await _ask_human(run_repository, run_id, str(params.get("question") or ""), params.get("options"))
             return {"cancelled": True} if answer is None else {"answer": answer}
@@ -556,6 +583,20 @@ async def run_acp_agent(
             await conn.request("session/load", load, timeout=900)
         finally:
             loading = False
+        await apply_session_mode()
+
+    async def apply_session_mode() -> None:
+        """Put the session in the agent's configured mode (fails closed)."""
+        if not session_mode:
+            return
+        assert conn is not None
+        try:
+            await conn.request("session/set_mode", {"sessionId": session_id, "modeId": session_mode}, timeout=120)
+        except Exception as exc:
+            raise RuntimeError(
+                f"[step '{step_id}'] the agent could not be put in mode '{session_mode}' "
+                f"(agent_input.acp_session_mode): {exc}"
+            ) from exc
 
     try:
         if acp_state and acp_state.get("prompt_id") is not None:
@@ -608,12 +649,17 @@ async def run_acp_agent(
                 "_meta": meta,
             }, timeout=900)
             session_id = new["sessionId"]
+            await apply_session_mode()
             if agent_task_repository is not None:
                 await agent_task_repository.save_task({
                     "_id": task_key, "run_id": run_id, "step_id": step_id, "status": "working",
                     "input": input_data, "outputs": [],
                 })
-            await send_prompt(build_prompt_text(input_data))
+            first = build_prompt_text(input_data)
+            if prompt_carries_system and agent_config.get("system_prompt"):
+                # For adapters that ignore _meta.systemPrompt: the role travels with the task.
+                first = f"## Your instructions\n{agent_config['system_prompt']}\n\n## Your task\n{first}"
+            await send_prompt(first)
 
         while True:
             if parked:
