@@ -164,3 +164,93 @@ async def test_webhook_rejects_bad_bearer_token():
             headers={"Authorization": "Bearer wrong"},
         )
     assert resp.status_code == 403
+
+
+# ─── auth modes and signature formats ────────────────────────────────────────
+
+import hashlib as _hashlib
+import hmac as _hmac
+import json as _json
+
+
+def _container_with_trigger(trigger: dict) -> ApplicationContainer:
+    container = _build_container(with_repos=True)
+    steps = [{"id": "trigger", "type": "http", "output_key": "payload", **trigger}]
+    defn = _make_defn()
+    defn.steps = steps
+    defn.to_raw_dict = MagicMock(return_value={"id": "hooked", "steps": steps})
+    container.workflow_backend.get = AsyncMock(return_value=defn)
+    return container
+
+
+async def _post_signed(container, body: bytes, headers: dict) -> int:
+    app = create_app()
+    app.state.container = container
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post("/api/v1/webhooks/hooked", content=body,
+                            headers={"Content-Type": "application/json", **headers})
+    return resp.status_code
+
+
+_BODY = _json.dumps({"event": "take_proposal.accepted"}).encode()
+_SIG = _hmac.new(b"s3cret", _BODY, _hashlib.sha256).hexdigest()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("header,value", [
+    ("X-Webhook-Signature", _SIG),
+    ("X-Webhook-Signature", f"sha256={_SIG}"),
+    ("X-Gbrain-Signature", f"sha256={_SIG}"),     # gbrain webhook sink
+    ("X-Hub-Signature", f"sha256={_SIG}"),        # Jira system webhooks
+    ("X-Hub-Signature-256", f"sha256={_SIG}"),    # GitHub-style
+])
+async def test_hmac_accepts_every_signature_header(header, value):
+    container = _container_with_trigger({"auth_mode": "hmac", "webhook_secret": "s3cret"})
+    assert await _post_signed(container, _BODY, {header: value}) == 202
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("headers", [
+    {},
+    {"X-Gbrain-Signature": "sha256=" + "0" * 64},
+    {"X-Hub-Signature": "sha1=" + _SIG},          # wrong algorithm
+    {"Authorization": "Bearer s3cret"},           # a bearer is not a signature
+])
+async def test_hmac_refuses_bad_or_missing_signatures(headers):
+    container = _container_with_trigger({"auth_mode": "hmac", "webhook_secret": "s3cret"})
+    assert await _post_signed(container, _BODY, headers) == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("headers,status", [
+    ({"Authorization": "Bearer tok"}, 202),            # Jira Automation
+    ({"X-Hub-Signature": f"sha256={_SIG}"}, 202),     # Jira system webhook
+    ({"X-Gbrain-Signature": f"sha256={_SIG}"}, 202),  # gbrain
+    ({"Authorization": "Bearer nope"}, 403),
+    ({"X-Hub-Signature": "sha256=" + "0" * 64}, 403),
+    ({}, 403),
+])
+async def test_any_accepts_bearer_or_signature(headers, status):
+    container = _container_with_trigger({"auth_mode": "any", "bearer_token": "tok", "webhook_secret": "s3cret"})
+    assert await _post_signed(container, _BODY, headers) == status
+
+
+@pytest.mark.asyncio
+async def test_any_with_only_a_token_still_works_for_bearer_and_refuses_signatures():
+    container = _container_with_trigger({"auth_mode": "any", "bearer_token": "tok"})
+    container.settings.webhook_secret = None
+    assert await _post_signed(container, _BODY, {"Authorization": "Bearer tok"}) == 202
+    assert await _post_signed(container, _BODY, {"X-Webhook-Signature": _SIG}) == 403
+
+
+@pytest.mark.asyncio
+async def test_any_with_nothing_configured_is_503():
+    container = _container_with_trigger({"auth_mode": "any"})
+    container.settings.webhook_secret = None
+    assert await _post_signed(container, _BODY, {"Authorization": "Bearer x"}) == 503
+
+
+@pytest.mark.asyncio
+async def test_unknown_auth_mode_is_refused():
+    container = _container_with_trigger({"auth_mode": "magic", "bearer_token": "tok"})
+    assert await _post_signed(container, _BODY, {"Authorization": "Bearer tok"}) == 503
