@@ -409,7 +409,18 @@ async def stream_graph_to_pause(
     updating step_statuses and run status in *run_repository* after each node.
 
     Callers should initialise ``run.step_statuses`` before calling this.
+
+    ``base_url`` defaults to the configured BASE_URL: a run resumed after an
+    approval (the callbacks, the UI, a Slack button) can pause again — a
+    dynamic step does at every gate — and that pause must notify as the first
+    one did.
     """
+    if base_url is None:
+        try:
+            from app.core.config import get_settings as _gs
+            base_url = _gs().base_url or None
+        except Exception:
+            base_url = None
     runner._current_run = run
     runner._current_run_repository = run_repository
 
@@ -698,6 +709,11 @@ async def stream_graph_to_pause(
         # when a Slack addon (slack_notifications) is attached to the agent step.
         # Without it, copilot_ui still surfaces the request for input; Slack is
         # simply not involved.
+        # A dynamic step paused at a gate: its open decisions go to Slack with
+        # Approve / Reject when the step carries the Slack addon.
+        if await notify_dynamic_gate(step, run.id, snap, _notify_values):
+            return
+
         is_agent_ask_context = (
             step and step.get("type") in ("langgraph-agent", "claude-agent")
             and active_interrupt_type == "ask_context"
@@ -772,6 +788,69 @@ async def stream_graph_to_pause(
                     run.state = {**run.state, "_slack_thread_ts": ts, "_slack_channel": channel}
                     run.touch()
                     await run_repository.update(run)
+
+
+def slack_addon_attached(step: dict[str, Any] | None) -> bool:
+    """Whether a Slack addon is attached to *step*: the explicit flag, or any of
+    the fields the editor's Slack addon writes onto the step."""
+    if not step:
+        return False
+    return bool(
+        step.get("slack_notifications") or step.get("slack_channel")
+        or step.get("slack_payload") or step.get("slack_token")
+    )
+
+
+async def notify_dynamic_gate(
+    step: dict[str, Any] | None, run_id: str, snap: Any, values: dict[str, Any],
+) -> bool:
+    """Post a paused dynamic step's open decisions to Slack (Approve / Reject).
+
+    Fires when the run is paused at a dynamic gate and a Slack addon is
+    attached to the step; a ``slack_payload`` template replaces the default
+    message (its context also has ``{plan}``). Returns whether it handled the
+    pause, so the caller skips its own Slack handling. A ``notify`` block on a
+    dynamic step without the Slack addon fires through the generic path.
+    """
+    gate = _interrupt_value(snap, "dynamic_approval")
+    if gate is None or not slack_addon_attached(step):
+        return False
+    from app.core.config import get_settings
+    from app.infrastructure.notifications.webhook_notifier import (
+        post_slack_addon_notification, post_slack_dynamic_decision, run_link,
+    )
+    settings = get_settings()
+    token = step.get("slack_token") or settings.slack_bot_token
+    channel = step.get("slack_channel") or settings.slack_approvals_channel
+    if not (token and channel):
+        logger.info("dynamic step '%s' paused; Slack addon attached but no token/channel configured", step.get("id"))
+        return True
+    if step.get("slack_payload"):
+        extra = {"slack_channel": step["slack_channel"]} if step.get("slack_channel") else {}
+        await post_slack_addon_notification(
+            bot_token=token, payload_template=step["slack_payload"], run_id=run_id,
+            state={**values, **extra, "plan": gate.get("plan", "")},
+        )
+    else:
+        await post_slack_dynamic_decision(
+            token, channel, run_id, gate,
+            request=str((values or {}).get("request") or ""),
+            run_url=run_link(getattr(settings, "ui_base_url", None), run_id),
+        )
+    return True
+
+
+def _interrupt_value(snap: Any, kind: str) -> dict[str, Any] | None:
+    """The value of the pending interrupt of type *kind*, from the snapshot's
+    tasks (subgraph interrupts surface there) or its top-level interrupts."""
+    for task in getattr(snap, "tasks", ()) or ():
+        for intr in getattr(task, "interrupts", ()) or ():
+            if isinstance(intr.value, dict) and intr.value.get("type") == kind:
+                return intr.value
+    for intr in getattr(snap, "interrupts", ()) or ():
+        if isinstance(intr.value, dict) and intr.value.get("type") == kind:
+            return intr.value
+    return None
 
 
 def _approval_interrupt_payload(case: Any) -> dict[str, Any]:

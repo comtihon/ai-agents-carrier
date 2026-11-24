@@ -556,6 +556,9 @@ async def _stream_graph(
 
     if run.status == "waiting_approval" and base_url and run.current_step:
         step = next((s for s in runner.steps if s["id"] == run.current_step), None)
+        from app.infrastructure.orchestration.yaml_graph import notify_dynamic_gate
+        if await notify_dynamic_gate(step, run.id, snap, dict(snap.values or {})):
+            return
         is_agent_ask_context = (
             step and step.get("type") in ("langgraph-agent", "claude-agent")
             and active_interrupt_type == "ask_context"
