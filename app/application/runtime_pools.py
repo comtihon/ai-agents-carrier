@@ -202,8 +202,10 @@ async def present(
                     {"run_id": a.run_id, "assigned_at": a.assigned_at.isoformat(), "run_status": status}
                 )
     members: list[dict[str, Any]] = []
+    statuses: list[MemberStatus] = []
     for m in pool.members:
         s = await member_status(m.agent_id, agent_backend=agent_backend, hub=hub)
+        statuses.append(s)
         members.append({
             "agent_id": m.agent_id,
             # Name and owner only: a private member's definition stays its owner's.
@@ -211,6 +213,7 @@ async def present(
             "owner_name": getattr(s.agent, "owner_name", None),
             "visibility": getattr(s.agent, "visibility", None),
             "runner_name": getattr(s.runner, "name", None),
+            "platform": getattr(s.runner, "os", None),
             "acp_agent": s.acp_agent,
             "online": s.online,
             "usable": s.usable,
@@ -222,6 +225,24 @@ async def present(
         })
     data["members"] = members
     data["member_count"] = len(members)
+    # What the pool offers: members per platform (their runners' OS) and per
+    # ACP agent, counting usable members (e.g. {"linux": 2, "win32": 1},
+    # {"claude": 3, "codex": 1}), and how many of them are online now.
+    platforms: dict[str, int] = {}
+    agents: dict[str, int] = {}
+    agents_online: dict[str, int] = {}
+    for m, status in zip(members, statuses):
+        if not m["usable"]:
+            continue
+        os_name = getattr(status.runner, "os", None) or "unknown"
+        platforms[os_name] = platforms.get(os_name, 0) + 1
+        name = m["acp_agent"] or "default"
+        agents[name] = agents.get(name, 0) + 1
+        if m["online"]:
+            agents_online[name] = agents_online.get(name, 0) + 1
+    data["platforms"] = platforms
+    data["agents"] = agents
+    data["agents_online"] = agents_online
     data["online_count"] = sum(1 for m in members if m["online"] and m["usable"])
     data["available_count"] = sum(1 for m in members if m["online"] and m["usable"] and not m["limited_until"])
     return data

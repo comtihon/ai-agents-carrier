@@ -124,6 +124,7 @@ async def test_summary_view_omits_agent_input_and_addons(client):
         "runner_id": None,
         "pool_id": None,
         "acp_agent": None,
+        "has_prompt": True,
         "max_concurrency": None,
         # Ownership travels with every list entry (auth off: public, unowned).
         "visibility": "public",
