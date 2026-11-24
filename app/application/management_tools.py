@@ -178,6 +178,9 @@ class ManagementDeps:
     # Connected machines (app.application.runners), for their per-agent
     # concurrency limits. None: those tools say runners are unavailable.
     runner_backend: Any = None
+    # Runtime pools (app.application.runtime_pools). None: the pool tools say
+    # pools are unavailable.
+    runtime_pool_backend: Any = None
 
 
 def deps_from_container(
@@ -206,6 +209,7 @@ def deps_from_container(
         stream_store=getattr(container, "stream_store", None),
         team_directory=getattr(container, "team_directory", None),
         runner_backend=getattr(container, "runner_backend", None),
+        runtime_pool_backend=getattr(container, "runtime_pool_backend", None),
     )
 
 
@@ -1288,6 +1292,22 @@ async def get_agent(deps: ManagementDeps, agent_id: str) -> str:
 # How carrier talks to an agent process: the pi-cloud-agent HTTP poll API,
 # or ACP over WebSocket through acp-web-proxy.
 _AGENT_PROTOCOLS = ("http-poll", "acp")
+_AGENT_RUNTIMES = ("local", "docker", "k8s", "runner", "pool")
+
+
+async def _resolve_pool(deps: ManagementDeps, pool_id: str):
+    """The runtime pool an agent may point at, or an error string.
+
+    Whether the agent's scope fits the pool's is checked on save, like any
+    reference (app.application.visibility)."""
+    backend = getattr(deps, "runtime_pool_backend", None)
+    if backend is None:
+        return None, "Runtime pools are not available on this deployment."
+    pool = await backend.get(pool_id) if pool_id else None
+    if pool is None:
+        return None, (f"Runtime pool '{pool_id}' not found." if pool_id
+                      else "default_runtime 'pool' needs pool_id (see list_runtime_pools).")
+    return pool, None
 
 
 
@@ -1317,6 +1337,7 @@ async def create_agent(
     brain_access: str = "none",
     max_concurrency: int | None = None,
     runner_id: str | None = None,
+    pool_id: str | None = None,
 ) -> str:
     if deps.agent_backend is None:
         return "Agent backend not configured."
@@ -1333,14 +1354,21 @@ async def create_agent(
             return "agent_input_json must be a JSON object."
     except Exception as e:
         return f"Invalid agent_input_json: {e}"
-    if default_runtime not in ("local", "docker", "k8s", "runner"):
-        return f"Invalid default_runtime '{default_runtime}'. Must be one of: local, docker, k8s, runner."
+    if default_runtime not in _AGENT_RUNTIMES:
+        return f"Invalid default_runtime '{default_runtime}'. Must be one of: {', '.join(_AGENT_RUNTIMES)}."
     runner = None
+    pool = None
     if default_runtime == "runner":
         runner, err = await _resolve_runner(deps, runner_id or "", acp_agent or None)
         if err:
             return err
         protocol = "acp"  # runner agents always speak ACP
+    elif default_runtime == "pool":
+        pool, err = await _resolve_pool(deps, pool_id or "")
+        if err:
+            return err
+        protocol = "acp"  # pool members are runner agents
+        acp_agent = None  # the member decides
     existing = await deps.agent_backend.get(agent_id)
     if existing is not None:
         return f"Agent '{agent_id}' already exists. Use update_agent to modify it."
@@ -1356,6 +1384,7 @@ async def create_agent(
         brain_access=brain_access,
         max_concurrency=max_concurrency or None,
         runner_id=runner.id if runner is not None else None,
+        pool_id=pool.id if pool is not None else None,
     )
     await deps.agent_backend.create(new_agent)
     return f"Agent '{agent_id}' created."
@@ -1375,6 +1404,7 @@ async def update_agent(
     brain_access: str = None,
     max_concurrency: int = None,
     runner_id: str = None,
+    pool_id: str = None,
 ) -> str:
     if deps.agent_backend is None:
         return "Agent backend not configured."
@@ -1407,14 +1437,30 @@ async def update_agent(
                 return err
             updated.runner_id = runner.id
             updated.protocol = "acp"  # type: ignore[assignment]
+    if pool_id is not None and pool_id != (updated.pool_id or ""):
+        if pool_id == "":
+            updated.pool_id = None
+        else:
+            pool, err = await _resolve_pool(deps, pool_id)
+            if err:
+                return err
+            updated.pool_id = pool.id
+            updated.protocol = "acp"  # type: ignore[assignment]
     if default_runtime is not None:
-        if default_runtime not in ("local", "docker", "k8s", "runner"):
-            return f"Invalid default_runtime '{default_runtime}'. Must be one of: local, docker, k8s, runner."
+        if default_runtime not in _AGENT_RUNTIMES:
+            return f"Invalid default_runtime '{default_runtime}'. Must be one of: {', '.join(_AGENT_RUNTIMES)}."
         if default_runtime == "runner" and not updated.runner_id:
             return "default_runtime 'runner' needs a connected machine: approve one in the Runners panel."
+        if default_runtime == "pool" and not updated.pool_id:
+            return "default_runtime 'pool' needs pool_id (see list_runtime_pools)."
         updated.default_runtime = default_runtime
     if updated.default_runtime == "runner" and not updated.runner_id:
         return "An agent with default_runtime 'runner' needs runner_id."
+    if updated.default_runtime == "pool":
+        if not updated.pool_id:
+            return "An agent with default_runtime 'pool' needs pool_id."
+        updated.protocol = "acp"  # type: ignore[assignment]
+        updated.acp_agent = None
     if addons_json is not None:
         # The whole list, like the REST API's `addons`: [] clears them.
         from pydantic import TypeAdapter, ValidationError
@@ -3776,3 +3822,149 @@ async def revoke_resource_access(
     await grants.revoke(deps, normalized, resource_id, found["id"])
     who = found.get("grantee_name") or found["grantee_id"]
     return f"Revoked {found['grantee_type']} {who}'s access to {normalized} '{resource_id}'."
+
+
+# ---------------------------------------------------------------------------
+# Runtime pools (app.application.runtime_pools)
+# ---------------------------------------------------------------------------
+
+def _pool_backend(deps: ManagementDeps) -> Any:
+    return getattr(deps, "runtime_pool_backend", None)
+
+
+async def _present_pool(deps: ManagementDeps, pool: Any) -> dict:
+    from app.application.runners import get_runner_hub
+    from app.application.runtime_pools import present
+    from app.application.visibility import unwrap
+    return await present(
+        pool, agent_backend=deps.agent_backend, hub=get_runner_hub(),
+        pool_backend=unwrap(_pool_backend(deps)), run_repository=deps.run_repository,
+    )
+
+
+@requires(Permission.READ)
+async def list_runtime_pools(deps: ManagementDeps) -> str:
+    """Every runtime pool the caller can see, with members and who is online."""
+    import json as _json
+    backend = _pool_backend(deps)
+    if backend is None:
+        return "Runtime pools are not available on this deployment."
+    pools = await backend.list()
+    if not pools:
+        return "No runtime pools."
+    return _json.dumps([await _present_pool(deps, p) for p in pools], indent=2, default=str)
+
+
+@requires(Permission.READ)
+async def get_runtime_pool(deps: ManagementDeps, pool_id: str) -> str:
+    import json as _json
+    backend = _pool_backend(deps)
+    if backend is None:
+        return "Runtime pools are not available on this deployment."
+    pool = await backend.get(pool_id)
+    if pool is None:
+        return f"Runtime pool '{pool_id}' not found."
+    return _json.dumps(await _present_pool(deps, pool), indent=2, default=str)
+
+
+@requires(Permission.WRITE)
+async def create_runtime_pool(
+    deps: ManagementDeps, pool_id: str, name: str, description: str = "",
+    visibility: str | None = None, team_id: str | None = None,
+) -> str:
+    from app.application.visibility import visibility_kwargs
+    from app.domain.models.runtime_pool import RuntimePool
+    backend = _pool_backend(deps)
+    if backend is None:
+        return "Runtime pools are not available on this deployment."
+    if visibility is not None and visibility not in ("private", "team", "public"):
+        return "visibility must be private, team or public."
+    if await backend.get(pool_id) is not None:
+        return f"Runtime pool '{pool_id}' already exists."
+    await backend.create(RuntimePool(
+        id=pool_id, name=name, description=description or None, **visibility_kwargs(visibility, team_id),
+    ))
+    return f"Runtime pool '{pool_id}' created. Owners of runner agents add them with join_runtime_pool."
+
+
+@requires(Permission.WRITE)
+async def update_runtime_pool(
+    deps: ManagementDeps, pool_id: str, name: str | None = None, description: str | None = None,
+    visibility: str | None = None, team_id: str | None = None,
+) -> str:
+    backend = _pool_backend(deps)
+    if backend is None:
+        return "Runtime pools are not available on this deployment."
+    if visibility is not None and visibility not in ("private", "team", "public"):
+        return "visibility must be private, team or public."
+    pool = await backend.get(pool_id)
+    if pool is None:
+        return f"Runtime pool '{pool_id}' not found."
+    updated = pool.model_copy()
+    if name is not None:
+        updated.name = name
+    if description is not None:
+        updated.description = description or None
+    if visibility is not None:
+        updated.visibility = visibility  # type: ignore[assignment]
+    if team_id is not None:
+        updated.team_id = team_id
+    await backend.update(pool_id, updated)
+    return f"Runtime pool '{pool_id}' updated."
+
+
+@requires(Permission.DELETE)
+async def delete_runtime_pool(deps: ManagementDeps, pool_id: str) -> str:
+    backend = _pool_backend(deps)
+    if backend is None:
+        return "Runtime pools are not available on this deployment."
+    if await backend.get(pool_id) is None:
+        return f"Runtime pool '{pool_id}' not found."
+    users = [a.id for a in await unwrap_agents(deps) if a.default_runtime == "pool" and a.pool_id == pool_id]
+    if users:
+        return f"Runtime pool '{pool_id}' is used by agent(s) {', '.join(users)}; point them elsewhere first."
+    await backend.delete(pool_id)
+    return f"Runtime pool '{pool_id}' deleted."
+
+
+async def unwrap_agents(deps: ManagementDeps) -> list:
+    from app.application.visibility import unwrap
+    return await unwrap(deps.agent_backend).list() if deps.agent_backend is not None else []
+
+
+@requires(Permission.WRITE)
+async def join_runtime_pool(deps: ManagementDeps, pool_id: str, agent_id: str) -> str:
+    """Add the caller's own runner agent to a pool."""
+    from app.application.runtime_pools import add_member
+    from app.application.visibility import unwrap
+    backend = _pool_backend(deps)
+    if backend is None:
+        return "Runtime pools are not available on this deployment."
+    pool = await backend.get(pool_id)
+    if pool is None:
+        return f"Runtime pool '{pool_id}' not found."
+    resolved, err = await _resolve_agent_id(deps, agent_id)
+    if err:
+        return err
+    agent = await deps.agent_backend.get(resolved)
+    if agent is None:
+        return f"Agent '{agent_id}' not found."
+    await add_member(unwrap(backend), pool, agent)
+    return (f"Agent '{agent.id}' joined runtime pool '{pool_id}': workflows using the pool may now run "
+            f"on its machine. Leave with leave_runtime_pool.")
+
+
+@requires(Permission.WRITE)
+async def leave_runtime_pool(deps: ManagementDeps, pool_id: str, agent_id: str) -> str:
+    """Take an agent out of a pool (its owner, the pool's editors, or its team's admins)."""
+    from app.application.runtime_pools import remove_member
+    from app.application.visibility import unwrap
+    backend = _pool_backend(deps)
+    if backend is None:
+        return "Runtime pools are not available on this deployment."
+    pool = await backend.get(pool_id)
+    if pool is None:
+        return f"Runtime pool '{pool_id}' not found."
+    agent = await unwrap(deps.agent_backend).get(agent_id) if deps.agent_backend is not None else None
+    await remove_member(unwrap(backend), pool, agent_id, agent)
+    return f"Agent '{agent_id}' left runtime pool '{pool_id}'."

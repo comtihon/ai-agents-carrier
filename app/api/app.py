@@ -65,6 +65,7 @@ from app.api.routes.health import router as health_router
 from app.api.routes.llm import router as llm_router
 from app.api.routes.run_data import router as run_data_router
 from app.api.routes.runners import router as runners_router
+from app.api.routes.runtime_pools import router as runtime_pools_router
 from app.api.routes.webhooks import router as webhooks_router
 from app.api.routes.workflows import router as workflows_router
 from app.core.config import get_settings
@@ -740,6 +741,7 @@ def create_app() -> FastAPI:
     app.include_router(agents_router, prefix=settings.api_prefix)
     app.include_router(agent_runtimes_router, prefix=settings.api_prefix)
     app.include_router(runners_router, prefix=settings.api_prefix)
+    app.include_router(runtime_pools_router, prefix=settings.api_prefix)
     app.include_router(datasources_router, prefix=settings.api_prefix)
     app.include_router(approvals_router, prefix=settings.api_prefix)
     app.include_router(events_router, prefix=settings.api_prefix)

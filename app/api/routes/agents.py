@@ -55,6 +55,8 @@ class AgentDefinitionRequest(BaseModel):
     acp_agent: str | None = None
     # default_runtime "runner": the machine (app.application.runners) it runs on.
     runner_id: str | None = None
+    # default_runtime "pool": the runtime pool (app.application.runtime_pools) it runs on.
+    pool_id: str | None = None
     # Shared company memory (gbrain) clearance: "none" | "read" | "write".
     brain_access: BrainAccess = "none"
     # Most runs of this agent's runtime at once, across all workflows and
@@ -83,6 +85,7 @@ class AgentDefinitionUpdateRequest(BaseModel):
     protocol: Literal["http-poll", "acp"] | None = None
     acp_agent: str | None = None
     runner_id: str | None = None
+    pool_id: str | None = None
     # None = omitted -> keep the stored value.
     brain_access: BrainAccess | None = None
     # Omitted -> keep the stored value; explicit null -> no limit.
@@ -101,11 +104,12 @@ def _require_backend(container: ApplicationContainer) -> None:
         raise HTTPException(status_code=501, detail="Agent backend not configured")
 
 
-_RUNTIMES = ("local", "docker", "k8s", "runner")
+_RUNTIMES = ("local", "docker", "k8s", "runner", "pool")
 
 
 async def _runner_fields(
-    container: ApplicationContainer, runtime: str, runner_id: str | None, protocol: str, acp_agent: str | None
+    container: ApplicationContainer, runtime: str, runner_id: str | None, protocol: str, acp_agent: str | None,
+    pool_id: str | None = None,
 ) -> dict[str, Any]:
     """protocol/acp_agent/runner_id for *runtime*, checking the caller may use the runner.
 
@@ -115,8 +119,17 @@ async def _runner_fields(
     """
     if runtime not in _RUNTIMES:
         raise HTTPException(status_code=400, detail=f"Unknown runtime '{runtime}' (one of {', '.join(_RUNTIMES)})")
+    if runtime == "pool":
+        # Which pool the caller may use (and whether this agent's scope fits
+        # the pool's) is checked on save, like any reference. The member
+        # decides the machine and its ACP agent.
+        backend = getattr(container, "runtime_pool_backend", None)
+        pool = await backend.get(pool_id) if backend is not None and pool_id else None
+        if pool is None:
+            raise HTTPException(status_code=400, detail=f"Runtime pool '{pool_id}' not found" if pool_id else "runtime 'pool' needs pool_id")
+        return {"protocol": "acp", "acp_agent": None, "runner_id": None, "pool_id": pool.id}
     if runtime != "runner":
-        return {"protocol": protocol, "acp_agent": acp_agent, "runner_id": None}
+        return {"protocol": protocol, "acp_agent": acp_agent, "runner_id": None, "pool_id": None}
     from app.application.visibility import can_see
     backend = getattr(container, "runner_backend", None)
     runner = await backend.get_runner(runner_id) if backend is not None and runner_id else None
@@ -124,7 +137,7 @@ async def _runner_fields(
         raise HTTPException(status_code=400, detail=f"Runner '{runner_id}' not found" if runner_id else "runtime 'runner' needs runner_id")
     if acp_agent and acp_agent not in runner.agents:
         raise HTTPException(status_code=400, detail=f"Runner '{runner.name}' does not offer agent '{acp_agent}'")
-    return {"protocol": "acp", "acp_agent": acp_agent or None, "runner_id": runner.id}
+    return {"protocol": "acp", "acp_agent": acp_agent or None, "runner_id": runner.id, "pool_id": None}
 
 
 # ─── Literal-segment routes (must come before /{agent_id}) ───────────────────
@@ -218,6 +231,7 @@ async def list_agents(
                 "description": a.description,
                 "default_runtime": a.default_runtime,
                 "runner_id": a.runner_id,
+                "pool_id": a.pool_id,
                 "acp_agent": a.acp_agent,
                 "max_concurrency": a.max_concurrency,
                 **ownership_fields(a),
@@ -247,7 +261,7 @@ async def create_agent(
     from pydantic import TypeAdapter
     _addon_adapter: TypeAdapter[list[AnyAgentAddon]] = TypeAdapter(list[AnyAgentAddon])
     runner_fields = await _runner_fields(
-        container, body.default_runtime, body.runner_id, body.protocol, body.acp_agent or None
+        container, body.default_runtime, body.runner_id, body.protocol, body.acp_agent or None, body.pool_id
     )
     defn = AgentDefinition(
         id=body.id,
@@ -327,9 +341,14 @@ async def update_agent(
         runner_id = existing.runner_id
     if body.default_runtime == "runner" and runner_id == existing.runner_id and body.protocol is None:
         # Unchanged runner: an older client round-trip keeps it as is.
-        runner_fields = {"protocol": "acp", "acp_agent": acp_agent, "runner_id": runner_id}
+        runner_fields = {"protocol": "acp", "acp_agent": acp_agent, "runner_id": runner_id, "pool_id": None}
+    elif body.default_runtime == "pool" and (body.pool_id or existing.pool_id) == existing.pool_id \
+            and existing.default_runtime == "pool":
+        runner_fields = {"protocol": "acp", "acp_agent": None, "runner_id": None, "pool_id": existing.pool_id}
     else:
-        runner_fields = await _runner_fields(container, body.default_runtime, runner_id, protocol, acp_agent)
+        runner_fields = await _runner_fields(
+            container, body.default_runtime, runner_id, protocol, acp_agent, body.pool_id or existing.pool_id
+        )
     defn = AgentDefinition(
         id=agent_id,
         name=body.name,
@@ -366,6 +385,9 @@ async def delete_agent(
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
 
     await container.agent_backend.delete(agent_id)
+    from app.application.runtime_pools import drop_agent_everywhere
+    from app.application.visibility import unwrap
+    await drop_agent_everywhere(unwrap(getattr(container, "runtime_pool_backend", None)), agent_id)
 
 
 @router.get("/{agent_id}/addons")

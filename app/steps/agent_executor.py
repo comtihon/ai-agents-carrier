@@ -862,11 +862,12 @@ async def execute_agent_step(
     from app.runtime.factory import get_runtime
 
     # A runner agent runs on a machine that dialled carrier: nothing to spawn.
-    if agent_def.default_runtime == "runner":
+    # A pool agent runs on a member of its runtime pool, which is a runner.
+    if agent_def.default_runtime in ("runner", "pool"):
         if agent_def.protocol != "acp":
             raise ValueError(f"[step '{step_id}'] agent '{agent_id}' runs on a runner and must use protocol 'acp'")
         runtime_type = "runner"
-    elif runtime_type == "runner":
+    elif runtime_type in ("runner", "pool"):
         raise ValueError(f"[step '{step_id}'] agent '{agent_id}' is not a runner agent (set it up from a connected machine)")
     runtime: AgentRuntime | None = None if runtime_type == "runner" else get_runtime(
         runtime_type,
@@ -888,7 +889,9 @@ async def execute_agent_step(
     # /start + /poll; everything after the raw output is shared.
     if agent_def.protocol == "acp":
         from app.steps.acp_executor import run_acp_agent
-        raw_output = await run_acp_agent(
+        from app.steps.acp_pool_executor import run_pool_agent
+        run_acp = run_pool_agent if agent_def.default_runtime == "pool" else run_acp_agent
+        raw_output = await run_acp(
             step=step,
             agent_def=agent_def,
             input_data=input_data,

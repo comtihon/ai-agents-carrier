@@ -353,6 +353,8 @@ class RunnerHub:
         self._data: dict[tuple[str, str], asyncio.Future] = {}
         # Set by the container: where runners and their limits are stored.
         self.backend: Any = None
+        # Set by the container: runtime pools and their run assignments (unscoped).
+        self.pool_backend: Any = None
 
     def is_online(self, runner_id: str) -> bool:
         s = self.sessions.get(runner_id)

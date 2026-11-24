@@ -49,8 +49,11 @@ class AgentDefinition(GrantableResource):
     description: str | None = None          # UI + dispatcher roster — NOT sent to agent
     # "runner": an ACP agent on a user's machine connected with acp-web-proxy
     # (app.application.runners); needs ``runner_id`` and ``protocol: "acp"``.
-    default_runtime: Literal["local", "docker", "k8s", "runner"] = "local"
+    # "pool": the next online member of a runtime pool (app.application.runtime_pools),
+    # kept for the whole workflow run; needs ``pool_id`` and ``protocol: "acp"``.
+    default_runtime: Literal["local", "docker", "k8s", "runner", "pool"] = "local"
     runner_id: str | None = None
+    pool_id: str | None = None
 
     # Sent to the agent on every run:
     agent_input: dict = Field(default_factory=dict)
