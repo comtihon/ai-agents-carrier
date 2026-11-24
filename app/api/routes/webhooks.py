@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hmac
 import json
 import logging
 from uuid import uuid4
@@ -13,13 +12,19 @@ from app.core.container import ApplicationContainer
 from app.domain.models.graph_run import GraphRun
 from app.infrastructure.config.graph_loader import build_runner_from_definition
 from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner, stream_graph_to_pause
-from app.infrastructure.triggers.webhook_validator import validate_webhook_signature
+from app.infrastructure.triggers.webhook_validator import valid_bearer, valid_signature
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
-_SIGNATURE_HEADER = "X-Webhook-Signature"
+# http trigger auth (``auth_mode`` on the workflow's ``http`` step):
+#   "hmac"   — HMAC-SHA256 of the raw body with ``webhook_secret`` (else the
+#              global WEBHOOK_SECRET), in any of SIGNATURE_HEADERS, bare hex or
+#              "sha256=<hex>" (carrier, gbrain, Jira system webhooks, GitHub);
+#   "bearer" — ``Authorization: Bearer <bearer_token>`` (Jira Automation);
+#   "any"    — either of the two, for a workflow started by both kinds of sender.
+_AUTH_MODES = ("hmac", "bearer", "any")
 
 
 async def _execute_webhook_run(
@@ -42,12 +47,14 @@ async def receive_webhook(
     background_tasks: BackgroundTasks,
     container: ApplicationContainer = Depends(get_container),
 ):
-    """Receive an HMAC-authenticated HTTP trigger and start a workflow run.
+    """Receive an authenticated HTTP trigger and start a workflow run.
 
-    The caller must include a ``X-Webhook-Signature`` header whose value is the
-    HMAC-SHA256 hex digest of the raw request body.  The signing secret is taken
-    from the workflow's ``http`` trigger step (``webhook_secret`` field) when set;
-    otherwise falls back to the global ``WEBHOOK_SECRET`` environment variable.
+    How the caller authenticates is the ``http`` trigger step's ``auth_mode``
+    (see ``_AUTH_MODES``): an HMAC-SHA256 signature of the raw body
+    (``X-Webhook-Signature``, ``X-Gbrain-Signature``, ``X-Hub-Signature`` or
+    ``X-Hub-Signature-256``, bare hex or ``sha256=<hex>``; secret from the
+    step's ``webhook_secret``, else the global ``WEBHOOK_SECRET``), a bearer
+    token (``Authorization: Bearer <bearer_token>``), or either (``any``).
 
     A field named ``request`` in the JSON body is used as the workflow's initial
     request string; if absent, the entire body is JSON-serialised as the request.
@@ -82,27 +89,29 @@ async def receive_webhook(
 
     body = await request.body()
 
-    if auth_mode == "bearer":
-        expected_token = (http_step or {}).get("bearer_token", "")
-        if not expected_token:
-            raise HTTPException(status_code=503, detail="Bearer token not configured on the http trigger step")
-        auth_header = request.headers.get("Authorization", "")
-        provided_token = auth_header.removeprefix("Bearer ").strip()
-        if not hmac.compare_digest(provided_token, expected_token):
-            logger.warning(
-                "Bearer token validation failed for workflow '%s' — received Authorization: %r",
-                workflow_id, auth_header[:60] if auth_header else "(none)",
-            )
-            raise HTTPException(status_code=403, detail="Invalid or missing Bearer token")
-    else:
-        per_workflow_secret = (http_step or {}).get("webhook_secret") or None
-        secret = per_workflow_secret or container.settings.webhook_secret
-        if not secret:
-            raise HTTPException(status_code=503, detail="Webhook secret not configured (set WEBHOOK_SECRET or per-workflow webhook_secret)")
-        signature = request.headers.get(_SIGNATURE_HEADER, "")
-        if not signature or not validate_webhook_signature(body, signature, secret):
-            logger.warning("Webhook signature validation failed for workflow '%s'", workflow_id)
-            raise HTTPException(status_code=403, detail="Invalid or missing webhook signature")
+    if auth_mode not in _AUTH_MODES:
+        raise HTTPException(status_code=503, detail=f"Unknown auth_mode '{auth_mode}' on the http trigger step")
+    token = (http_step or {}).get("bearer_token") or ""
+    secret = (http_step or {}).get("webhook_secret") or container.settings.webhook_secret or ""
+    use_bearer = auth_mode in ("bearer", "any")
+    use_hmac = auth_mode in ("hmac", "any")
+    if use_bearer and not use_hmac and not token:
+        raise HTTPException(status_code=503, detail="Bearer token not configured on the http trigger step")
+    if use_hmac and not use_bearer and not secret:
+        raise HTTPException(status_code=503, detail="Webhook secret not configured (set WEBHOOK_SECRET or per-workflow webhook_secret)")
+    if auth_mode == "any" and not token and not secret:
+        raise HTTPException(status_code=503, detail="Neither a bearer token nor a webhook secret is configured on the http trigger step")
+    ok = (use_bearer and valid_bearer(request.headers, token)) or (
+        use_hmac and bool(secret) and valid_signature(body, request.headers, secret)
+    )
+    if not ok:
+        logger.warning("Webhook auth (%s) failed for workflow '%s'", auth_mode, workflow_id)
+        detail = {
+            "bearer": "Invalid or missing Bearer token",
+            "hmac": "Invalid or missing webhook signature",
+            "any": "Invalid or missing Bearer token or webhook signature",
+        }[auth_mode]
+        raise HTTPException(status_code=403, detail=detail)
 
     # Checked only after the signature/token has been verified: an unauthenticated
     # caller must not be able to probe which workflows exist and which are off.
