@@ -155,6 +155,70 @@ def pick_permission_option(params: dict[str, Any], blocked_commands: list[str]) 
     return {"outcome": {"outcome": "selected", "optionId": choice.get("optionId")}}
 
 
+# ─── read-only agents ────────────────────────────────────────────────────────
+# ``agent_input.read_only: true`` makes an agent unable to change code: it may
+# read, search, run commands (tests, linters, builds) and report, but not edit
+# files or change git/GitHub state. Enforced twice:
+#   1. inside Claude: claude-agent-acp passes ``_meta.claudeCode.options`` to the
+#      Claude Agent SDK, whose ``disallowedTools`` removes the edit tools and
+#      denies the listed Bash command prefixes outright, whatever the agent's
+#      permission mode (sent on session/new AND session/load: the adapter
+#      rebuilds a loaded session from that request's own _meta);
+#   2. in carrier: a permission request for an edit/delete/move tool call or a
+#      listed command is rejected (covers agents that ask, e.g. codex).
+# Not a sandbox: a determined agent could still write a file through some
+# other program; the prompt and the reviewers of its output remain the guard
+# for that. ``agent_input.disallowed_tools`` adds more SDK rules.
+
+READ_ONLY_EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+# Commands (prefixes) that change files, git history, remotes or GitHub.
+READ_ONLY_BLOCKED_COMMANDS = (
+    "git commit", "git push", "git merge", "git rebase", "git reset", "git revert",
+    "git cherry-pick", "git am", "git apply", "git stash", "git tag", "git branch -d", "git branch -D",
+    "git checkout -b", "git switch -c", "git restore", "git rm", "git mv", "git add",
+    "gh pr create", "gh pr merge", "gh pr edit", "gh pr close", "gh pr comment", "gh pr review",
+    "gh issue create", "gh issue edit", "gh issue comment", "gh release", "gh repo",
+    "gh api -X", "gh api --method",
+    "sed -i", "perl -i", "tee", "truncate", "patch", "rm", "mv",
+)
+_READ_ONLY_KINDS = frozenset({"edit", "delete", "move"})
+_READ_ONLY_NOTICE = (
+    "You are READ-ONLY in this job: you must not create, edit, move or delete files, and must not "
+    "commit, push, merge, open or edit pull requests. Editing tools and those commands are disabled. "
+    "You may read code, search, clone/fetch repositories, check out existing branches and run tests, "
+    "linters and builds. Report problems in your output instead of fixing them."
+)
+
+
+def is_read_only(agent_input: dict[str, Any] | None) -> bool:
+    return bool((agent_input or {}).get("read_only"))
+
+
+def claude_code_options(agent_input: dict[str, Any] | None) -> dict[str, Any]:
+    """``_meta.claudeCode.options`` for claude-agent-acp ({} when nothing to restrict)."""
+    agent_input = agent_input or {}
+    rules: list[str] = [str(r) for r in agent_input.get("disallowed_tools") or [] if r]
+    if is_read_only(agent_input):
+        rules += list(READ_ONLY_EDIT_TOOLS)
+        rules += [f"Bash({cmd}:*)" for cmd in READ_ONLY_BLOCKED_COMMANDS]
+    rules = list(dict.fromkeys(rules))
+    return {"disallowedTools": rules} if rules else {}
+
+
+def read_only_denied(params: dict[str, Any]) -> bool:
+    """Whether a permission request asks a read-only agent for a write."""
+    tool_call = params.get("toolCall") or {}
+    if str(tool_call.get("kind") or "").lower() in _READ_ONLY_KINDS:
+        return True
+    raw = json.dumps(tool_call.get("rawInput") or {}, default=str) + " " + str(tool_call.get("title") or "")
+    if re.search(r'"(file_path|notebook_path)"', raw) and re.search(r'"(content|new_string|edits|new_source)"', raw):
+        return True
+    return any(
+        re.search(rf"(^|[\s\"'/;&|(]){re.escape(cmd)}($|[\s\"';&|)])", raw)
+        for cmd in READ_ONLY_BLOCKED_COMMANDS
+    )
+
+
 # ─── run state sink ──────────────────────────────────────────────────────────
 
 
@@ -299,6 +363,10 @@ async def run_acp_agent(
 
     async def on_request(method: str, params: dict[str, Any]) -> Any:
         if method == "session/request_permission":
+            if read_only and read_only_denied(params):
+                title = str((params.get("toolCall") or {}).get("title") or "a write")
+                sink.add(f"refused (read-only agent): {title[:200]}")
+                return pick_permission_option({**params, "toolCall": {"rawInput": {"command": "__read_only__"}}}, ["__read_only__"])
             return pick_permission_option(params, blocked)
         if method == "_carrier/ask":
             answer = await _ask_human(run_repository, run_id, str(params.get("question") or ""), params.get("options"))
@@ -306,6 +374,8 @@ async def run_acp_agent(
         raise AcpError(f"carrier does not implement {method}")
 
     agent_input = agent_def.agent_input or {}
+    read_only = is_read_only(agent_input)
+    cc_options = claude_code_options(agent_input)
     on_runner = agent_def.default_runtime == "runner"
     hub = None
     runner = None
@@ -544,7 +614,11 @@ async def run_acp_agent(
             raise RuntimeError(f"[step '{step_id}'] the agent's connection was lost and it cannot reload its session (no loadSession)")
         loading = True
         try:
-            await conn.request("session/load", {"sessionId": session_id, "cwd": await session_cwd(), "mcpServers": session_mcp_servers()}, timeout=900)
+            load: dict[str, Any] = {"sessionId": session_id, "cwd": await session_cwd(), "mcpServers": session_mcp_servers()}
+            if cc_options:
+                # The adapter rebuilds the session from this request's _meta: resend the restrictions.
+                load["_meta"] = {"claudeCode": {"options": cc_options}}
+            await conn.request("session/load", load, timeout=900)
         finally:
             loading = False
 
@@ -588,9 +662,15 @@ async def run_acp_agent(
                 carrier_meta.pop("credentials", None)
                 carrier_meta["tools"] = [{**t, "env": {}} for t in carrier_meta.get("tools") or []]
             meta: dict[str, Any] = {"carrier": carrier_meta}
-            if agent_config.get("system_prompt"):
+            system_prompt = agent_config.get("system_prompt") or ""
+            if read_only:
+                system_prompt = (system_prompt + "\n\n" + _READ_ONLY_NOTICE).strip()
+            if system_prompt:
                 # claude-agent-acp's slot for a system prompt; others ignore it.
-                meta["systemPrompt"] = {"type": "preset", "preset": "claude_code", "append": agent_config["system_prompt"]}
+                meta["systemPrompt"] = {"type": "preset", "preset": "claude_code", "append": system_prompt}
+            if cc_options:
+                # Claude Agent SDK options (claude-agent-acp): hard tool restrictions.
+                meta["claudeCode"] = {"options": cc_options}
             new = await conn.request("session/new", {
                 "cwd": await session_cwd(),
                 "mcpServers": session_mcp_servers(),
