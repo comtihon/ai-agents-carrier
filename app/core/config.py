@@ -490,6 +490,11 @@ class Settings(BaseSettings):
     # moves to the next member (an agent may override it with
     # agent_input.pool_grace_s).
     acp_pool_grace_s: int = Field(default=120, alias="ACP_POOL_GRACE_S")
+    # Runtime pools: how long a pool step waits while no member is online
+    # (at the start, or after the run's last online member went away) before
+    # failing. 0 = until one comes online. An agent may override it with
+    # agent_input.pool_wait_s.
+    acp_pool_wait_s: int = Field(default=0, alias="ACP_POOL_WAIT_S")
     # Validity of the signed URLs a runner syncs an s3-addon workspace with
     # (capped at 7 days); they are signed afresh on every launch.
     acp_runner_workspace_url_ttl_s: int = Field(default=86400, alias="ACP_RUNNER_WORKSPACE_URL_TTL_S")

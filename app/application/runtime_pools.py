@@ -56,7 +56,9 @@ from app.infrastructure.auth.authorization import get_current_subject
 logger = logging.getLogger(__name__)
 
 # How long a pool step waits for any member to come online before failing.
-DEFAULT_MEMBER_WAIT_S = 600.0
+# None (or <= 0): wait until one does — the default, so a run started while
+# every member is offline simply starts when the first comes back.
+DEFAULT_MEMBER_WAIT_S: float | None = None
 # How long a run's member may be offline before the run moves on.
 DEFAULT_GRACE_S = 120.0
 _POLL_S = 5.0
@@ -257,18 +259,25 @@ async def assign_member(
     failed: str | None = None,
     exclude: set[str] | None = None,
     grace_s: float = DEFAULT_GRACE_S,
-    wait_s: float = DEFAULT_MEMBER_WAIT_S,
+    wait_s: float | None = DEFAULT_MEMBER_WAIT_S,
     on_wait: Any = None,
 ) -> tuple[MemberStatus, PoolAssignment]:
     """The member run *run_id* uses on pool *pool_id* (see module docstring).
 
-    *failed*: the member the run just lost; the run moves on from it (unless a
-    parallel step already moved it). *exclude*: members not to pick.
+    *failed*: the member the run just lost; the run moves on from it to
+    another ONLINE member (unless a parallel step already moved it).
+    *exclude*: members not to pick on the first pass.
+
+    When no member is online the call waits: *wait_s* seconds, or until one
+    comes online when *wait_s* is None or <= 0. While waiting every member is
+    eligible again, the run's own member (including *failed*) first — it holds
+    the run's workspace — then the others in round-robin order. *on_wait* is
+    awaited once, when the waiting starts. Cancelling the caller stops the wait.
     """
     exclude = set(exclude or ())
     if failed:
         exclude.add(failed)
-    deadline = time.monotonic() + wait_s
+    deadline = time.monotonic() + wait_s if wait_s is not None and wait_s > 0 else None
     waited = False
     while True:
         pool = await pool_backend.get(pool_id)
@@ -280,10 +289,16 @@ async def assign_member(
         if current is not None and current.agent_id != failed and current.agent_id in pool.member_ids():
             s = await member_status(current.agent_id, agent_backend=agent_backend, hub=hub)
             if s.usable and current.agent_id not in exclude:
-                if s.online or (s.runner is not None and await hub.wait_online(s.runner.id, grace_s)):
+                # The grace applies once; while waiting, the run's member is
+                # simply checked on every round, like the others.
+                if s.online or (
+                    not waited and s.runner is not None and await hub.wait_online(s.runner.id, grace_s)
+                ):
                     return s, current
-                logger.info("pool %s: run %s lost member %s (offline)", pool_id, run_id, current.agent_id)
-            exclude.add(current.agent_id)
+                if not waited:
+                    logger.info("pool %s: run %s lost member %s (offline)", pool_id, run_id, current.agent_id)
+            if not waited:
+                exclude.add(current.agent_id)
         picked = await _pick(pool, pool_backend=pool_backend, agent_backend=agent_backend, hub=hub, exclude=exclude)
         if picked is not None:
             replacing = current.agent_id if current is not None else None
@@ -295,14 +310,17 @@ async def assign_member(
                     return s, won
                 continue
             return picked, won
-        if time.monotonic() >= deadline:
+        if deadline is not None and time.monotonic() >= deadline:
             raise NoMemberAvailable(
-                f"no member of runtime pool '{pool.name or pool_id}' came online within {int(wait_s)}s "
+                f"no member of runtime pool '{pool.name or pool_id}' came online within {int(wait_s or 0)}s "
                 f"({len(pool.members)} member(s))"
             )
-        if not waited and on_wait is not None:
+        if not waited:
             waited = True
-            await on_wait(pool)
-        # Members that went offline may be back; only the one just lost stays out.
-        exclude = {failed} if failed else set()
+            if on_wait is not None:
+                await on_wait(pool)
+        # Nobody else is online: every member may serve the run again — the
+        # one it just lost too, and that one first if it comes back first.
+        failed = None
+        exclude = set()
         await asyncio.sleep(_POLL_S)
