@@ -122,6 +122,7 @@ async def test_summary_view_omits_agent_input_and_addons(client):
         "default_runtime": "local",
         # What the concurrency view needs to derive the runtime key and limit.
         "runner_id": None,
+        "pool_id": None,
         "acp_agent": None,
         "max_concurrency": None,
         # Ownership travels with every list entry (auth off: public, unowned).

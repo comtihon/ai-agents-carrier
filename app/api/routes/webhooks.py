@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
 _SIGNATURE_HEADER = "X-Webhook-Signature"
+# Also accepted, from senders whose header name is fixed: gbrain's webhook
+# notification sink and GitHub-style webhooks. Same HMAC-SHA256 of the body,
+# optionally prefixed "sha256=".
+_ALT_SIGNATURE_HEADERS = ("X-Gbrain-Signature", "X-Hub-Signature-256")
 
 
 async def _execute_webhook_run(
@@ -99,7 +103,9 @@ async def receive_webhook(
         secret = per_workflow_secret or container.settings.webhook_secret
         if not secret:
             raise HTTPException(status_code=503, detail="Webhook secret not configured (set WEBHOOK_SECRET or per-workflow webhook_secret)")
-        signature = request.headers.get(_SIGNATURE_HEADER, "")
+        signature = request.headers.get(_SIGNATURE_HEADER, "") or next(
+            (request.headers[h] for h in _ALT_SIGNATURE_HEADERS if request.headers.get(h)), ""
+        )
         if not signature or not validate_webhook_signature(body, signature, secret):
             logger.warning("Webhook signature validation failed for workflow '%s'", workflow_id)
             raise HTTPException(status_code=403, detail="Invalid or missing webhook signature")

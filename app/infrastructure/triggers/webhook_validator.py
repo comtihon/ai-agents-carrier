@@ -10,5 +10,9 @@ def validate_webhook_signature(body: bytes, signature: str, secret: str) -> bool
     The expected signature is HMAC-SHA256(key=secret, msg=body) as a hex digest.
     Uses hmac.compare_digest for timing-safe comparison.
     """
+    signature = signature.strip()
+    # GitHub-style senders (gbrain's webhook sink, X-Hub-Signature-256) prefix it.
+    if signature.lower().startswith("sha256="):
+        signature = signature[len("sha256="):]
     computed = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(computed, signature)
+    return hmac.compare_digest(computed, signature.lower())

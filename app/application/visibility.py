@@ -67,13 +67,14 @@ from typing import Any, Callable, Iterable, Literal
 
 from app.infrastructure.auth.authorization import get_current_subject
 
-Kind = Literal["agent", "datasource", "script", "workflow"]
+Kind = Literal["agent", "datasource", "script", "workflow", "pool"]
 
 _LABEL: dict[str, str] = {
     "agent": "agent",
     "datasource": "data source",
     "script": "script",
     "workflow": "workflow",
+    "pool": "runtime pool",
 }
 
 
@@ -376,6 +377,10 @@ def references(kind: str, resource: Any) -> list[tuple[str, str]]:
         for addon in getattr(resource, "addons", None) or []:
             if getattr(addon, "type", None) == "datasource" and getattr(addon, "source_id", None):
                 refs.append(("datasource", str(addon.source_id)))
+        # A pool agent uses its pool. The pool's members are not references:
+        # each joined by its owner's choice (app.application.runtime_pools).
+        if getattr(resource, "default_runtime", None) == "pool" and getattr(resource, "pool_id", None):
+            refs.append(("pool", str(resource.pool_id)))
     return refs
 
 
@@ -525,7 +530,7 @@ class ReferenceGuard:
     async def check_narrowing(self, kind: str, resource: Any) -> None:
         """Refuse to narrow a resource that something wider still uses."""
         rid = getattr(resource, "id", None)
-        referrer_kinds = ["workflow"] + (["agent"] if kind == "datasource" else [])
+        referrer_kinds = ["workflow"] + (["agent"] if kind in ("datasource", "pool") else [])
         for referrer_kind in referrer_kinds:
             backend = self._resolve(referrer_kind)
             if backend is None:

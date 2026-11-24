@@ -486,6 +486,10 @@ class Settings(BaseSettings):
     # How long a step waits for an offline runner before failing (an agent may
     # override it with agent_input.runner_wait_s).
     acp_runner_wait_s: int = Field(default=600, alias="ACP_RUNNER_WAIT_S")
+    # Runtime pools: how long a run's member may be offline before the run
+    # moves to the next member (an agent may override it with
+    # agent_input.pool_grace_s).
+    acp_pool_grace_s: int = Field(default=120, alias="ACP_POOL_GRACE_S")
     # Validity of the signed URLs a runner syncs an s3-addon workspace with
     # (capped at 7 days); they are signed afresh on every launch.
     acp_runner_workspace_url_ttl_s: int = Field(default=86400, alias="ACP_RUNNER_WORKSPACE_URL_TTL_S")

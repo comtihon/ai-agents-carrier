@@ -111,6 +111,14 @@ EXPECTED_TOOL_PERMISSIONS: dict[str, Permission] = {
     "delete_agent": Permission.DELETE,
     "list_agent_concurrency": Permission.READ,
     "update_runner_concurrency": Permission.WRITE,
+    # runtime pools
+    "list_runtime_pools": Permission.READ,
+    "get_runtime_pool": Permission.READ,
+    "create_runtime_pool": Permission.WRITE,
+    "update_runtime_pool": Permission.WRITE,
+    "delete_runtime_pool": Permission.DELETE,
+    "join_runtime_pool": Permission.WRITE,
+    "leave_runtime_pool": Permission.WRITE,
     # data sources
     "list_datasources": Permission.READ,
     "get_datasource": Permission.READ,

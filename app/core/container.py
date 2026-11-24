@@ -85,6 +85,7 @@ _SCOPED_BACKENDS: dict[str, str] = {
     "agent_backend": "agent",
     "data_source_backend": "datasource",
     "script_backend": "script",
+    "runtime_pool_backend": "pool",
 }
 
 
@@ -153,6 +154,9 @@ class ApplicationContainer:
     # Machines connected with acp-web-proxy (app.application.runners). None in
     # legacy test setups: the runner routes answer 404.
     runner_backend: Any = None
+    # Runtime pools (app.application.runtime_pools): sets of runner agents a
+    # pool agent runs on. None in legacy test setups: the pool routes answer 404.
+    runtime_pool_backend: Any = None
     # Slots and queues of concurrency-limited agent runtimes
     # (app.application.concurrency). None: the process-local in-memory store.
     concurrency_backend: Any = None
@@ -199,6 +203,8 @@ class ApplicationContainer:
         # Runner steps record usage limits through the hub.
         from app.application.runners import get_runner_hub
         get_runner_hub().backend = self.runner_backend
+        # Pool steps pick and keep their member through the hub.
+        get_runner_hub().pool_backend = unwrap(self.runtime_pool_backend)
         # Agent steps take runtime slots from here.
         from app.application.concurrency import set_concurrency_backend
         set_concurrency_backend(self.concurrency_backend)
@@ -1157,6 +1163,8 @@ class ApplicationContainer:
             await unwrap(self.agent_backend).close()
         if self.runner_backend is not None and hasattr(self.runner_backend, "close"):
             await self.runner_backend.close()
+        if hasattr(unwrap(self.runtime_pool_backend), "close"):
+            await unwrap(self.runtime_pool_backend).close()
         if self.concurrency_backend is not None and hasattr(self.concurrency_backend, "close"):
             await self.concurrency_backend.close()
         if isinstance(unwrap(self.data_source_backend), MongoDataSourceBackend):
@@ -1354,6 +1362,8 @@ def build_container(settings: Settings) -> ApplicationContainer:
     team_directory = MongoTeamDirectory(settings.mongodb_uri, settings.mongodb_database)
     from app.infrastructure.persistence.runner_backend import MongoRunnerBackend
     runner_backend = MongoRunnerBackend(settings.mongodb_uri, settings.mongodb_database)
+    from app.infrastructure.persistence.runtime_pool_backend import MongoRuntimePoolBackend
+    runtime_pool_backend = MongoRuntimePoolBackend(settings.mongodb_uri, settings.mongodb_database)
     from app.infrastructure.persistence.concurrency_backend import MongoConcurrencyBackend
     concurrency_backend = MongoConcurrencyBackend(settings.mongodb_uri, settings.mongodb_database)
     # Registry starts empty; populated asynchronously in startup().
@@ -1385,6 +1395,7 @@ def build_container(settings: Settings) -> ApplicationContainer:
         agent_task_repository=agent_task_repository,
         warm_pod_repository=warm_pod_repository,
         runner_backend=runner_backend,
+        runtime_pool_backend=runtime_pool_backend,
         concurrency_backend=concurrency_backend,
         team_directory=team_directory,
         login_script_store=MongoLoginScriptStore(team_directory.database),

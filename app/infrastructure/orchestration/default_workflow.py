@@ -136,6 +136,7 @@ def build_default_workflow(
         # scripts too) and the user/team directory for the team tools.
         script_backend=getattr(container, "script_backend", None),
         team_directory=getattr(container, "team_directory", None),
+        runtime_pool_backend=getattr(container, "runtime_pool_backend", None),
         refresh_runner=refresh_runner,
         refresh_datasources=refresh_datasources,
     )
@@ -487,7 +488,7 @@ def build_default_workflow(
         return await core.get_agent(deps, agent_id)
 
     @tool
-    async def create_agent(agent_id: str, name: str, description: str = "", default_runtime: str = "local", agent_input_json: str = "{}", protocol: str = "http-poll", acp_agent: str = None, brain_access: str = "none", max_concurrency: int = None, runner_id: str = None) -> str:
+    async def create_agent(agent_id: str, name: str, description: str = "", default_runtime: str = "local", agent_input_json: str = "{}", protocol: str = "http-poll", acp_agent: str = None, brain_access: str = "none", max_concurrency: int = None, runner_id: str = None, pool_id: str = None) -> str:
         """Create a new agent definition. agent_input_json is a JSON object of default input overrides.
 
         protocol: "http-poll" (pi-cloud-agent /start + /poll, the default) or
@@ -501,14 +502,18 @@ def build_default_workflow(
         runner_id: with default_runtime "runner", the connected machine
         (Runners panel, e.g. "rnr-..."); protocol becomes "acp" and acp_agent
         must be one the runner offers.
+        pool_id: with default_runtime "pool", the runtime pool (list_runtime_pools)
+        whose members run this agent: each workflow run takes the next online
+        member and keeps it for all its steps. protocol becomes "acp"; the
+        member decides the machine and its ACP agent.
         """
         return await core.create_agent(
             deps, agent_id, name, description, default_runtime, agent_input_json, protocol, acp_agent,
-            brain_access, max_concurrency, runner_id,
+            brain_access, max_concurrency, runner_id, pool_id,
         )
 
     @tool
-    async def update_agent(agent_id: str, name: str = None, description: str = None, default_runtime: str = None, agent_input_json: str = None, protocol: str = None, acp_agent: str = None, addons_json: str = None, brain_access: str = None, max_concurrency: int = None, runner_id: str = None) -> str:
+    async def update_agent(agent_id: str, name: str = None, description: str = None, default_runtime: str = None, agent_input_json: str = None, protocol: str = None, acp_agent: str = None, addons_json: str = None, brain_access: str = None, max_concurrency: int = None, runner_id: str = None, pool_id: str = None) -> str:
         """Update an existing agent definition. Only provided fields are changed; others preserved.
 
         protocol: "http-poll" or "acp". acp_agent: the proxy's agent name for
@@ -525,10 +530,12 @@ def build_default_workflow(
         to keep current.
         runner_id: the connected machine for default_runtime "runner"
         ("" clears it); omit to keep current.
+        pool_id: the runtime pool for default_runtime "pool" ("" clears it);
+        omit to keep current.
         """
         return await core.update_agent(
             deps, agent_id, name, description, default_runtime, agent_input_json, protocol, acp_agent,
-            addons_json, brain_access, max_concurrency, runner_id,
+            addons_json, brain_access, max_concurrency, runner_id, pool_id,
         )
 
     @tool
@@ -556,6 +563,60 @@ def build_default_workflow(
     async def delete_agent(agent_id: str) -> str:
         """Delete an agent definition by exact id."""
         return await core.delete_agent(deps, agent_id)
+
+    # ── runtime pools ───────────────────────────────────────────────────────
+
+    @tool
+    async def list_runtime_pools() -> str:
+        """List runtime pools you can see: members, how many are online now, and which runs hold which member.
+
+        A runtime pool is a set of runner agents (agents on connected
+        machines, private ones included) that pool agents (default_runtime
+        "pool") run on. Each workflow run takes the next online member (round
+        robin) and keeps it for all its steps; it moves on only when that
+        member goes offline.
+        """
+        return await core.list_runtime_pools(deps)
+
+    @tool
+    async def get_runtime_pool(pool_id: str) -> str:
+        """One runtime pool: members, online status, quota limits and the runs holding each member."""
+        return await core.get_runtime_pool(deps, pool_id)
+
+    @tool
+    async def create_runtime_pool(
+        pool_id: str, name: str, description: str = "", visibility: str = None, team_id: str = None,
+    ) -> str:
+        """Create a runtime pool. visibility: private (default), team or public; team_id with
+        "team" (default: your team). Members are added by their owners with join_runtime_pool."""
+        return await core.create_runtime_pool(deps, pool_id, name, description, visibility, team_id)
+
+    @tool
+    async def update_runtime_pool(
+        pool_id: str, name: str = None, description: str = None, visibility: str = None, team_id: str = None,
+    ) -> str:
+        """Rename a runtime pool or change who can see it. Members change only through join/leave."""
+        return await core.update_runtime_pool(deps, pool_id, name, description, visibility, team_id)
+
+    @tool
+    async def delete_runtime_pool(pool_id: str) -> str:
+        """Delete a runtime pool no agent uses any more."""
+        return await core.delete_runtime_pool(deps, pool_id)
+
+    @tool
+    async def join_runtime_pool(pool_id: str, agent_id: str) -> str:
+        """Add YOUR OWN runner agent to a runtime pool.
+
+        Only the agent's owner may do this: workflows using the pool will run
+        on that agent's machine, with whatever it can reach. Private agents
+        may join; they stay private (nobody else can see or edit them).
+        """
+        return await core.join_runtime_pool(deps, pool_id, agent_id)
+
+    @tool
+    async def leave_runtime_pool(pool_id: str, agent_id: str) -> str:
+        """Take an agent out of a runtime pool (its owner, whoever may edit the pool, or the pool team's admins)."""
+        return await core.leave_runtime_pool(deps, pool_id, agent_id)
 
     # --- Data source tools ---
 
@@ -1562,6 +1623,8 @@ def build_default_workflow(
                       create_workflow, update_workflow, delete_workflow,
                       list_agents, get_agent, create_agent, update_agent, delete_agent,
                       list_agent_concurrency, update_runner_concurrency,
+                      list_runtime_pools, get_runtime_pool, create_runtime_pool, update_runtime_pool,
+                      delete_runtime_pool, join_runtime_pool, leave_runtime_pool,
                       list_datasources, get_datasource, create_datasource, update_datasource,
                       list_scripts, get_script, create_script, update_script, delete_script,
                       get_event,
