@@ -489,3 +489,190 @@ async def test_jobs_of_one_workflow_run_share_its_member(world, monkeypatch):
 async def test_root_run_id_survives_a_parent_cycle():
     from app.steps.acp_pool_executor import root_run_id
     assert await root_run_id(Runs({"x": "y", "y": "x"}), "x") in ("x", "y")
+
+
+# ─── waiting for a member ────────────────────────────────────────────────────
+
+class StateRepo:
+    """A run repository that records the step's state keys over time."""
+
+    def __init__(self) -> None:
+        from types import SimpleNamespace
+        self.run = SimpleNamespace(id="run-1", state={}, touch=lambda: None, parent_run_id=None)
+        self.seen: list[dict] = []
+
+    async def get(self, run_id):
+        return self.run
+
+    async def update(self, run):
+        self.seen.append(dict(run.state))
+
+
+@pytest.mark.asyncio
+async def test_assign_waits_without_limit_by_default(world):
+    import asyncio
+    (a,) = await _pool_of(world, "ann", online=False)
+
+    async def later():
+        await asyncio.sleep(0.2)   # far beyond the tests' usual wait_s
+        world.online(a.runner_id)
+
+    task = asyncio.create_task(later())
+    member, _ = await assign_member(
+        "eng", "run-1", pool_backend=world.pools_raw, agent_backend=world.agents_raw, hub=world.hub,
+        grace_s=0.01, wait_s=None,
+    )
+    await task
+    assert member.agent_id == a.id
+    # 0 means the same as None: no limit.
+    world.offline(a.runner_id)
+    task = asyncio.create_task(later())
+    member, _ = await assign_member(
+        "eng", "run-2", pool_backend=world.pools_raw, agent_backend=world.agents_raw, hub=world.hub,
+        grace_s=0.01, wait_s=0,
+    )
+    await task
+    assert member.agent_id == a.id
+
+
+@pytest.mark.asyncio
+async def test_configured_finite_wait_still_fails(world):
+    await _pool_of(world, "ann", online=False)
+    with pytest.raises(NoMemberAvailable):
+        await assign_member(
+            "eng", "run-1", pool_backend=world.pools_raw, agent_backend=world.agents_raw, hub=world.hub,
+            grace_s=0.01, wait_s=0.05,
+        )
+
+
+@pytest.mark.asyncio
+async def test_waiting_is_cancellable(world):
+    import asyncio
+    await _pool_of(world, "ann", online=False)
+    task = asyncio.create_task(assign_member(
+        "eng", "run-1", pool_backend=world.pools_raw, agent_backend=world.agents_raw, hub=world.hub,
+        grace_s=0.01, wait_s=None,
+    ))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_last_member_lost_waits_and_prefers_it_when_it_returns(world):
+    import asyncio
+    a, b = await _pool_of(world, "ann", "bob")
+    assert (await _assign(world, "run-1"))[0].agent_id == a.id
+    world.offline(a.runner_id)
+    world.offline(b.runner_id)
+
+    async def later():
+        await asyncio.sleep(0.05)
+        world.online(a.runner_id)     # the lost member comes back first
+        await asyncio.sleep(0.05)
+        world.online(b.runner_id)
+
+    task = asyncio.create_task(later())
+    member, assignment = await _assign(world, "run-1", failed=a.id, wait_s=None)
+    await task
+    assert member.agent_id == a.id
+    assert assignment.agent_id == a.id and assignment.previous == []
+
+
+@pytest.mark.asyncio
+async def test_last_member_lost_moves_to_whichever_returns_first(world):
+    import asyncio
+    a, b = await _pool_of(world, "ann", "bob")
+    await _assign(world, "run-1")
+    world.offline(a.runner_id)
+    world.offline(b.runner_id)
+
+    async def later():
+        await asyncio.sleep(0.05)
+        world.online(b.runner_id)
+
+    task = asyncio.create_task(later())
+    member, assignment = await _assign(world, "run-1", failed=a.id, wait_s=None)
+    await task
+    assert member.agent_id == b.id
+    assert assignment.previous == [a.id]
+
+
+@pytest.mark.asyncio
+async def test_pool_step_waits_for_a_member_then_runs_and_reports_the_wait(world, monkeypatch):
+    import asyncio
+    from app.steps import acp_executor
+    from app.steps.acp_pool_executor import run_pool_agent
+    (a,) = await _pool_of(world, "ann", online=False)
+    repo = StateRepo()
+    ran: list[str] = []
+
+    async def fake_run(**kw):
+        ran.append(kw["agent_def"].runner_id)
+        return {"result": "done"}
+
+    monkeypatch.setattr(acp_executor, "run_acp_agent", fake_run)
+
+    async def later():
+        await asyncio.sleep(0.1)
+        world.online(a.runner_id)
+
+    task = asyncio.create_task(later())
+    out = await run_pool_agent(agent_def=_pool_agent(), run_id="run-1", task_key="t", step={"id": "code"},
+                               settings=object(), runner_hub=world.hub, agent_backend=world.agents_raw,
+                               run_repository=repo)
+    await task
+    assert out == {"result": "done"} and ran == [a.runner_id]
+    waits = [s["_pool_wait_code"] for s in repo.seen if s.get("_pool_wait_code")]
+    assert waits and waits[0]["pool_id"] == "eng" and waits[0]["since"] and waits[0]["wait_s"] is None
+    assert "_pool_wait_code" not in repo.run.state     # cleared once a member was found
+    assert any("waiting for a member" in p for p in repo.run.state.get("_agent_progress_code", []))
+
+
+@pytest.mark.asyncio
+async def test_pool_step_last_member_lost_mid_step_waits_and_resumes_on_it(world, monkeypatch):
+    import asyncio
+    from app.steps import acp_executor
+    from app.steps.acp_pool_executor import run_pool_agent
+    (a,) = await _pool_of(world, "ann")
+    tasks = Tasks()
+    runners: list[str] = []
+
+    async def come_back():
+        await asyncio.sleep(0.1)
+        world.online(a.runner_id)
+
+    async def fake_run(**kw):
+        runners.append(kw["agent_def"].runner_id)
+        if len(runners) == 1:
+            world.offline(a.runner_id)
+            asyncio.get_running_loop().create_task(come_back())
+            raise RuntimeError("machine 'ann-laptop' is offline")
+        return {"result": "done"}
+
+    monkeypatch.setattr(acp_executor, "run_acp_agent", fake_run)
+    agent = _pool_agent()
+    agent.agent_input["pool_grace_s"] = 0.01
+    out = await run_pool_agent(agent_def=agent, run_id="run-1", task_key="t", step={"id": "code"},
+                               settings=object(), runner_hub=world.hub, agent_backend=world.agents_raw,
+                               agent_task_repository=tasks)
+    assert out == {"result": "done"}
+    assert runners == [a.runner_id, a.runner_id]
+
+
+@pytest.mark.asyncio
+async def test_pool_wait_limit_per_agent(world, monkeypatch):
+    from app.steps import acp_executor
+    from app.steps.acp_pool_executor import run_pool_agent
+    await _pool_of(world, "ann", online=False)
+
+    async def fake_run(**kw):
+        return {"result": "never"}
+
+    monkeypatch.setattr(acp_executor, "run_acp_agent", fake_run)
+    agent = _pool_agent()
+    agent.agent_input["pool_wait_s"] = 0.05
+    with pytest.raises(NoMemberAvailable):
+        await run_pool_agent(agent_def=agent, run_id="run-1", task_key="t", step={"id": "code"},
+                             settings=object(), runner_hub=world.hub, agent_backend=world.agents_raw)
