@@ -4,23 +4,16 @@ import hashlib
 import hmac
 from typing import Mapping
 
-# Where senders put an HMAC-SHA256 signature of the raw body, in the order
-# checked: carrier's own header, gbrain's webhook notification sink, Jira
-# system webhooks (and older GitHub-style senders), GitHub-style senders.
-SIGNATURE_HEADERS: tuple[str, ...] = (
-    "X-Webhook-Signature",
-    "X-Gbrain-Signature",
-    "X-Hub-Signature",
-    "X-Hub-Signature-256",
-)
+# Header carrying the signature unless the trigger names another
+# (``signature_header`` on the http step).
+DEFAULT_SIGNATURE_HEADER = "X-Webhook-Signature"
 
 
 def validate_webhook_signature(body: bytes, signature: str, secret: str) -> bool:
     """Verify HMAC-SHA256 signature for an incoming webhook request.
 
     The expected signature is HMAC-SHA256(key=secret, msg=body) as a hex digest,
-    bare or prefixed ``sha256=`` (gbrain, Jira, GitHub). Any other algorithm
-    prefix is refused. Uses hmac.compare_digest for timing-safe comparison.
+    bare or prefixed ``sha256=``. Any other algorithm prefix is refused. Uses hmac.compare_digest for timing-safe comparison.
     """
     signature = signature.strip()
     if "=" in signature:
@@ -31,13 +24,10 @@ def validate_webhook_signature(body: bytes, signature: str, secret: str) -> bool
     return hmac.compare_digest(computed, signature.strip().lower())
 
 
-def signatures_from(headers: Mapping[str, str]) -> list[str]:
-    """Every signature the request carries, from any of SIGNATURE_HEADERS."""
-    return [headers[h] for h in SIGNATURE_HEADERS if headers.get(h)]
-
-
-def valid_signature(body: bytes, headers: Mapping[str, str], secret: str) -> bool:
-    return any(validate_webhook_signature(body, sig, secret) for sig in signatures_from(headers))
+def valid_signature(body: bytes, headers: Mapping[str, str], secret: str, header: str | None = None) -> bool:
+    """Whether *header* (default DEFAULT_SIGNATURE_HEADER) signs *body* with *secret*."""
+    signature = headers.get(header or DEFAULT_SIGNATURE_HEADER) or ""
+    return bool(signature) and validate_webhook_signature(body, signature, secret)
 
 
 def valid_bearer(headers: Mapping[str, str], token: str) -> bool:

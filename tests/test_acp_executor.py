@@ -40,8 +40,6 @@ class FakeProxy:
         self.port = 0
         self.prompts = 0
         self.token = None
-        self.perm_command = "rm -rf /"
-        self.perm_kind: str | None = None
 
     async def start(self) -> None:
         self.server = await websockets.serve(self._handler, "127.0.0.1", 0, process_request=self._process, process_response=self._respond)
@@ -117,7 +115,7 @@ class FakeProxy:
             await self.emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "sess-1", "update": {
                 "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "bash ls", "kind": "execute", "status": "pending",
                 "rawInput": {"command": "ls"}}}})
-            perm = await self.ask_client(900, "session/request_permission", {"sessionId": "sess-1", "toolCall": {"toolCallId": "t1", "rawInput": {"command": self.perm_command}, **({"kind": self.perm_kind} if self.perm_kind else {})},
+            perm = await self.ask_client(900, "session/request_permission", {"sessionId": "sess-1", "toolCall": {"toolCallId": "t1", "rawInput": {"command": "rm -rf /"}},
                                                                                  "options": [{"optionId": "y", "kind": "allow_once"}, {"optionId": "n", "kind": "reject_once"}]})
             self.permission_answer = perm
             await self.emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "sess-1", "update": {
@@ -414,72 +412,26 @@ async def test_an_urgent_message_cancels_the_running_turn_and_takes_its_place():
     assert out["result"] == '{"summary": "switched approach"}'
 
 
-# ─── read-only agents ────────────────────────────────────────────────────────
-
-from app.steps.acp_executor import claude_code_options, read_only_denied  # noqa: E402
-
-
-def test_claude_code_options_for_read_only_agents():
-    assert claude_code_options({}) == {}
-    assert claude_code_options({"read_only": False}) == {}
-    rules = claude_code_options({"read_only": True})["disallowedTools"]
-    for tool in ("Edit", "Write", "MultiEdit", "NotebookEdit", "Bash(git push:*)", "Bash(git commit:*)",
-                 "Bash(gh pr merge:*)", "Bash(sed -i:*)"):
-        assert tool in rules
-    # Reading and testing stay possible.
-    assert not any(r.startswith(("Read", "Grep", "Glob", "Bash(pytest", "Bash(npm test", "Bash(git fetch")) for r in rules)
-    extra = claude_code_options({"disallowed_tools": ["WebFetch"]})["disallowedTools"]
-    assert extra == ["WebFetch"]
-
-
-@pytest.mark.parametrize("tool_call,denied", [
-    ({"kind": "edit", "rawInput": {"file_path": "a.py"}}, True),
-    ({"kind": "delete", "rawInput": {}}, True),
-    ({"kind": "move", "rawInput": {}}, True),
-    ({"rawInput": {"file_path": "/x/a.py", "content": "print(1)"}}, True),              # Write
-    ({"rawInput": {"file_path": "/x/a.py", "old_string": "a", "new_string": "b"}}, True),  # Edit
-    ({"kind": "execute", "rawInput": {"command": "git push origin ai/x"}}, True),
-    ({"kind": "execute", "rawInput": {"command": "cd repo && git commit -am wip"}}, True),
-    ({"kind": "execute", "rawInput": {"command": "gh pr merge 12 --squash"}}, True),
-    ({"kind": "execute", "rawInput": {"command": "sed -i s/a/b/ f.py"}}, True),
-    ({"kind": "read", "rawInput": {"file_path": "/x/a.py"}}, False),
-    ({"kind": "execute", "rawInput": {"command": "pytest -q tests"}}, False),
-    ({"kind": "execute", "rawInput": {"command": "git fetch origin && git checkout ai/x"}}, False),
-    ({"kind": "execute", "rawInput": {"command": "git diff origin/staging...ai/x"}}, False),
-    ({"kind": "execute", "rawInput": {"command": "npm run lint"}}, False),
-    ({"kind": "search", "rawInput": {"pattern": "commit"}}, False),
-])
-def test_read_only_denies_writes_only(tool_call, denied):
-    assert read_only_denied({"toolCall": tool_call}) is denied
-
-
 @pytest.mark.asyncio
-async def test_read_only_agent_gets_restrictions_and_writes_are_refused():
+async def test_claude_code_options_pass_through_untouched():
+    options = {"disallowedTools": ["Edit", "Bash(foo:*)"], "anything": {"nested": 1}}
+    agent = AgentDefinition(id="a", default_runtime="k8s", protocol="acp", acp_agent="claude",
+                            agent_input={"claude_code_options": options})
     proxy = FakeProxy()
-    proxy.perm_command = "git push origin ai/feature"   # not in blocked_commands; refused as a write
-    agent = AgentDefinition(id="rev", default_runtime="k8s", protocol="acp", acp_agent="claude",
-                            agent_input={"read_only": True})
     await proxy.start()
     try:
-        out, _, repo = await _run(proxy, agent=agent)
+        await _run(proxy, agent=agent)
     finally:
         await proxy.stop()
-    assert out["result"] == '{"summary": "done"}'
-    meta = proxy.session_new["_meta"]
-    assert "Edit" in meta["claudeCode"]["options"]["disallowedTools"]
-    assert "READ-ONLY" in meta["systemPrompt"]["append"] and "You are a coder." in meta["systemPrompt"]["append"]
-    assert proxy.permission_answer == {"outcome": {"outcome": "selected", "optionId": "n"}}
-    assert any("refused (read-only agent)" in p for p in repo.runs["run-1"].state["_agent_progress_code"])
+    assert proxy.session_new["_meta"]["claudeCode"] == {"options": options}
 
 
 @pytest.mark.asyncio
-async def test_writing_agent_is_unchanged():
+async def test_no_claude_code_options_no_meta():
     proxy = FakeProxy()
-    proxy.perm_command = "git push origin ai/feature"
     await proxy.start()
     try:
         await _run(proxy)
     finally:
         await proxy.stop()
     assert "claudeCode" not in proxy.session_new["_meta"]
-    assert proxy.permission_answer == {"outcome": {"outcome": "selected", "optionId": "y"}}
