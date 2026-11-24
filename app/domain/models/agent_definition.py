@@ -32,6 +32,10 @@ class AgentDefinition(GrantableResource):
     agent_input:
         All runtime configuration sent to the agent on every run.
         Typical keys: ``system_prompt``, ``model``, ``tools``, ``max_tokens``.
+        ACP agents also read ``read_only: true`` (no file edits, commits,
+        pushes or PR changes, enforced in the agent and in carrier; see
+        app.steps.acp_executor) and ``disallowed_tools`` (extra Claude Agent
+        SDK deny rules, e.g. ``"Bash(curl:*)"``).
         Populates ``AgentConfig`` fields and ``extra`` for every runtime.
     image:
         Docker image (docker runtime only — ``local`` runs the agent from
