@@ -20,6 +20,29 @@ from app.application.runtime_pools import DEFAULT_GRACE_S, DEFAULT_MEMBER_WAIT_S
 logger = logging.getLogger(__name__)
 
 
+async def root_run_id(run_repository: Any, run_id: str, max_depth: int = 10) -> str:
+    """The run a pool assignment belongs to: the outermost run *run_id* is part of.
+
+    A dynamic workflow runs each job as a child run, and a ``workflow`` step
+    runs its sub-workflow as one too; all of them are the same workflow run for
+    the pool, so they share its member.
+    """
+    current = run_id
+    if run_repository is None:
+        return current
+    for _ in range(max_depth):
+        try:
+            run = await run_repository.get(current)
+        except Exception:
+            logger.debug("could not load run %s", current, exc_info=True)
+            return current
+        parent = getattr(run, "parent_run_id", None) if run is not None else None
+        if not parent or parent == current:
+            return current
+        current = parent
+    return current
+
+
 def member_agent_def(agent_def: Any, member: Any, grace_s: float) -> Any:
     """*agent_def* as a runner agent on *member*'s machine."""
     agent_input = dict(agent_def.agent_input or {})
@@ -54,11 +77,14 @@ async def run_pool_agent(*, agent_def: Any, run_id: str, task_key: str, step: di
         sink.add(f"waiting for a member of runtime pool '{pool.name or pool.id}' to come online")
         await sink.flush()
 
+    # Jobs of a dynamic workflow and sub-workflow runs keep the member of the
+    # workflow run they belong to.
+    sticky_run = await root_run_id(run_repository, run_id)
     failed: str | None = None
     tried: set[str] = set()
     while True:
         member, _ = await assign_member(
-            agent_def.pool_id, run_id,
+            agent_def.pool_id, sticky_run,
             pool_backend=hub.pool_backend, agent_backend=agent_backend, hub=hub,
             failed=failed, exclude=tried, grace_s=grace_s, wait_s=wait_s, on_wait=on_wait,
         )
