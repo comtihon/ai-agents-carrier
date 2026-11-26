@@ -6,9 +6,19 @@ from typing import Any
 
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorCollection
 from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 from app.core.config import Settings
 from app.domain.models.graph_run import GraphRun
+
+
+class DuplicateTriggerError(Exception):
+    """A run for this workflow was already started by the same Pub/Sub message."""
+
+    def __init__(self, graph_id: str, trigger_message_id: str) -> None:
+        super().__init__(f"workflow '{graph_id}' already has a run for message {trigger_message_id}")
+        self.graph_id = graph_id
+        self.trigger_message_id = trigger_message_id
 
 
 # Fields the run list never draws. This is where the weight sits: step_inputs
@@ -54,10 +64,28 @@ class MongoGraphRunRepository:
         await self._collection.create_index([("created_at", -1)])
         await self._collection.create_index([("graph_id", 1), ("created_at", -1)])
         await self._collection.create_index([("status", 1), ("created_at", -1)])
+        # One run per Pub/Sub message and workflow: Pub/Sub delivers at least
+        # once, and a redelivery must not start the run again.
+        await self._collection.create_index(
+            [("graph_id", 1), ("trigger_message_id", 1)],
+            name="uniq_graph_trigger_message",
+            unique=True,
+            partialFilterExpression={"trigger_message_id": {"$type": "string"}},
+        )
 
     async def create(self, run: GraphRun) -> None:
+        """Insert a new run.
+
+        Raises ``DuplicateTriggerError`` when the run carries a
+        ``trigger_message_id`` that already started a run of the same workflow.
+        """
         run.touch()
-        await self._collection.insert_one(self._to_doc(run))
+        try:
+            await self._collection.insert_one(self._to_doc(run))
+        except DuplicateKeyError as exc:
+            if run.trigger_message_id:
+                raise DuplicateTriggerError(run.graph_id, run.trigger_message_id) from exc
+            raise
 
     async def update(self, run: GraphRun) -> None:
         run.touch()
