@@ -296,6 +296,13 @@ async def run_acp_agent(
     reject_kinds = [str(k) for k in _agent_input.get("reject_tool_kinds") or [] if k]
     session_mode = _agent_input.get("acp_session_mode")
     session_mode = str(session_mode) if session_mode else None
+    #   acp_config_options     — {configId: value}, each set with
+    #                            session/set_config_option on every new or loaded
+    #                            session, e.g. {"model": "gpt-6-luna",
+    #                            "reasoning_effort": "low"} for codex-acp.
+    config_options = {
+        str(k): v for k, v in (_agent_input.get("acp_config_options") or {}).items() if k and v is not None
+    }
     prompt_carries_system = bool(_agent_input.get("system_prompt_in_prompt"))
     # While session/load replays the conversation, its updates are history.
     loading = False
@@ -595,6 +602,33 @@ async def run_acp_agent(
         finally:
             loading = False
         await apply_session_mode()
+        # A reloaded session is mid-task: a refused option must not end it.
+        await apply_config_options(strict=False)
+
+    async def apply_config_options(*, strict: bool) -> None:
+        """Set the agent's configured session options (agent_input.acp_config_options).
+
+        strict (a new session, before its first prompt): a refused option fails
+        the step. Otherwise (a reloaded session that is already working) it is
+        logged and the session continues as it was.
+        """
+        assert conn is not None
+        for config_id, value in config_options.items():
+            try:
+                await conn.request(
+                    "session/set_config_option",
+                    {"sessionId": session_id, "configId": config_id, "value": value},
+                    timeout=120,
+                )
+            except Exception as exc:
+                msg = (
+                    f"[step '{step_id}'] the agent refused session option {config_id}={value!r} "
+                    f"(agent_input.acp_config_options): {exc}"
+                )
+                if strict:
+                    raise RuntimeError(msg) from exc
+                logger.warning("%s; continuing the reloaded session unchanged", msg)
+                sink.add(f"session option {config_id}={value!r} not applied: {exc}")
 
     async def apply_session_mode() -> None:
         """Put the session in the agent's configured mode (fails closed)."""
@@ -661,6 +695,7 @@ async def run_acp_agent(
             }, timeout=900)
             session_id = new["sessionId"]
             await apply_session_mode()
+            await apply_config_options(strict=True)
             if agent_task_repository is not None:
                 await agent_task_repository.save_task({
                     "_id": task_key, "run_id": run_id, "step_id": step_id, "status": "working",
