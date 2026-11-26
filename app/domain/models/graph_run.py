@@ -62,6 +62,10 @@ class GraphRun(BaseModel):
     # means "resumed N times on startup and the server died each time before
     # the run made any progress" — see ApplicationContainer._recover_incomplete_runs.
     recovery_attempts: int = 0
+    # "<topic>/<message id>" of the Pub/Sub message that started this run.
+    # Unique per workflow (Mongo index), so a redelivered message cannot
+    # start the same run twice.
+    trigger_message_id: str | None = None
     last_recovery_at: datetime | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

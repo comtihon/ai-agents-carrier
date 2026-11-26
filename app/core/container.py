@@ -26,7 +26,7 @@ from app.infrastructure.config.graph_loader import (
 from app.infrastructure.integrations.openhands import OpenHandsAdapter
 from app.infrastructure.orchestration.checkpointer import MongoDBCheckpointSaver
 from app.infrastructure.orchestration.yaml_graph import YamlGraphRunner, stream_graph_to_pause
-from app.infrastructure.persistence.mongo import MongoClientProvider, MongoGraphRunRepository, MongoPvcLeaseRepository, MongoAgentTaskRepository, MongoWarmPodRepository
+from app.infrastructure.persistence.mongo import DuplicateTriggerError, MongoClientProvider, MongoGraphRunRepository, MongoPvcLeaseRepository, MongoAgentTaskRepository, MongoWarmPodRepository
 from app.application.visibility import ReferenceGuard, RunnerLookup, VisibilityScopedBackend, unwrap
 from app.infrastructure.persistence.login_script_store import (
     LoginScriptStore,
@@ -145,6 +145,9 @@ class ApplicationContainer:
     # Runners keyed by run_id — alive for the duration of the run so that
     # approval-resume uses the exact definition snapshot from run start.
     live_runners: dict[str, YamlGraphRunner] = field(default_factory=dict)
+    # Event-triggered runs executing in the background. Held so the tasks are
+    # not garbage-collected mid-run; each removes itself when done.
+    background_runs: set[asyncio.Task] = field(default_factory=set)
     cron_scheduler: CronScheduler = field(default_factory=CronScheduler)
     # Built in startup() when PUBSUB_ENABLED — None means pubsub triggers are
     # parsed and stored but nothing subscribes to them.
@@ -620,7 +623,21 @@ class ApplicationContainer:
         logger.info("Event '%s' created for topic %s", event_id, spec.topic)
 
     def _make_pubsub_job(self, workflow_id: str, step: dict):
-        """Build the event callback that starts a run for one pubsub step."""
+        """Build the event callback that starts a run for one pubsub step.
+
+        The callback returns as soon as the run is saved, and the subscriber
+        acks the message then; the run itself executes in a background task.
+        Holding the message for the whole run (minutes to hours for agent
+        steps) meant every carrier restart, and every run longer than the
+        client's lease limit, redelivered it and started the run a second time
+        next to the one startup recovery resumed. The saved run carries the
+        trigger payload, so recovery can restart it from the first step.
+
+        A message that already started a run of this workflow (same topic and
+        message id, enforced by a unique index) is acked without a new run.
+        If saving the run fails for any other reason the error propagates and
+        the message is nacked for redelivery.
+        """
         step_id = step["id"]
         request_template = step.get("request_template", "")
 
@@ -665,40 +682,66 @@ class ApplicationContainer:
                 except WorkflowDisabledError as exc:
                     logger.info("Pub/Sub trigger skipped: %s", exc.detail)
                     return
+            except Exception:
+                logger.exception("Pub/Sub job: preparing workflow '%s' failed", workflow_id)
+                return
 
-                thread_id = str(uuid4())
-                self.live_runners[thread_id] = runner
-
-                run = GraphRun(
-                    id=thread_id,
-                    graph_id=workflow_id,
-                    user_request=request,
-                    status="running",
-                    workflow_definition=definition_snapshot,
-                )
+            thread_id = str(uuid4())
+            trigger_info = {**meta, "triggered_at": now.isoformat(), "step_id": step_id}
+            initial_state = {
+                "request": request,
+                "trigger_payload": payload,
+                "trigger_info": trigger_info,
+            }
+            message_id = str(meta.get("message_id") or "")
+            run = GraphRun(
+                id=thread_id,
+                graph_id=workflow_id,
+                user_request=request,
+                status="running",
+                workflow_definition=definition_snapshot,
+                # Saved with the run so startup recovery can restart it from
+                # the first step once the message is acked.
+                state={"trigger_payload": payload, "trigger_info": trigger_info},
+                step_statuses={s["id"]: "pending" for s in runner.steps},
+                trigger_message_id=f"{meta.get('topic') or ''}/{message_id}" if message_id else None,
+            )
+            try:
                 await self.run_repository.create(run)
-                run.step_statuses = {s["id"]: "pending" for s in runner.steps}
-
-                trigger_info = {**meta, "triggered_at": now.isoformat(), "step_id": step_id}
-                initial_state = {
-                    "request": request,
-                    "trigger_payload": payload,
-                    "trigger_info": trigger_info,
-                }
-                logger.info(
-                    "Pub/Sub trigger started run %s for workflow '%s' (message %s)",
-                    thread_id, workflow_id, meta.get("message_id", "?"),
+            except DuplicateTriggerError:
+                logger.warning(
+                    "Pub/Sub message %s redelivered: workflow '%s' already has a run for it; not starting another",
+                    message_id, workflow_id,
                 )
+                return
+
+            self.live_runners[thread_id] = runner
+            logger.info(
+                "Pub/Sub trigger started run %s for workflow '%s' (message %s)",
+                thread_id, workflow_id, message_id or "?",
+            )
+            self._start_background_run(runner, run, initial_state)
+
+        return job
+
+    def _start_background_run(self, runner: YamlGraphRunner, run: GraphRun, initial_state: dict) -> asyncio.Task:
+        """Execute a saved run in a background task, kept alive in ``background_runs``."""
+
+        async def drive() -> None:
+            try:
                 await stream_graph_to_pause(
                     runner, run, self.run_repository, initial_state, base_url=self.settings.base_url,
                 )
-
-                if run.status in ("completed", "failed", "cancelled", "rejected"):
-                    self.live_runners.pop(thread_id, None)
             except Exception:
-                logger.exception("Pub/Sub job execution failed for workflow '%s'", workflow_id)
+                logger.exception("run %s (workflow '%s'): execution failed", run.id, run.graph_id)
+            finally:
+                if run.status in ("completed", "failed", "cancelled", "rejected"):
+                    self.live_runners.pop(run.id, None)
 
-        return job
+        task = asyncio.create_task(drive(), name=f"run-{run.id}")
+        self.background_runs.add(task)
+        task.add_done_callback(self.background_runs.discard)
+        return task
 
     def _make_cron_job(self, workflow_id: str, request_template: str):
         async def job() -> None:
@@ -931,6 +974,13 @@ class ApplicationContainer:
         if run.state and isinstance(run.state, dict):
             for k, v in run.state.items():
                 if k.startswith("_") and v is not None:
+                    accumulated.setdefault(k, v)
+            # Event-triggered runs are saved with their trigger before the
+            # Pub/Sub message is acked, so a run that died before its first
+            # step finished still has the event to start over from.
+            for k in ("trigger_payload", "trigger_info"):
+                v = run.state.get(k)
+                if isinstance(v, dict) and not v.get("__ref__"):
                     accumulated.setdefault(k, v)
 
         config = {"configurable": {"thread_id": run.id}}
