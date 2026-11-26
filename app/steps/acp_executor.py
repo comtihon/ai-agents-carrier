@@ -214,6 +214,17 @@ class _ProgressSink:
             except Exception:
                 logger.debug("progress flush failed for run %s", self.run_id, exc_info=True)
 
+    async def reset_recovery_attempts(self) -> None:
+        """The run reached a point it can safely wait at (a concurrency queue, a slot): a startup recovery
+        that got here did not take the server down, so it must not count towards the crash-loop guard."""
+        reset = getattr(self.repo, "reset_recovery_attempts", None)
+        if reset is None:
+            return
+        try:
+            await reset(self.run_id)
+        except Exception:
+            logger.debug("recovery_attempts reset failed for run %s", self.run_id, exc_info=True)
+
     async def set_state(self, key: str, value: Any) -> None:
         """Set (None: remove) one key of run.state right away."""
         if self.repo is None:

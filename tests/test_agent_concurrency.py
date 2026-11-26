@@ -435,3 +435,46 @@ async def test_mcp_tools_set_and_show_concurrency():
     listed = json.loads(await core.list_agent_concurrency(deps))
     assert listed[0]["key"] == "runner:r1:claude" and listed[0]["limit"] == 1
     assert "no concurrency cap" in await core.update_runner_concurrency(deps, "r1", "claude", 0)
+
+
+# ─── startup-recovery crash-loop guard vs. queued runs ───────────────────────
+
+
+async def test_queued_run_resets_its_recovery_counter():
+    """A recovered run that re-enters the queue survived the recovery: not a crash loop (prod: agentic-mf runs
+    queued behind a one-slot runner were quarantined after three ordinary restarts and the workflow disabled)."""
+    from app.application.concurrency import queue_reporter
+    from app.domain.models.graph_run import GraphRun
+    from app.steps.acp_executor import _ProgressSink
+    from tests.test_recovery_crash_loop_guard import _FakeRunRepository
+
+    run = GraphRun(id="r-queued", graph_id="wf", user_request="x", status="running", recovery_attempts=2)
+    repo = _FakeRunRepository([run])
+    b = InMemoryConcurrencyBackend()
+    holder = _slot(b, "holder")
+    await holder.acquire()
+
+    sink = _ProgressSink(repo, "r-queued", "model")
+    on_wait, on_acquired = queue_reporter(sink, "model", "agent:x", 1, "a")
+    waiter = _slot(b, "r-queued", on_wait=on_wait, on_acquired=on_acquired)
+    task = asyncio.ensure_future(waiter.acquire())
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    assert repo.docs["r-queued"].recovery_attempts == 0
+    assert repo.docs["r-queued"].state["_queue_wait_model"]["position"] == 1
+
+    # Recovered again while holding its slot (re-attached turn): getting the slot back resets it too.
+    repo.docs["r-queued"].recovery_attempts = 2
+    await holder.release()
+    await asyncio.wait_for(task, 1)
+    assert waiter.held and repo.docs["r-queued"].recovery_attempts == 0
+    await waiter.release()
+
+
+async def test_queue_reporter_tolerates_a_sink_without_reset():
+    from app.application.concurrency import queue_reporter
+
+    sink = SimpleNamespace(add=lambda line: None, flush=AsyncMock(), set_state=AsyncMock())
+    on_wait, on_acquired = queue_reporter(sink, "s", "agent:x", 1, "a")
+    await on_wait(1, 1)
+    await on_acquired(True)

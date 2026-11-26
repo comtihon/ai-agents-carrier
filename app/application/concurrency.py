@@ -285,8 +285,17 @@ def queue_reporter(sink: Any, step_id: str, key: str, limit: int | None, agent_i
     state_key = f"_queue_wait_{step_id}"
     since: list[str] = []
 
+    async def alive() -> None:
+        # Waiting in the queue (or holding the slot again) after a restart is not a crash loop: reset the run's
+        # startup-recovery counter, or a run queued behind a long holder is quarantined (and its workflow
+        # disabled) after run_recovery_max_attempts ordinary restarts.
+        reset = getattr(sink, "reset_recovery_attempts", None)
+        if reset is not None:
+            await reset()
+
     async def on_wait(position: int, holders: int) -> None:
-        if not since:
+        first = not since
+        if first:
             since.append(_utcnow().isoformat())
             sink.add(f"⏳ queued for {key} (position {position}, limit {limit})")
             await sink.flush()
@@ -294,11 +303,14 @@ def queue_reporter(sink: Any, step_id: str, key: str, limit: int | None, agent_i
             "key": key, "limit": limit, "position": position, "holders": holders,
             "since": since[0], "agent_id": agent_id,
         })
+        if first:
+            await alive()
 
     async def on_acquired(waited: bool) -> None:
         if waited:
             await sink.set_state(state_key, None)
             sink.add("▶ slot acquired")
+        await alive()
 
     return on_wait, on_acquired
 
