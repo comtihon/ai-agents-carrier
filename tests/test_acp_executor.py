@@ -45,6 +45,8 @@ class FakeProxy:
         self.prompt_texts: list[str] = []
         self.modes: list[dict] = []
         self.fail_set_mode = False
+        self.config_options: list[dict] = []
+        self.fail_config_option = False
 
     async def start(self) -> None:
         self.server = await websockets.serve(self._handler, "127.0.0.1", 0, process_request=self._process, process_response=self._respond)
@@ -116,6 +118,12 @@ class FakeProxy:
                 await self.emit({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "unknown mode"}})
             else:
                 await reply({})
+        elif m == "session/set_config_option":
+            self.config_options.append(p)
+            if self.fail_config_option:
+                await self.emit({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "Invalid params"}})
+            else:
+                await reply({"configOptions": []})
         elif m == "session/prompt":
             self.prompt_texts.append("".join(b.get("text", "") for b in p.get("prompt") or []))
             self.prompts += 1
@@ -497,6 +505,46 @@ async def test_unknown_session_mode_fails_the_step():
     try:
         with pytest.raises(RuntimeError, match="could not be put in mode 'nope'"):
             await _run(proxy, agent=_opt_agent(acp_session_mode="nope"))
+    finally:
+        await proxy.stop()
+    assert proxy.prompts == 0
+
+
+@pytest.mark.asyncio
+async def test_config_options_are_set_on_the_new_session_before_the_prompt():
+    proxy = FakeProxy()
+    await proxy.start()
+    try:
+        await _run(proxy, agent=_opt_agent(acp_config_options={"model": "gpt-6-luna", "reasoning_effort": "low"}))
+    finally:
+        await proxy.stop()
+    assert proxy.config_options == [
+        {"sessionId": "sess-1", "configId": "model", "value": "gpt-6-luna"},
+        {"sessionId": "sess-1", "configId": "reasoning_effort", "value": "low"},
+    ]
+    methods = [m.get("method") for m in proxy.received if m.get("method")]
+    assert methods.index("session/set_config_option") < methods.index("session/prompt")
+
+
+@pytest.mark.asyncio
+async def test_no_config_options_configured_none_sent():
+    proxy = FakeProxy()
+    await proxy.start()
+    try:
+        await _run(proxy)
+    finally:
+        await proxy.stop()
+    assert proxy.config_options == []
+
+
+@pytest.mark.asyncio
+async def test_refused_config_option_on_a_new_session_fails_the_step_before_any_prompt():
+    proxy = FakeProxy()
+    proxy.fail_config_option = True
+    await proxy.start()
+    try:
+        with pytest.raises(RuntimeError, match="refused session option model='nope'"):
+            await _run(proxy, agent=_opt_agent(acp_config_options={"model": "nope"}))
     finally:
         await proxy.stop()
     assert proxy.prompts == 0

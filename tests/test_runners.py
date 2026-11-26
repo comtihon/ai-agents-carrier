@@ -257,6 +257,7 @@ class FakeRunner:
         self.control = None
         self.task: asyncio.Task | None = None
         self.forget_after_limit = False
+        self.refuse_config_on_load = False
         self.upload_result: dict = {"event": "uploaded", "bytes": 10}
 
     async def start(self) -> None:
@@ -332,6 +333,11 @@ class FakeRunner:
         elif m == "session/load":
             await self.emit(cid, _chunk("HISTORY "))
             await reply({})
+        elif m == "session/set_config_option":
+            if self.refuse_config_on_load and any(c == "session/load" for c, _ in self.calls):
+                await self.emit(cid, {"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "Invalid params"}})
+            else:
+                await reply({"configOptions": []})
         elif m == "session/prompt":
             self.prompts.append(p)
             step = self.script.pop(0) if self.script else "ok"
@@ -382,11 +388,12 @@ SETTINGS = SimpleNamespace(acp_runner_wait_s=5, acp_quota_max_wait_s=86400, acp_
 
 async def _step(
     runs: Runs | None = None, tasks: Tasks | None = None, acp_agent: str | None = "codex",
-    agent_config: dict | None = None, settings: Any = SETTINGS,
+    agent_config: dict | None = None, settings: Any = SETTINGS, agent_input: dict | None = None,
 ) -> dict:
     return await run_acp_agent(
         step={"id": "code"},
-        agent_def=AgentDefinition(id="laptop-codex", default_runtime="runner", runner_id="rnr-1", protocol="acp", acp_agent=acp_agent),
+        agent_def=AgentDefinition(id="laptop-codex", default_runtime="runner", runner_id="rnr-1", protocol="acp", acp_agent=acp_agent,
+                                  agent_input=agent_input or {}),
         input_data={"task": "fix it"},
         agent_config=agent_config or {"env_vars": {"SECRET": "x"}, "system_prompt": "be good"},
         runtime=None,
@@ -644,6 +651,31 @@ async def test_usage_limit_reloads_the_session_when_the_connection_is_gone(serve
         assert load["sessionId"] == "s1"
         assert fake.prompts[-1]["prompt"][0]["text"] == CONTINUE_PROMPT
         assert "HISTORY" not in out["result"]
+    finally:
+        await fake.stop()
+
+
+async def test_config_options_are_reapplied_on_reload_and_a_refusal_does_not_end_the_session(server, monkeypatch):
+    """A reloaded session is mid-task: a refused option is logged, the work goes on."""
+    _, token = await _runner(server)
+
+    async def slow_sleep(seconds: float) -> None:
+        await asyncio.sleep(2.5)
+
+    monkeypatch.setattr(acp_executor, "_sleep", slow_sleep)
+    fake = FakeRunner(server, token, ["limit", "ok"])
+    fake.forget_after_limit = True
+    fake.refuse_config_on_load = True
+    await fake.start()
+    try:
+        out = await _step(agent_input={"acp_config_options": {"model": "gpt-6-luna"}})
+        assert out["result"] == '{"summary": "done"}'
+        methods = [m for m, _ in fake.calls]
+        sets = [i for i, m in enumerate(methods) if m == "session/set_config_option"]
+        assert len(sets) == 2  # new session, then the reloaded one
+        assert methods.index("session/new") < sets[0] < methods.index("session/prompt")
+        assert methods.index("session/load") < sets[1]
+        assert fake.prompts[-1]["prompt"][0]["text"] == CONTINUE_PROMPT
     finally:
         await fake.stop()
 

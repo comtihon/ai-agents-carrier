@@ -37,7 +37,11 @@ class AgentDefinition(GrantableResource):
         as ``disallowedTools``), on session/new and session/load.
         Further ACP options, generic across adapters: ``acp_session_mode``
         (set with ``session/set_mode`` on every new or loaded session; the
-        step fails if the adapter refuses it), ``system_prompt_in_prompt``
+        step fails if the adapter refuses it), ``acp_config_options``
+        ({configId: value}, each set with ``session/set_config_option`` on every
+        new or loaded session, e.g. ``{"model": "gpt-6-luna"}`` for codex-acp;
+        refused on a new session the step fails before its first prompt, on a
+        reloaded one it is logged and the session continues), ``system_prompt_in_prompt``
         (also send the system prompt at the top of the first prompt, for
         adapters without a system-prompt slot), ``reject_tool_kinds`` (ACP
         tool kinds whose permission requests are rejected) and
