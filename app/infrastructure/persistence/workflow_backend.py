@@ -74,6 +74,9 @@ class LocalFilesWorkflowBackend(WorkflowDefinitionBackend):
                 enabled=raw.get("enabled", True),
                 use_meta_llm=raw.get("use_meta_llm", True),
                 brain_access=normalize_brain_access(raw.get("brain_access")),
+                brain_write_prefixes=[
+                    str(p) for p in (raw.get("brain_write_prefixes") or []) if p
+                ],
                 visibility=raw.get("visibility", "public"),
                 owner_id=raw.get("owner_id"),
                 owner_name=raw.get("owner_name"),
@@ -131,6 +134,8 @@ class LocalFilesWorkflowBackend(WorkflowDefinitionBackend):
         data["use_meta_llm"] = definition.use_meta_llm
         if definition.brain_access != "none":
             data["brain_access"] = definition.brain_access
+        if definition.brain_write_prefixes:
+            data["brain_write_prefixes"] = list(definition.brain_write_prefixes)
         data["enabled"] = definition.enabled
         if definition.visibility != "public" or definition.owner_id:
             data["visibility"] = definition.visibility

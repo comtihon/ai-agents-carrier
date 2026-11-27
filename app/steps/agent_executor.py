@@ -178,6 +178,7 @@ def _build_agent_config(
     datasource_grants: dict[str, list[str]] | None = None,
     workflow_id: str | None = None,
     workflow_brain_access: str | None = None,
+    workflow_brain_write_prefixes: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build the ``agent_config`` payload to forward in ``POST /start``.
 
@@ -407,6 +408,7 @@ def _build_agent_config(
     brain_entry, brain_prompt = _brain_mcp_entry(
         agent_def, settings, run_id=run_id, workflow_id=workflow_id,
         workflow_brain_access=workflow_brain_access,
+        workflow_brain_write_prefixes=workflow_brain_write_prefixes,
     )
     if brain_entry is not None:
         mcp_servers.append(brain_entry)
@@ -519,6 +521,7 @@ def _brain_mcp_entry(
     run_id: str | None,
     workflow_id: str | None,
     workflow_brain_access: str | None,
+    workflow_brain_write_prefixes: list[str] | None = None,
 ) -> tuple[dict[str, Any] | None, str]:
     """The ``brain`` MCP entry and its prompt section, or ``(None, "")``.
 
@@ -542,7 +545,28 @@ def _brain_mcp_entry(
         )
         return None, ""
 
+    from app.core.config import normalize_brain_write_prefix
     from app.infrastructure.auth.brain_grant import BrainGrant, mint_brain_grant
+
+    # Extra write prefixes: what the workflow asks for, bounded by the
+    # operator allowlist. Read-only grants never carry any.
+    write_prefixes: list[str] = []
+    if access == "write" and workflow_brain_write_prefixes:
+        allowed = set(settings.gbrain_write_prefixes_allowed or [])
+        dropped: list[str] = []
+        for requested in workflow_brain_write_prefixes:
+            normalized = normalize_brain_write_prefix(requested)
+            if normalized is not None and normalized in allowed:
+                if normalized not in write_prefixes:
+                    write_prefixes.append(normalized)
+            else:
+                dropped.append(str(requested))
+        if dropped:
+            logger.warning(
+                "agent '%s' (run '%s', workflow '%s'): brain write prefixes %s "
+                "are not in GBRAIN_WRITE_PREFIXES_ALLOWED — dropped",
+                agent_def.id, run_id or "-", workflow_id or "-", dropped,
+            )
 
     token = mint_brain_grant(
         BrainGrant(
@@ -550,6 +574,7 @@ def _brain_mcp_entry(
             agent_id=agent_def.id,
             workflow_id=workflow_id or "",
             access=access,
+            write_prefixes=write_prefixes,
         ),
         settings.resolved_brain_grant_signing_key(),
         ttl_seconds=settings.brain_grant_ttl_seconds,
@@ -557,8 +582,10 @@ def _brain_mcp_entry(
     if not token:
         return None, ""
     logger.info(
-        "agent '%s' (run '%s', workflow '%s') granted shared memory access '%s'",
+        "agent '%s' (run '%s', workflow '%s') granted shared memory access '%s'"
+        " (extra write prefixes: %s)",
         agent_def.id, run_id or "-", workflow_id or "-", access,
+        ", ".join(write_prefixes) or "none",
     )
     namespace = (settings.gbrain_write_namespace or "carrier").strip("/") or "carrier"
     lines = [
@@ -582,6 +609,15 @@ def _brain_mcp_entry(
             "reusable, verified knowledge. Never write secrets, credentials, "
             "tokens or customer personal data (PII).",
         ]
+        if write_prefixes:
+            prefix_list = ", ".join(f"`{p}`" for p in write_prefixes)
+            lines += [
+                "",
+                f"This workflow also lets you write pages under {prefix_list}: "
+                "a `brain_put_page` slug starting with one of these prefixes is "
+                f"written at exactly the slug you give (not under `{namespace}/`). "
+                "Any other slug still goes under the namespace.",
+            ]
     return {
         "name": BRAIN_MCP_NAME,
         "transport": "streamable_http",
@@ -765,6 +801,7 @@ async def execute_agent_step(
     datasource_grants: dict[str, list[str]] | None = None,
     workflow_id: str | None = None,
     workflow_brain_access: str | None = None,
+    workflow_brain_write_prefixes: list[str] | None = None,
 ) -> dict[str, Any]:
     """Execute a ``langgraph-agent`` or ``claude-agent`` step.
 
@@ -804,6 +841,10 @@ async def execute_agent_step(
         The running workflow and its ``brain_access`` level. The agent's shared
         memory access is the lower of this and the agent's own level; ``None``
         counts as ``"none"`` (fail closed).
+    workflow_brain_write_prefixes:
+        The workflow's ``brain_write_prefixes``: extra gbrain slug prefixes its
+        agents may write under. Only those in ``GBRAIN_WRITE_PREFIXES_ALLOWED``
+        reach a ``write`` grant.
 
     Returns
     -------
@@ -886,6 +927,7 @@ async def execute_agent_step(
     agent_config_payload = _build_agent_config(
         agent_def, settings, step=step, run_id=run_id, state=state, datasource_grants=datasource_grants,
         workflow_id=workflow_id, workflow_brain_access=workflow_brain_access,
+        workflow_brain_write_prefixes=workflow_brain_write_prefixes,
     )
     resolved_env_vars: dict[str, str] = agent_config_payload.get("env_vars") or {}
 

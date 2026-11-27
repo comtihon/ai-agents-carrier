@@ -1245,6 +1245,11 @@ class YamlGraphRunner:
         # Ceiling on agent steps' shared memory access; unknown/missing = none.
         from app.domain.models.brain_access import normalize_brain_access
         self._brain_access: str = normalize_brain_access(definition.get("brain_access"))
+        # Extra gbrain write prefixes requested by the workflow; intersected
+        # with the operator allowlist when the agent's grant is minted.
+        self._brain_write_prefixes: list[str] = [
+            str(p) for p in (definition.get("brain_write_prefixes") or []) if p
+        ]
         self.readonly: bool = False  # Set post-construction by build_registry_from_definitions
         # A disabled workflow starts no runs; see app.application.run_control.
         # Read off the definition (not post-construction like readonly) so runners
@@ -1917,6 +1922,7 @@ class YamlGraphRunner:
         graph_id = self.id
         use_meta_llm = self._use_meta_llm
         brain_access = self._brain_access
+        brain_write_prefixes = self._brain_write_prefixes
 
         async def node(state: dict) -> dict:
             step_id = step["id"]
@@ -1952,6 +1958,7 @@ class YamlGraphRunner:
                     use_meta_llm=use_meta_llm,
                     workflow_id=graph_id,
                     workflow_brain_access=brain_access,
+                    workflow_brain_write_prefixes=brain_write_prefixes,
                 )
             except Exception as _step_exc:
                 from app.steps.agent_executor import MetaLLMRejectionError

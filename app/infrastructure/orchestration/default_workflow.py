@@ -320,6 +320,7 @@ def build_default_workflow(
         workflow_id: str, name: str, description: str, steps_json: str,
         use_storage: bool = False, enabled: bool = True, use_meta_llm: bool = True,
         brain_access: str = "none",
+        brain_write_prefixes: list[str] | str | None = None,
     ) -> str:
         """Create a new workflow definition and register it immediately.
 
@@ -401,6 +402,11 @@ def build_default_workflow(
                 workflow's agent steps: "none" (default), "read" or "write".
                 Each agent step gets the lower of this and the agent's own
                 brain_access.
+            brain_write_prefixes: Extra gbrain slug prefixes this workflow's
+                agents may write under besides the carrier namespace, as a list
+                or comma-separated string (e.g. "kb/initiatives/"). Only
+                prefixes in the operator allowlist GBRAIN_WRITE_PREFIXES_ALLOWED
+                take effect; needs brain_access "write" (workflow and agent).
             enabled: Pass False to create the workflow already disabled. A
                 workflow carrying a `cron` or `pubsub` trigger is eligible to fire
                 as soon as it is registered, so one that is not ready yet must be
@@ -418,7 +424,7 @@ def build_default_workflow(
         return await core.create_workflow(
             deps, workflow_id, name, description, steps_json,
             use_storage=use_storage, enabled=enabled, use_meta_llm=use_meta_llm,
-            brain_access=brain_access,
+            brain_access=brain_access, brain_write_prefixes=brain_write_prefixes,
         )
 
     @tool
@@ -432,6 +438,7 @@ def build_default_workflow(
         use_meta_llm: bool | None = None,
         relayout: bool = False,
         brain_access: str | None = None,
+        brain_write_prefixes: list[str] | str | None = None,
     ) -> str:
         """Update an existing workflow definition (name, description, steps, enabled).
 
@@ -453,6 +460,11 @@ def build_default_workflow(
             use_meta_llm: Turn the meta-LLM on or off. Omit to keep current.
             brain_access: Shared company memory ceiling ("none" | "read" |
                 "write") for the agent steps. Omit to keep current.
+            brain_write_prefixes: Extra gbrain slug prefixes this workflow's
+                agents may write under besides the carrier namespace, as a list
+                or comma-separated string (e.g. "kb/initiatives/"). Only
+                prefixes in the operator allowlist GBRAIN_WRITE_PREFIXES_ALLOWED
+                take effect; needs brain_access "write". Omit to keep current; [] or "" clears.
             relayout: Recompute every canvas position from the graph. Off by
                 default, because a stored position may be where a person dragged
                 the node on the canvas and replacing their arrangement is not an
@@ -468,6 +480,7 @@ def build_default_workflow(
         return await core.update_workflow(
             deps, workflow_id, name, description, steps_json or None, enabled,
             use_storage, use_meta_llm, relayout=relayout, brain_access=brain_access,
+            brain_write_prefixes=brain_write_prefixes,
         )
 
     @tool

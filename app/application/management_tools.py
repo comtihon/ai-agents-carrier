@@ -1062,6 +1062,7 @@ async def get_workflow(
         f"Use storage: {defn.use_storage}",
         f"Use meta LLM: {defn.use_meta_llm}",
         f"Brain access: {defn.brain_access}",
+        f"Brain write prefixes: {', '.join(defn.brain_write_prefixes) or '(none)'}",
         f"Read-only: {defn.readonly}",
         f"Steps: {len(steps)}"
         + (" — " + ", ".join(f"{st.get('id')}({st.get('type')})" for st in steps
@@ -1084,16 +1085,54 @@ def _invalid_brain_access(value: str) -> str:
     return f"Invalid brain_access '{value}'. Must be one of: {', '.join(_BRAIN_ACCESS_LEVELS)}."
 
 
+def _parse_brain_write_prefixes(value: Any) -> tuple[list[str] | None, str | None]:
+    """Parse ``brain_write_prefixes`` (list or comma-separated string).
+
+    Returns ``(prefixes, None)`` with each prefix normalized to ``a/b/`` form,
+    or ``(None, error)`` when one of them is unsafe or too broad. Whether a
+    prefix actually takes effect is decided at run time by the operator
+    allowlist ``GBRAIN_WRITE_PREFIXES_ALLOWED``.
+    """
+    from app.core.config import normalize_brain_write_prefix
+
+    if value is None:
+        return [], None
+    if isinstance(value, str):
+        items = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        return None, "brain_write_prefixes must be a list of strings or a comma-separated string."
+    out: list[str] = []
+    for item in items:
+        if isinstance(item, str) and not item.strip():
+            continue
+        normalized = normalize_brain_write_prefix(item)
+        if normalized is None:
+            return None, (
+                f"Invalid brain_write_prefixes entry {item!r}: needs at least two "
+                "slug segments (e.g. 'kb/initiatives/'), no '..', '.', "
+                "empty segments or backslashes."
+            )
+        if normalized not in out:
+            out.append(normalized)
+    return out, None
+
+
 @requires(Permission.WRITE)
 async def create_workflow(
     deps: ManagementDeps, workflow_id: str, name: str, description: str, steps_json: str,
     use_storage: bool = False, enabled: bool = True, use_meta_llm: bool = True,
     brain_access: str = "none",
+    brain_write_prefixes: list[str] | str | None = None,
 ) -> str:
     if deps.workflow_backend is None:
         return "Workflow creation unavailable: no persistent backend configured."
     if brain_access not in _BRAIN_ACCESS_LEVELS:
         return _invalid_brain_access(brain_access)
+    write_prefixes, prefix_err = _parse_brain_write_prefixes(brain_write_prefixes)
+    if prefix_err:
+        return prefix_err
     try:
         steps = json.loads(steps_json)
     except json.JSONDecodeError as exc:
@@ -1134,6 +1173,7 @@ async def create_workflow(
         id=workflow_id, name=name, description=description, steps=steps,
         use_storage=use_storage, enabled=enabled, use_meta_llm=use_meta_llm,
         brain_access=brain_access,
+        brain_write_prefixes=write_prefixes or [],
         ui=apply_layout(None, steps),
     )
     await deps.workflow_backend.create(defn)
@@ -1162,11 +1202,17 @@ async def update_workflow(
     use_meta_llm: bool | None = None,
     relayout: bool = False,
     brain_access: str | None = None,
+    brain_write_prefixes: list[str] | str | None = None,
 ) -> str:
     if deps.workflow_backend is None:
         return "Workflow updates unavailable: no persistent backend configured."
     if brain_access is not None and brain_access not in _BRAIN_ACCESS_LEVELS:
         return _invalid_brain_access(brain_access)
+    write_prefixes: list[str] | None = None
+    if brain_write_prefixes is not None:
+        write_prefixes, prefix_err = _parse_brain_write_prefixes(brain_write_prefixes)
+        if prefix_err:
+            return prefix_err
 
     resolved, err = await _resolve_workflow_id(deps, workflow_id)
     if err:
@@ -1192,6 +1238,8 @@ async def update_workflow(
         defn.use_meta_llm = use_meta_llm
     if brain_access is not None:
         defn.brain_access = brain_access  # type: ignore[assignment]
+    if write_prefixes is not None:
+        defn.brain_write_prefixes = write_prefixes
     if steps_json is not None:
         try:
             steps = json.loads(steps_json)

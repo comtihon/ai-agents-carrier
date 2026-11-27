@@ -15,7 +15,12 @@ Read tools (``read`` and ``write`` grants)::
 
 Write tools (``write`` grants only)::
 
-    brain_put_page    -> put_page   (slug forced under GBRAIN_WRITE_NAMESPACE/)
+    brain_put_page    -> put_page   (slug forced under GBRAIN_WRITE_NAMESPACE/,
+                                     unless it starts with one of the grant's
+                                     write_prefixes that is still in
+                                     GBRAIN_WRITE_PREFIXES_ALLOWED: then kept
+                                     verbatim; refused if that prefix has since
+                                     left the allowlist)
     brain_remember    -> remember   (provenance forced to the carrier run)
 
 Scoping mirrors ``app.api.mcp.datasources_server``: the ASGI gate
@@ -107,16 +112,8 @@ def _clamp(limit: int | None, default: int, cap: int) -> int:
     return max(1, min(value, cap))
 
 
-def namespaced_slug(slug: str, namespace: str) -> str:
-    """Return *slug* under ``<namespace>/``, or raise ``ToolError``.
-
-    Agents write only into the carrier's own corner of the shared memory. A
-    slug that already starts with the namespace is kept; any other is prefixed.
-    Traversal (``..``), absolute slugs, backslashes and empty segments are
-    rejected rather than "fixed", because silently rewriting them would put the
-    page somewhere the agent did not name.
-    """
-    ns = (namespace or "carrier").strip().strip("/") or "carrier"
+def _validated_slug(slug: str) -> tuple[str, list[str]]:
+    """Return the stripped *slug* and its segments, or raise ``ToolError``."""
     raw = (slug or "").strip()
     if not raw:
         raise ToolError("slug must not be empty")
@@ -127,9 +124,47 @@ def namespaced_slug(slug: str, namespace: str) -> str:
     parts = raw.split("/")
     if any(p in ("", ".", "..") for p in parts):
         raise ToolError("slug must not contain '..', '.' or empty segments")
+    return raw, parts
+
+
+def namespaced_slug(slug: str, namespace: str) -> str:
+    """Return *slug* under ``<namespace>/``, or raise ``ToolError``.
+
+    Agents write only into the carrier's own corner of the shared memory. A
+    slug that already starts with the namespace is kept; any other is prefixed.
+    Traversal (``..``), absolute slugs, backslashes and empty segments are
+    rejected rather than "fixed", because silently rewriting them would put the
+    page somewhere the agent did not name.
+    """
+    ns = (namespace or "carrier").strip().strip("/") or "carrier"
+    raw, parts = _validated_slug(slug)
     if parts[0] != ns:
         raw = f"{ns}/{raw}"
     return raw
+
+
+def resolve_write_slug(
+    slug: str,
+    namespace: str,
+    grant_prefixes: list[str] | None,
+    allowed_prefixes: list[str] | None,
+) -> tuple[str, str | None]:
+    """Where a ``brain_put_page`` lands: ``(final_slug, matched_prefix)``.
+
+    The slug is validated exactly like :func:`namespaced_slug`. If it then
+    starts with one of *grant_prefixes* that is **also** still in
+    *allowed_prefixes* (the current operator allowlist — defense in depth
+    against a grant minted under an older, wider allowlist), it is kept
+    verbatim and the matched prefix is returned. Otherwise it is namespaced
+    and the prefix is ``None``. A slug equal to a bare prefix (no page name
+    below it) is not a match.
+    """
+    raw, _parts = _validated_slug(slug)
+    allowed = set(allowed_prefixes or [])
+    for prefix in grant_prefixes or []:
+        if prefix in allowed and raw.startswith(prefix) and len(raw) > len(prefix):
+            return raw, prefix
+    return namespaced_slug(raw, namespace), None
 
 
 def provenance(grant: BrainGrant) -> str:
@@ -242,7 +277,10 @@ def build_brain_mcp(
     @mcp.tool(name="brain_put_page")
     async def brain_put_page(
         slug: Annotated[str, Field(description=(
-            f"Page slug; it is stored under '{write_namespace}/' (prefixed when missing)"
+            f"Page slug; it is stored under '{write_namespace}/' (prefixed when "
+            "missing), unless it starts with one of the extra write prefixes "
+            "this run was granted (see your instructions): then it is stored "
+            "at exactly this slug"
         ))],
         content: Annotated[str, Field(description="Full page content (markdown)")],
         reason: Annotated[str, Field(description="Why this page is written or changed")],
@@ -252,13 +290,43 @@ def build_brain_mcp(
         ))] = None,
     ):
         """Create or replace a page in the shared memory under the carrier
-        namespace. Never put secrets, credentials or customer personal data in
+        namespace (or, verbatim, under an extra write prefix this run was
+        granted). Never put secrets, credentials or customer personal data in
         it."""
         grant = _grant()
-        final_slug = namespaced_slug(slug, write_namespace)
+        from app.core.config import get_settings
+
+        if grant.write_prefixes:
+            # Re-read the allowlist now: a prefix removed by the operator after
+            # the grant was minted must stop working immediately.
+            allowed_now = get_settings().gbrain_write_prefixes_allowed
+        else:
+            allowed_now = []
+        final_slug, matched = resolve_write_slug(
+            slug, write_namespace, grant.write_prefixes, allowed_now,
+        )
+        if grant.write_prefixes and matched is None:
+            stale = [
+                p for p in grant.write_prefixes
+                if p not in allowed_now and (slug or "").strip().startswith(p)
+            ]
+            if stale:
+                # Refuse rather than silently namespacing: the agent was told
+                # this slug lands verbatim, so a page elsewhere would mislead.
+                logger.warning(
+                    "brain write put_page refused: grant prefix %s is no longer "
+                    "in GBRAIN_WRITE_PREFIXES_ALLOWED (run='%s' workflow='%s' "
+                    "agent='%s')",
+                    stale, grant.run_id, grant.workflow_id, grant.agent_id,
+                )
+                raise ToolError(
+                    f"Writing under '{stale[0]}' is no longer allowed on this backend"
+                )
         logger.info(
-            "brain write put_page slug='%s' run='%s' workflow='%s' agent='%s'",
-            final_slug, grant.run_id, grant.workflow_id, grant.agent_id,
+            "brain write put_page slug='%s' path=%s run='%s' workflow='%s' agent='%s'",
+            final_slug,
+            f"prefix:{matched}" if matched else "namespace",
+            grant.run_id, grant.workflow_id, grant.agent_id,
         )
         return await _call("put_page", {
             "slug": final_slug,
