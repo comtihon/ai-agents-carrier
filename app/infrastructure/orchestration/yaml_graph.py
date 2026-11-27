@@ -1938,6 +1938,9 @@ class YamlGraphRunner:
             # Agents granted to this workflow resolve here, and only here.
             agent_backend = granted_for_workflow(agent_backend, graph_id)
             logger.info("[%s] step '%s' running (%s)", graph_id, step_id, step["type"])
+            on_start_token = None
+            if isinstance(step.get("on_start_publish"), dict):
+                on_start_token = self._arm_on_start_publish(step, state)
             try:
                 return await execute_agent_step(
                     step, state, agent_backend, run_id, callback_base_url,
@@ -1988,8 +1991,36 @@ class YamlGraphRunner:
                     }
                 logger.error("[%s] step '%s' raised: %s", graph_id, step_id, _step_exc)
                 return {"__failed_step__": step_id, "error": str(_step_exc)}
+            finally:
+                if on_start_token is not None:
+                    from app.steps.agent_start import agent_on_start
+
+                    agent_on_start.reset(on_start_token)
 
         return node
+
+    def _arm_on_start_publish(self, step: dict[str, Any], state: dict):
+        """Set the agent step's start hook (``on_start_publish``) for this node's executor call.
+
+        The message is rendered against the state the step starts with and sent
+        once the agent actually starts executing -- after it got a slot of its
+        runtime when concurrency is limited, not while it waits in the queue.
+        A failed render or publish is logged; it never fails the step.
+        """
+        from app.steps.agent_start import agent_on_start
+
+        graph_id, step_id = self.id, step["id"]
+        cfg = step["on_start_publish"]
+
+        async def on_start() -> None:
+            try:
+                topic, send = self._prepare_pubsub_publish(cfg, state)
+                message_id = await send()
+                logger.info("[%s] step '%s' on_start_publish: message %s to %s", graph_id, step_id, message_id, topic)
+            except Exception:
+                logger.exception("[%s] step '%s' on_start_publish failed (step continues)", graph_id, step_id)
+
+        return agent_on_start.set(on_start)
 
     def _llm_node(self, step: dict[str, Any]):
         graph_id = self.id
@@ -2474,6 +2505,39 @@ class YamlGraphRunner:
 
         return node
 
+    def _prepare_pubsub_publish(self, cfg: dict[str, Any], state: dict):
+        """Render one publish config (``topic``, ``project_id``, ``data``, ``attributes``,
+        ``timeout_seconds``) against *state*; returns ``(topic_path, send)``.
+
+        Rendering and the allowlist check happen now; ``send()`` publishes and
+        returns the message id.  Shared by the ``pubsub_publish`` step and an
+        agent step's ``on_start_publish``.
+        """
+        from app.core.config import get_settings
+        from app.infrastructure.orchestration import pubsub_publish as pp
+
+        settings = get_settings()
+        project_id = (
+            self._render(str(cfg.get("project_id") or ""), state).strip()
+            or settings.pubsub_project_id
+        )
+        topic = pp.resolve_topic(self._render(str(cfg.get("topic") or ""), state), project_id)
+        pp.check_allowed(topic, pp.parse_allowlist(settings.pubsub_publish_allowed_topics))
+        raw_data = cfg.get("data")
+        data = self._render(raw_data, state) if isinstance(raw_data, str) else self._render_deep(raw_data, state)
+        attributes = {
+            str(k): self._render(str(v), state)
+            for k, v in (cfg.get("attributes") or {}).items()
+            if v is not None
+        }
+        timeout = float(cfg.get("timeout_seconds") or pp.DEFAULT_TIMEOUT_SECONDS)
+        payload = pp.encode_data(data)
+
+        async def send() -> str:
+            return await pp.publish(topic, payload, attributes, timeout)
+
+        return topic, send
+
     def _pubsub_publish_node(self, step: dict[str, Any]):
         """Publish one message to a Google Cloud Pub/Sub topic.
 
@@ -2493,25 +2557,9 @@ class YamlGraphRunner:
             step_id = step["id"]
             output_key = step.get("output_key") or step_id
             try:
-                from app.core.config import get_settings
-
-                settings = get_settings()
-                project_id = (
-                    self._render(str(step.get("project_id") or ""), state).strip()
-                    or settings.pubsub_project_id
-                )
-                topic = pp.resolve_topic(self._render(str(step.get("topic") or ""), state), project_id)
-                pp.check_allowed(topic, pp.parse_allowlist(settings.pubsub_publish_allowed_topics))
-                raw_data = step.get("data")
-                data = self._render(raw_data, state) if isinstance(raw_data, str) else self._render_deep(raw_data, state)
-                attributes = {
-                    str(k): self._render(str(v), state)
-                    for k, v in (step.get("attributes") or {}).items()
-                    if v is not None
-                }
-                timeout = float(step.get("timeout_seconds") or pp.DEFAULT_TIMEOUT_SECONDS)
+                topic, send = self._prepare_pubsub_publish(step, state)
                 logger.info("[%s] step '%s' running (pubsub_publish %s)", graph_id, step_id, topic)
-                message_id = await pp.publish(topic, pp.encode_data(data), attributes, timeout)
+                message_id = await send()
                 logger.info("[%s] step '%s' published message %s", graph_id, step_id, message_id)
                 return {output_key: {"message_id": message_id, "topic": topic}}
             except Exception as exc:

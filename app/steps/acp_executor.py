@@ -29,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from app.application.concurrency import ConcurrencySlot, queue_reporter, runtime_for
+from app.steps.agent_start import fire_agent_on_start
 from app.application.runners import RunnerOffline
 from app.core.config import BRAIN_MCP_NAME, DATASOURCES_MCP_NAME
 from app.domain.models.runner import AgentLimit
@@ -669,6 +670,8 @@ async def run_acp_agent(
                     # Known to be out of quota: wait before taking the machine's time.
                     await park(LimitInfo(known.kind, known.until, known.message))
             await slot.acquire()
+            # The agent starts working now (after the queue, if any): the step's on_start_publish.
+            await fire_agent_on_start()
             if runner is None:
                 token = secrets.token_urlsafe(32)
                 env = dict(agent_config.get("env_vars") or {})

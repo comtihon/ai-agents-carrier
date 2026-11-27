@@ -680,6 +680,37 @@ async def test_config_options_are_reapplied_on_reload_and_a_refusal_does_not_end
         await fake.stop()
 
 
+async def test_start_hook_fires_once_after_the_slot_is_acquired(server):
+    """A step's on_start_publish: when the agent starts, after any queue."""
+    from app.application.concurrency import set_concurrency_backend
+    from app.infrastructure.persistence.concurrency_backend import InMemoryConcurrencyBackend
+    from app.steps.agent_start import agent_on_start
+
+    _, token = await _runner(server)
+    await server.runners.update_runner("rnr-1", {"agent_concurrency": {"codex": 1}})
+    leases = InMemoryConcurrencyBackend()
+    set_concurrency_backend(leases)
+    fired: list[int] = []
+
+    async def hook() -> None:
+        rows = await leases.list_keys(datetime.now(timezone.utc))
+        fired.append(sum(len(r["holders"]) for r in rows))
+
+    fake = FakeRunner(server, token, ["ok"])
+    await fake.start()
+    reset = agent_on_start.set(hook)
+    try:
+        out = await _step()
+        assert out["result"] == '{"summary": "done"}'
+        assert fired == [1]  # once, while holding the slot
+        methods = [m for m, _ in fake.calls]
+        assert "session/new" in methods
+    finally:
+        agent_on_start.reset(reset)
+        set_concurrency_backend(None)
+        await fake.stop()
+
+
 async def test_parked_step_resumes_after_a_carrier_restart(server, monkeypatch):
     _, token = await _runner(server)
 
@@ -699,7 +730,19 @@ async def test_parked_step_resumes_after_a_carrier_restart(server, monkeypatch):
             "quota": {"kind": "usage_limit", "message": "limit", "resets_at": None, "resume_at": None},
             "quota_started": datetime.now(timezone.utc).timestamp(),
         }}
-        out = await _step(tasks=tasks)
+        from app.steps.agent_start import agent_on_start
+
+        fired: list[bool] = []
+
+        async def hook() -> None:
+            fired.append(True)
+
+        reset = agent_on_start.set(hook)
+        try:
+            out = await _step(tasks=tasks)
+        finally:
+            agent_on_start.reset(reset)
+        assert fired == []  # resuming a step that already started is not a start
         assert out["result"] == '{"summary": "done"}'
         assert [m for m, _ in fake.calls] == ["session/prompt", "_proxy/shutdown"]
         assert fake.prompts[0]["prompt"][0]["text"] == CONTINUE_PROMPT
