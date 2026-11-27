@@ -32,6 +32,11 @@ class WorkflowDefinition(GrantableResource):
     # Ceiling on the shared company memory (gbrain) access of this workflow's
     # agent steps; each step gets min(this, the agent's brain_access).
     brain_access: BrainAccess = "none"
+    # Extra gbrain slug prefixes (e.g. "kb/initiatives/") this workflow's
+    # agents may write under besides the carrier namespace. Only prefixes in
+    # the operator allowlist GBRAIN_WRITE_PREFIXES_ALLOWED take effect, and only
+    # for agents with effective brain_access "write".
+    brain_write_prefixes: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -51,5 +56,6 @@ class WorkflowDefinition(GrantableResource):
         d["use_meta_llm"] = self.use_meta_llm
         d["use_storage"] = self.use_storage
         d["brain_access"] = self.brain_access
+        d["brain_write_prefixes"] = list(self.brain_write_prefixes)
         d["enabled"] = self.enabled
         return d

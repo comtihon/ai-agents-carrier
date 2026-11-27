@@ -103,6 +103,13 @@ secrets: {}
 #     url: http://gbrain.gbrain.svc.cluster.local:3131/mcp
 #     toolPrefix: ""          # "gbrain_" only when url is the Airteam MCP gateway
 #     writeNamespace: carrier
+# Optional extra write prefixes: GBRAIN_WRITE_PREFIXES_ALLOWED is the operator
+# allowlist of slug prefixes a workflow may let its agents write under (via the
+# workflow's `brain_write_prefixes`) besides the write namespace. Set it in
+# `config` above (comma-separated, each with at least two segments), e.g.
+#   config:
+#     GBRAIN_WRITE_PREFIXES_ALLOWED: "kb/initiatives/,team/projects/"
+# Unset / empty (the default) = agents write only under the namespace.
 gbrain:
   url: ""
   toolPrefix: ""

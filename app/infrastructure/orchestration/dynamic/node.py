@@ -214,6 +214,7 @@ def make_job_runner(runner: "YamlGraphRunner", step: dict[str, Any], config: Dyn
                 # Jobs run inside the parent workflow: its ceiling applies.
                 workflow_id=runner.id,
                 workflow_brain_access=getattr(runner, "_brain_access", "none"),
+                workflow_brain_write_prefixes=getattr(runner, "_brain_write_prefixes", None),
             )
             output = {k: result[k] for k in fields if k in result}
             if "_meta_llm_result" in result:

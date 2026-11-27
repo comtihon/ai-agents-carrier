@@ -91,6 +91,9 @@ class WorkflowDefinitionRequest(BaseModel):
     use_storage: bool = False
     # Shared company memory ceiling for this workflow's agent steps.
     brain_access: BrainAccess = "none"
+    # Extra gbrain slug prefixes the agents may write under (bounded by the
+    # operator allowlist GBRAIN_WRITE_PREFIXES_ALLOWED at run time).
+    brain_write_prefixes: list[str] = []
     enabled: bool = True
     # None = the default: private when a user creates it, public without auth.
     visibility: Visibility | None = None
@@ -115,11 +118,22 @@ class WorkflowDefinitionUpdateRequest(BaseModel):
     use_meta_llm: bool | None = None
     use_storage: bool | None = None
     brain_access: BrainAccess | None = None
+    brain_write_prefixes: list[str] | None = None
     enabled: bool | None = None
     visibility: Visibility | None = None
     # With visibility "team": which team. Omitted = the caller's own (a
     # super admin may name any team; anyone else only their own).
     team_id: str | None = None
+
+
+def _validated_brain_write_prefixes(prefixes: list[str]) -> list[str]:
+    """Normalize ``brain_write_prefixes`` or answer 422 on an unsafe entry."""
+    from app.application.management_tools import _parse_brain_write_prefixes
+
+    parsed, err = _parse_brain_write_prefixes(prefixes)
+    if err:
+        raise HTTPException(status_code=422, detail=err)
+    return parsed or []
 
 
 class RestartFromStepRequest(BaseModel):
@@ -752,6 +766,7 @@ async def create_workflow(
         use_meta_llm=body.use_meta_llm,
         use_storage=body.use_storage,
         brain_access=body.brain_access,
+        brain_write_prefixes=_validated_brain_write_prefixes(body.brain_write_prefixes),
         enabled=body.enabled,
         **visibility_kwargs(body.visibility, body.team_id),
     )
@@ -1175,6 +1190,11 @@ async def update_workflow(
         ),
         brain_access=(
             existing.brain_access if body.brain_access is None else body.brain_access
+        ),
+        brain_write_prefixes=(
+            existing.brain_write_prefixes
+            if body.brain_write_prefixes is None
+            else _validated_brain_write_prefixes(body.brain_write_prefixes)
         ),
         enabled=existing.enabled if body.enabled is None else body.enabled,
         created_at=existing.created_at,

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from functools import lru_cache
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 def _default_api_key_env(name: str) -> str:
@@ -236,6 +237,28 @@ DATASOURCES_MCP_NAME = "datasources"
 # Reserved the same way: it is granted only by ``brain_access``, never by an
 # ``mcp`` addon checkbox (app.steps.agent_executor).
 BRAIN_MCP_NAME = "brain"
+
+_logger = logging.getLogger(__name__)
+
+
+def normalize_brain_write_prefix(prefix: Any) -> str | None:
+    """Normalize a gbrain write prefix to ``a/b/`` form, or ``None`` if unsafe.
+
+    Strips whitespace and a leading ``/`` and ensures a trailing ``/``. Rejects
+    empty values, backslashes, ``.`` / ``..`` / empty segments, and prefixes
+    with fewer than two segments (``kb/`` alone is too broad).
+    """
+    if not isinstance(prefix, str):
+        return None
+    raw = prefix.strip().lstrip("/")
+    if not raw or "\\" in raw:
+        return None
+    parts = raw.rstrip("/").split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        return None
+    if len(parts) < 2:
+        return None
+    return "/".join(parts) + "/"
 
 
 class Settings(BaseSettings):
@@ -668,6 +691,15 @@ class Settings(BaseSettings):
     # Slug namespace every agent write lands under (`<namespace>/...`).
     gbrain_write_namespace: str = Field(default="carrier", alias="GBRAIN_WRITE_NAMESPACE")
     gbrain_timeout_seconds: float = Field(default=15.0, alias="GBRAIN_TIMEOUT_SECONDS")
+    # Operator allowlist of extra slug prefixes a workflow may let its agents
+    # write under (besides the namespace above), via the workflow's
+    # ``brain_write_prefixes``. Comma-separated, e.g. "kb/initiatives/".
+    # Empty (default) turns the feature off. Each entry is normalized to
+    # ``a/b/`` form; entries with traversal, backslashes or fewer than two
+    # segments (too broad, e.g. "kb/") are dropped with a warning.
+    gbrain_write_prefixes_allowed: Annotated[list[str], NoDecode] = Field(
+        default_factory=list, alias="GBRAIN_WRITE_PREFIXES_ALLOWED"
+    )
     # Signs the per-run brain grants (app.infrastructure.auth.brain_grant).
     # Falls back to the data source grant key, so a deployment that has one
     # needs no new secret.
@@ -788,6 +820,28 @@ class Settings(BaseSettings):
         auth wrappers read as "no usable key" and fail closed on.
         """
         return value.strip() if isinstance(value, str) else value
+
+    @field_validator("gbrain_write_prefixes_allowed", mode="before")
+    @classmethod
+    def _parse_write_prefixes(cls, value: Any) -> list[str]:
+        """Parse the comma-separated allowlist and drop unsafe entries."""
+        if value is None:
+            return []
+        items = value.split(",") if isinstance(value, str) else list(value)
+        out: list[str] = []
+        for item in items:
+            normalized = normalize_brain_write_prefix(item)
+            if normalized is None:
+                if str(item or "").strip():
+                    _logger.warning(
+                        "GBRAIN_WRITE_PREFIXES_ALLOWED: dropping unsafe or too broad "
+                        "prefix %r (needs at least two segments, no '..' or '\\')",
+                        item,
+                    )
+                continue
+            if normalized not in out:
+                out.append(normalized)
+        return out
 
     def resolved_mcp_datasources_url(self) -> str:
         """URL of the in-process data sources MCP server.

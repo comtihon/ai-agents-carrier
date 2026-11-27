@@ -23,7 +23,7 @@ import logging
 import time
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.infrastructure.auth._signed_token import (
     looks_like,
@@ -52,6 +52,11 @@ class BrainGrant(BaseModel):
     agent_id: str = ""
     workflow_id: str = ""
     access: Literal["read", "write"] = "read"
+    # Extra slug prefixes (``a/b/`` form) a ``write`` grant may write under
+    # verbatim, besides GBRAIN_WRITE_NAMESPACE: the workflow's
+    # ``brain_write_prefixes`` intersected with GBRAIN_WRITE_PREFIXES_ALLOWED at
+    # mint time. Absent in tokens minted before the field existed (= none).
+    write_prefixes: list[str] = Field(default_factory=list)
     # Unix seconds; 0 ("no expiry stated") is rejected by verification.
     expires_at: int = 0
 
