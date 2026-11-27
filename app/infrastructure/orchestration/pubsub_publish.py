@@ -122,7 +122,22 @@ def validate_pubsub_publish_steps(steps: Any) -> list[str]:
     if not isinstance(steps, list):
         return errors
     for step in steps:
-        if not isinstance(step, dict) or step.get("type") != "pubsub_publish":
+        if not isinstance(step, dict):
+            continue
+        if "on_start_publish" in step:
+            # An agent step's start message: same fields as a pubsub_publish step.
+            hook = step.get("on_start_publish")
+            sid = step.get("id", "?")
+            if step.get("type") not in ("claude-agent", "langgraph-agent"):
+                errors.append(f"step '{sid}': 'on_start_publish' is only supported on agent steps")
+            elif not isinstance(hook, dict):
+                errors.append(f"step '{sid}': 'on_start_publish' must be an object")
+            else:
+                errors += [
+                    e.replace(f"step '{hook.get('id', sid)}':", f"step '{sid}' on_start_publish:", 1)
+                    for e in validate_pubsub_publish_steps([{**hook, "id": sid, "type": "pubsub_publish"}])
+                ]
+        if step.get("type") != "pubsub_publish":
             continue
         sid = step.get("id", "?")
         topic = step.get("topic")

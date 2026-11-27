@@ -1342,6 +1342,8 @@ async def execute_agent_step(
     )
     try:
         await _slot.acquire()
+        from app.steps.agent_start import fire_agent_on_start
+        await fire_agent_on_start()
         raw_output = await _drive_http_poll()
     finally:
         if _slot.gated:

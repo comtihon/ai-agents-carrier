@@ -195,3 +195,108 @@ def test_make_node_dispatches_pubsub_publish():
 def test_render_dot_access_reads_dict_keys():
     r = YamlGraphRunner._render
     assert r("{event.projectId}/{event.missing}/{event[projectId]}", STATE) == "p-42//p-42"
+
+
+# ─── an agent step's on_start_publish ────────────────────────────────────────
+
+_ON_START = {
+    "topic": "service.modelapi.prediction",
+    "data": {"projectId": "{event.projectId}", "status": "Running"},
+    "attributes": {"source": "agent", "agentStatus": "running", "projectId": "{event.projectId}"},
+}
+
+
+def _agent_node(monkeypatch, step: dict, behaviour):
+    """The agent node with execute_agent_step replaced by *behaviour*."""
+    import app.application.visibility as visibility
+    import app.steps.agent_executor as agent_executor
+
+    monkeypatch.setattr(visibility, "granted_for_workflow", lambda backend, wf: backend)
+    monkeypatch.setattr(agent_executor, "execute_agent_step", behaviour)
+    step = {"id": "model", "type": "claude-agent", "agent_id": "a", **step}
+    runner = YamlGraphRunner({"id": "wf", "steps": [step]}, object(), lambda *a, **k: [])
+    runner._agent_backend = object()
+    return runner._agent_node(step)
+
+
+@pytest.mark.asyncio
+async def test_on_start_publish_is_sent_when_the_agent_starts_not_before(monkeypatch, publisher):
+    from app.steps.agent_start import agent_on_start, fire_agent_on_start
+
+    _settings(monkeypatch, "service.modelapi.prediction")
+    seen: list[int] = []
+
+    async def behaviour(step, state, *a, **k):
+        seen.append(len(publisher.calls))  # queued: nothing published yet
+        await fire_agent_on_start()        # the executor got its slot
+        seen.append(len(publisher.calls))
+        return {"model_output": "done"}
+
+    node = _agent_node(monkeypatch, {"on_start_publish": _ON_START}, behaviour)
+    out = await node(STATE)
+
+    assert out == {"model_output": "done"}
+    assert seen == [0, 1]
+    call = publisher.calls[0]
+    assert call["topic"] == "projects/proj-a/topics/service.modelapi.prediction"
+    assert json.loads(call["data"]) == {"projectId": "p-42", "status": "Running"}
+    assert call["attrs"] == {"source": "agent", "agentStatus": "running", "projectId": "p-42"}
+    assert agent_on_start.get() is None  # not left set for the next step
+
+
+@pytest.mark.asyncio
+async def test_agent_that_never_starts_publishes_nothing(monkeypatch, publisher):
+    _settings(monkeypatch, "service.modelapi.prediction")
+
+    async def behaviour(step, state, *a, **k):
+        raise RuntimeError("cancelled while queued")
+
+    node = _agent_node(monkeypatch, {"on_start_publish": _ON_START, "ignore_errors": True}, behaviour)
+    out = await node(STATE)
+
+    assert out["model"]["ok"] is False
+    assert publisher.calls == []
+
+
+@pytest.mark.asyncio
+async def test_failed_on_start_publish_does_not_fail_the_step(monkeypatch, publisher):
+    from app.steps.agent_start import fire_agent_on_start
+
+    _settings(monkeypatch, "")  # publishing disabled -> the hook fails
+
+    async def behaviour(step, state, *a, **k):
+        await fire_agent_on_start()
+        return {"model_output": "done"}
+
+    node = _agent_node(monkeypatch, {"on_start_publish": _ON_START}, behaviour)
+    assert await node(STATE) == {"model_output": "done"}
+    assert publisher.calls == []
+
+
+@pytest.mark.asyncio
+async def test_agent_step_without_on_start_publish_has_no_hook(monkeypatch, publisher):
+    from app.steps.agent_start import agent_on_start
+
+    hooks: list = []
+
+    async def behaviour(step, state, *a, **k):
+        hooks.append(agent_on_start.get())
+        return {}
+
+    await _agent_node(monkeypatch, {}, behaviour)(STATE)
+    assert hooks == [None]
+
+
+def test_on_start_publish_validation():
+    ok = [{"id": "model", "type": "claude-agent", "on_start_publish": _ON_START}]
+    assert pp.validate_pubsub_publish_steps(ok) == []
+    errs = pp.validate_pubsub_publish_steps([
+        {"id": "model", "type": "claude-agent", "on_start_publish": {"data": {}}},
+        {"id": "x", "type": "python", "on_start_publish": _ON_START},
+        {"id": "y", "type": "claude-agent", "on_start_publish": "topic"},
+    ])
+    assert errs == [
+        "step 'model' on_start_publish: 'topic' is required",
+        "step 'x': 'on_start_publish' is only supported on agent steps",
+        "step 'y': 'on_start_publish' must be an object",
+    ]
